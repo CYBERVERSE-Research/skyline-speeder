@@ -82,6 +82,17 @@ Skyline Speeder 是一套**只需部署在 TCP 连接服务器发送端**的加�
 curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash
 ```
 
+> [!NOTE]
+> 最小化服务器镜像上经常**既没有 `curl` 也没有 `sudo`**。先装一个下载工具；已经是
+> root 就把 `sudo` 去掉：
+>
+> ```bash
+> apt-get update && apt-get install -y curl        # 或 wget
+>
+> curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | bash
+> wget -qO- https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | bash
+> ```
+
 或者自己克隆下来看过再装（**推荐**，这个脚本会改全机 TCP 行为）：
 
 ```bash
@@ -98,6 +109,9 @@ sudo ./install.sh --no-enable  # 安装但不挂载 skyline_cc
 sudo ./install.sh --uninstall  # 卸载（保留 /etc/skyline-speeder 配置）
 ```
 
+安装器会在改动任何东西之前记录当前的拥塞控制算法与默认 qdisc，`--uninstall`
+会把它们还原。**装之前跑 BBR 的机器，卸载后回到 BBR**，而不是停在 `fallback_cc`。
+
 > [!NOTE]
 > BPF 对象必须在**目标机器本身**编译（或显式指定同版本内核的 BTF），不能搬运在别的内核版本上编译好的 `.bpf.o`。
 
@@ -108,6 +122,12 @@ ssctl status    # 运行时状态、能力集与决策计数器
 ssctl flows     # 逐连接视图
 ssctl drain     # 优雅摘除，等待存量连接自然结束
 ```
+
+> [!TIP]
+> `ssctl drain` 会等所有 skyline_cc 连接结束——**你自己的 SSH 会话就是其中一条**，
+> 所以通过 SSH 执行它必然走到超时。这是安全的：drain 在开始等待**之前**就已经把
+> sysctl 写回 `fallback_cc`，无论如何都不会再有新连接用 skyline_cc。struct_ops 会
+> 保持挂载直到最后一条流结束，内核把这报告为一个活跃引用，不是错误。
 
 ## cgroup 前提
 

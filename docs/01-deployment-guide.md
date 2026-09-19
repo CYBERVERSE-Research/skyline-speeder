@@ -135,6 +135,11 @@ sudo ssctl flows
 异常，只是启动竞态；上面的 `timeout 30 sh -c '...'` 等 socket 文件出现后
 再继续，自动化脚本应保留这一步而不是直接假设 socket 立即可用。
 
+`install.sh` 在启动 daemon 之前会把当前的 `net.ipv4.tcp_congestion_control` 与
+`net.core.default_qdisc` 快照到 `/etc/skyline-speeder/pre-install-state`（只写一次，
+重装不会把 `skyline_cc` 误记成"原值"）；`--uninstall` 读取它还原。装之前跑 BBR 的
+机器，卸载后回到 BBR，而不是停在 `fallback_cc`。
+
 `skyline-speederd.service` 启动后只是常驻进程，不会自动挂载 `skyline_cc`——必须显式执行
 `ssctl enable` 才会真正附加拥塞控制算法、让 `enabled_modules` 里配置的
 模块生效；不执行这一步，新连接会一直走配置文件里的 `fallback_cc`。
@@ -172,6 +177,13 @@ sudo ssctl set-rack-rto --srtt-permille 1100 --floor-us 20000 --ceiling-us 20000
 只在 RTT 边界切换到新配置槽，避免同一轮 ACK 处理内读到新旧混杂的值。
 
 ## 9. 摘除与回滚
+
+> [!IMPORTANT]
+> **通过 SSH 执行 `drain` 必然走到超时**：你自己的 SSH 连接就是一条 skyline_cc 流，
+> 它不会在 drain 等待期间结束。这不是故障——drain 在开始等待**之前**就已经把
+> `net.ipv4.tcp_congestion_control` 写回 `fallback_cc`，所以无论超时与否都不会再有
+> 新连接使用 skyline_cc；struct_ops 保持挂载直到最后一条存量流结束，这是内核的引用
+> 计数行为。要真正等到归零，从串口控制台或一条不走本机 skyline_cc 的通道执行。
 
 优雅摘除用 `drain`：
 

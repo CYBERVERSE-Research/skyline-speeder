@@ -208,9 +208,14 @@ ssctl drain --timeout 60
 # 停止（等价于 SIGTERM，会正确注销全部 struct_ops 与 BPF 链接）
 systemctl stop skyline-speeder-enable.service skyline-speederd.service
 
-# 彻底卸载（保留 /etc/skyline-speeder 配置）
+# 彻底卸载（保留 /etc/skyline-speeder 配置，并还原安装前的 cc/qdisc）
 sudo ./install.sh --uninstall
 ```
+
+`drain` 经 SSH 执行必然超时（执行者的 SSH 连接本身就是一条 skyline_cc 存量流）；
+sysctl 在等待前已写回 `fallback_cc`，故超时不影响"新连接不再使用 skyline_cc"这一
+结果。`--uninstall` 从 `/etc/skyline-speeder/pre-install-state` 还原安装前的
+拥塞控制算法与默认 qdisc。
 
 M1 tier-2 的 RTO 调节与重传 DSCP 标记**不受 drain 影响**，需单独关闭：
 

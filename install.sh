@@ -14,6 +14,12 @@
 #
 set -euo pipefail
 
+# A caller's LC_ALL often names a locale this machine does not have generated,
+# and apt/perl then emit a screenful of "Setting locale failed" before doing the
+# work correctly anyway. Pin it so installer output is deterministic and the
+# real messages are not buried.
+export LC_ALL=C.UTF-8 LANG=C.UTF-8 LANGUAGE=
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KVER="$(uname -r)"
 MODE=install
@@ -55,6 +61,34 @@ if [ "$MODE" = uninstall ]; then
           /usr/local/sbin/skyline-speederd /usr/local/bin/ssctl
     rm -rf /opt/skyline-speeder
     systemctl daemon-reload
+
+    # Put back what was in place before the install. Without this an operator
+    # who ran BBR before installing is silently left on `fallback_cc` (cubic)
+    # after uninstalling -- a downgrade nobody asked for, and a confusing one
+    # because nothing reports it. The snapshot lives under /etc/skyline-speeder,
+    # which uninstall deliberately keeps.
+    STATE=/etc/skyline-speeder/pre-install-state
+    if [ -r "$STATE" ]; then
+        # shellcheck disable=SC1090  # a generated two-line key=value file
+        . "$STATE"
+        if [ -n "${PRE_INSTALL_CC:-}" ]; then
+            if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null \
+                | grep -qw -- "$PRE_INSTALL_CC"; then
+                sysctl -qw "net.ipv4.tcp_congestion_control=$PRE_INSTALL_CC"
+                ok "congestion control restored to $PRE_INSTALL_CC"
+            else
+                warn "cannot restore '$PRE_INSTALL_CC': no longer available on this kernel"
+            fi
+        fi
+        if [ -n "${PRE_INSTALL_QDISC:-}" ]; then
+            sysctl -qw "net.core.default_qdisc=$PRE_INSTALL_QDISC" 2>/dev/null \
+                && ok "default qdisc restored to $PRE_INSTALL_QDISC" \
+                || warn "could not restore default qdisc to $PRE_INSTALL_QDISC"
+        fi
+    else
+        warn "no pre-install snapshot at $STATE; leaving sysctls as they are."
+        warn "Current: cc=$(sysctl -n net.ipv4.tcp_congestion_control) qdisc=$(sysctl -n net.core.default_qdisc)"
+    fi
     # /etc/skyline-speeder is left in place on purpose: it holds operator-tuned
     # configuration that a reinstall should not silently discard.
     ok "removed (configuration kept at /etc/skyline-speeder)"
@@ -119,8 +153,14 @@ if [ "$MODE" = check ]; then
 fi
 
 info "installing build toolchain"
-apt-get update -qq
-apt-get install -y -qq "${PKGS[@]}" || die "failed to install build prerequisites"
+# `-qq` silences apt but not dpkg, which still prints an unpack line per
+# package plus a "Reading database" progress bar. Dpkg::Use-Pty=0 stops the
+# progress redraw; the log keeps the detail for when something actually fails.
+APT_LOG=$(mktemp)
+apt_quiet() { apt-get -y -qq -o Dpkg::Use-Pty=0 "$@" >>"$APT_LOG" 2>&1; }
+apt_quiet update || { cat "$APT_LOG" >&2; die "apt-get update failed"; }
+apt_quiet install "${PKGS[@]}" || { cat "$APT_LOG" >&2; die "failed to install build prerequisites"; }
+rm -f "$APT_LOG"
 ok "toolchain installed"
 
 # --- 5. Rust ---------------------------------------------------------------
@@ -167,6 +207,19 @@ info "validating configuration and BPF objects against this kernel"
 /usr/local/sbin/skyline-speederd --config "$CFG" --validate-only --verify-bpf >/dev/null \
     || die "validation failed; run without >/dev/null to see the verifier output"
 ok "all BPF objects passed the kernel verifier"
+
+# Snapshot before anything starts changing sysctls: the daemon writes
+# fallback_cc on load and `ssctl enable` writes skyline_cc after it attaches.
+# Only written once -- a reinstall must not record skyline_cc as the "original".
+STATE=/etc/skyline-speeder/pre-install-state
+if [ ! -e "$STATE" ]; then
+    install -d /etc/skyline-speeder
+    cat > "$STATE" <<EOF
+PRE_INSTALL_CC=$(sysctl -n net.ipv4.tcp_congestion_control)
+PRE_INSTALL_QDISC=$(sysctl -n net.core.default_qdisc)
+EOF
+    ok "recorded pre-install state: cc=$(sysctl -n net.ipv4.tcp_congestion_control) qdisc=$(sysctl -n net.core.default_qdisc)"
+fi
 
 systemctl enable --now skyline-speederd.service
 ok "skyline-speederd.service started"

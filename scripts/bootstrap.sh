@@ -26,6 +26,10 @@
 #
 set -euo pipefail
 
+# See install.sh for why: a caller's LC_ALL often names a locale this machine
+# has not generated, and apt/perl bury the real output under locale warnings.
+export LC_ALL=C.UTF-8 LANG=C.UTF-8 LANGUAGE=
+
 main() {
     local REPO="${SKYLINE_REPO:-CYBERVERSE-Research/skyline-speeder}"
     local REF="${SKYLINE_REF:-main}"

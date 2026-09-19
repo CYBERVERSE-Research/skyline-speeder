@@ -83,6 +83,17 @@ Verified: `6.12.101`, `6.18.42`, `7.1.6` pass (including IPv4/IPv6 data-path smo
 curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash
 ```
 
+> [!NOTE]
+> A minimal server image often has neither `curl` nor `sudo`. Install a fetch
+> tool first, and drop `sudo` if you are already root:
+>
+> ```bash
+> apt-get update && apt-get install -y curl        # or wget
+>
+> curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | bash
+> wget -qO- https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | bash
+> ```
+
 Or clone it and read the script before running it — **recommended**, since this changes the congestion control of every new connection on the machine:
 
 ```bash
@@ -99,6 +110,10 @@ sudo ./install.sh --no-enable  # install without attaching skyline_cc
 sudo ./install.sh --uninstall  # remove (keeps /etc/skyline-speeder)
 ```
 
+The installer records the congestion control and default qdisc in place before
+it changes anything, and `--uninstall` puts them back. Uninstalling a host that
+ran BBR returns it to BBR, not to `fallback_cc`.
+
 > [!NOTE]
 > BPF objects must be compiled **on the target machine** (or against explicitly supplied BTF from the same kernel). A `.bpf.o` built on a different kernel version cannot be shipped and reused.
 
@@ -109,6 +124,14 @@ ssctl status    # runtime state, kernel capabilities, decision counters
 ssctl flows     # per-flow view
 ssctl drain     # graceful detach, waits for existing flows to finish
 ```
+
+> [!TIP]
+> `ssctl drain` waits for every skyline_cc flow to end — **and your own SSH
+> session is one of them**, so over SSH it will always reach its timeout. That
+> is safe: drain writes the sysctl back to `fallback_cc` *before* it starts
+> waiting, so no new connection uses skyline_cc either way. The struct_ops stays
+> attached until the last flow closes, which the kernel reports as a live
+> reference, not an error.
 
 ## The cgroup prerequisite
 

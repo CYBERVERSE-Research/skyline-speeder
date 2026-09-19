@@ -28,6 +28,19 @@ for anyone holding a prebuilt `.bpf.o`.
 
 ### Fixed
 
+- CI: the BPF job failed on every run. Ubuntu's `bpftool` package is a wrapper
+  script from `linux-tools-common` that dispatches to a binary matching
+  `uname -r`; no such package exists for the runner kernel, so the wrapper
+  passed a `command -v` check and then failed at run time. CI now installs the
+  upstream static bpftool, pinned by sha256, and verifies it by running it.
+- `install.sh --uninstall` left the host on `fallback_cc` instead of whatever it
+  ran before. The installer now snapshots the congestion control and default
+  qdisc to `/etc/skyline-speeder/pre-install-state` before starting anything,
+  and the uninstaller restores both.
+- Installer output was buried under dpkg unpack lines and locale warnings.
+  `LC_ALL` is pinned and apt runs with `Dpkg::Use-Pty=0`, with the full log
+  printed only when a step actually fails.
+
 - `ssctl drain` followed by a manual `ssctl enable` no longer leaves the system
   default congestion control on `fallback_cc`.
 
@@ -89,6 +102,14 @@ First public release.
 - **The `ssctl` wire protocol has no authentication**, relying entirely on Unix
   socket file permissions. Multi-tenant hosts need additional access control.
 - The experiment harness requires **Python 3.11 or newer** (`tomllib`).
+- **`ssctl drain` cannot complete over SSH.** The operator's own SSH connection
+  is a skyline_cc flow and will not end while drain waits, so drain always
+  reaches its timeout. It is safe — the sysctl is written back to `fallback_cc`
+  before the wait begins — but the struct_ops stays attached until that session
+  closes.
+- The documented one-line installer needs `curl`, which a minimal server image
+  may not have. `bootstrap.sh` installs it if missing, but only once it is
+  running; the README now shows the prerequisite and a `wget` equivalent.
 
 [Unreleased]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/CYBERVERSE-Research/skyline-speeder/releases/tag/v0.1.0
