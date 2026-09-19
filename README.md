@@ -115,7 +115,7 @@ it changes anything, and `--uninstall` puts them back. Uninstalling a host that
 ran BBR returns it to BBR, not to `fallback_cc`.
 
 > [!NOTE]
-> BPF objects must be compiled **on the target machine** (or against explicitly supplied BTF from the same kernel). A `.bpf.o` built on a different kernel version cannot be shipped and reused.
+> The installer builds the BPF objects locally, which is why it needs clang, LLVM and bpftool. That is a property of the current installer, **not** of the objects: they are CO-RE relocatable and do load on kernels other than the one they were compiled against. Measured both ways on Debian 13 — objects built under 6.12.63 load and run on 6.19.14, and objects built against a 6.12 header load on 6.12.63 after being compiled on 6.19.14. `infra/kernel/core-portability.sh` makes that check repeatable.
 
 Day-to-day:
 

@@ -13,10 +13,29 @@ BPF_OBJECTS := $(patsubst bpf/%.bpf.c,$(BPF_DIR)/%.bpf.o,$(BPF_SOURCES))
 
 all: bpf rust
 
+# vmlinux.h only has to DEFINE the types the BPF sources touch. It does not
+# have to come from the kernel the objects will eventually run on: the header
+# bpftool generates carries
+# `#pragma clang attribute push (__attribute__((preserve_access_index)))`, so
+# every direct field access emits a CO-RE relocation record and libbpf fixes
+# the offsets at load time against whatever kernel is actually running. Verified
+# by building under 6.12.63 and loading the unchanged objects on 6.19.14 --
+# see infra/kernel/core-portability.sh, which makes that check repeatable.
+#
+# So PREBUILT_VMLINUX_H lets a build use a header generated elsewhere, which is
+# what makes it possible to compile where there is no /sys/kernel/btf/vmlinux
+# and no bpftool at all (a container, a release pipeline, a cross build).
+ifneq ($(PREBUILT_VMLINUX_H),)
+$(VMLINUX_H): $(PREBUILT_VMLINUX_H)
+	@mkdir -p $(dir $@)
+	cp $< $@.part
+	mv $@.part $@
+else
 $(VMLINUX_H): $(VMLINUX_BTF)
 	@mkdir -p $(dir $@)
 	$(BPFTOOL) btf dump file $(VMLINUX_BTF) format c > $@.part
 	mv $@.part $@
+endif
 
 $(BPF_DIR)/%.bpf.o: bpf/%.bpf.c bpf/include/skyline_abi.h $(VMLINUX_H)
 	@mkdir -p $(BPF_DIR)

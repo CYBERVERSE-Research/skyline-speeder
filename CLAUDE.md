@@ -24,9 +24,17 @@ make test                         # 含 cargo test
 skyline-speederd --config config/speeder.toml --validate-only --verify-bpf
 ```
 
-`make bpf` 从**本机** `/sys/kernel/btf/vmlinux` 读取类型信息，因此必须在目标
-内核上执行，或用 `make VMLINUX_BTF=<路径> bpf` 显式指定。
+`make bpf` 默认从**本机** `/sys/kernel/btf/vmlinux` 读取类型信息；也可以用
+`make VMLINUX_BTF=<路径> bpf` 指定另一份 BTF，或用
+`make PREBUILT_VMLINUX_H=<路径> bpf` 直接提供已生成好的头（这条路径**不需要
+bpftool，也不需要 /sys/kernel/btf/vmlinux**，供容器/发布流水线使用）。
 `bpf/include/vmlinux.h` 是构建产物，**不提交**。
+
+vmlinux.h 只需要**定义**代码用到的类型，不必来自最终运行的那个内核：bpftool 生成的
+头带 `preserve_access_index`，每处字段访问都生成 CO-RE 重定位记录，偏移由 libbpf 在
+加载时按运行内核的 BTF 修正。已双向实测（6.12.63 ↔ 6.19.14），复现脚本见
+`infra/kernel/core-portability.sh`。**改动数据面后若要依赖这条性质，必须重跑该脚本**
+——CO-RE 能修偏移，修不了字段改名或删除。
 
 ## 硬性不变量
 

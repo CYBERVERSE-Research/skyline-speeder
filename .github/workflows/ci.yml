@@ -110,6 +110,29 @@ jobs:
           make bpf BPFTOOL="$(command -v bpftool)"
           ls -l build/bpf/
 
+      # An object without .BTF.ext carries no CO-RE relocation records, which
+      # would mean its field offsets are baked in and it only works on the
+      # kernel it was compiled against. Shipping prebuilt objects depends on
+      # this section existing, so assert it rather than assume it.
+      - name: Assert CO-RE relocations are present
+        run: |
+          set -euo pipefail
+          for object in build/bpf/*.bpf.o; do
+            if readelf -S "$object" | grep -q '\.BTF\.ext'; then
+              echo "ok   $object carries .BTF.ext"
+            else
+              echo "::error::$object has no .BTF.ext section; it is not CO-RE relocatable"
+              exit 1
+            fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bpf-objects-${{ github.sha }}
+          path: build/bpf/*.bpf.o
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Note what was not checked
         run: |
           {

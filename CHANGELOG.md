@@ -10,6 +10,29 @@ for anyone holding a prebuilt `.bpf.o`.
 
 ## [Unreleased]
 
+### Added
+
+- `infra/kernel/core-portability.sh` — a repeatable two-phase check that objects
+  built against one kernel's types load on another: `freeze` records the objects
+  and their digests on the build kernel, `verify` proves the bytes are unchanged
+  and pushes them through the target kernel's verifier. It knows nothing about
+  hosts or transports, so it works for whatever kernel pair needs checking.
+- `make PREBUILT_VMLINUX_H=<path> bpf` builds against a header generated
+  elsewhere, with no bpftool and no `/sys/kernel/btf/vmlinux` required. This is
+  what lets the objects be built in a container or a release pipeline.
+- CI now asserts every built object carries a `.BTF.ext` section — without it an
+  object has no CO-RE relocation records and is bound to its build kernel — and
+  uploads the objects as a build artifact.
+
+### Changed
+
+- Corrected the claim that a `.bpf.o` built on a different kernel version cannot
+  be shipped and reused. It can: the objects are CO-RE relocatable. Verified in
+  both directions on Debian 13 — built under 6.12.63, loaded and run under
+  6.19.14; and built against a 6.12 header on 6.19.14, loaded under 6.12.63.
+  The installer still builds locally; distributing prebuilt objects is separate
+  work.
+
 ### Changed
 
 - **`ssctl enable` now activates host-wide.** On a successful struct_ops attach
