@@ -10,87 +10,18 @@ for anyone holding a prebuilt `.bpf.o`.
 
 ## [Unreleased]
 
-### Added
-
-- `install.sh --prebuilt` installs published release artifacts instead of
-  compiling: no clang, no LLVM, no bpftool and no Rust on the target host, only
-  `curl` and `tar`. `--release <tag>` pins a version, and `SKYLINE_ARTIFACT_URL`
-  takes either an https URL (mirror, internal artifact store) or a local path,
-  for hosts with no route to github.com.
-- `.github/workflows/release.yml` builds and publishes those artifacts on a `v*`
-  tag, compiling against a pinned reference header rather than the runner's own
-  kernel, and refusing to build if that header is not configured.
-- `infra/kernel/make-reference-vmlinux.sh` generates the reference header on a
-  host running the oldest supported kernel, and prints the digest the workflow
-  pins it by.
-
-- `infra/kernel/core-portability.sh` — a repeatable two-phase check that objects
-  built against one kernel's types load on another: `freeze` records the objects
-  and their digests on the build kernel, `verify` proves the bytes are unchanged
-  and pushes them through the target kernel's verifier. It knows nothing about
-  hosts or transports, so it works for whatever kernel pair needs checking.
-- `make PREBUILT_VMLINUX_H=<path> bpf` builds against a header generated
-  elsewhere, with no bpftool and no `/sys/kernel/btf/vmlinux` required. This is
-  what lets the objects be built in a container or a release pipeline.
-- CI now asserts every built object carries a `.BTF.ext` section — without it an
-  object has no CO-RE relocation records and is bound to its build kernel — and
-  uploads the objects as a build artifact.
-
-### Changed
-
-- Corrected the claim that a `.bpf.o` built on a different kernel version cannot
-  be shipped and reused. It can: the objects are CO-RE relocatable. Verified in
-  both directions on Debian 13 — built under 6.12.63, loaded and run under
-  6.19.14; and built against a 6.12 header on 6.19.14, loaded under 6.12.63.
-  The installer still builds locally; distributing prebuilt objects is separate
-  work.
-
-### Changed
-
-- **`ssctl enable` now activates host-wide.** On a successful struct_ops attach
-  it writes `net.ipv4.tcp_congestion_control = skyline_cc`, so every new TCP
-  connection on the machine uses it, not only connections from processes inside
-  the cgroup. The sysctl write happens after the attach because the kernel
-  rejects an algorithm name it has not seen registered.
-- **`ssctl drain` is now symmetric.** It writes the sysctl back to `fallback_cc`
-  first, then closes the cgroup dispatch path, then waits, then unregisters —
-  the same order `infra/boot-disable.sh` uses. A drain that times out now leaves
-  the struct_ops attached but the default already back on `fallback_cc`.
-- `infra/boot-enable.sh` no longer writes the congestion-control sysctl itself;
-  `ssctl enable` owns it. The script now reads it back and fails loudly if the
-  default did not move. The write in `infra/boot-disable.sh` is kept
-  deliberately as the path that still works when the daemon is already gone.
-
-### Fixed
-
-- CI: the BPF job failed on every run. Ubuntu's `bpftool` package is a wrapper
-  script from `linux-tools-common` that dispatches to a binary matching
-  `uname -r`; no such package exists for the runner kernel, so the wrapper
-  passed a `command -v` check and then failed at run time. CI now installs the
-  upstream static bpftool, pinned by sha256, and verifies it by running it.
-- `install.sh --uninstall` left the host on `fallback_cc` instead of whatever it
-  ran before. The installer now snapshots the congestion control and default
-  qdisc to `/etc/skyline-speeder/pre-install-state` before starting anything,
-  and the uninstaller restores both.
-- Installer output was buried under dpkg unpack lines and locale warnings.
-  `LC_ALL` is pinned and apt runs with `Dpkg::Use-Pty=0`, with the full log
-  printed only when a step actually fails.
-
-- `ssctl drain` followed by a manual `ssctl enable` no longer leaves the system
-  default congestion control on `fallback_cc`.
-
-### Licensing
-
-- Copyright is recorded as **CYBERVERSE LLC**. The project is **GPL-2.0-only**
-  throughout, and every source file now carries an `SPDX-License-Identifier`.
-  `LICENSE` holds the complete GPL-2.0 text; `NOTICE` records why GPL-2.0 is
-  required, the upstream kernel attributions, and the trademark terms.
-
-## [0.1.0] - 2026-09-18
+## [0.1.0] - 2026-09-19
 
 First public release.
 
+Everything below is in this release. Nothing was published before it, so there
+is no "changed since" to report: work that happened between the first commit and
+the tag is release content, not a changelog of revisions, and is recorded as such
+rather than as fixes to a version nobody could have installed.
+
 ### Added
+
+**Data path**
 
 - `skyline_cc` — eBPF struct_ops congestion control with four independently
   switchable modules: adaptive cwnd (M2), loss-rate compensation (M3), pacing
@@ -99,13 +30,57 @@ First public release.
   selection, plus a per-flow dynamic RTO floor and ceiling.
 - `skyline_tc` — TC egress program: packet/byte/GSO accounting and retransmit
   DSCP marking for IPv4 and IPv6.
-- `skyline-speederd` / `ssctl` — Rust control plane: capability probing, online
-  reconfiguration through a double-slot generation counter, graceful drain, and
-  a `--validate-only --verify-bpf` health check that leaves no runtime state.
-- `install.sh` — one-click Debian/Ubuntu installer with `--check`, `--no-enable`
-  and `--uninstall`.
+
+**Control plane**
+
+- `skyline-speederd` / `ssctl` — capability probing, online reconfiguration
+  through a double-slot generation counter, graceful drain, and a
+  `--validate-only --verify-bpf` health check that leaves no runtime state.
+- `ssctl enable` activates host-wide: on a successful struct_ops attach it
+  writes `net.ipv4.tcp_congestion_control = skyline_cc`, so every new TCP
+  connection on the machine uses it, not only connections from processes inside
+  the cgroup. The sysctl write happens after the attach, because the kernel
+  rejects an algorithm name it has not seen registered.
+- `ssctl drain` is the symmetric reverse: the sysctl goes back to `fallback_cc`
+  first, then the cgroup dispatch path closes, then it waits, then it
+  unregisters. A drain that times out leaves the struct_ops attached but the
+  default already back on `fallback_cc`.
+
+**Installation**
+
+- `install.sh` — one-click Debian/Ubuntu installer with `--prebuilt`, `--check`,
+  `--no-enable` and `--uninstall`.
+- `--prebuilt` installs published artifacts instead of compiling: no clang, no
+  LLVM, no bpftool and no Rust on the target host, only `curl` and `tar`.
+  `--release <tag>` pins a version; `SKYLINE_ARTIFACT_URL` takes an https URL
+  (mirror, internal artifact store) or a local path, for hosts with no route to
+  github.com.
+- The installer snapshots the congestion control and default qdisc to
+  `/etc/skyline-speeder/pre-install-state` before it starts anything, and
+  `--uninstall` restores both. A host that ran BBR comes back on BBR.
 - `scripts/bootstrap.sh` — remote installer entry point for `curl | sudo bash`,
   with optional `SKYLINE_SHA256` tarball pinning.
+
+**Build and release**
+
+- `.github/workflows/release.yml` builds and publishes artifacts on a `v*` tag,
+  compiling against a pinned reference header rather than the runner's own
+  kernel, and refusing to build when that header is not configured.
+- `infra/kernel/make-reference-vmlinux.sh` generates that header on a host
+  running the oldest supported kernel and prints the digest it is pinned by.
+- `infra/kernel/core-portability.sh` — a repeatable two-phase check that objects
+  built against one kernel's types load on another: `freeze` records the objects
+  and their digests on the build kernel, `verify` proves the bytes are unchanged
+  and pushes them through the target kernel's verifier. It knows nothing about
+  hosts or transports, so it works for whatever kernel pair needs checking.
+- `make PREBUILT_VMLINUX_H=<path> bpf` builds against a header generated
+  elsewhere, with no bpftool and no `/sys/kernel/btf/vmlinux` required.
+- CI asserts every built object carries a `.BTF.ext` section — without it an
+  object has no CO-RE relocation records and is bound to its build kernel — and
+  uploads the objects as a build artifact.
+
+**Research**
+
 - Two-VM experiment harness under `research/experiments/` and the performance
   report it produces.
 
@@ -113,10 +88,23 @@ First public release.
 
 - Kernels `6.12.101`, `6.18.42` and `7.1.6`, including IPv4/IPv6 data-path smoke
   tests. `6.1.180` and `6.6.148` are rejected at load, as expected.
+- **CO-RE portability, both directions**, on Debian 13 with the objects checked
+  byte-identical at each step: built under 6.12.63, the verifier passes on
+  6.19.14 and the objects attach and carry real traffic there; built on 6.19.14
+  against a 6.12 header, the verifier passes on 6.12.63.
 - Neutrality: with all modules off, within 0.01% of stock kernel CUBIC on a
   zero-loss link.
 - Retransmit DSCP marking: about 97,000 marked segments across IPv4 and IPv6
   captures, zero false positives.
+- The one-click install, the prebuilt install and the uninstall path, end to end
+  on a clean Debian 13 host running 6.12.63.
+
+### Licensing
+
+- Copyright **CYBERVERSE LLC**, **GPL-2.0-only** throughout, with an
+  `SPDX-License-Identifier` on every source file. `LICENSE` holds the complete
+  GPL-2.0 text; `NOTICE` records why GPL-2.0 is required, the upstream kernel
+  attributions, and the trademark terms.
 
 ### Known issues and limitations
 
@@ -131,20 +119,23 @@ First public release.
 - **No cross-flow coordination.** Each flow estimates bandwidth independently and
   applies its own gain, so several flows sharing one bottleneck will collectively
   overshoot.
+- **`ssctl drain` cannot complete over SSH.** The operator's own SSH connection
+  is a skyline_cc flow and will not end while drain waits, so drain always
+  reaches its timeout. It is safe — the sysctl is written back to `fallback_cc`
+  before the wait begins — but the struct_ops stays attached until that session
+  closes.
+- **The one-line installer needs `curl`**, which a minimal server image may not
+  have. `bootstrap.sh` installs it when missing, but only once it is already
+  running; the READMEs show the prerequisite and a `wget` equivalent.
+- **CO-RE fixes offsets, not names.** A field renamed or removed in a future
+  kernel makes relocation fail at load. Two kernels and one architecture is
+  evidence, not proof, which is why the check is a script rather than a claim.
 - **`early-loss` is an observation counter only.** It drives no decision.
 - **`runtime.pin_dir` is unused.** The field is parsed and validated but nothing
   pins BPF objects yet.
 - **The `ssctl` wire protocol has no authentication**, relying entirely on Unix
   socket file permissions. Multi-tenant hosts need additional access control.
 - The experiment harness requires **Python 3.11 or newer** (`tomllib`).
-- **`ssctl drain` cannot complete over SSH.** The operator's own SSH connection
-  is a skyline_cc flow and will not end while drain waits, so drain always
-  reaches its timeout. It is safe — the sysctl is written back to `fallback_cc`
-  before the wait begins — but the struct_ops stays attached until that session
-  closes.
-- The documented one-line installer needs `curl`, which a minimal server image
-  may not have. `bootstrap.sh` installs it if missing, but only once it is
-  running; the README now shows the prerequisite and a `wget` equivalent.
 
 [Unreleased]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/CYBERVERSE-Research/skyline-speeder/releases/tag/v0.1.0
