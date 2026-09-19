@@ -68,33 +68,46 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq clang llvm libbpf-dev libelf-dev zlib1g-dev
 
-      # bpftool is only needed to dump the running kernel's BTF into vmlinux.h.
-      # Its packaging differs across Ubuntu releases, so try the candidates in
-      # order rather than assuming one of them.
-      - name: Install bpftool
+      # bpftool is only needed to dump the kernel's BTF into vmlinux.h.
+      #
+      # Do NOT use Ubuntu's `bpftool` package: it ships a wrapper script from
+      # linux-tools-common that dispatches to a real binary matching `uname -r`.
+      # Runner kernels have no matching linux-tools package in the archive, so
+      # the wrapper lands on PATH, satisfies `command -v`, and only then fails at
+      # run time with "WARNING: bpftool not found for kernel 6.17.0-1022" and a
+      # non-zero exit. Presence is not usability; this job was red for exactly
+      # that reason.
+      #
+      # The upstream static build has no kernel coupling and is pinned by digest.
+      - name: Install bpftool (upstream static build)
+        env:
+          BPFTOOL_VERSION: v7.7.0
+          BPFTOOL_SHA256: 09150596f09356b0ff632dd7f9856e0ea86bf96b269e9bc94278d9a9432a268c
         run: |
-          sudo apt-get install -y -qq bpftool \
-            || sudo apt-get install -y -qq linux-tools-common linux-tools-generic \
-            || echo "bpftool not installable from the archive"
-          command -v bpftool || ls -l /usr/lib/linux-tools/*/bpftool || true
+          set -euo pipefail
+          url="https://github.com/libbpf/bpftool/releases/download/${BPFTOOL_VERSION}/bpftool-${BPFTOOL_VERSION}-amd64.tar.gz"
+          curl -fsSL --proto '=https' --tlsv1.2 -o /tmp/bpftool.tar.gz "$url"
+          echo "${BPFTOOL_SHA256}  /tmp/bpftool.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf /tmp/bpftool.tar.gz -C "$HOME/.local/bin" bpftool
+          chmod +x "$HOME/.local/bin/bpftool"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          # Run it. This is the check the previous `command -v` guard lacked.
+          "$HOME/.local/bin/bpftool" version
 
-      # CO-RE needs the host's BTF. Runner images normally ship it, but if a
-      # future image does not, that is a runner-infrastructure fact and not a
-      # defect in the pull request -- warn and skip rather than paint the check
-      # red for something no contributor can fix.
+      # CO-RE needs a kernel BTF to generate vmlinux.h from. A missing one is
+      # now a hard failure rather than a skip: with bpftool pinned, BTF is the
+      # only remaining infrastructure dependency, and a check that silently
+      # stops running is worse than one that goes red and gets looked at.
       - name: Compile CO-RE objects
         run: |
+          set -euo pipefail
           if [ ! -r /sys/kernel/btf/vmlinux ]; then
-            echo "::warning::/sys/kernel/btf/vmlinux is absent on this runner; skipping the BPF compile"
-            exit 0
+            echo "::error::/sys/kernel/btf/vmlinux is absent on this runner; CO-RE objects cannot be compiled"
+            exit 1
           fi
-          BPFTOOL=$(command -v bpftool || echo /usr/lib/linux-tools/*/bpftool | awk '{print $1}')
-          if [ ! -x "$BPFTOOL" ]; then
-            echo "::warning::no usable bpftool on this runner; skipping the BPF compile"
-            exit 0
-          fi
-          echo "using bpftool: $BPFTOOL"
-          make bpf BPFTOOL="$BPFTOOL"
+          bpftool version
+          make bpf BPFTOOL="$(command -v bpftool)"
           ls -l build/bpf/
 
       - name: Note what was not checked
