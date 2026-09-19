@@ -1,0 +1,142 @@
+# Release pipeline: build the artifacts a user installs with
+# `install.sh --prebuilt`, so that installing needs no clang, no LLVM, no
+# bpftool and no Rust toolchain on the target machine.
+#
+# The objects are compiled against a PINNED REFERENCE HEADER generated from the
+# oldest supported kernel (6.12 LTS), not against whatever kernel this runner
+# happens to boot. CO-RE fixes field offsets at load time, but it cannot
+# conjure a field that does not exist: an object compiled against a newer
+# kernel's types can reference something added after 6.12 and then fail to load
+# there. A field present in 6.12 is still present in 6.19; the reverse does not
+# hold. See infra/kernel/make-reference-vmlinux.sh, which generates the header,
+# and infra/kernel/core-portability.sh, which checks the resulting objects load
+# on a kernel other than the one they were built against.
+#
+# Because the header is supplied, this job needs no bpftool and no
+# /sys/kernel/btf/vmlinux at all.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and publish'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and publish artifacts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential pkg-config clang llvm \
+            libbpf-dev libelf-dev zlib1g-dev
+
+      # Refusing rather than falling back to the runner's own BTF is deliberate.
+      # A silent fallback would produce objects compiled against a 6.17+ kernel
+      # and ship them to 6.12 users, which is the exact failure this pipeline
+      # exists to avoid -- and it would fail at their load time, not ours.
+      - name: Fetch the pinned reference vmlinux.h
+        env:
+          REFERENCE_URL: ${{ vars.SKYLINE_REFERENCE_VMLINUX_URL }}
+          REFERENCE_SHA256: ${{ vars.SKYLINE_REFERENCE_VMLINUX_SHA256 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${REFERENCE_URL:-}" ] || [ -z "${REFERENCE_SHA256:-}" ]; then
+            echo "::error::SKYLINE_REFERENCE_VMLINUX_URL and SKYLINE_REFERENCE_VMLINUX_SHA256 must both be set as repository variables. Generate the header with infra/kernel/make-reference-vmlinux.sh on a 6.12 host, publish it, and point these at it."
+            exit 1
+          fi
+          curl -fsSL --proto '=https' --tlsv1.2 -o reference.h.gz "$REFERENCE_URL"
+          echo "${REFERENCE_SHA256}  reference.h.gz" | sha256sum -c -
+          gunzip -c reference.h.gz > reference-vmlinux.h
+          grep -q 'preserve_access_index' reference-vmlinux.h \
+            || { echo "::error::reference header lacks the preserve_access_index pragma; objects built from it would not be CO-RE relocatable"; exit 1; }
+          echo "reference header: $(wc -l < reference-vmlinux.h) lines"
+
+      - name: Build BPF objects against the reference header
+        run: make bpf PREBUILT_VMLINUX_H="$PWD/reference-vmlinux.h"
+
+      - name: Assert CO-RE relocations are present
+        run: |
+          set -euo pipefail
+          for object in build/bpf/*.bpf.o; do
+            readelf -S "$object" | grep -q '\.BTF\.ext' \
+              || { echo "::error::$object has no .BTF.ext section"; exit 1; }
+            echo "ok   $object"
+          done
+
+      - name: Build the control plane
+        run: cargo build --workspace --release
+
+      # Layout matches what infra/install-prebuilt-guest.sh already expects, so
+      # the test bed and `install.sh --prebuilt` consume the same tarball rather
+      # than two shapes that drift apart.
+      - name: Assemble the artifact
+        id: assemble
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          NAME="skyline-speeder-${TAG}-$(uname -m)"
+          mkdir -p "$NAME"/{bin,bpf,config,packaging,infra}
+          install -m 0755 target/release/skyline-speederd target/release/ssctl "$NAME/bin/"
+          install -m 0644 build/bpf/*.bpf.o "$NAME/bpf/"
+          # speeder-guest.toml, not speeder.toml: the dev config has a relative
+          # bpf_dir (build/bpf) that only resolves inside a source tree, and an
+          # installed daemon would look for objects that are not there. This is
+          # the same file install-guest.sh puts in place for a source install.
+          install -m 0644 config/speeder-guest.toml "$NAME/config/speeder.toml"
+          install -m 0644 packaging/*.service "$NAME/packaging/"
+          install -m 0755 infra/boot-enable.sh infra/boot-disable.sh \
+            infra/run-in-skyline-cgroup.sh infra/apply-guest-profile.sh \
+            infra/collect-guest-metrics.sh infra/snapshot-skyline-events.sh "$NAME/infra/"
+
+          # Provenance travels with the artifact. Without it nobody can tell,
+          # months later, which kernel's types these objects were built against
+          # -- which is the one fact that decides whether they load.
+          cat > "$NAME/MANIFEST" <<EOF
+          tag=${TAG}
+          commit=${{ github.sha }}
+          arch=$(uname -m)
+          built_on_runner_kernel=$(uname -r)
+          reference_vmlinux_sha256=${{ vars.SKYLINE_REFERENCE_VMLINUX_SHA256 }}
+          built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+          sha256sum "$NAME"/bin/* "$NAME"/bpf/*.bpf.o >> "$NAME/MANIFEST"
+
+          tar -czf "${NAME}.tar.gz" "$NAME"
+          sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          cat "${NAME}.tar.gz.sha256"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            ${{ steps.assemble.outputs.name }}.tar.gz
+            ${{ steps.assemble.outputs.name }}.tar.gz.sha256
+          fail_on_unmatched_files: true
+          body: |
+            Prebuilt artifacts. Install without a build toolchain:
+
+            ```
+            sudo ./install.sh --prebuilt
+            ```
+
+            The BPF objects were compiled against a pinned reference `vmlinux.h`
+            generated from a 6.12 LTS kernel, so they load on 6.12 and newer.
+            `MANIFEST` inside the tarball records the provenance and the digest
+            of every shipped binary and object.
+
+            Kernel 6.12 LTS or newer is still required, and `/sys/kernel/btf/vmlinux`
+            must be present: CO-RE resolves field offsets against it at load time.

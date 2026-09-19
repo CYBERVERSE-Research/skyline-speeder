@@ -105,10 +105,34 @@ sudo ./install.sh
 The installer: installs the toolchain (clang/llvm/libbpf/bpftool/Rust) → compiles the three CO-RE BPF objects against **this machine's kernel BTF** → builds the Rust control plane → detects and writes the egress interface → pushes every object through the kernel verifier → starts the daemon and enables it at boot. **It installs no proxy and opens no port.**
 
 ```bash
+sudo ./install.sh --prebuilt   # install published artifacts, no build toolchain
 sudo ./install.sh --check      # preflight only, changes nothing
 sudo ./install.sh --no-enable  # install without attaching skyline_cc
 sudo ./install.sh --uninstall  # remove (keeps /etc/skyline-speeder)
 ```
+
+### Installing without a build toolchain
+
+`--prebuilt` downloads the published release artifacts instead of compiling, so
+the host needs **no clang, no LLVM, no bpftool and no Rust** — only `curl` and
+`tar`. The shipped BPF objects were compiled against a pinned reference header
+generated from a 6.12 LTS kernel, and CO-RE fixes the field offsets against
+*this* kernel when they load.
+
+```bash
+sudo ./install.sh --prebuilt                  # latest release
+sudo ./install.sh --release v0.1.0            # a specific tag
+
+# From a mirror, an internal artifact store, or a host with no route to
+# github.com -- copy the tarball over and point at it:
+SKYLINE_ARTIFACT_URL=/path/to/skyline-speeder-<tag>-x86_64.tar.gz \
+  sudo -E ./install.sh --prebuilt
+```
+
+The kernel requirement is unchanged: 6.12 LTS or newer, with
+`/sys/kernel/btf/vmlinux` present, because that is what CO-RE relocates
+against at load time. Each artifact carries a `MANIFEST` recording the commit,
+the reference header digest and the digest of every shipped binary and object.
 
 The installer records the congestion control and default qdisc in place before
 it changes anything, and `--uninstall` puts them back. Uninstalling a host that

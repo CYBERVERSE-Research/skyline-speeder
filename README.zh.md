@@ -104,10 +104,31 @@ sudo ./install.sh
 一键脚本会完成：安装工具链（clang/llvm/libbpf/bpftool/Rust）→ 用**本机内核 BTF** 编译三个 CO-RE BPF 对象 → 构建 Rust 控制面 → 自动探测并写入出口网卡 → 过一遍内核验证器 → 启动并配置开机自启。**不安装任何代理，不监听任何端口。**
 
 ```bash
+sudo ./install.sh --prebuilt   # 装已发布的产物，不需要编译工具链
 sudo ./install.sh --check      # 只做前置检查
 sudo ./install.sh --no-enable  # 安装但不挂载 skyline_cc
 sudo ./install.sh --uninstall  # 卸载（保留 /etc/skyline-speeder 配置）
 ```
+
+### 不装编译工具链的安装方式
+
+`--prebuilt` 下载已发布的产物而不是现场编译，目标机**不需要 clang、LLVM、bpftool
+和 Rust**，只要 `curl` 和 `tar`。随包的 BPF 对象是用 6.12 LTS 生成的固定参考头编译
+的，加载时由 CO-RE 按**这台机器**的内核修正字段偏移。
+
+```bash
+sudo ./install.sh --prebuilt                  # 最新 release
+sudo ./install.sh --release v0.1.0            # 指定 tag
+
+# 镜像站、内网制品库，或者根本连不上 github.com 的机器：
+# 自己把 tarball 拷过去，然后指过去
+SKYLINE_ARTIFACT_URL=/path/to/skyline-speeder-<tag>-x86_64.tar.gz \
+  sudo -E ./install.sh --prebuilt
+```
+
+内核要求不变：6.12 LTS 以上，且 `/sys/kernel/btf/vmlinux` 必须存在——CO-RE 正是
+在加载时对着它做重定位。每个产物都带一份 `MANIFEST`，记录 commit、参考头指纹，以及
+每个二进制和对象的指纹。
 
 安装器会在改动任何东西之前记录当前的拥塞控制算法与默认 qdisc，`--uninstall`
 会把它们还原。**装之前跑 BBR 的机器，卸载后回到 BBR**，而不是停在 `fallback_cc`。

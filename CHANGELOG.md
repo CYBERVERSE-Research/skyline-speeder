@@ -12,6 +12,18 @@ for anyone holding a prebuilt `.bpf.o`.
 
 ### Added
 
+- `install.sh --prebuilt` installs published release artifacts instead of
+  compiling: no clang, no LLVM, no bpftool and no Rust on the target host, only
+  `curl` and `tar`. `--release <tag>` pins a version, and `SKYLINE_ARTIFACT_URL`
+  takes either an https URL (mirror, internal artifact store) or a local path,
+  for hosts with no route to github.com.
+- `.github/workflows/release.yml` builds and publishes those artifacts on a `v*`
+  tag, compiling against a pinned reference header rather than the runner's own
+  kernel, and refusing to build if that header is not configured.
+- `infra/kernel/make-reference-vmlinux.sh` generates the reference header on a
+  host running the oldest supported kernel, and prints the digest the workflow
+  pins it by.
+
 - `infra/kernel/core-portability.sh` — a repeatable two-phase check that objects
   built against one kernel's types load on another: `freeze` records the objects
   and their digests on the build kernel, `verify` proves the bytes are unchanged

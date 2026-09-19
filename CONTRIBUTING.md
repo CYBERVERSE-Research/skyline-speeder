@@ -146,6 +146,40 @@ and **must not be used to draw performance conclusions**.
   Those comments are worth more than the code around them. Do not delete them
   for brevity.
 
+## Cutting a release
+
+Release artifacts are built by `.github/workflows/release.yml` when a `v*` tag
+is pushed. It compiles the BPF objects against a **pinned reference header**
+generated from the oldest supported kernel, not against whatever the runner
+boots — CO-RE fixes field offsets, but it cannot conjure a field that does not
+exist, so an object built against a 6.17 header can reference something absent
+on 6.12 and fail to load there.
+
+That header is not in the repository (`vmlinux.h` stays a build artefact). It is
+published once and pinned by digest:
+
+```bash
+# on a host running the oldest supported kernel (6.12 LTS)
+infra/kernel/make-reference-vmlinux.sh
+# publish the .h.gz it produces, then:
+gh variable set SKYLINE_REFERENCE_VMLINUX_URL    --body "<asset download URL>"
+gh variable set SKYLINE_REFERENCE_VMLINUX_SHA256 --body "<digest it printed>"
+```
+
+The workflow **refuses to build** if those two variables are unset. That is
+deliberate: falling back to the runner's own BTF would silently ship objects
+built against a newer kernel, and the failure would land on a 6.12 user's
+machine rather than in CI.
+
+After a release, verify the shipped objects load on a kernel other than the one
+they were built against:
+
+```bash
+SKYLINE_BPF_DIR=<unpacked artifact>/bpf infra/kernel/core-portability.sh freeze
+# get to the other kernel
+infra/kernel/core-portability.sh verify
+```
+
 ## Never commit
 
 See `.gitignore`. In particular:

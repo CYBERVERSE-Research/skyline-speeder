@@ -7,10 +7,17 @@
 # units, and activates skyline_cc across reboots. Installs no proxy, no network
 # service, and opens no port.
 #
-#   sudo ./install.sh              # install and activate
+#   sudo ./install.sh              # build from source, install and activate
+#   sudo ./install.sh --prebuilt   # install published artifacts, no toolchain
 #   sudo ./install.sh --check      # preflight only, change nothing
 #   sudo ./install.sh --no-enable  # install but leave skyline_cc detached
 #   sudo ./install.sh --uninstall  # remove
+#
+# --prebuilt downloads the release artifacts instead of compiling. It needs no
+# clang, no LLVM, no bpftool and no Rust: the BPF objects were built against a
+# pinned reference header from the oldest supported kernel, and CO-RE fixes the
+# field offsets against THIS kernel when they load. Everything else about the
+# install is identical.
 #
 set -euo pipefail
 
@@ -24,6 +31,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KVER="$(uname -r)"
 MODE=install
 ENABLE=1
+SOURCE=build          # build | prebuilt
+RELEASE_TAG=          # empty means "latest"
+REPO_SLUG=${SKYLINE_REPO:-CYBERVERSE-Research/skyline-speeder}
 
 CSI=$'\033'; RED="${CSI}[31m"; GRN="${CSI}[32m"; YLW="${CSI}[33m"; BLD="${CSI}[1m"; RST="${CSI}[0m"
 info() { printf '%s==>%s %s\n' "$BLD" "$RST" "$*"; }
@@ -36,7 +46,9 @@ while [ "$#" -gt 0 ]; do
         --check) MODE=check; shift ;;
         --no-enable) ENABLE=0; shift ;;
         --uninstall) MODE=uninstall; shift ;;
-        -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --prebuilt) SOURCE=prebuilt; shift ;;
+        --release) [ "$#" -ge 2 ] || die "--release needs a tag"; SOURCE=prebuilt; RELEASE_TAG="$2"; shift 2 ;;
+        -h|--help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
     esac
 done
@@ -139,20 +151,37 @@ ok "cgroup v2 available"
 
 # --- 4. packages -----------------------------------------------------------
 export DEBIAN_FRONTEND=noninteractive
-PKGS=(build-essential pkg-config clang llvm libbpf-dev libelf-dev zlib1g-dev bpftool curl)
+if [ "$SOURCE" = prebuilt ]; then
+    # The whole point of --prebuilt: no compiler, no LLVM, no bpftool, no Rust.
+    # Only what it takes to fetch and unpack an archive.
+    PKGS=(curl ca-certificates tar)
+else
+    PKGS=(build-essential pkg-config clang llvm libbpf-dev libelf-dev zlib1g-dev bpftool curl)
+fi
 
 if [ "$MODE" = check ]; then
     info "preflight only; no changes will be made"
-    MISSING=()
-    for c in clang llvm-config bpftool cargo; do
-        command -v "$c" >/dev/null 2>&1 || MISSING+=("$c")
-    done
-    [ ${#MISSING[@]} -eq 0 ] && ok "toolchain present" || warn "missing: ${MISSING[*]}"
+    if [ "$SOURCE" = prebuilt ]; then
+        MISSING=()
+        for c in curl tar; do command -v "$c" >/dev/null 2>&1 || MISSING+=("$c"); done
+        [ ${#MISSING[@]} -eq 0 ] && ok "fetch tools present" || warn "missing: ${MISSING[*]}"
+        ok "prebuilt install needs no build toolchain on this host"
+    else
+        MISSING=()
+        for c in clang llvm-config bpftool cargo; do
+            command -v "$c" >/dev/null 2>&1 || MISSING+=("$c")
+        done
+        [ ${#MISSING[@]} -eq 0 ] && ok "toolchain present" || warn "missing: ${MISSING[*]}"
+    fi
     info "preflight complete"
     exit 0
 fi
 
-info "installing build toolchain"
+if [ "$SOURCE" = prebuilt ]; then
+    info "installing fetch prerequisites"
+else
+    info "installing build toolchain"
+fi
 # `-qq` silences apt but not dpkg, which still prints an unpack line per
 # package plus a "Reading database" progress bar. Dpkg::Use-Pty=0 stops the
 # progress redraw; the log keeps the detail for when something actually fails.
@@ -161,9 +190,11 @@ apt_quiet() { apt-get -y -qq -o Dpkg::Use-Pty=0 "$@" >>"$APT_LOG" 2>&1; }
 apt_quiet update || { cat "$APT_LOG" >&2; die "apt-get update failed"; }
 apt_quiet install "${PKGS[@]}" || { cat "$APT_LOG" >&2; die "failed to install build prerequisites"; }
 rm -f "$APT_LOG"
-ok "toolchain installed"
+ok "prerequisites installed"
 
 # --- 5. Rust ---------------------------------------------------------------
+# Skipped entirely for a prebuilt install -- the binaries are already built.
+if [ "$SOURCE" = build ]; then
 # rust-toolchain.toml pins the channel; rustup honours it automatically inside
 # the repo, so only the rustup installation itself is handled here.
 if ! command -v cargo >/dev/null 2>&1; then
@@ -179,10 +210,110 @@ fi
 export PATH
 command -v cargo >/dev/null 2>&1 || die "cargo is still not on PATH after rustup install"
 ok "rust: $(cargo --version)"
+fi
 
-# --- 6. build and install --------------------------------------------------
-info "building BPF objects and the Rust control plane (this takes a few minutes)"
-"$REPO_ROOT/infra/install-guest.sh" --confirm-install
+# --- 6. obtain and install the artifacts -----------------------------------
+install_prebuilt() {
+    local api="https://api.github.com/repos/${REPO_SLUG}/releases"
+    local arch; arch=$(uname -m)
+    local staging; staging=$(mktemp -d)
+    # shellcheck disable=SC2064  # expand $staging now, not at trap time
+    trap "rm -rf '$staging'" RETURN
+
+    # An explicit artifact skips release resolution entirely. Two forms, because
+    # there are two situations: a mirror or internal artifact store (an https
+    # URL), and a host with no route to the internet at all, where the operator
+    # copies the tarball over by hand and points at the file. The second form is
+    # a plain path rather than file://, because Debian builds curl with the file
+    # protocol disabled and --proto '=https' would reject it anyway -- and that
+    # restriction is worth keeping.
+    local url=${SKYLINE_ARTIFACT_URL:-}
+    local local_artifact=
+    if [ -n "$url" ] && [ -f "$url" ]; then
+        local_artifact=$url
+        url=
+        info "using local artifact: $local_artifact"
+    elif [ -n "$url" ]; then
+        info "using SKYLINE_ARTIFACT_URL"
+    else
+
+    if [ -n "$RELEASE_TAG" ]; then
+        api="$api/tags/$RELEASE_TAG"
+    else
+        api="$api/latest"
+    fi
+
+    info "resolving release from ${REPO_SLUG}"
+    curl -fsSL --proto '=https' --tlsv1.2 -o "$staging/release.json" "$api" \
+        || die "cannot reach the release API. Check network access, or use the
+   source build (drop --prebuilt), or pass --release <tag>."
+
+    # grep rather than a JSON parser: python3/jq are not guaranteed on a
+    # minimal server image, and needing one to install would undercut the
+    # point of a toolchain-free path.
+    url=$(grep -o "https://[^\"]*skyline-speeder-[^\"]*-${arch}\.tar\.gz" \
+          "$staging/release.json" | head -1)
+    [ -n "$url" ] || die "no prebuilt artifact for $arch in that release.
+   Published artifacts are per-architecture; build from source instead."
+    fi
+
+    if [ -n "$local_artifact" ]; then
+        cp -- "$local_artifact" "$staging/artifact.tar.gz"
+        [ -r "${local_artifact}.sha256" ] \
+            && cp -- "${local_artifact}.sha256" "$staging/artifact.sha256"
+    else
+        info "downloading $(basename -- "$url")"
+        curl -fsSL --proto '=https' --tlsv1.2 -o "$staging/artifact.tar.gz" "$url" \
+            || die "artifact download failed"
+        curl -fsSL --proto '=https' --tlsv1.2 -o "$staging/artifact.sha256" \
+            "${url}.sha256" 2>/dev/null || true
+    fi
+
+    # The digest is published beside the artifact. Verify it: this tarball is
+    # about to be unpacked into /usr/local and /opt and run as root.
+    if [ -r "$staging/artifact.sha256" ]; then
+        local want got
+        want=$(cut -d' ' -f1 < "$staging/artifact.sha256")
+        got=$(sha256sum "$staging/artifact.tar.gz" | cut -d' ' -f1)
+        [ "$want" = "$got" ] || die "sha256 mismatch
+   expected: $want
+   actual:   $got"
+        ok "sha256 verified"
+    else
+        warn "no published .sha256 beside the artifact; trusting TLS alone"
+    fi
+
+    tar -xzf "$staging/artifact.tar.gz" -C "$staging" || die "artifact did not unpack"
+    local root
+    root=$(find "$staging" -mindepth 1 -maxdepth 1 -type d -name 'skyline-speeder-*' | head -1)
+    [ -n "$root" ] && [ -x "$root/bin/skyline-speederd" ] \
+        || die "unexpected artifact layout: no bin/skyline-speederd at the top level"
+
+    if [ -r "$root/MANIFEST" ]; then
+        info "artifact provenance"
+        sed -n '1,6p' -- "$root/MANIFEST" | sed 's/^/     /'
+    fi
+
+    install -d /opt/skyline-speeder/bpf /opt/skyline-speeder/infra \
+        /etc/skyline-speeder /run/skyline-speeder /sys/fs/bpf/skyline-speeder
+    install -m 0755 "$root/bin/skyline-speederd" /usr/local/sbin/skyline-speederd
+    install -m 0755 "$root/bin/ssctl" /usr/local/bin/ssctl
+    install -m 0644 "$root"/bpf/*.bpf.o /opt/skyline-speeder/bpf/
+    install -m 0755 "$root"/infra/*.sh /opt/skyline-speeder/infra/
+    install -m 0644 "$root"/packaging/*.service /etc/systemd/system/
+    [ -e /etc/skyline-speeder/speeder.toml ] \
+        || install -m 0644 "$root/config/speeder.toml" /etc/skyline-speeder/speeder.toml
+    mkdir -p /sys/fs/cgroup/skyline-speeder
+    systemctl daemon-reload
+    ok "prebuilt artifacts installed (no toolchain was used)"
+}
+
+if [ "$SOURCE" = prebuilt ]; then
+    install_prebuilt
+else
+    info "building BPF objects and the Rust control plane (this takes a few minutes)"
+    "$REPO_ROOT/infra/install-guest.sh" --confirm-install
+fi
 
 # --- 7. point the TC program at the real egress interface ------------------
 # The shipped template targets the reference test bed's interface name, which
