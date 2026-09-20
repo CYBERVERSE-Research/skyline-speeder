@@ -3,6 +3,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use bytemuck::{bytes_of, try_from_bytes, try_pod_read_unaligned};
 use clap::Parser;
+use libbpf_rs::btf::{types::Struct, Btf, BtfKind, BtfType, TypeId};
 use libbpf_rs::{
     Link, MapCore, MapFlags, Object, ObjectBuilder, RingBufferBuilder, TcHook, TcHookBuilder,
     TC_EGRESS,
@@ -1007,32 +1008,92 @@ fn display_modules(modules: &[Module]) -> String {
         .join(",")
 }
 
+const KERNEL_BTF_PATH: &str = "/sys/kernel/btf/vmlinux";
+
+/// The kernel wraps every struct_ops type `T` in a `bpf_struct_ops_T` value
+/// type, and libbpf resolves exactly this name (as a struct) when it loads the
+/// `skyline_cc` map. Its presence is therefore the precondition the load itself
+/// depends on, which the string "struct_ops" appearing somewhere is not:
+/// `bpftool feature probe` names it on every line about it, "map_type
+/// struct_ops is NOT available" included, so the old substring match was true
+/// whenever bpftool ran at all and false whenever it was not installed.
+const STRUCT_OPS_VALUE_TYPE: &str = "bpf_struct_ops_tcp_congestion_ops";
+
+/// Function-pointer member added by the out-of-tree bounded RACK patch. No
+/// upstream kernel has it, so `false` is the normal answer.
+const RACK_REO_HOOK_MEMBER: &str = "rack_reo_wnd";
+
+/// Capabilities that are facts about the kernel's type information.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BtfCapabilities {
+    struct_ops: bool,
+    rack_reo_hook: bool,
+}
+
+fn probe_btf_capabilities(btf: &Btf<'_>) -> BtfCapabilities {
+    let mut capabilities = BtfCapabilities::default();
+    // Filtered by kind rather than looked up by name: `type_by_name` returns the
+    // first type of *any* kind carrying the name, while libbpf's own lookup is
+    // `btf__find_by_name_kind(.., BTF_KIND_STRUCT)`. The RACK hook needs the
+    // walk anyway -- the patch, not this repository, decides which struct
+    // carries the member.
+    for ty in btf.type_by_kind::<Struct<'_>>() {
+        if ty.name() == Some(OsStr::new(STRUCT_OPS_VALUE_TYPE)) {
+            capabilities.struct_ops = true;
+        }
+        if ty.iter().any(|member| {
+            member.name == Some(OsStr::new(RACK_REO_HOOK_MEMBER))
+                && is_function_pointer(btf, member.ty)
+        }) {
+            capabilities.rack_reo_hook = true;
+        }
+    }
+    capabilities
+}
+
+fn is_function_pointer(btf: &Btf<'_>, type_id: TypeId) -> bool {
+    btf.type_by_id::<BtfType<'_>>(type_id)
+        .map(|ty| ty.skip_mods_and_typedefs())
+        .filter(|ty| ty.kind() == BtfKind::Ptr)
+        .and_then(|pointer| pointer.next_type())
+        .is_some_and(|pointee| pointee.skip_mods_and_typedefs().kind() == BtfKind::FuncProto)
+}
+
 fn probe_capabilities(config: &SkylineConfig) -> CapabilityReport {
     let kernel_release = fs::read_to_string("/proc/sys/kernel/osrelease")
         .unwrap_or_else(|_| "unknown".to_owned())
         .trim()
         .to_owned();
-    let btf = Path::new("/sys/kernel/btf/vmlinux").is_file();
+    let btf = Path::new(KERNEL_BTF_PATH).is_file();
     let bpffs = Path::new("/sys/fs/bpf").is_dir();
     let cgroup_v2 = Path::new("/sys/fs/cgroup/cgroup.controllers").is_file();
     let fq_available = command_success("modinfo", &["sch_fq"])
         || fs::read_to_string("/proc/modules")
             .map(|modules| modules.lines().any(|line| line.starts_with("sch_fq ")))
             .unwrap_or(false);
-    let struct_ops =
-        btf && command_output_contains("bpftool", &["feature", "probe", "kernel"], "struct_ops");
-    let rack_reo_hook = command_output_contains(
-        "bpftool",
-        &[
-            "btf",
-            "dump",
-            "file",
-            "/sys/kernel/btf/vmlinux",
-            "format",
-            "c",
-        ],
-        "(*rack_reo_wnd)",
-    );
+    let mut notes = Vec::new();
+    // Read from the kernel BTF in-process, never by shelling out to bpftool.
+    // A `--prebuilt` host deliberately has no bpftool, and a missing binary
+    // used to read as "no struct_ops": the install failed on a stock kernel
+    // that supported it, and a patched kernel would have lost its RACK hook
+    // without a word. A parse failure is reported for the same reason -- it
+    // must not look like a kernel that simply lacks the feature.
+    let BtfCapabilities {
+        struct_ops,
+        rack_reo_hook,
+    } = if btf {
+        match Btf::from_path(KERNEL_BTF_PATH) {
+            Ok(kernel_btf) => probe_btf_capabilities(&kernel_btf),
+            Err(error) => {
+                notes.push(format!(
+                    "kernel BTF at {KERNEL_BTF_PATH} could not be parsed: {error:#}"
+                ));
+                BtfCapabilities::default()
+            }
+        }
+    } else {
+        BtfCapabilities::default()
+    };
     let fallback_cc_available =
         fs::read_to_string("/proc/sys/net/ipv4/tcp_available_congestion_control")
             .map(|available| {
@@ -1041,7 +1102,6 @@ fn probe_capabilities(config: &SkylineConfig) -> CapabilityReport {
                     .any(|name| name == config.fallback_cc.as_str())
             })
             .unwrap_or(false);
-    let mut notes = Vec::new();
 
     if !config.runtime.cgroup_path.is_dir() {
         notes.push(format!(
@@ -1100,16 +1160,6 @@ fn command_success(program: &str, arguments: &[&str]) -> bool {
         .args(arguments)
         .output()
         .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-fn command_output_contains(program: &str, arguments: &[&str], needle: &str) -> bool {
-    Command::new(program)
-        .args(arguments)
-        .output()
-        .map(|output| {
-            output.status.success() && String::from_utf8_lossy(&output.stdout).contains(needle)
-        })
         .unwrap_or(false)
 }
 
@@ -1260,4 +1310,175 @@ fn main() -> Result<()> {
         return Ok(());
     }
     serve(daemon)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BTF_KIND_INT: u32 = 1;
+    const BTF_KIND_PTR: u32 = 2;
+    const BTF_KIND_STRUCT: u32 = 4;
+    const BTF_KIND_FUNC_PROTO: u32 = 13;
+
+    /// Hand-assembled raw BTF, so the probe is tested against kernels this
+    /// machine is not running: one without struct_ops, one with the RACK patch.
+    /// Asserting on the host's own /sys/kernel/btf/vmlinux would only ever
+    /// exercise whichever single answer the build host happens to give.
+    struct RawBtf {
+        types: Vec<u8>,
+        strings: Vec<u8>,
+        next_id: u32,
+    }
+
+    impl RawBtf {
+        fn new() -> Self {
+            Self {
+                types: Vec::new(),
+                // Offset 0 of the string section is the empty (anonymous) name.
+                strings: vec![0],
+                next_id: 1,
+            }
+        }
+
+        fn string(&mut self, value: &str) -> u32 {
+            let offset = self.strings.len() as u32;
+            self.strings.extend_from_slice(value.as_bytes());
+            self.strings.push(0);
+            offset
+        }
+
+        /// `struct btf_type`: name_off, info (kind << 24 | vlen), size-or-type.
+        fn push_type(&mut self, name_off: u32, kind: u32, vlen: u32, size_or_type: u32) -> u32 {
+            for word in [name_off, kind << 24 | vlen, size_or_type] {
+                self.types.extend_from_slice(&word.to_ne_bytes());
+            }
+            let id = self.next_id;
+            self.next_id += 1;
+            id
+        }
+
+        fn int(&mut self) -> u32 {
+            let name_off = self.string("int");
+            let id = self.push_type(name_off, BTF_KIND_INT, 0, 4);
+            // Trailing u32: encoding 0, bit offset 0, 32 bits wide.
+            self.types.extend_from_slice(&32u32.to_ne_bytes());
+            id
+        }
+
+        /// `void (*)(void)`.
+        fn function_pointer(&mut self) -> u32 {
+            let proto = self.push_type(0, BTF_KIND_FUNC_PROTO, 0, 0);
+            self.push_type(0, BTF_KIND_PTR, 0, proto)
+        }
+
+        /// Members are laid out as if each were 8 bytes; nothing reads offsets.
+        fn structure(&mut self, name: &str, members: &[(&str, u32)]) -> u32 {
+            let name_off = self.string(name);
+            let member_names: Vec<u32> =
+                members.iter().map(|(name, _)| self.string(name)).collect();
+            let id = self.push_type(
+                name_off,
+                BTF_KIND_STRUCT,
+                members.len() as u32,
+                members.len() as u32 * 8,
+            );
+            for (index, (member_name_off, (_, member_type))) in
+                member_names.iter().zip(members).enumerate()
+            {
+                for word in [*member_name_off, *member_type, index as u32 * 64] {
+                    self.types.extend_from_slice(&word.to_ne_bytes());
+                }
+            }
+            id
+        }
+
+        fn parse(&self, test_name: &str) -> Btf<'static> {
+            let mut blob = Vec::new();
+            blob.extend_from_slice(&0xeb9f_u16.to_ne_bytes());
+            blob.extend_from_slice(&[1, 0]); // version, flags
+            for word in [
+                24, // hdr_len
+                0,  // type_off
+                self.types.len() as u32,
+                self.types.len() as u32, // str_off
+                self.strings.len() as u32,
+            ] {
+                blob.extend_from_slice(&word.to_ne_bytes());
+            }
+            blob.extend_from_slice(&self.types);
+            blob.extend_from_slice(&self.strings);
+
+            // libbpf-rs 0.24 only parses BTF from a path. Tests share a process,
+            // so the name carries the test as well as the pid.
+            let path = std::env::temp_dir().join(format!(
+                "skyline-speederd-{}-{test_name}.btf",
+                std::process::id()
+            ));
+            fs::write(&path, blob).expect("write BTF fixture");
+            let parsed = Btf::from_path(&path);
+            let _ = fs::remove_file(&path);
+            parsed.expect("parse BTF fixture")
+        }
+    }
+
+    #[test]
+    fn stock_kernel_has_struct_ops_but_no_rack_hook() {
+        let mut btf = RawBtf::new();
+        let callback = btf.function_pointer();
+        let ops = btf.structure("tcp_congestion_ops", &[("cong_control", callback)]);
+        btf.structure(STRUCT_OPS_VALUE_TYPE, &[("data", ops)]);
+
+        assert_eq!(
+            probe_btf_capabilities(&btf.parse("stock")),
+            BtfCapabilities {
+                struct_ops: true,
+                rack_reo_hook: false,
+            }
+        );
+    }
+
+    #[test]
+    fn rack_patched_kernel_reports_the_hook() {
+        let mut btf = RawBtf::new();
+        let callback = btf.function_pointer();
+        let ops = btf.structure(
+            "tcp_congestion_ops",
+            &[("cong_control", callback), (RACK_REO_HOOK_MEMBER, callback)],
+        );
+        btf.structure(STRUCT_OPS_VALUE_TYPE, &[("data", ops)]);
+
+        assert_eq!(
+            probe_btf_capabilities(&btf.parse("rack-patched")),
+            BtfCapabilities {
+                struct_ops: true,
+                rack_reo_hook: true,
+            }
+        );
+    }
+
+    /// The false positive the bpftool scrape had: a kernel without struct_ops
+    /// for TCP still has plenty of types whose names merely contain the word.
+    #[test]
+    fn struct_ops_is_not_inferred_from_similar_names() {
+        let mut btf = RawBtf::new();
+        let callback = btf.function_pointer();
+        btf.structure("tcp_congestion_ops", &[("cong_control", callback)]);
+        btf.structure("bpf_struct_ops", &[("init", callback)]);
+        btf.structure("bpf_struct_ops_tcp_congestion_ops_extra", &[]);
+
+        assert_eq!(
+            probe_btf_capabilities(&btf.parse("no-struct-ops")),
+            BtfCapabilities::default()
+        );
+    }
+
+    #[test]
+    fn rack_hook_must_be_a_function_pointer() {
+        let mut btf = RawBtf::new();
+        let int = btf.int();
+        btf.structure("tcp_sock", &[(RACK_REO_HOOK_MEMBER, int)]);
+
+        assert!(!probe_btf_capabilities(&btf.parse("rack-scalar")).rack_reo_hook);
+    }
 }

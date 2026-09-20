@@ -10,6 +10,22 @@ for anyone holding a prebuilt `.bpf.o`.
 
 ## [Unreleased]
 
+### Fixed
+
+- `install.sh --prebuilt` failed on a stock Debian 13 host with `BPF struct_ops
+  support was not detected` (#5). The capability probe shelled out to `bpftool`,
+  which a prebuilt install deliberately does not have, and read the missing
+  binary as a missing kernel feature. `struct_ops` and `rack_reo_hook` are now
+  read in-process from `/sys/kernel/btf/vmlinux`; a BTF file that cannot be
+  parsed is reported in `capabilities.notes` instead of looking like an
+  unsupported kernel.
+- The same probe reported `struct_ops: true` on any host where bpftool ran at
+  all: it matched the substring `struct_ops`, which `bpftool feature probe` also
+  prints on its "is NOT available" line.
+- `install.sh` no longer blames the verifier for every validation failure, and
+  prints the full command to rerun rather than referring to a `>/dev/null` that
+  a `curl | bash` user never typed.
+
 ## [0.1.0] - 2026-09-19
 
 First public release.

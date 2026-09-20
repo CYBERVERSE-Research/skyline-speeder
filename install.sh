@@ -335,8 +335,13 @@ fi
 # exits without leaving runtime state, so a kernel/BTF mismatch surfaces here
 # rather than as a half-started daemon.
 info "validating configuration and BPF objects against this kernel"
+# The failure is not necessarily the verifier's: a missing kernel capability
+# stops the run before any object is loaded. Hand over the whole command --
+# someone who came in through `curl | bash` never typed a `>/dev/null` to drop.
 /usr/local/sbin/skyline-speederd --config "$CFG" --validate-only --verify-bpf >/dev/null \
-    || die "validation failed; run without >/dev/null to see the verifier output"
+    || die "validation failed (the reason is on the 'Error:' line above).
+   For the capability report and the verifier log, run:
+     /usr/local/sbin/skyline-speederd --config $CFG --validate-only --verify-bpf"
 ok "all BPF objects passed the kernel verifier"
 
 # Snapshot before anything starts changing sysctls: the daemon writes

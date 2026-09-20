@@ -128,6 +128,12 @@ struct Response {
 | `rack_reo_hook` | 探测一个内核补丁专用的钩子是否存在，标准上游内核上恒为 `false`，仅记录不影响启动 |
 | `notes` | 自由文本，记录软性降级信息（例如某功能因内核能力不足而退化为纯观测） |
 
+`struct_ops` 与 `rack_reo_hook` 由 `skyline-speederd` 进程内直接解析
+`/sys/kernel/btf/vmlinux` 得出，**不依赖 bpftool**（`--prebuilt` 主机上本来就没有它）：
+`struct_ops` 看内核 BTF 中是否存在结构体 `bpf_struct_ops_tcp_congestion_ops`——libbpf
+加载 `skyline_cc` 时解析的正是这个类型；`rack_reo_hook` 看是否有结构体带名为
+`rack_reo_wnd` 的函数指针成员。BTF 文件存在但解析失败时两项都为 `false`，原因写进 `notes`。
+
 ## 5. ABI 版本
 
 BPF 侧的三段配置各自独立维护自己的 ABI 版本号，互不联动——三者的生命周期
