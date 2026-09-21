@@ -267,6 +267,72 @@ skyline-speederd --config config/speeder.toml --validate-only --verify-bpf
 
 If you already know your egress bandwidth, it is fixed, and you are on an older kernel, tcp-brutal is the simpler answer. Skyline Speeder is for when the bandwidth is unknown or varies, you want observability and a congestion guardrail, and you can run a 6.12+ kernel. Neither is appropriate for a genuinely congested bottleneck.
 
+### Measured against tcp-brutal on a production path
+
+The table above is design properties. This is what they came to on one real link,
+with both algorithms applied server-side only through the same per-destination route
+override:
+
+| | Where | Role |
+|---|---|---|
+| **Server** | KVM VPS in **Singapore** · 10 Gbps | sends; the only side that is accelerated |
+| **Client** | **Alibaba Cloud** ECS, **South China (Guangdong)** · 200 Mbps | receives; stock TCP, untouched |
+
+Addresses are omitted. RTT 70–73 ms, 10–30% loss, measured in the evening peak
+(22:55–23:37 China Standard Time). The route is asymmetric, as mainland cross-border
+routes often are: data from Singapore enters China over China Mobile International
+(AS58453) and China Mobile Guangdong (AS9808), while ACKs return over China Telecom
+(AS4134) and NTT (AS2914).
+
+What ran: skyline_cc with the coefficients that shipped as the default in 0.1.0 — the
+set now kept as the "high random loss" preset in [docs/usage.md](docs/usage.md), the
+same one the grid above measured. **Today's defaults have not been run on this path.**
+tcp-brutal v2.0.0 at 200 Mbps with its default cwnd gain; bbr as shipped by the kernel.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/single-ended-ataglance-dark.svg">
+  <img alt="tcp-brutal and skyline_cc measured against a bbr baseline across game, video, web and bulk traffic" src="docs/images/single-ended-ataglance-light.svg">
+</picture>
+
+8 rotations × 3 algorithms × 5 scenarios = 120 runs; 119 completed and one bbr
+page-load run timed out. Algorithm order was
+rotated every rotation so that a path degrading mid-test cannot favour whoever went
+first. Where each one wins, counted per rotation so that drift between rotations
+cannot decide it:
+
+| Scenario | Winner | Margin |
+|---|---|---|
+| **Video** (6 MB chunks @ 48 Mbps) | **tcp-brutal** | startup 7/8 rotations, chunk p95 6/8 |
+| **Game** (ping-pong, 60 msg/s) | **skyline_cc** | jitter 5/8, stalls >150 ms 4/8 |
+| **Bulk, 4 streams** | tie — both beat bbr | 117 / 115 vs 77 Mbps |
+| **Bulk, 1 stream** | bbr and skyline_cc tie; brutal last | 4/8, 4/8, 0/8 rotations; median 59 / 53 / 46 Mbps |
+| **Web page load** | no stable winner | rotation-to-rotation spread exceeds the difference |
+
+The result worth internalising is the single-stream one. **On a single stream,
+tcp-brutal sent the most and delivered the least: 13.9% of its segments were
+retransmissions, against 9.9% for bbr and 11.1% for skyline_cc, for a median of
+46 Mbps.** At 10–30% loss the 200 Mbps it was configured with is far above what the
+path can actually deliver, and brutal's design — send harder when packets are lost, to
+hold the target delivered rate — turns into pure amplification. That is not a bug; it
+is the price of its open loop, and its own documentation says so: *"set it too high and
+you only produce loss."* On an earlier, shorter run over the same path at 3–10% loss
+(n=3), the same 200M configuration had the best single-stream median of the three —
+117 Mbps against bbr's 89 and skyline_cc's 95. The configuration did not change; the
+link did, and nothing told the operator to re-tune.
+
+> [!NOTE]
+> **On RTT this run sits below this project's target envelope, and bbr looks
+> correspondingly strong in it.** The grid above is at 100–300 ms RTT, where stock BBR
+> falls to 3–31 Mbit/s once loss reaches 15–20%; this path's 70 ms RTT lets BBR recover
+> from loss far more easily, and its loss comes from a real cross-border carrier path at
+> evening peak rather than the uniform random loss `netem` injects. Read this section as
+> evidence about algorithm *character*, not as a second throughput benchmark.
+
+Per-rotation numbers, the full metric set, and the raw records:
+[research/experiments/single-ended/](research/experiments/single-ended/) —
+and a per-scenario absolute view in
+[docs/images/single-ended-detail-light.svg](docs/images/single-ended-detail-light.svg).
+
 ## Documentation
 
 The five documents under `docs/` are in Chinese.

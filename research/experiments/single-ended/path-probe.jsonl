@@ -1,0 +1,8 @@
+{"rot":1,"ts":1789916127,"loss_pct":10,"rtt_avg_ms":72.575}
+{"rot":2,"ts":1789916422,"loss_pct":10,"rtt_avg_ms":72.658}
+{"rot":3,"ts":1789916735,"loss_pct":20,"rtt_avg_ms":72.795}
+{"rot":4,"ts":1789917062,"loss_pct":15,"rtt_avg_ms":72.447}
+{"rot":5,"ts":1789917373,"loss_pct":30,"rtt_avg_ms":72.813}
+{"rot":6,"ts":1789917675,"loss_pct":10,"rtt_avg_ms":72.581}
+{"rot":7,"ts":1789918005,"loss_pct":25,"rtt_avg_ms":73.002}
+{"rot":8,"ts":1789918326,"loss_pct":20,"rtt_avg_ms":69.703}

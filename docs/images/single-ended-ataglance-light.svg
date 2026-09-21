@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1060" height="596" viewBox="0 0 1060 596" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" role="img" aria-label="tcp-brutal and skyline_cc measured against a bbr baseline across game, video, web and bulk traffic">
+<rect width="1060" height="596" fill="#fcfcfb"/>
+<text x="34" y="40" font-size="23" font-weight="700" fill="#0b0b0b">How much better than bbr?</text>
+<text x="34" y="63" font-size="13" fill="#52514e">Singapore server → Alibaba Cloud client in South China · RTT 70–73 ms, 10–30% loss, 200 Mbps bottleneck</text>
+<text x="34" y="82" font-size="12" fill="#6b6a66">Accelerated on the server only. Bars right of the line beat stock bbr; left of it lose to it. Medians of 8 rotations, 119 of 120 runs completed.</text>
+<line x1="351.8" y1="108" x2="351.8" y2="524" stroke="#e8e7e3" stroke-width="1"/>
+<text x="351.8" y="102" font-size="10.5" text-anchor="middle" fill="#6b6a66">-50%</text>
+<line x1="477.4" y1="108" x2="477.4" y2="524" stroke="#e8e7e3" stroke-width="1"/>
+<text x="477.4" y="102" font-size="10.5" text-anchor="middle" fill="#6b6a66">-25%</text>
+<line x1="728.6" y1="108" x2="728.6" y2="524" stroke="#e8e7e3" stroke-width="1"/>
+<text x="728.6" y="102" font-size="10.5" text-anchor="middle" fill="#6b6a66">+25%</text>
+<line x1="854.2" y1="108" x2="854.2" y2="524" stroke="#e8e7e3" stroke-width="1"/>
+<text x="854.2" y="102" font-size="10.5" text-anchor="middle" fill="#6b6a66">+50%</text>
+<text x="228" y="138" font-size="12.5" text-anchor="end" fill="#0b0b0b">Game · stalls &gt;150 ms</text>
+<text x="228" y="152" font-size="10.5" text-anchor="end" fill="#6b6a66">bbr 822</text>
+<path d="M603.0,122.0 L888.8,122.0 Q892.3,122.0 892.3,125.5 L892.3,133.5 Q892.3,137.0 888.8,137.0 L603.0,137.0 Z" fill="#eb6834"/>
+<text x="899.3" y="134" font-size="11.5" font-weight="600" text-anchor="start" fill="#0b0b0b">+58%  <tspan font-weight="400" fill="#6b6a66">348</tspan></text>
+<path d="M603.0,141.0 L921.8,141.0 Q925.3,141.0 925.3,144.5 L925.3,152.5 Q925.3,156.0 921.8,156.0 L603.0,156.0 Z" fill="#1baf7a"/>
+<text x="932.3" y="153" font-size="11.5" font-weight="600" text-anchor="start" fill="#0b0b0b">+64%  <tspan font-weight="400" fill="#6b6a66">294</tspan></text>
+<text x="228" y="184" font-size="12.5" text-anchor="end" fill="#0b0b0b">Game · RTT p95</text>
+<text x="228" y="198" font-size="10.5" text-anchor="end" fill="#6b6a66">bbr 447 ms</text>
+<path d="M603.0,168.0 L762.9,168.0 Q766.4,168.0 766.4,171.5 L766.4,179.5 Q766.4,183.0 762.9,183.0 L603.0,183.0 Z" fill="#eb6834"/>
+<text x="773.4" y="180" font-size="11.5" font-weight="600" text-anchor="start" fill="#0b0b0b">+33%  <tspan font-weight="400" fill="#6b6a66">302 ms</tspan></text>
+<path d="M603.0,187.0 L763.9,187.0 Q767.4,187.0 767.4,190.5 L767.4,198.5 Q767.4,202.0 763.9,202.0 L603.0,202.0 Z" fill="#1baf7a"/>
+<text x="774.4" y="199" font-size="11.5" font-weight="600" text-anchor="start" fill="#0b0b0b">+33%  <tspan font-weight="400" fill="#6b6a66">301 ms</tspan></text>
+<text x="228" y="230" font-size="12.5" text-anchor="end" fill="#0b0b0b">Game · jitter</text>
+<text x="228" y="244" font-size="10.5" text-anchor="end" fill="#6b6a66">bbr 23.8 ms</text>
+<path d="M603.0,214.0 L603.4,214.0 Q603.7,214.0 603.7,214.4 L603.7,228.6 Q603.7,229.0 603.4,229.0 L603.0,229.0 Z" fill="#eb6834"/>
+<text x="610.7" y="226" font-size="11.5" font-weight="600" text-anchor="start" fill="#0b0b0b">+0%  <tspan font-weight="400" fill="#6b6a66">23.7 ms</tspan></text>
+<path d="M603.0,233.0 L642.1,233.0 Q645.6,233.0 645.6,236.5 L645.6,244.5 Q645.6,248.0 642.1,248.0 L603.0,248.0 Z" fill="#1baf7a"/>
+<text x="652.6" y="245" font-size="11.5" font-weight="600" text-anchor="start" fill="#0b0b0b">+8%  <tspan font-weight="400" fill="#6b6a66">21.8 ms</tspan></text>
+<text x="228" y="276" font-size="12.5" text-anchor="end" fill="#0b0b0b">Video · chunk p95</text>
+<text x="228" y="290" font-size="10.5" text-anchor="end" fill="#6b6a66">bbr 2,432 ms</text>
+<path d="M603.0,260.0 L832.6,260.0 Q836.1,260.0 836.1,263.5 L836.1,271.5 Q836.1,275.0 832.6,275.0 L603.0,275.0 Z" fill="#eb6834"/>
+<text x="843.1" y="272" font-size="11.5" font-weight="600" text-anchor="start" fill="#0b0b0b">+46%  <tspan font-weight="400" fill="#6b6a66">1,304 ms</tspan></text>
+<path d="M603.0,279.0 L801.2,279.0 Q804.7,279.0 804.7,282.5 L804.7,290.5 Q804.7,294.0 801.2,294.0 L603.0,294.0 Z" fill="#1baf7a"/>
+<text x="811.7" y="291" font-size="11.5" font-weight="600" text-anchor="start" fill="#0b0b0b">+40%  <tspan font-weight="400" fill="#6b6a66">1,456 ms</tspan></text>
+<text x="228" y="322" font-size="12.5" text-anchor="end" fill="#0b0b0b">Video · startup</text>
+<text x="228" y="336" font-size="10.5" text-anchor="end" fill="#6b6a66">bbr 2,090 ms</text>
+<path d="M603.0,306.0 L831.4,306.0 Q834.9,306.0 834.9,309.5 L834.9,317.5 Q834.9,321.0 831.4,321.0 L603.0,321.0 Z" fill="#eb6834"/>
+<text x="841.9" y="318" font-size="11.5" font-weight="600" text-anchor="start" fill="#0b0b0b">+46%  <tspan font-weight="400" fill="#6b6a66">1,125 ms</tspan></text>
+<path d="M603.0,325.0 L725.2,325.0 Q728.7,325.0 728.7,328.5 L728.7,336.5 Q728.7,340.0 725.2,340.0 L603.0,340.0 Z" fill="#1baf7a"/>
+<text x="735.7" y="337" font-size="11.5" font-weight="600" text-anchor="start" fill="#0b0b0b">+25%  <tspan font-weight="400" fill="#6b6a66">1,567 ms</tspan></text>
+<text x="228" y="368" font-size="12.5" text-anchor="end" fill="#0b0b0b">Web · page load</text>
+<text x="228" y="382" font-size="10.5" text-anchor="end" fill="#6b6a66">bbr 1,855 ms</text>
+<path d="M603.0,352.0 L455.6,352.0 Q452.1,352.0 452.1,355.5 L452.1,363.5 Q452.1,367.0 455.6,367.0 L603.0,367.0 Z" fill="#eb6834"/>
+<text x="445.1" y="364" font-size="11.5" font-weight="600" text-anchor="end" fill="#0b0b0b">-30%  <tspan font-weight="400" fill="#6b6a66">2,413 ms</tspan></text>
+<path d="M603.0,371.0 L501.2,371.0 Q497.7,371.0 497.7,374.5 L497.7,382.5 Q497.7,386.0 501.2,386.0 L603.0,386.0 Z" fill="#1baf7a"/>
+<text x="490.7" y="383" font-size="11.5" font-weight="600" text-anchor="end" fill="#0b0b0b">-21%  <tspan font-weight="400" fill="#6b6a66">2,244 ms</tspan></text>
+<text x="228" y="414" font-size="12.5" text-anchor="end" fill="#0b0b0b">Bulk · 1 stream</text>
+<text x="228" y="428" font-size="10.5" text-anchor="end" fill="#6b6a66">bbr 59 Mbps</text>
+<path d="M603.0,398.0 L495.4,398.0 Q491.9,398.0 491.9,401.5 L491.9,409.5 Q491.9,413.0 495.4,413.0 L603.0,413.0 Z" fill="#eb6834"/>
+<text x="484.9" y="410" font-size="11.5" font-weight="600" text-anchor="end" fill="#0b0b0b">-22%  <tspan font-weight="400" fill="#6b6a66">46 Mbps</tspan></text>
+<path d="M603.0,417.0 L558.8,417.0 Q555.3,417.0 555.3,420.5 L555.3,428.5 Q555.3,432.0 558.8,432.0 L603.0,432.0 Z" fill="#1baf7a"/>
+<text x="548.3" y="429" font-size="11.5" font-weight="600" text-anchor="end" fill="#0b0b0b">-9%  <tspan font-weight="400" fill="#6b6a66">53 Mbps</tspan></text>
+<text x="228" y="460" font-size="12.5" text-anchor="end" fill="#0b0b0b">Bulk · 4 streams</text>
+<text x="228" y="474" font-size="10.5" text-anchor="end" fill="#6b6a66">bbr 77 Mbps</text>
+<path d="M603.0,444.0 L847.5,444.0 Q851.0,444.0 851.0,447.5 L851.0,455.5 Q851.0,459.0 847.5,459.0 L603.0,459.0 Z" fill="#eb6834"/>
+<text x="858.0" y="456" font-size="11.5" font-weight="600" text-anchor="start" fill="#0b0b0b">+49%  <tspan font-weight="400" fill="#6b6a66">115 Mbps</tspan></text>
+<path d="M603.0,463.0 L857.6,463.0 Q861.1,463.0 861.1,466.5 L861.1,474.5 Q861.1,478.0 857.6,478.0 L603.0,478.0 Z" fill="#1baf7a"/>
+<text x="868.1" y="475" font-size="11.5" font-weight="600" text-anchor="start" fill="#0b0b0b">+51%  <tspan font-weight="400" fill="#6b6a66">117 Mbps</tspan></text>
+<text x="228" y="506" font-size="12.5" text-anchor="end" fill="#0b0b0b">Cost · retransmit rate</text>
+<text x="228" y="520" font-size="10.5" text-anchor="end" fill="#6b6a66">bbr 9.9%</text>
+<path d="M603.0,490.0 L473.1,490.0 Q469.6,490.0 469.6,493.5 L469.6,501.5 Q469.6,505.0 473.1,505.0 L603.0,505.0 Z" fill="#eb6834"/>
+<text x="462.6" y="502" font-size="11.5" font-weight="600" text-anchor="end" fill="#0b0b0b">-27%  <tspan font-weight="400" fill="#6b6a66">12.5%</tspan></text>
+<path d="M603.0,509.0 L521.9,509.0 Q518.4,509.0 518.4,512.5 L518.4,520.5 Q518.4,524.0 521.9,524.0 L603.0,524.0 Z" fill="#1baf7a"/>
+<text x="511.4" y="521" font-size="11.5" font-weight="600" text-anchor="end" fill="#0b0b0b">-17%  <tspan font-weight="400" fill="#6b6a66">11.6%</tspan></text>
+<line x1="603.0" y1="108" x2="603.0" y2="524" stroke="#2a78d6" stroke-width="2"/>
+<text x="603.0" y="102" font-size="10.5" text-anchor="middle" font-weight="600" fill="#2a78d6">bbr</text>
+<rect x="34" y="560" width="11" height="11" rx="2.5" fill="#eb6834"/>
+<text x="51" y="570" font-size="12" fill="#52514e">tcp-brutal @200M</text>
+<rect x="187.2" y="560" width="11" height="11" rx="2.5" fill="#1baf7a"/>
+<text x="204.2" y="570" font-size="12" fill="#52514e">skyline_cc</text>
+<text x="1026" y="570" font-size="10.5" text-anchor="end" fill="#6b6a66">skyline_cc 0.1.0 coefficients (today&#8217;s &#8220;high random loss&#8221; preset) · field measurement, not the controlled test bed</text>
+</svg>
