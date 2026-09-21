@@ -121,19 +121,20 @@ sudo ssctl reset-module-config
 
 | 参数 | 它管什么 | 调大会怎样 | 调小会怎样 | 默认 |
 |---|---|---|---|---:|
-| `--cruise-inflight-gain` | **稳定期最多能比理论值多发多少** | 高丢包时更能顶住 | 高丢包下发不出去 | `2.0` |
-| `--cruise-pacing-gain` | **稳定期发送速率是估算带宽的多少倍** | 更激进，可能堆队列 | 更保守，吞吐低 | `1.1` |
+| `--cruise-inflight-gain` | **稳定期最多能比理论值多发多少** | 高丢包时更能顶住 | 高丢包下发不出去 | `3.0` |
+| `--cruise-pacing-gain` | **稳定期发送速率是估算带宽的多少倍** | 更激进，可能堆队列 | 更保守，吞吐低 | `1.25` |
 | `--guardrail-gain` | **发现真拥塞时降到原来的几成**（自我保护） | 降得少，更激进 | 降得狠，更安全 | `0.8` |
-| `--loss-inflation-max-ratio` | **最多为丢包补偿多发多少**（0.5 = 最多多发 50%） | 丢包补偿更强 | 补偿更弱 | `0.5` |
-| `--max-queue-delay-ms` | **排队延迟超过多少毫秒就认为堵了** | 更晚才减速，延迟更高 | 更早减速，延迟更低 | `100` |
+| `--loss-inflation-max-ratio` | **最多按多高的丢包率做补偿**（按 `1/(1-p)` 多发：0.10 ≈ 多发 11%，0.5 = 多发一倍） | 随机丢包链路上补偿更足；拥塞型瓶颈上会越丢越发 | 补偿更弱，更不容易自己把链路挤爆 | `0.10` |
+| `--max-queue-delay-ms` | **排队延迟超过多少毫秒就认为堵了** | 更晚才减速，延迟更高 | 更早减速，延迟更低 | `70` |
 | `--startup-gain` | **刚开始连接时冲多猛** | 起速快，可能过冲 | 起速慢更稳 | `3.0` |
 | `--initial-cwnd-packets` | **一开始就发多少个包**（不用慢慢试探） | 小文件传输更快 | 更保守 | `100` |
 | `--max-pacing-mbps` | **速率硬上限**，单位 Mbps | 允许跑更快 | 限速 | `1200` |
 | `--max-cwnd-packets` | **未确认数据的硬上限**，单位包数 | 允许更多在途数据 | 省内存但限吞吐 | `50000` |
+| `--min-cwnd-packets` | **窗口的下限**，单位包数（只在 `adaptive-cwnd` 开启时生效） | 小流量连接丢包后窗口里还有足够的包触发快速恢复，不必干等超时；发送速率仍由 pacing 决定，不会因此发得更快 | 回到历史行为 | `4` |
 
 **改完立刻生效，不用重启**，而且是在每条连接的 RTT 边界上平滑切换，不会传到一半出乱子。
 
-### 三档现成配方（复制即用）
+### 四档现成配方（复制即用）
 
 Skyline Speeder 没有 BBR 那样的内置档位，只有裸参数。下面三条命令是我们整理的等价档位，
 **直接复制粘贴**即可，不需要理解每个参数。
@@ -143,11 +144,12 @@ Skyline Speeder 没有 BBR 那样的内置档位，只有裸参数。下面三�
 ```bash
 sudo ssctl set-module-config \
   --max-pacing-mbps 1200 --max-cwnd-packets 50000 \
-  --max-queue-delay-ms 50 --max-queue-delay-ratio 1.0 \
-  --initial-cwnd-packets 50 --min-rtt-window-s 10 --bw-window-rtts 10 \
+  --max-queue-delay-ms 50 --max-queue-delay-ratio 0.5 \
+  --initial-cwnd-packets 50 --min-cwnd-packets 4 \
+  --min-rtt-window-s 30 --bw-window-rtts 6 \
   --startup-plateau-rtts 3 --startup-growth-ratio 0.25 --startup-gain 2.0 \
   --cruise-inflight-gain 1.5 --cruise-pacing-gain 1.05 \
-  --guardrail-gain 0.7 --loss-inflation-max-ratio 0.5
+  --guardrail-gain 0.7 --loss-inflation-max-ratio 0.10
 ```
 
 **② 默认档 —— 出厂设置**（等价于 `ssctl reset-module-config`）
@@ -162,7 +164,8 @@ sudo ssctl reset-module-config
 sudo ssctl set-module-config \
   --max-pacing-mbps 2000 --max-cwnd-packets 100000 \
   --max-queue-delay-ms 200 --max-queue-delay-ratio 2.0 \
-  --initial-cwnd-packets 200 --min-rtt-window-s 30 --bw-window-rtts 10 \
+  --initial-cwnd-packets 200 --min-cwnd-packets 4 \
+  --min-rtt-window-s 30 --bw-window-rtts 10 \
   --startup-plateau-rtts 5 --startup-growth-ratio 0.15 --startup-gain 4.0 \
   --cruise-inflight-gain 3.0 --cruise-pacing-gain 1.3 \
   --guardrail-gain 1.0 --loss-inflation-max-ratio 0.5
@@ -172,15 +175,19 @@ sudo ssctl set-module-config \
 
 | 参数 | 默认 | 激进 | 效果 |
 |---|---:|---:|---|
-| `cruise-pacing-gain` | 1.1 | **1.3** | 稳定期按带宽估计的 1.3 倍发 —— **最主要的提速旋钮** |
-| `cruise-inflight-gain` | 2.0 | **3.0** | 允许更多数据同时在途 |
+| `cruise-pacing-gain` | 1.25 | **1.3** | 稳定期按带宽估计的 1.3 倍发 |
+| `cruise-inflight-gain` | 3.0 | 3.0 | 与默认档相同 |
 | `startup-gain` | 3.0 | **4.0** | 起步冲得更猛 |
 | `guardrail-gain` | 0.8 | **1.0** | 检测到拥塞时**不再降速**（1.0 = 中性） |
-| `max-queue-delay-ms` | 100 | **200** | 排队延迟翻倍才认为"堵了" |
+| `max-queue-delay-ms` / `max-queue-delay-ratio` | 70 / 0.6 | **200 / 2.0** | 排队延迟高得多才认为"堵了" |
+| `loss-inflation-max-ratio` | 0.10 | **0.5** | 丢包补偿放开到最多多发一倍 |
+| `bw-window-rtts` | 6 | **10** | 带宽估计记住更久以前的峰值 |
 | `initial-cwnd-packets` | 100 | **200** | 连接一建立就发 200 个包 |
 | `max-cwnd-packets` / `max-pacing-mbps` | 50000 / 1200 | **100000 / 2000** | 抬高两个硬上限 |
 
-**实测效果**（东京机房 → 客户端，RTT ≈ 18ms 干净链路，经代理下载 50MB，5 轮交错对比）：
+**实测效果**（单台服务器 → 客户端，RTT ≈ 18ms 的干净链路，下载 50MB，5 轮交错对比）。
+这组数据测于默认系数调整**之前**：表里的「默认档」是当时的默认值，也就是下面的
+「④ 高随机丢包档」；现在的默认档没有在这条链路上重测过。
 
 | | 默认档 | 激进档 |
 |---|---:|---:|
@@ -198,6 +205,26 @@ sudo ssctl set-module-config \
 > 激进档把 `guardrail-gain` 设成 1.0，等于**关掉了自我保护降速**。在真正拥塞的链路上
 > 它会持续挤占缓冲、推高延迟，也会挤压同链路上的其他流量。
 > **只在"线路带宽充足"时使用。**
+
+**④ 高随机丢包档 —— 原默认值**（链路确实是 10%-20% 的**随机**丢包、不是被挤爆的丢包）
+
+```bash
+sudo ssctl set-module-config \
+  --max-pacing-mbps 1200 --max-cwnd-packets 50000 \
+  --max-queue-delay-ms 100 --max-queue-delay-ratio 1.0 \
+  --initial-cwnd-packets 100 --min-cwnd-packets 4 \
+  --min-rtt-window-s 10 --bw-window-rtts 10 \
+  --startup-plateau-rtts 3 --startup-growth-ratio 0.25 --startup-gain 3.0 \
+  --cruise-inflight-gain 2.0 --cruise-pacing-gain 1.1 \
+  --guardrail-gain 0.8 --loss-inflation-max-ratio 0.5
+```
+
+这是 [性能验证报告](04-performance-report.md) 里 `skyline-best` 测的那组系数，针对的是
+"丢包不代表拥塞"的链路：丢包补偿放到最多多发一倍，护栏放得很宽。默认档后来改掉它，
+是因为在并发连接很多、丢包主要来自瓶颈被挤满的生产环境里，这组系数会越丢越发——
+重传明显增多，速度却没有换来。**判断方法**：换档后看重传占比和 RTO 超时数（做法见
+文末「附：视频卡顿 / 大文件传输中断怎么查」），重传涨了而吞吐没涨，就说明你的丢包是
+挤出来的，回默认档。
 
 ### 让档位重启后依然生效
 
@@ -222,12 +249,13 @@ sudo systemctl restart skyline-speeder-enable.service
 
 | 参数 | 允许范围 | 备注 |
 |---|---|---|
-| `--bw-window-rtts` | **1 – 10** | 默认已是 10，**没有加大空间** |
-| `--loss-inflation-max-ratio` | **0 – 0.5** | 默认已是 0.5（BPF 侧硬编码 500‰），**已顶格** |
+| `--bw-window-rtts` | **1 – 10** | 默认 6；10 是硬上限 |
+| `--loss-inflation-max-ratio` | **0 – 0.5** | 默认 0.10；0.5 是 BPF 侧硬编码的上限（500‰） |
 | `--guardrail-gain` | 0 – 1.0 | 1.0 = 不降速；0 = 关闭该护栏 |
 | `--startup-growth-ratio` | 0 – 1.0 | |
 | `--startup-gain` / `--cruise-*-gain` | ≥ 1.0 | 无上限，但越大越容易堆队列 |
 | `--max-cwnd-packets` | ≥ 4 | |
+| `--min-cwnd-packets` | **4 – `--max-cwnd-packets`** | 低于 4 会被拒绝（BPF 侧本来就不会让窗口低于 4） |
 
 > 命令是**全量覆盖**的：只要有**任何一个**参数越界，**整条命令都会被拒绝**，
 > 已生效的配置保持不变。返回里会写明是哪个参数、允许范围是多少。
@@ -241,12 +269,13 @@ sudo ssctl status
 # 2. 把所有要保留的值一起写全（这里示范：只想把护栏放松到 0.9）
 sudo ssctl set-module-config \
   --max-pacing-mbps 1200 --max-cwnd-packets 50000 \
-  --max-queue-delay-ms 100 --max-queue-delay-ratio 1.0 \
-  --initial-cwnd-packets 100 --min-rtt-window-s 10 --bw-window-rtts 10 \
-  --startup-plateau-rtts 3 --startup-growth-ratio 0.25 --startup-gain 3.0 \
-  --cruise-inflight-gain 2.0 --cruise-pacing-gain 1.1 \
+  --max-queue-delay-ms 70 --max-queue-delay-ratio 0.6 \
+  --initial-cwnd-packets 100 --min-cwnd-packets 4 \
+  --min-rtt-window-s 30 --bw-window-rtts 6 \
+  --startup-plateau-rtts 5 --startup-growth-ratio 0.20 --startup-gain 3.0 \
+  --cruise-inflight-gain 3.0 --cruise-pacing-gain 1.25 \
   --guardrail-gain 0.9 \
-  --loss-inflation-max-ratio 0.5
+  --loss-inflation-max-ratio 0.10
 
 # 3. 不满意就一键还原
 sudo ssctl reset-module-config
@@ -461,12 +490,13 @@ sudo ssctl enable
 # 更早减速、降得更狠
 sudo ssctl set-module-config \
   --max-pacing-mbps 1200 --max-cwnd-packets 50000 \
-  --max-queue-delay-ms 50 --max-queue-delay-ratio 1.0 \
-  --initial-cwnd-packets 100 --min-rtt-window-s 10 --bw-window-rtts 10 \
-  --startup-plateau-rtts 3 --startup-growth-ratio 0.25 --startup-gain 3.0 \
-  --cruise-inflight-gain 2.0 --cruise-pacing-gain 1.05 \
+  --max-queue-delay-ms 50 --max-queue-delay-ratio 0.5 \
+  --initial-cwnd-packets 100 --min-cwnd-packets 4 \
+  --min-rtt-window-s 30 --bw-window-rtts 6 \
+  --startup-plateau-rtts 5 --startup-growth-ratio 0.20 --startup-gain 3.0 \
+  --cruise-inflight-gain 3.0 --cruise-pacing-gain 1.05 \
   --guardrail-gain 0.7 \
-  --loss-inflation-max-ratio 0.5
+  --loss-inflation-max-ratio 0.10
 ```
 
 ### 场景 4：连接经常莫名卡死几十秒
@@ -533,7 +563,7 @@ sudo ssctl reset-module-config
 ```
 
 如果还想要速度，**不要动 `guardrail-gain`**（那是自我保护开关），
-只小幅提 `cruise-pacing-gain`（1.1 → 1.15 → 1.2），每档跑上面的脚本看 RTO 超时数，
+只小幅提 `cruise-pacing-gain`（1.25 → 1.3 → 1.35），每档跑上面的脚本看 RTO 超时数，
 涨得明显就退回去。
 
 ### 第三步：限制死连接的挂起时长

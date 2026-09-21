@@ -514,6 +514,19 @@ static __always_inline bool skyline_update_model(struct sock *sk,
     return new_round;
 }
 
+/* M2's cwnd floor -- config->min_cwnd_packets, never below SKYLINE_MIN_CWND
+ * (see skyline_abi.h's min_cwnd_packets doc comment for why a BDP-derived
+ * target alone is too small for thin flows on a lossy path). The max() is
+ * not just defensive: it is what keeps this floor from ever dropping under
+ * the one the M2-off path uses, whatever userspace wrote. M2-on path only --
+ * skyline_grow_cwnd()/skyline_apply_prr()/skyline_set_state() keep the fixed
+ * SKYLINE_MIN_CWND so this knob cannot perturb B1/B2 neutrality.
+ */
+static __always_inline __u32 skyline_min_cwnd(const struct skyline_config *config)
+{
+    return max_t(__u32, config->min_cwnd_packets, SKYLINE_MIN_CWND);
+}
+
 static __always_inline __u32 skyline_bdp_packets(struct tcp_sock *tp,
                                              struct skyline_flow_state *flow,
                                              const struct skyline_config *config,
@@ -536,7 +549,7 @@ static __always_inline __u32 skyline_bdp_packets(struct tcp_sock *tp,
     inflation = skyline_loss_inflation_permille(flow, config);
     bytes = bytes * inflation / 1000U;
     packets = bytes / max_t(__u32, tp->mss_cache, 1U);
-    return max_t(__u32, packets, SKYLINE_MIN_CWND);
+    return max_t(__u32, packets, skyline_min_cwnd(config));
 }
 
 /* SKYLINE_FEATURE_AUTO_PACING: kernel-equivalent pacing-rate ceiling for when
@@ -661,8 +674,13 @@ static __always_inline void skyline_set_cwnd_target(struct tcp_sock *tp,
     tp->snd_cwnd = target;
     if (config->max_cwnd_packets && tp->snd_cwnd > config->max_cwnd_packets)
         tp->snd_cwnd = config->max_cwnd_packets;
-    if (tp->snd_cwnd < SKYLINE_MIN_CWND)
-        tp->snd_cwnd = SKYLINE_MIN_CWND;
+    /* Floor last, so it holds even against the guardrail's gain clamp above
+     * -- same ordering the fixed SKYLINE_MIN_CWND floor always had here.
+     * Userspace validation keeps min_cwnd_packets <= max_cwnd_packets, so
+     * this can never undo the cap just applied.
+     */
+    if (tp->snd_cwnd < skyline_min_cwnd(config))
+        tp->snd_cwnd = skyline_min_cwnd(config);
 }
 
 /* M2-off path only (B1/B2 neutrality) -- real CUBIC's growth curve plus its

@@ -15,7 +15,7 @@ use thiserror::Error;
 /// `bpf/include/skyline_abi.h`'s top-of-file comment for what the current
 /// layout encodes (target deployment envelope, M2/M3 semantics, the
 /// queue-delay/ECN guardrail's `guardrail_gain_permille`).
-pub const ABI_VERSION: u32 = 6;
+pub const ABI_VERSION: u32 = 7;
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,6 +308,11 @@ pub struct ModuleTuningConfig {
     pub max_queue_delay_ratio: f64,
     /// See `SkylineConfig::initial_cwnd_packets`.
     pub initial_cwnd_packets: u32,
+    /// See `SkylineConfig::min_cwnd_packets`. Defaulted on the wire so a
+    /// request that predates the field still means "today's behavior"
+    /// rather than failing to parse.
+    #[serde(default = "default_min_cwnd_packets")]
+    pub min_cwnd_packets: u32,
     pub min_rtt_window_s: u32,
     pub bw_window_rtts: u32,
     pub startup_plateau_rtts: u32,
@@ -337,6 +342,7 @@ impl ModuleTuningConfig {
             max_queue_delay_ms: config.max_queue_delay_ms,
             max_queue_delay_ratio: config.max_queue_delay_ratio,
             initial_cwnd_packets: config.initial_cwnd_packets,
+            min_cwnd_packets: config.min_cwnd_packets,
             min_rtt_window_s: config.adaptive_cwnd.min_rtt_window_s,
             bw_window_rtts: config.adaptive_cwnd.bw_window_rtts,
             startup_plateau_rtts: config.adaptive_cwnd.startup_plateau_rtts,
@@ -361,6 +367,7 @@ impl ModuleTuningConfig {
         config.max_queue_delay_ms = self.max_queue_delay_ms;
         config.max_queue_delay_ratio = self.max_queue_delay_ratio;
         config.initial_cwnd_packets = self.initial_cwnd_packets;
+        config.min_cwnd_packets = self.min_cwnd_packets;
         config.adaptive_cwnd.min_rtt_window_s = self.min_rtt_window_s;
         config.adaptive_cwnd.bw_window_rtts = self.bw_window_rtts;
         config.adaptive_cwnd.startup_plateau_rtts = self.startup_plateau_rtts;
@@ -411,6 +418,15 @@ pub struct SkylineConfig {
     /// whatever the kernel already set (today's behavior).
     #[serde(default)]
     pub initial_cwnd_packets: u32,
+    /// Floor under M2's BDP-derived cwnd target (see
+    /// `bpf/include/skyline_abi.h`'s `min_cwnd_packets` doc comment). A thin
+    /// or app-limited flow's `bw_bps * base_rtt` comes out below a handful
+    /// of packets, and a window that small can only recover from a loss via
+    /// a tail-loss probe or an RTO. Pacing still sets the send rate, so this
+    /// does not make a flow send faster. Omitted = 4, the floor this project
+    /// always had; only consulted while M2 (`adaptive-cwnd`) is on.
+    #[serde(default = "default_min_cwnd_packets")]
+    pub min_cwnd_packets: u32,
     pub adaptive_cwnd: AdaptiveCwndConfig,
     pub loss_classifier: LossClassifierConfig,
     #[serde(default)]
@@ -443,6 +459,18 @@ impl SkylineConfig {
         }
         if self.max_cwnd_packets < 4 {
             return Err(ConfigError::Invalid("max_cwnd_packets must be at least 4"));
+        }
+        // The BPF side takes max(min_cwnd_packets, SKYLINE_MIN_CWND), so a
+        // smaller value would be silently ignored -- reject it here instead.
+        if self.min_cwnd_packets < MIN_CWND_FLOOR {
+            return Err(ConfigError::Invalid("min_cwnd_packets must be at least 4"));
+        }
+        // skyline_set_cwnd_target() applies the cap first and the floor last;
+        // a floor above the cap would undo the cap on every ACK.
+        if self.min_cwnd_packets > self.max_cwnd_packets {
+            return Err(ConfigError::Invalid(
+                "min_cwnd_packets must not exceed max_cwnd_packets",
+            ));
         }
         if !(1..=10).contains(&self.adaptive_cwnd.bw_window_rtts) {
             return Err(ConfigError::Invalid(
@@ -596,6 +624,8 @@ impl SkylineConfig {
             cruise_pacing_permille: permille(self.adaptive_cwnd.cruise_pacing_gain),
             loss_inflation_max_permille: permille(self.loss_classifier.loss_inflation_max_ratio),
             guardrail_gain_permille: permille(self.adaptive_cwnd.guardrail_gain),
+            min_cwnd_packets: self.min_cwnd_packets,
+            reserved: 0,
         }
     }
 }
@@ -606,6 +636,14 @@ fn permille(value: f64) -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+/// `SKYLINE_MIN_CWND` in `bpf/skyline_cc.bpf.c` -- the fixed floor the M2-off
+/// path keeps, and the lowest value `min_cwnd_packets` may take.
+pub const MIN_CWND_FLOOR: u32 = 4;
+
+fn default_min_cwnd_packets() -> u32 {
+    MIN_CWND_FLOOR
 }
 
 #[repr(C)]
@@ -638,6 +676,12 @@ pub struct KernelConfig {
     /// count are unchanged, see `bpf/include/skyline_abi.h`'s top-of-file
     /// comment.
     pub guardrail_gain_permille: u32,
+    /// See `SkylineConfig::min_cwnd_packets`.
+    pub min_cwnd_packets: u32,
+    /// Explicit tail padding -- the `u64` above makes the struct 8-byte
+    /// aligned and `Pod` rejects implicit padding. Always 0; mirrors
+    /// `struct skyline_config`'s `reserved`.
+    pub reserved: u32,
 }
 
 /// Mirrors `struct skyline_rto_tuning` (`bpf/include/skyline_abi.h`). Independent of
@@ -894,7 +938,7 @@ mod tests {
         // modules -- see config/speeder.toml's enabled_modules comment.
         assert!(config.feature_mask().contains(FeatureMask::EARLY_LOSS));
         // See config/speeder.toml's comment for the default coefficients.
-        assert_eq!(config.kernel_config().cruise_pacing_permille, 1100);
+        assert_eq!(config.kernel_config().cruise_pacing_permille, 1250);
     }
 
     #[test]
@@ -1061,7 +1105,7 @@ mod tests {
         let mut config = SkylineConfig::load("../../config/speeder.toml").expect("load config");
         let mut tuning = ModuleTuningConfig::from_config(&config);
         // from_config() must recover exactly what's in config/speeder.toml today.
-        assert_eq!(tuning.cruise_inflight_gain, 2.0);
+        assert_eq!(tuning.cruise_inflight_gain, 3.0);
         assert_eq!(tuning.startup_gain, 3.0);
 
         tuning.loss_inflation_max_ratio = 0.4;
@@ -1135,6 +1179,91 @@ mod tests {
         tuning.initial_cwnd_packets = 200;
         tuning.apply_to(&mut config);
         assert_eq!(config.kernel_config().initial_cwnd_packets, 200);
+    }
+
+    #[test]
+    fn min_cwnd_packets_defaults_to_the_historical_floor_when_omitted() {
+        // Every configuration file written before this field existed must
+        // keep loading, and must keep meaning "4".
+        let content = fs::read_to_string("../../config/speeder.toml").expect("read config");
+        let without: String = content
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("min_cwnd_packets"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_ne!(
+            without.len(),
+            content.len(),
+            "fixture no longer declares the field"
+        );
+        let config: SkylineConfig = toml::from_str(&without).expect("parse without the field");
+        config.validate().expect("still valid");
+        assert_eq!(config.min_cwnd_packets, MIN_CWND_FLOOR);
+        assert_eq!(config.kernel_config().min_cwnd_packets, MIN_CWND_FLOOR);
+    }
+
+    #[test]
+    fn module_tuning_request_without_min_cwnd_packets_still_parses() {
+        // `ModuleTuningConfig` is the `set-module-config` wire payload; a
+        // request that predates the field must mean today's behavior, not
+        // fail to deserialize.
+        let config = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        let wire = toml::to_string(&ModuleTuningConfig::from_config(&config)).expect("serialize");
+        let without: String = wire
+            .lines()
+            .filter(|line| !line.starts_with("min_cwnd_packets"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let tuning: ModuleTuningConfig = toml::from_str(&without).expect("parse without the field");
+        assert_eq!(tuning.min_cwnd_packets, MIN_CWND_FLOOR);
+    }
+
+    #[test]
+    fn module_tuning_config_kernel_config_carries_min_cwnd_packets() {
+        let mut config = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        let mut tuning = ModuleTuningConfig::from_config(&config);
+        tuning.min_cwnd_packets = 16;
+        tuning.apply_to(&mut config);
+        config
+            .validate()
+            .expect("16 is within [4, max_cwnd_packets]");
+        let kernel = config.kernel_config();
+        assert_eq!(kernel.min_cwnd_packets, 16);
+        assert_eq!(kernel.reserved, 0);
+        assert_eq!(
+            ModuleTuningConfig::from_config(&config).min_cwnd_packets,
+            16
+        );
+    }
+
+    #[test]
+    fn min_cwnd_packets_must_stay_between_the_fixed_floor_and_the_cap() {
+        let base = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+
+        // Below SKYLINE_MIN_CWND the BPF side would silently ignore it.
+        let mut config = base.clone();
+        config.min_cwnd_packets = MIN_CWND_FLOOR - 1;
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+
+        // Above the cap the floor would undo the cap on every ACK.
+        let mut config = base.clone();
+        config.min_cwnd_packets = config.max_cwnd_packets + 1;
+        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+
+        let mut config = base;
+        config.min_cwnd_packets = config.max_cwnd_packets;
+        config
+            .validate()
+            .expect("floor == cap is degenerate but consistent");
+    }
+
+    #[test]
+    fn kernel_config_has_no_implicit_padding() {
+        // 4 x u32, one u64, 14 x u32 -- `Pod` already refuses to compile with
+        // implicit padding; this pins the size `struct skyline_config` in
+        // bpf/include/skyline_abi.h has to match.
+        assert_eq!(std::mem::size_of::<KernelConfig>(), 80);
+        assert_eq!(std::mem::align_of::<KernelConfig>(), 8);
     }
 
     #[test]

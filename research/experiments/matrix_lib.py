@@ -389,8 +389,12 @@ def _parse_module_config(item: dict[str, Any]) -> ModuleConfigSpec:
         startup_plateau_rtts=int(item.get("startup_plateau_rtts", 3)),
         startup_growth_ratio=float(item.get("startup_growth_ratio", 0.25)),
         startup_gain=float(item.get("startup_gain", 3.0)),
-        # cruise_inflight_gain/cruise_pacing_gain defaults mirror
-        # config/speeder.toml's defaults.
+        # Deliberately NOT config/speeder.toml's shipped defaults: every
+        # default in this block is the coefficient set
+        # docs/04-performance-report.md measured as `skyline-best`, pinned
+        # here so that report stays reproducible after the shipped defaults
+        # moved to field-tuned values. A profile that wants the shipped
+        # defaults has to spell them out.
         cruise_inflight_gain=float(item.get("cruise_inflight_gain", 2.0)),
         cruise_pacing_gain=float(item.get("cruise_pacing_gain", 1.1)),
         guardrail_gain=float(item.get("guardrail_gain", 0.8)),

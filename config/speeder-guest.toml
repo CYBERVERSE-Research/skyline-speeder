@@ -10,32 +10,37 @@ auto_pacing_enabled = true
 fallback_cc = "cubic"
 max_pacing_mbps = 1200
 max_cwnd_packets = 50000
-max_queue_delay_ms = 100
+max_queue_delay_ms = 70
 # See config/speeder.toml's comment: RTT-relative queue guardrail ratio.
-max_queue_delay_ratio = 1.0
+max_queue_delay_ratio = 0.6
 # See config/speeder.toml's comment: aggressive initial window.
 initial_cwnd_packets = 100
+# See config/speeder.toml's comment: floor under M2's cwnd target.
+min_cwnd_packets = 4
 
 # 这两段的默认值可能被实验矩阵通过 `ssctl set-module-config`（见
 # research/experiments/run_matrix.py 的 apply_module_config()）逐 case 覆盖；
 # 不像 [rack_tuning] 那样有"guest 必须整段省略"的强约束，因为这里走的是
 # skyline-speederd 自己管理的内存态配置，不存在被外部 sysctl 写入绕过的风险。
-# See config/speeder.toml's comment for the full rationale (targeting the
-# 10-20% loss / 100-300ms RTT deployment box).
+# See config/speeder.toml's comment for the full rationale. The values below
+# only matter for a case that does not override them: the matrix's own
+# coefficient defaults (research/experiments/matrix_lib.py) stay pinned to the
+# set docs/04-performance-report.md measured, so that report stays
+# reproducible.
 [adaptive_cwnd]
-min_rtt_window_s = 10
-bw_window_rtts = 10
-startup_plateau_rtts = 3
-startup_growth_ratio = 0.25
+min_rtt_window_s = 30
+bw_window_rtts = 6
+startup_plateau_rtts = 5
+startup_growth_ratio = 0.20
 startup_gain = 3.0
-cruise_inflight_gain = 2.0
-cruise_pacing_gain = 1.1
+cruise_inflight_gain = 3.0
+cruise_pacing_gain = 1.25
 # See config/speeder.toml's comment: queue-delay/ECN guardrail cut.
 guardrail_gain = 0.8
 
 [loss_classifier]
 # See config/speeder.toml's comment: single loss-rate compensation factor.
-loss_inflation_max_ratio = 0.5
+loss_inflation_max_ratio = 0.10
 
 # [rack_tuning] 必须整段保持注释：这台 guest 由实验矩阵
 # （infra/apply-guest-profile.sh）逐 case 精确控制 tcp_recovery/

@@ -6,6 +6,13 @@
 个问题：这套构建在目标部署环境和护栏场景下，相对内核默认 CUBIC/BBR 表现
 如何。
 
+> **本报告测的不是当前的出厂默认系数。** 全篇的 `skyline-best` 用的是报告测量
+> 时的默认值（第 3.4 节列出），它现在以「高随机丢包档」的名字保留在
+> `docs/usage.md` 里；实验矩阵自身的系数默认值（`research/experiments/
+> matrix_lib.py`）也钉在这一组上，所以本报告仍可复现。当前出厂默认值是后来
+> 在生产部署上调出来的另一组（见 `docs/03-design.md` 第 12 节），**没有在这套
+> 测试台矩阵上重跑过，本报告的任何数字都不适用于它**。
+
 ## 1. 摘要与主要结论
 
 1. **目标环境全 9 点网格上，`skyline-best` 同时反超默认 CUBIC 和默认 BBR**
@@ -125,7 +132,7 @@ BBR 在部分场景呈双峰分布，小样本下用它的中位数做门槛不�
 | `b1-controlled-cubic` | `cubic` | 受控 CUBIC 基线（`fq` qdisc，隔离"换队列调度器"本身的影响） |
 | `bbr-fq` | `bbr` | 业界标准对照 |
 | `b2-skyline-base` | `skyline_cc` | Skyline Speeder 框架但四个可选模块全关，中性基线（应与 `b1` 等价） |
-| `skyline-best` | `skyline_cc` | 全部模块开启，当前默认系数 |
+| `skyline-best` | `skyline_cc` | 全部模块开启，报告测量时的默认系数：`cruise_inflight_gain` 2.0 / `cruise_pacing_gain` 1.1 / `loss_inflation_max_ratio` 0.5 / 护栏 100ms·1.0× / `min_rtt_window_s` 10 / `bw_window_rtts` 10 / STARTUP 退出 3 轮·25%（**不是**当前出厂默认值，见文首说明） |
 
 以下是围绕 `skyline-best` 的对照用配置变体，各自只改一个系数，用来隔离该系数
 的影响：

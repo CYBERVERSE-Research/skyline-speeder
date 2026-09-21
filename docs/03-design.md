@@ -223,6 +223,15 @@ stateDiagram-v2
 `cruise_pacing_gain` 更宽松），真正的限速器是 M4 的 pacing 速率。超过
 `max_cwnd_packets` 硬上限直接砍到该值。
 
+**cwnd 下限**：目标值低于 `min_cwnd_packets` 时取该下限（省略 = 4，即历史上
+写死的 `SKYLINE_MIN_CWND`）。细流或长期受应用限速的流，`带宽估计 × 基准RTT`
+算出来只有几个包；这么小的窗口丢一个包之后，后面没有足够的包产生 SACK 反馈，
+只能靠尾丢探测或 RTO 恢复。下限在硬上限和护栏钳位**之后**应用（与原先固定下限
+的次序一致），配置校验保证它不超过 `max_cwnd_packets`。它不改变发送速率——
+速率仍由 pacing 决定——只是不让 cwnd 成为重传的瓶颈。BPF 侧实际取
+`max(min_cwnd_packets, 4)`；M2 关闭的中性基线路径不读这个字段，始终用固定的
+4 包下限，因此 B1/B2 中性性不受影响。
+
 **永不因丢包降窗**：`skyline_ssthresh()` 在 M2 开启时直接返回当前 cwnd 不变，
 不计算任何降幅——这是"丢包默认不携带拥塞信息"这条设计原则最直接的体现。
 唯一还能限制流的是下面的护栏。
@@ -363,17 +372,40 @@ M4，M1 的两层（若已启用）不受影响。
 
 ## 12. 系数选择依据
 
-`cruise_inflight_gain`（2.0）/`cruise_pacing_gain`（1.1）：cwnd 增益刻意
-比 pacing 增益更宽松——cwnd 只需要不成为限制因素，真正的限速器是 pacing，
-这个设计跟 BBR 把 cwnd 当作上限而非主要速率控制手段是同一个思路。两个数
-值本身在目标环境网格上按吞吐与自伤风险权衡选定，完整验证数据见
-`docs/04-performance-report.md`。
+**出厂默认值有两代，证据来源不同，不要混读。**
+
+第一代（`docs/04-performance-report.md` 测的 `skyline-best`，现在是
+`docs/usage.md` 的「高随机丢包档」）在测试台的目标环境网格上选定：
+`cruise_inflight_gain` 2.0 / `cruise_pacing_gain` 1.1 按吞吐与自伤风险权衡，
+`loss_inflation_max_ratio` 0.5（最多 2.0 倍补偿）覆盖 10%-20% 随机丢包上界
+并留出重传开销的余量，护栏 100ms / 1.0 倍基准 RTT。它的前提是第 1 节那条
+"丢包不携带拥塞信息"。
+
+第二代（当前默认值）来自一台生产部署上的交替对照调参：大量并发连接、基准
+RTT 约 100-150ms，丢包主要来自瓶颈被挤满而不是随机丢包——第一代的前提在
+那里不成立。改动分成互相配合的两组：
+
+- **收紧"刹车"**：`loss_inflation_max_ratio` 0.5 → 0.10、护栏
+  100ms / 1.0 → 70ms / 0.6、`min_rtt_window_s` 10 → 30、`bw_window_rtts`
+  10 → 6。机制上的理由各自写在 `config/speeder.toml` 对应字段的注释里；
+  核心是 M3 的补偿在拥塞型瓶颈上是一条正反馈（丢得越多补得越多），而原
+  护栏阈值恰好落在这类链路实际能堆出的排队时延之上，几乎不触发。
+- **放开"油门"**：`cruise_pacing_gain` 1.1 → 1.25、`cruise_inflight_gain`
+  2.0 → 3.0、STARTUP 退出判定 3 轮 / 25% → 5 轮 / 20%。CRUISE 是终态且没
+  有周期性探测，带宽估计只能靠 > 1.0 的 pacing 增益往上刷新。
+
+两组必须一起用：只放开油门、不收紧刹车的组合，重传增多而速度没有换来；
+`cruise_pacing_gain` 再往上（1.4）同样如此；`cruise_inflight_gain` 退回 2.0
+时 RTO 超时明显增多。围绕当前默认值逐个参数再调，没有找到稳定更优的取值。
+
+这一代**没有**在测试台矩阵上重跑过，`docs/04-performance-report.md` 里的
+数字不适用于它；按本仓库的性能声明纪律，这里不给出生产环境上的具体数字。
+cwnd 增益刻意比 pacing 增益更宽松这一点两代相同——cwnd 只需要不成为限制
+因素，真正的限速器是 pacing，跟 BBR 把 cwnd 当作上限而非主要速率控制手段
+是同一个思路。
 
 `guardrail_gain`（0.8）：护栏触发时降到测得带宽的 80%，是工程选定的初始
 值，尚未做多候选值的专门对比实验。
-
-`loss_inflation_max_ratio`（0.5，对应最多 2.0 倍补偿）：覆盖目标环境
-10%-20% 丢包上界并留出重传开销的余量。
 
 `rto_max_normal_permille`/`rto_max_congested_permille`（3000/6000，即
 3 倍/6 倍基准 RTT）：直接按"随机独立丢包场景下等更久不提高重传成功率"这

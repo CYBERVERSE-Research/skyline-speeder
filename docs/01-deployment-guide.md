@@ -165,7 +165,7 @@ M2/M3/M4 的系数和 M1 tier-2 的 RTO 参数都可以在 `skyline-speederd` �
 不需要重启：
 
 ```bash
-sudo ssctl set-module-config --cruise-inflight-gain 2.0 --cruise-pacing-gain 1.1 --guardrail-gain 0.8
+sudo ssctl set-module-config --cruise-inflight-gain 3.0 --cruise-pacing-gain 1.25 --guardrail-gain 0.8
 sudo ssctl set-rack-rto --srtt-permille 1100 --floor-us 20000 --ceiling-us 200000
 ```
 

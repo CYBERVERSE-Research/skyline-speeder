@@ -17,20 +17,30 @@ auto_pacing_enabled = true
 fallback_cc = "cubic"
 max_pacing_mbps = 1200
 max_cwnd_packets = 50000
-max_queue_delay_ms = 100
+max_queue_delay_ms = 70
 # Ratio of base RTT added to max_queue_delay_ms to form the actual guardrail
-# (max of the two -- see skyline_max_queue_delay_us() in bpf/skyline_cc.bpf.c). 1.0
-# lets the guardrail widen automatically on higher-RTT paths instead of
-# staying pinned to the fixed 100ms floor, which is what makes the much
-# higher cruise_inflight_gain/cruise_pacing_gain below safe on the target
-# box's 100-300ms-RTT scenarios they were tuned against.
-max_queue_delay_ratio = 1.0
+# (max of the two -- see skyline_max_queue_delay_us() in bpf/skyline_cc.bpf.c), so
+# the guardrail still widens on higher-RTT paths instead of staying pinned to
+# the fixed floor. 70ms / 0.6 replaced 100ms / 1.0 after tuning on a
+# production deployment (many concurrent flows, roughly 100-150ms base RTT):
+# there the standing queue a flow could build topped out just under the old
+# threshold, so the one congestion signal this controller accepts almost
+# never fired. 100ms / 1.0 is what docs/04-performance-report.md measured.
+max_queue_delay_ratio = 0.6
 # Aggressive initial window (see bpf/include/skyline_abi.h's
 # initial_cwnd_packets doc comment) -- standard IW10 slow-start takes ~7
 # RTTs (2.1s at 300ms RTT) to reach 1000 packets, too slow for the target
 # box's high-RTT corner. 0 disables this (falls back to the kernel's own
 # initial window).
 initial_cwnd_packets = 100
+# Floor under M2's BDP-derived cwnd target (see bpf/include/skyline_abi.h's
+# min_cwnd_packets doc comment). A thin or app-limited flow's
+# bw_bps * base_rtt comes out below a handful of packets, and a window that
+# small can only recover from a loss through a tail-loss probe or an RTO.
+# Pacing (M4) still sets the send rate, so raising this does not make a flow
+# send faster. 4 is the floor this project always had; must stay within
+# [4, max_cwnd_packets]; only consulted while adaptive-cwnd (M2) is on.
+min_cwnd_packets = 4
 
 # 这两段（[adaptive_cwnd]/[loss_classifier]）的全部数值现在都可以在不重启
 # skyline-speederd 的情况下用 `ssctl set-module-config`/`reset-module-config` 在线覆盖
@@ -41,21 +51,34 @@ initial_cwnd_packets = 100
 # 不是目标）：M2 是 STARTUP/CRUISE 两态状态机，开启时直接掌管全部 CA 状态下
 # 的 cwnd（不被 PRR 接管），cruise_inflight_gain/cruise_pacing_gain 是 CRUISE
 # 终态的增益系数。见 bpf/include/skyline_abi.h 顶部注释与 docs/03-design.md。
+#
+# 下面这组默认值来自一台生产部署上的交替对照调参（大量并发连接、基准 RTT 约
+# 100-150ms、丢包以拥塞型为主而不是纯随机），不是来自测试台矩阵；
+# docs/04-performance-report.md 测的是调整之前的那组系数（见该文 3.4 节）。
+# 链路确实是 10%-20% 纯随机丢包时，用 docs/usage.md 的「高随机丢包档」。
 [adaptive_cwnd]
-min_rtt_window_s = 10
-bw_window_rtts = 10
-startup_plateau_rtts = 3
-startup_growth_ratio = 0.25
+# min-RTT 窗口：CRUISE 增益恒 >= 1.0 且没有排空阶段，窗口太短时基准 RTT 会把
+# 这条流自己堆出来的常驻队列算进去，护栏阈值和 cwnd 目标跟着往上漂。
+min_rtt_window_s = 30
+# 带宽估计取最近几轮的峰值：窗口越长，被 ACK 压缩抬高的样本、瓶颈变窄之前的
+# 旧速率被记住得越久，pacing 速率就越容易脱离链路当前真实交付的速率。
+bw_window_rtts = 6
+# STARTUP 退出判定：连续这么多轮带宽涨幅低于 startup_growth_ratio。受应用限速
+# 的轮次同样会被算作"没涨"，判定太急会让流带着偏低的带宽估计永久进入 CRUISE。
+startup_plateau_rtts = 5
+startup_growth_ratio = 0.20
 # SKYLINE_MODE_STARTUP 的单一增益（cwnd 目标和 pacing 速率共用）。
 startup_gain = 3.0
 # SKYLINE_MODE_CRUISE 的 cwnd 目标增益——刻意比 cruise_pacing_gain 更宽松，
-# cwnd 只需要不成为限制因素，真正的限速器是 pacing。在目标环境网格上按
-# 吞吐与自伤风险权衡选定：更激进的候选在测试台带宽上限下没有带来提升，
-# 反而在高 RTT/高丢包点因过量发送略有下降；这组取值与更保守的候选相比
-# 吞吐持平或更优，且在真实拥塞型瓶颈上自伤风险更低。
-cruise_inflight_gain = 2.0
-# SKYLINE_MODE_CRUISE 的 pacing 速率增益——M4 开启时真正生效的限速值。
-cruise_pacing_gain = 1.1
+# cwnd 只需要不成为限制因素，真正的限速器是 pacing。生产部署上退回 2.0 时
+# RTO 超时明显增多（窗口余量不够，丢包后更容易只剩等超时这一条路），再加到
+# 4.0 没有看到额外收益。
+cruise_inflight_gain = 3.0
+# SKYLINE_MODE_CRUISE 的 pacing 速率增益——M4 开启时真正生效的限速值。CRUISE 是
+# 终态且没有周期性探测，带宽估计只能靠这个 > 1.0 的增益往上刷新，增益太低时
+# 估计值爬升很慢。1.25 是和收紧后的丢包补偿/护栏一起选定的：不收紧那两项、
+# 单独调高它只会增加重传而换不来速度，再往上（1.4）同样如此。
+cruise_pacing_gain = 1.25
 # 队列时延/ECN 护栏触发时对 cwnd 目标和 pacing 速率共同生效的增益——
 # 这是 Skyline Speeder 唯一还承认的真实拥塞信号，触发时不该只是"停止加速"（增益回到
 # 1.0），而应该主动降速。0.8 = 降到测得带宽的 80%，是一个尚待用小规模实验
@@ -66,9 +89,12 @@ guardrail_gain = 0.8
 [loss_classifier]
 # M3 是单一丢包率补偿系数（1/(1-p)，见 bpf/skyline_cc.bpf.c 的
 # skyline_loss_inflation_permille() 文档注释），不做多路丢包分类——目标环境下
-# "永远不因丢包降窗"才是正确答案。0.5 = 补偿到测得丢包率50%封顶
-# （2.0x），覆盖目标环境的10-20%丢包上界并留出重传开销的余量。
-loss_inflation_max_ratio = 0.5
+# "永远不因丢包降窗"才是正确答案。补偿封顶 0.10（最多 1.11x）：足够抵消
+# 个位数百分比随机丢包造成的带宽低估。封顶放得更高时，它在拥塞型瓶颈上是一条
+# 正反馈——丢得越多补得越多、发得越多、丢得更多，只有护栏能打断。链路确实是
+# 10%-20% 纯随机丢包（docs/04-performance-report.md 测的环境）时调回 0.5
+# （2.0x，覆盖该丢包上界并留出重传开销的余量）。
+loss_inflation_max_ratio = 0.10
 
 # [rack_tuning]
 # 全局 RACK sysctl 默认值。留空/整段省略 = skyline-speederd 不接管，所有权交给实验矩阵

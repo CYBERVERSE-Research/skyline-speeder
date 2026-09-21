@@ -181,6 +181,7 @@ BPF 侧的三段配置各自独立维护自己的 ABI 版本号，互不联动�
 | `max_queue_delay_ms` | u32 | 队列时延护栏的固定基准值（毫秒） | 是 |
 | `max_queue_delay_ratio` | f64 | 按基准 RTT 折算的护栏增量比例，实际护栏 = `max(max_queue_delay_ms, 基准RTT × 该比例)`，让护栏在高 RTT 路径上自动放宽而不是卡在固定毫秒数；`0.0` = 不放宽，恒等于 `max_queue_delay_ms` | 是 |
 | `initial_cwnd_packets` | u32 | 连接建立时的初始 cwnd（包），`0` = 不覆盖、使用内核自身的初始窗口 | 是 |
+| `min_cwnd_packets` | u32 | M2 的 cwnd 目标下限（包），取值范围 `4`–`max_cwnd_packets`，省略 = `4`（历史行为）。只在 `adaptive-cwnd` 开启时生效；M2 关闭的中性基线路径始终使用固定的 4 包下限，不受此字段影响。发送速率仍由 pacing 决定，见 `docs/03-design.md` 第 6 节 | 是 |
 
 ### 6.2 `[adaptive_cwnd]`（M2 系数）
 

@@ -66,6 +66,8 @@ Full methodology, validity boundaries and limitations: [docs/04-performance-repo
 
 > [!NOTE]
 > These numbers come from one two-VM test bed capped at 100 Mbit/s. They are not a claim about your link. Reproduction steps are in [research/experiments/README.md](research/experiments/README.md).
+>
+> They were measured with the coefficient set that shipped as the default at the time, which is tuned for random loss and now lives on as the "high random loss" preset in [docs/usage.md](docs/usage.md). Today's defaults were tuned later on a production deployment where loss came from a full bottleneck, and have **not** been run through this test bed. If your link really does lose 10-20% at random, apply that preset to get the behaviour measured here.
 
 ## Kernel requirement
 
@@ -193,7 +195,7 @@ ssctl enable --all-off                        # everything off, as a control bas
 > `ssctl drain` is the symmetric reverse: it writes the sysctl back to
 > `fallback_cc` first, then waits for existing flows to finish.
 
-**2. Sixteen runtime parameters**, applied online without a restart — send gain, guardrail slowdown, loss-compensation ceiling, queueing-delay threshold, startup aggressiveness, hard rate and window caps. Each flow switches at an RTT boundary via a double-slot + generation counter, so no flow ever reads a torn mix of old and new coefficients.
+**2. Seventeen runtime parameters**, applied online without a restart — send gain, guardrail slowdown, loss-compensation ceiling, queueing-delay threshold, startup aggressiveness, hard rate and window caps. Each flow switches at an RTT boundary via a double-slot + generation counter, so no flow ever reads a torn mix of old and new coefficients.
 
 > [!CAUTION]
 > `set-module-config` is **absolute-overwrite**, not incremental. Setting one parameter resets every other parameter to the CLI's built-in default — *not* to the value in your config file. See [docs/usage.md](docs/usage.md) (Chinese).

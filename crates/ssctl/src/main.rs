@@ -78,8 +78,9 @@ enum Command {
     /// M2 ([adaptive_cwnd]) / M3 ([loss_classifier]) coefficients, plus the
     /// top-level safety limits. Absolute-replace semantics, same as
     /// SetRackRto -- every field is always sent. Defaults below match
-    /// config/speeder.toml's current values (kept in sync by hand, same as
-    /// SetRackRto's defaults). M2 is a two-mode (STARTUP/CRUISE)
+    /// config/speeder.toml's current values; the
+    /// `set_module_config_defaults_match_the_shipped_config` test fails if
+    /// the two drift apart. M2 is a two-mode (STARTUP/CRUISE)
     /// rate-driven controller, M3 a single loss-rate compensation factor
     /// -- see bpf/include/skyline_abi.h's top-of-file comment.
     SetModuleConfig {
@@ -87,34 +88,39 @@ enum Command {
         max_pacing_mbps: u64,
         #[arg(long, default_value_t = 50_000)]
         max_cwnd_packets: u32,
-        #[arg(long, default_value_t = 100)]
+        #[arg(long, default_value_t = 70)]
         max_queue_delay_ms: u32,
         /// Ratio of base RTT added to max-queue-delay-ms to form the actual
         /// guardrail (max of the two). 0.0 keeps the guardrail exactly at
         /// max-queue-delay-ms.
-        #[arg(long, default_value_t = 1.0)]
+        #[arg(long, default_value_t = 0.6)]
         max_queue_delay_ratio: f64,
         /// Aggressive initial window (packets). 0 leaves the kernel's
         /// own IW alone.
         #[arg(long, default_value_t = 100)]
         initial_cwnd_packets: u32,
-        #[arg(long, default_value_t = 10)]
+        /// Floor under M2's BDP-derived cwnd target (packets), 4 or more.
+        /// Pacing still sets the send rate; this only keeps a thin flow's
+        /// window large enough to recover from a loss without an RTO.
+        #[arg(long, default_value_t = 4)]
+        min_cwnd_packets: u32,
+        #[arg(long, default_value_t = 30)]
         min_rtt_window_s: u32,
-        #[arg(long, default_value_t = 10)]
+        #[arg(long, default_value_t = 6)]
         bw_window_rtts: u32,
-        #[arg(long, default_value_t = 3)]
+        #[arg(long, default_value_t = 5)]
         startup_plateau_rtts: u32,
-        #[arg(long, default_value_t = 0.25)]
+        #[arg(long, default_value_t = 0.20)]
         startup_growth_ratio: f64,
         /// SKYLINE_MODE_STARTUP's single gain (cwnd target and pacing rate both
         /// use it while M2 is on).
         #[arg(long, default_value_t = 3.0)]
         startup_gain: f64,
         /// SKYLINE_MODE_CRUISE's cwnd-target gain.
-        #[arg(long, default_value_t = 2.0)]
+        #[arg(long, default_value_t = 3.0)]
         cruise_inflight_gain: f64,
         /// SKYLINE_MODE_CRUISE's pacing-rate gain.
-        #[arg(long, default_value_t = 1.1)]
+        #[arg(long, default_value_t = 1.25)]
         cruise_pacing_gain: f64,
         /// Gain applied to both cwnd and pacing for the rest of a round in
         /// which the queue-delay/ECN guardrail trips. 0.0 keeps the
@@ -125,7 +131,7 @@ enum Command {
         /// Ceiling on the measured per-flow loss rate to compensate for when
         /// inflating BDP-derived targets/pacing rate. 0.0 disables this
         /// (inflation always exactly 1.0x).
-        #[arg(long, default_value_t = 0.5)]
+        #[arg(long, default_value_t = 0.10)]
         loss_inflation_max_ratio: f64,
         /// Turn off the PRR-style continuous recovery-phase rate limiting
         /// (on by default, independent of --modules -- see
@@ -202,6 +208,7 @@ fn request(command: Command) -> Request {
             max_queue_delay_ms,
             max_queue_delay_ratio,
             initial_cwnd_packets,
+            min_cwnd_packets,
             min_rtt_window_s,
             bw_window_rtts,
             startup_plateau_rtts,
@@ -220,6 +227,7 @@ fn request(command: Command) -> Request {
                 max_queue_delay_ms,
                 max_queue_delay_ratio,
                 initial_cwnd_packets,
+                min_cwnd_packets,
                 min_rtt_window_s,
                 bw_window_rtts,
                 startup_plateau_rtts,
@@ -259,5 +267,25 @@ fn main() -> Result<()> {
         Ok(())
     } else {
         anyhow::bail!("{}", response.message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skyline_common::SkylineConfig;
+
+    /// `set-module-config` is absolute-replace: a flag left off the command
+    /// line is sent as its built-in default, not left alone. If those
+    /// defaults drift from the shipped configuration file, "change one knob"
+    /// silently rewrites every other knob to a stale value.
+    #[test]
+    fn set_module_config_defaults_match_the_shipped_config() {
+        let arguments = Arguments::parse_from(["ssctl", "set-module-config"]);
+        let Request::SetModuleConfig { config: from_cli } = request(arguments.command) else {
+            panic!("set-module-config did not build a SetModuleConfig request");
+        };
+        let shipped = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        assert_eq!(from_cli, ModuleTuningConfig::from_config(&shipped));
     }
 }

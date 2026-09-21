@@ -23,7 +23,7 @@
  * skyline_set_cwnd_target()/skyline_apply_pacing() use (`guardrail_gain_permille`),
  * not by cutting cwnd.
  */
-#define SKYLINE_ABI_VERSION 6
+#define SKYLINE_ABI_VERSION 7
 #define SKYLINE_EVENT_RING_SIZE (1U << 20)
 
 enum skyline_feature {
@@ -167,6 +167,24 @@ struct skyline_config {
      * enabled.
      */
     __u32 guardrail_gain_permille;
+    /* Floor under M2's BDP-derived cwnd target (skyline_set_cwnd_target()/
+     * skyline_bdp_packets()). bw_bps * base_rtt comes out below a handful of
+     * packets for any thin or app-limited flow, and a window that small has
+     * no way to recover from a loss except a tail-loss probe or an RTO --
+     * there are not enough packets behind the hole to produce the SACK
+     * feedback RACK needs. Pacing (M4) still sets the send rate, so raising
+     * this does not make a flow send faster; it only stops cwnd from being
+     * what holds back a retransmission. Never goes below SKYLINE_MIN_CWND
+     * (skyline_min_cwnd() takes the max of the two), and is deliberately not
+     * consulted on the M2-off path, which keeps the fixed SKYLINE_MIN_CWND so
+     * this knob cannot perturb B1/B2 neutrality.
+     */
+    __u32 min_cwnd_packets;
+    /* Explicit tail padding: the __u64 above makes the struct 8-byte
+     * aligned, and the Rust mirror (KernelConfig) is bytemuck::Pod, which
+     * rejects implicit padding. Always 0.
+     */
+    __u32 reserved;
 };
 
 struct skyline_flow_state {

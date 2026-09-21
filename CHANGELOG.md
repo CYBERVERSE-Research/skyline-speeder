@@ -10,6 +10,38 @@ for anyone holding a prebuilt `.bpf.o`.
 
 ## [Unreleased]
 
+### Added
+
+- `min_cwnd_packets` (`--min-cwnd-packets`): the floor under M2's BDP-derived
+  cwnd target is now configurable instead of the compile-time 4. It defaults to
+  4, so an existing `speeder.toml` that does not declare it behaves exactly as
+  before. Valid range is `4`..=`max_cwnd_packets`; the M2-off neutral path keeps
+  the fixed floor and does not read it. Pacing still sets the send rate.
+
+### Changed
+
+- **Default coefficients.** `config/speeder.toml` and `ssctl set-module-config`'s
+  built-in defaults move together to a set tuned by interleaved A/B on a
+  production deployment (many concurrent flows, roughly 100-150ms base RTT,
+  loss dominated by a full bottleneck rather than random loss):
+  `cruise_pacing_gain` 1.1 -> 1.25, `cruise_inflight_gain` 2.0 -> 3.0,
+  `startup_plateau_rtts` 3 -> 5, `startup_growth_ratio` 0.25 -> 0.20,
+  `loss_inflation_max_ratio` 0.5 -> 0.10, `max_queue_delay_ms` 100 -> 70,
+  `max_queue_delay_ratio` 1.0 -> 0.6, `min_rtt_window_s` 10 -> 30,
+  `bw_window_rtts` 10 -> 6. An installed `/etc/skyline-speeder/speeder.toml` is
+  never overwritten, so an existing host keeps its values until its operator
+  edits the file -- but `ssctl set-module-config` sends the *new* built-in
+  default for every flag left off the command line. The previous set is kept as
+  the "high random loss" preset in `docs/usage.md`; it is what
+  `docs/04-performance-report.md` measured, and the experiment matrix stays
+  pinned to it. The new set has not been run through that matrix.
+- A test now fails if `ssctl set-module-config`'s defaults drift from
+  `config/speeder.toml`; they used to be kept in sync by hand.
+- **`SKYLINE_ABI_VERSION` 6 -> 7.** `struct skyline_config` grows by
+  `min_cwnd_packets` plus an explicit `reserved` tail word (72 -> 80 bytes). A
+  `.bpf.o` built against version 6 is rejected by a newer daemon and vice
+  versa; rebuild or reinstall both together.
+
 ### Fixed
 
 - `install.sh --prebuilt` failed on a stock Debian 13 host with `BPF struct_ops
