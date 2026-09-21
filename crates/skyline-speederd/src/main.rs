@@ -16,7 +16,7 @@ use skyline_common::{
 };
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -48,16 +48,18 @@ struct BpfRuntime {
 }
 
 impl BpfRuntime {
-    /// `event_file` is a shared handle opened once by `Daemon::new()` and
+    /// `event_log` is a shared handle opened once by `Daemon::new()` and
     /// passed to every runtime that might write events. Two separate
     /// `File`/`Mutex` instances opened on the same path do NOT serialize
     /// each other's writes, so any writer that appended through its own
     /// handle instead of this shared one could interleave mid-line and
-    /// corrupt events.jsonl. Kept as a shared `Arc<Mutex<File>>` rather
-    /// than a plain `File` so a future second writer stays safe by
+    /// corrupt events.jsonl -- and would also keep its own idea of the file
+    /// size, defeating `EventLog`'s cap. Kept as a shared
+    /// `Arc<Mutex<EventLog>>` so a future second writer stays safe by
     /// construction -- see start_event_reader()'s single-buffer write for
-    /// how the current sole writer uses it.
-    fn load(config: &SkylineConfig, event_file: Arc<Mutex<File>>) -> Result<Self> {
+    /// how the current sole writer uses it. `None` means the event log is
+    /// off (`events_max_mib = 0`).
+    fn load(config: &SkylineConfig, event_log: Option<Arc<Mutex<EventLog>>>) -> Result<Self> {
         let cc_path = config.runtime.bpf_dir.join("skyline_cc.bpf.o");
 
         // Baseline before anything is attached: if the attach below fails, the
@@ -81,12 +83,17 @@ impl BpfRuntime {
                 .context("attach skyline_cc struct_ops")?
         };
         runtime.links.push(struct_ops_link);
-        runtime.event_threads.push(start_event_reader(
-            &cc_object,
-            "events",
-            event_file.clone(),
-            runtime.event_stop.clone(),
-        )?);
+        // With the log off nothing drains the ring buffer: once it is full,
+        // bpf_ringbuf_reserve() fails and skyline_emit() drops the event,
+        // which costs less than reading and discarding every one.
+        if let Some(event_log) = event_log {
+            runtime.event_threads.push(start_event_reader(
+                &cc_object,
+                "events",
+                event_log,
+                runtime.event_stop.clone(),
+            )?);
+        }
         runtime.objects.push(cc_object);
 
         Ok(runtime)
@@ -481,7 +488,7 @@ impl Drop for TcRuntime {
 fn start_event_reader(
     object: &Object,
     map_name: &str,
-    event_file: Arc<Mutex<File>>,
+    event_log: Arc<Mutex<EventLog>>,
     stop: Arc<AtomicBool>,
 ) -> Result<JoinHandle<()>> {
     let map = object
@@ -502,14 +509,15 @@ fn start_event_reader(
             "state": event.state,
         });
         // One write_all() call for the whole line (body + newline), not two
-        // separate calls -- the shared Arc<Mutex<File>> (see BpfRuntime::load's
-        // doc comment) already serializes the two reader threads, but a
-        // single buffer is cheap defense in depth against ever going back to
-        // a split write/writeln pair.
+        // separate calls -- the shared Arc<Mutex<EventLog>> (see
+        // BpfRuntime::load's doc comment) already serializes the two reader
+        // threads, but a single buffer is cheap defense in depth against ever
+        // going back to a split write/writeln pair. It is also what lets
+        // EventLog rotate only between lines, never in the middle of one.
         if let Ok(mut line) = serde_json::to_vec(&payload) {
             line.push(b'\n');
-            if let Ok(mut file) = event_file.lock() {
-                let _ = file.write_all(&line);
+            if let Ok(mut log) = event_log.lock() {
+                let _ = log.append(&line);
             }
         }
         0
@@ -522,6 +530,82 @@ fn start_event_reader(
             }
         }
     }))
+}
+
+/// The file behind `runtime.events_path`, capped at `max_bytes`. It lives on
+/// /run, a RAM-backed tmpfs that the rest of the host needs too: appending
+/// without a limit once filled all of it on a busy host, and Docker, which keeps
+/// runc state under /run, stopped being able to start containers. Nothing
+/// reported an error until then. When a line would take the file past
+/// `max_bytes` it is renamed to `<events_path>.1`, replacing the previous one,
+/// and a new file is started, so at most about `2 * max_bytes` is ever held.
+/// `infra/snapshot-skyline-events.sh` reads across one such rotation.
+struct EventLog {
+    path: PathBuf,
+    rotated_path: PathBuf,
+    max_bytes: u64,
+    file: File,
+    /// Bytes in `file`, tracked here so the common case costs no syscall.
+    len: u64,
+}
+
+impl EventLog {
+    fn open(path: &Path, max_bytes: u64) -> Result<Self> {
+        let file =
+            open_for_append(path).with_context(|| format!("open event log {}", path.display()))?;
+        // Not necessarily empty: under systemd RuntimeDirectory= removes the
+        // previous run's log, but nothing does when the daemon runs by hand.
+        let len = file
+            .metadata()
+            .with_context(|| format!("stat event log {}", path.display()))?
+            .len();
+        let mut rotated_path = path.as_os_str().to_owned();
+        rotated_path.push(".1");
+        Ok(Self {
+            path: path.to_path_buf(),
+            rotated_path: rotated_path.into(),
+            max_bytes,
+            file,
+            len,
+        })
+    }
+
+    fn append(&mut self, line: &[u8]) -> io::Result<()> {
+        let line_len = line.len() as u64;
+        if self.len + line_len > self.max_bytes {
+            // `len` only counts this process's writes. Re-read the real size
+            // before rotating: an operator may have truncated the file in place
+            // to reclaim space, which O_APPEND handles without our help.
+            self.len = self.file.metadata()?.len();
+            // An empty file always takes the line, even one longer than the
+            // cap, so a tiny cap cannot turn into rotating on every event.
+            if self.len > 0 && self.len + line_len > self.max_bytes {
+                self.rotate()?;
+            }
+        }
+        self.file.write_all(line)?;
+        self.len += line_len;
+        Ok(())
+    }
+
+    fn rotate(&mut self) -> io::Result<()> {
+        match fs::rename(&self.path, &self.rotated_path) {
+            Ok(()) => {}
+            // Someone deleted the live file. Its space only comes back once
+            // this handle is closed, which replacing it below does.
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            // Rather than write past the cap, drop this line; the next one
+            // retries the rename.
+            Err(error) => return Err(error),
+        }
+        self.file = open_for_append(&self.path)?;
+        self.len = 0;
+        Ok(())
+    }
+}
+
+fn open_for_append(path: &Path) -> io::Result<File> {
+    OpenOptions::new().create(true).append(true).open(path)
 }
 
 fn interface_index(interface: &str) -> Result<i32> {
@@ -675,8 +759,8 @@ struct Daemon {
     /// startup, restored by `Request::ResetRetransmitDscp`.
     retransmit_dscp_defaults: RetransmitDscpConfig,
     /// Opened once at startup by `Daemon::new()` -- see `BpfRuntime::load`'s
-    /// doc comment.
-    event_file: Arc<Mutex<File>>,
+    /// doc comment. `None` when `events_max_mib = 0`.
+    event_log: Option<Arc<Mutex<EventLog>>>,
 }
 
 impl Daemon {
@@ -685,19 +769,18 @@ impl Daemon {
         let rack_rto_defaults = config.rack_rto;
         let module_tuning_defaults = ModuleTuningConfig::from_config(&config);
         let retransmit_dscp_defaults = config.retransmit_dscp;
-        if let Some(parent) = config.runtime.events_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create event directory {}", parent.display()))?;
-        }
-        let event_file = Arc::new(Mutex::new(
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&config.runtime.events_path)
-                .with_context(|| {
-                    format!("open event log {}", config.runtime.events_path.display())
-                })?,
-        ));
+        let event_log = match config.runtime.events_max_mib {
+            0 => None,
+            max_mib => {
+                let path = &config.runtime.events_path;
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("create event directory {}", parent.display()))?;
+                }
+                let max_bytes = u64::from(max_mib) * 1024 * 1024;
+                Some(Arc::new(Mutex::new(EventLog::open(path, max_bytes)?)))
+            }
+        };
         Ok(Self {
             config,
             capabilities,
@@ -708,7 +791,7 @@ impl Daemon {
             rack_rto_defaults,
             module_tuning_defaults,
             retransmit_dscp_defaults,
-            event_file,
+            event_log,
         })
     }
 
@@ -811,7 +894,7 @@ impl Daemon {
                 if let Some(runtime) = &mut self.runtime {
                     runtime.update_config(&self.config)?;
                 } else {
-                    self.runtime = Some(BpfRuntime::load(&self.config, self.event_file.clone())?);
+                    self.runtime = Some(BpfRuntime::load(&self.config, self.event_log.clone())?);
                 }
                 if let Some(policy) = &mut self.policy {
                     policy.set_policy_enabled(true)?;
@@ -1480,5 +1563,99 @@ mod tests {
         btf.structure("tcp_sock", &[(RACK_REO_HOOK_MEMBER, int)]);
 
         assert!(!probe_btf_capabilities(&btf.parse("rack-scalar")).rack_reo_hook);
+    }
+
+    /// A fresh directory per test; the crate has no tempfile dependency and
+    /// these tests need nothing more.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("skyline-event-log-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        dir
+    }
+
+    /// 16 bytes, so a 64-byte cap holds exactly four.
+    const EVENT_LINE: &[u8] = b"0123456789abcde\n";
+
+    #[test]
+    fn event_log_rotates_at_the_cap_and_keeps_one_previous_file() {
+        let dir = scratch_dir("rotate");
+        let path = dir.join("events.jsonl");
+        let mut log = EventLog::open(&path, 64).expect("open event log");
+        // Five full files' worth plus one line.
+        for _ in 0..21 {
+            log.append(EVENT_LINE).expect("append");
+        }
+        assert_eq!(fs::read(&path).expect("read live"), EVENT_LINE);
+        assert_eq!(
+            fs::read(dir.join("events.jsonl.1")).expect("read rotated"),
+            EVENT_LINE.repeat(4),
+            "rotation must happen between lines and fill the file to the cap"
+        );
+        assert_eq!(fs::read_dir(&dir).expect("list").count(), 2);
+        fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    #[test]
+    fn event_log_counts_what_an_existing_file_already_holds() {
+        let dir = scratch_dir("existing");
+        let path = dir.join("events.jsonl");
+        fs::write(&path, EVENT_LINE.repeat(4)).expect("seed");
+        let mut log = EventLog::open(&path, 64).expect("open event log");
+        log.append(EVENT_LINE).expect("append");
+        assert_eq!(fs::read(&path).expect("read live"), EVENT_LINE);
+        assert_eq!(
+            fs::read(dir.join("events.jsonl.1")).expect("read rotated"),
+            EVENT_LINE.repeat(4)
+        );
+        fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    #[test]
+    fn event_log_follows_an_external_truncate_or_delete() {
+        let dir = scratch_dir("external");
+        let path = dir.join("events.jsonl");
+        let rotated = dir.join("events.jsonl.1");
+        let mut log = EventLog::open(&path, 64).expect("open event log");
+        for _ in 0..4 {
+            log.append(EVENT_LINE).expect("append");
+        }
+
+        // Truncated in place: the file has room again, so no rotation.
+        File::options()
+            .write(true)
+            .open(&path)
+            .expect("reopen")
+            .set_len(0)
+            .expect("truncate");
+        log.append(EVENT_LINE).expect("append after truncate");
+        assert_eq!(fs::read(&path).expect("read live"), EVENT_LINE);
+        assert!(!rotated.exists());
+
+        // Deleted: writes go to the unlinked inode until the cap, then the
+        // log starts a new file in its place instead of failing forever.
+        fs::remove_file(&path).expect("delete");
+        for _ in 0..4 {
+            log.append(EVENT_LINE).expect("append after delete");
+        }
+        assert_eq!(fs::read(&path).expect("read live"), EVENT_LINE);
+        assert!(!rotated.exists());
+        fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    #[test]
+    fn event_log_takes_a_line_longer_than_the_cap_without_looping() {
+        let dir = scratch_dir("oversized");
+        let path = dir.join("events.jsonl");
+        let mut log = EventLog::open(&path, 8).expect("open event log");
+        log.append(EVENT_LINE).expect("first append");
+        log.append(EVENT_LINE).expect("second append");
+        assert_eq!(fs::read(&path).expect("read live"), EVENT_LINE);
+        assert_eq!(
+            fs::read(dir.join("events.jsonl.1")).expect("read rotated"),
+            EVENT_LINE
+        );
+        fs::remove_dir_all(&dir).expect("clean up");
     }
 }

@@ -44,6 +44,16 @@ for anyone holding a prebuilt `.bpf.o`.
 
 ### Fixed
 
+- **The event log could fill `/run`.** `skyline-speederd` appended every BPF
+  event to `runtime.events_path` (`/run/skyline-speeder/events.jsonl`) with no
+  limit. `/run` is a RAM-backed tmpfs shared with the rest of the host, and on a
+  busy host the log filled all of it, at which point Docker could no longer write
+  its runc state files; skyline-speeder itself reported nothing. The log is now capped by `runtime.events_max_mib` (default 8): at the
+  cap it is renamed to `events.jsonl.1` and a new file started, so it holds at
+  most about twice that. The default also applies to an installed
+  `speeder.toml` that predates the field. `events_max_mib = 0` turns the log
+  off. `infra/snapshot-skyline-events.sh` gained a rotation-aware
+  `cursor`/`since` pair, which the experiment harness now uses.
 - `install.sh --prebuilt` failed on a stock Debian 13 host with `BPF struct_ops
   support was not detected` (#5). The capability probe shelled out to `bpftool`,
   which a prebuilt install deliberately does not have, and read the missing

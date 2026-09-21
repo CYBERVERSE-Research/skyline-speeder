@@ -210,6 +210,12 @@ sudo ssctl drain --timeout 60
 护栏触发/配置代际切换等事件。完整字段与事件码含义见
 `docs/02-interface-reference.md` 第 4/8 节。
 
+事件日志位于 `/run`（内存 tmpfs），大小受 `runtime.events_max_mib` 限制（默认 8 MiB，
+满了轮转为 `events.jsonl.1`，最多约占两倍）；不需要事件时设为 `0` 即可关闭。
+早于此上限的版本会无限增长，可能写满 `/run`，使 Docker 等依赖 `/run` 的服务失败。
+在这类版本上用 `truncate -c -s 0 /run/skyline-speeder/events.jsonl` 回收空间，不要用
+`rm`：daemon 仍持有文件句柄，删除后空间不会释放。
+
 **M1 tier-2 排障决策树**（`rack_rto.stats` 一直是 0 时）：
 
 1. `rack_rto.stats.rtt_callbacks` 也是 0 → BPF 程序完全没被调用，先检查目标

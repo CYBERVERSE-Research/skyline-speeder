@@ -143,4 +143,8 @@ cgroup_path = "/sys/fs/cgroup/skyline-speeder"
 socket_path = "/run/skyline-speeder/speeder.sock"
 state_path = "/run/skyline-speeder/state.json"
 events_path = "/run/skyline-speeder/events.jsonl"
+# /run is a RAM-backed tmpfs shared with the rest of the host. Past this many
+# MiB the event log is rotated to events.jsonl.1 (one old file kept), so it
+# never holds much more than twice this. 0 turns the event log off.
+events_max_mib = 8
 tc_interface = "data0"

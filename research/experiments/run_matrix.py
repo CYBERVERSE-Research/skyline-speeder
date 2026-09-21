@@ -628,7 +628,7 @@ def communicate_or_terminate(process, timeout):
 
 def _collect_failure_diagnostics(
     case_dir, server, server_process, metrics_process, perf_process,
-    event_start_line, router_sudo,
+    event_cursor, router_sudo,
 ):
     """Best-effort diagnostic capture for a case whose try block raised
     before reaching its own normal diagnostic-collection code (e.g. the
@@ -690,8 +690,8 @@ def _collect_failure_diagnostics(
             [
                 "sudo",
                 "/opt/skyline-speeder/infra/snapshot-skyline-events.sh",
-                "from",
-                str(event_start_line),
+                "since",
+                event_cursor,
             ],
             check=False,
             timeout=15,
@@ -795,7 +795,8 @@ def run_case(
         "error": None,
     }
     processes = []
-    event_start_line = 1
+    # "0:0" = "no log yet", i.e. everything in it is this case's.
+    event_cursor = "0:0"
     # Only used when case.scenario.segments is non-empty (see
     # _run_segment_schedule below); always bound so the `finally` block can
     # unconditionally stop/join them regardless of where an exception was
@@ -924,14 +925,20 @@ def run_case(
             case_dir / "nstat-before.txt",
             server.run(["nstat", "-az"], check=False).stdout,
         )
-        event_count = server.run(
-            ["sudo", "/opt/skyline-speeder/infra/snapshot-skyline-events.sh", "count"],
-            check=False,
+        # An INODE:LINES cursor rather than a line number: the daemon
+        # rotates the log at runtime.events_max_mib, and the snapshot
+        # script needs to know which file the count was taken in.
+        event_cursor = (
+            server.run(
+                [
+                    "sudo",
+                    "/opt/skyline-speeder/infra/snapshot-skyline-events.sh",
+                    "cursor",
+                ],
+                check=False,
+            ).stdout.strip()
+            or "0:0"
         )
-        try:
-            event_start_line = int(event_count.stdout.strip() or "0") + 1
-        except ValueError:
-            event_start_line = 1
         write_text(
             case_dir / "skyline-status-before.json",
             server.run(["sudo", "ssctl", "status"], check=False).stdout,
@@ -1159,8 +1166,8 @@ def run_case(
                 [
                     "sudo",
                     "/opt/skyline-speeder/infra/snapshot-skyline-events.sh",
-                    "from",
-                    str(event_start_line),
+                    "since",
+                    event_cursor,
                 ],
                 check=False,
             ).stdout,
@@ -1217,7 +1224,7 @@ def run_case(
                 server_process,
                 metrics_process,
                 perf_process,
-                event_start_line,
+                event_cursor,
                 router_sudo,
             )
         for process in processes:

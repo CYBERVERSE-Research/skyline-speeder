@@ -139,6 +139,14 @@ pub struct RuntimeConfig {
     pub socket_path: PathBuf,
     pub state_path: PathBuf,
     pub events_path: PathBuf,
+    /// Size, in MiB, at which `events_path` is renamed to `<events_path>.1`
+    /// (replacing the previous one) and started afresh, so the event log never
+    /// holds much more than twice this. `events_path` sits on /run, a RAM-backed
+    /// tmpfs shared with everything else on the host; an unbounded log once
+    /// filled it and took Docker down with it. Defaulted so a config written
+    /// before the cap existed is bounded too. 0 turns the event log off.
+    #[serde(default = "default_events_max_mib")]
+    pub events_max_mib: u32,
     #[serde(default)]
     pub tc_interface: Option<String>,
 }
@@ -646,6 +654,13 @@ fn default_min_cwnd_packets() -> u32 {
     MIN_CWND_FLOOR
 }
 
+/// See `RuntimeConfig::events_max_mib`.
+pub const DEFAULT_EVENTS_MAX_MIB: u32 = 8;
+
+fn default_events_max_mib() -> u32 {
+    DEFAULT_EVENTS_MAX_MIB
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct KernelConfig {
@@ -950,6 +965,37 @@ mod tests {
             PathBuf::from("/opt/skyline-speeder/bpf")
         );
         assert_eq!(config.runtime.tc_interface.as_deref(), Some("data0"));
+    }
+
+    #[test]
+    fn event_log_stays_bounded_when_config_predates_the_cap() {
+        // An installed /etc/skyline-speeder/speeder.toml is never overwritten,
+        // so the hosts that hit the unbounded log will not gain the field on
+        // upgrade -- they must get the cap anyway, not "unlimited".
+        let content =
+            fs::read_to_string("../../config/speeder-guest.toml").expect("read guest config");
+        let legacy: String = content
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("events_max_mib"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_ne!(
+            legacy, content,
+            "guest config should declare events_max_mib"
+        );
+        let config: SkylineConfig = toml::from_str(&legacy).expect("parse legacy config");
+        assert_eq!(config.runtime.events_max_mib, DEFAULT_EVENTS_MAX_MIB);
+
+        for path in [
+            "../../config/speeder.toml",
+            "../../config/speeder-guest.toml",
+        ] {
+            let shipped = SkylineConfig::load(path).expect("load shipped config");
+            assert_eq!(
+                shipped.runtime.events_max_mib, DEFAULT_EVENTS_MAX_MIB,
+                "{path}"
+            );
+        }
     }
 
     #[test]

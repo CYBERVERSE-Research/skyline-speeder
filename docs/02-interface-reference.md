@@ -248,6 +248,7 @@ BPF 侧的三段配置各自独立维护自己的 ABI 版本号，互不联动�
 | `socket_path` | path | 控制面 Unix socket 路径 |
 | `state_path` | path | 运行期状态落盘路径（供外部监控读取，不是配置输入） |
 | `events_path` | path | 事件流落盘路径 |
+| `events_max_mib` | u32 | 事件日志的大小上限（MiB），默认 `8`。超过后轮转，最多占用约两倍；`0` 关闭事件日志。缺省时同样取 `8`，详见第 8 节 |
 | `tc_interface` | Option\<string\> | TC 程序（统计 + DSCP 标记）挂载的网络接口名；不设置则两者都不加载 |
 
 生产环境示例见 `config/speeder-guest.toml`（`bpf_dir`/`pin_dir` 指向部署后的
@@ -292,3 +293,17 @@ struct SkylineEvent {
 
 （编号不连续：3-8 是保留的编号空位，当前实现从未产出，也不需要消费者
 处理，消费者可以依赖 1/2/9/10/11 这几个编号保持固定不变。）
+
+**大小上限与轮转。** `events_path` 默认在 `/run` 下，而 `/run` 是按内存计的 tmpfs，
+与 systemd、Docker（runc 状态）等共用。连接多、丢包或排队频繁的主机上事件量很大：
+早期版本不设上限，曾把 `/run` 整个写满，导致 Docker 无法写入 runc 状态文件，
+而本服务自身不报任何错误。现在追加一行会使文件超过 `events_max_mib` 时，daemon 先把它重命名为
+`<events_path>.1`（覆盖上一个），再新建文件继续写。轮转只发生在行与行之间，
+最多占用约 `2 × events_max_mib`。外部截断（`truncate -c -s 0`）会立即释放空间，
+daemon 从文件开头接着写；直接 `rm` 也不会出错，但被删的文件仍由 daemon 持有，
+要等它写到上限、换成新文件时空间才释放。`events_max_mib = 0` 时不打开文件，也不读取 ring
+buffer，内核侧的事件在 ring buffer 满后直接丢弃。
+
+按区间截取事件请用 `infra/snapshot-skyline-events.sh cursor` 记下游标（`INODE:行数`），
+事后用 `since <游标>` 取出其后的全部事件。该脚本能跨一次轮转拼接 `.1` 与当前文件；
+跨两次及以上时会在 stderr 提示中间有事件丢失。
