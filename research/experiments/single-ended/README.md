@@ -150,10 +150,14 @@ sudo ./server-setup.sh stop
 
 ## 两个执行中发现的仓库/环境问题
 
-- **`install.sh` 源码路径装的是 guest 配置**。源码编译走 `infra/install-guest.sh`，安装
-  `config/speeder-guest.toml`（`[rack_rto]` 整段缺失，M1 动态 RTO 默认关闭）；`--prebuilt`
-  路径装的才是 `config/speeder.toml`。同一条 `./install.sh` 落下两套默认值。本次测试用
-  `ssctl set-rack-rto` 手动补上了生产值。
+- **动态 RTO 默认关闭，且配置文件里的 `[rack_rto]` 在启动时不生效**——这两点都是设计如此，
+  文档有写（`docs/usage.md` 第五节）：守护进程启动时把 BPF 侧的 RTO 调节清零，直到显式执行
+  `ssctl set-rack-rto`。源码安装和 `--prebuilt` 装的都是同一份生产模板 `speeder-guest.toml`，
+  它刻意不写 `[rack_rto]`，因为实验矩阵依赖 `reset-rack-rto` 等于"关闭"。所以本次测试用
+  `setalgo.sh` 显式下发取值。
+  另外，从代码看，`ssctl status` 的 `rack_rto.config` 报告的是配置文件里的值而不是内核侧的实际
+  状态；配置文件写了 `enabled = true` 时，状态会显示已开启、实际却没有生效。本次测试的配置
+  文件没有 `[rack_rto]`，没有触发这种情况，也未在测试中复现。
 
 - **`rto_max` 在 6.12 内核上全部被拒**。`TCP_RTO_MAX_MS` 需要 Linux 6.15+，本次内核 6.12.63，
   `rto_max_rejected: 59 / rto_max_applied: 0`。计数器如实记录，不属于静默失效，但测试时已关闭该半个功能。
