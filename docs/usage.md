@@ -98,18 +98,23 @@ sudo ssctl enable --all-off
 > [!CAUTION]
 > **`ssctl set-module-config` 是"全量覆盖"，不是"只改你写的那个"。**
 >
-> 每个参数在命令行里都有内置默认值。你只写一个参数时，**其余 15 个会被静默重置成
+> 每个参数在命令行里都有内置默认值。你只写一个参数时，**其余 16 个会被静默重置成
 > 内置默认值**，而不是保持你配置文件里的自定义值。
 >
 > ```bash
-> # 危险：你以为只改了护栏，实际上其他 15 个参数全被重置了
+> # 危险：你以为只改了护栏，实际上其他 16 个参数全被重置了
 > sudo ssctl set-module-config --guardrail-gain 0.5
 > ```
 >
 > **正确做法**：先 `ssctl status` 看当前值，然后把**所有**你想保留的参数一起写全。
 > 如果你从没改过配置文件，内置默认值恰好和出厂值一致，那么单独写一个是安全的。
+>
+> 例外：从 0.1.0 升级的主机。安装脚本不会覆盖已有的 `/etc/skyline-speeder/speeder.toml`，
+> 里面仍是旧默认值（即下面的「④ 高随机丢包档」），和新版 `ssctl` 的内置默认值不同。
+> 在这类主机上单独写一个参数，会把其余参数一起换成新默认值；而 `reset-module-config`
+> 回到的是配置文件里的旧值。
 
-想回到出厂设置，随时可以：
+想回到配置文件里的设置（全新安装的主机上就是出厂设置），随时可以：
 
 ```bash
 sudo ssctl reset-module-config
@@ -136,7 +141,7 @@ sudo ssctl reset-module-config
 
 ### 四档现成配方（复制即用）
 
-Skyline Speeder 没有 BBR 那样的内置档位，只有裸参数。下面三条命令是我们整理的等价档位，
+Skyline Speeder 没有 BBR 那样的内置档位，只有裸参数。下面四档是我们整理的等价档位，
 **直接复制粘贴**即可，不需要理解每个参数。
 
 **① 保守档 —— 低延迟优先**（游戏、语音、SSH 交互）
@@ -152,7 +157,7 @@ sudo ssctl set-module-config \
   --guardrail-gain 0.7 --loss-inflation-max-ratio 0.10
 ```
 
-**② 默认档 —— 出厂设置**（等价于 `ssctl reset-module-config`）
+**② 默认档 —— 出厂设置**（等价于 `ssctl reset-module-config`；从 0.1.0 升级且没改过配置文件的主机上，它回到的是 ④。要切到新默认档，执行不带任何参数的 `sudo ssctl set-module-config`，它发送的正是新版内置默认值；想重启后依然生效，再改配置文件，见「让档位重启后依然生效」）
 
 ```bash
 sudo ssctl reset-module-config
@@ -178,6 +183,7 @@ sudo ssctl set-module-config \
 | `cruise-pacing-gain` | 1.25 | **1.3** | 稳定期按带宽估计的 1.3 倍发 |
 | `cruise-inflight-gain` | 3.0 | 3.0 | 与默认档相同 |
 | `startup-gain` | 3.0 | **4.0** | 起步冲得更猛 |
+| `startup-growth-ratio` | 0.20 | **0.15** | 带宽每轮增长不到 15% 才算到顶，更晚退出 STARTUP |
 | `guardrail-gain` | 0.8 | **1.0** | 检测到拥塞时**不再降速**（1.0 = 中性） |
 | `max-queue-delay-ms` / `max-queue-delay-ratio` | 70 / 0.6 | **200 / 2.0** | 排队延迟高得多才认为"堵了" |
 | `loss-inflation-max-ratio` | 0.10 | **0.5** | 丢包补偿放开到最多多发一倍 |
@@ -448,7 +454,7 @@ sudo ssctl status
 
 ```
 "enabled": true                      <- 加速已挂载
-"capabilities": { ... 五项全 true }   <- 环境满足要求
+"capabilities": { ... 六项硬性前提全 true }   <- 环境满足要求
 "active_flows": 大于 0                <- 有连接在用
 ```
 
@@ -546,7 +552,9 @@ print(f"重传率 {r*100/o:.2f}%  RTO超时 {b['TcpExt:TCPTimeouts']-a['TcpExt:T
 EOF
 ```
 
-我们在同一台机器上实测三档（每档 40 秒真实业务流量，中位数）：
+我们在同一台机器上实测三档（每档 40 秒真实业务流量，中位数）。这组数据测于默认系数调整
+**之前**：「默认档」是当时的默认值，也就是上面的「④ 高随机丢包档」；「保守档」也是调整前的
+版本。现在的默认档和保守档没有用这个方法重测过，下面「2.7 倍」的结论只适用于激进档与 ④ 的对比。
 
 | 档位 | 重传率 | **RTO 超时 / 40 秒** |
 |---|---:|---:|
@@ -556,7 +564,8 @@ EOF
 
 **激进档的 RTO 超时是默认档的 2.7 倍**，三轮测试全部最高。RTO 超时就是卡顿的直接来源。
 
-**处置：先回默认档**
+**处置：先回默认档**（从 0.1.0 升级且没改过配置文件的主机上，`reset-module-config` 回到的是 ④；
+要回新默认档，改用不带任何参数的 `sudo ssctl set-module-config`，见 ②）
 
 ```bash
 sudo ssctl reset-module-config
@@ -587,7 +596,7 @@ sudo sysctl -p /etc/sysctl.d/99-zz-skyline-speeder-retries.conf
 ## 九、出问题了怎么退回
 
 ```bash
-# 1. 参数改乱了 -> 还原出厂参数
+# 1. 参数改乱了 -> 还原成配置文件里的参数（从 0.1.0 升级的主机上是旧默认值）
 sudo ssctl reset-module-config
 
 # 2. 想暂时不用加速（等现有连接自然结束，不断线）

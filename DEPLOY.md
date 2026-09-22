@@ -21,6 +21,12 @@ sudo ./install.sh
   && ssctl status | grep -q '"enabled": true'
 ```
 
+> **升级已有安装**：`install.sh` 不会重启已在运行的 `skyline-speederd`，上面的判据在旧 daemon
+> 上也照样成立。先执行 `systemctl stop skyline-speeder-enable.service skyline-speederd.service`
+> 再运行 `./install.sh`，并追加判据
+> `! readlink /proc/$(systemctl show -p MainPID --value skyline-speederd)/exe | grep -q '(deleted)'`。
+> 从 0.1.0 升级的完整注意事项见 `CHANGELOG.md` 的 *Upgrading from 0.1.0*。
+
 ---
 
 ## 1. 硬性前置条件
@@ -82,6 +88,23 @@ sed -i "s|^tc_interface = \".*\"|tc_interface = \"$DEV\"|" /etc/skyline-speeder/
 grep '^tc_interface' /etc/skyline-speeder/speeder.toml
 ```
 
+> **升级已有安装**：`install-guest.sh` 只替换文件，不会重启已在运行的 `skyline-speederd`。
+> 第 4 节验证通过后执行：
+>
+> ```bash
+> # 按第 5 节挂载的主机上 enable unit 是 active：restart 会连带重启它，它的 ExecStop
+> # （boot-disable.sh）先把默认算法写回 fallback_cc 再 drain，无需手动 drain。
+> # 只有它不是 active（skyline_cc 由裸 `ssctl enable` 挂载）时才要手动 drain：单独停止
+> # daemon 不会写回 fallback_cc。经 SSH 执行的 drain 必然超时并返回非零（见第 8 节），属预期。
+> systemctl is-active -q skyline-speeder-enable.service || ssctl drain --timeout 60 || true
+> systemctl is-active -q skyline-speeder-enable.service \
+>   || [ "$(sysctl -n net.ipv4.tcp_congestion_control)" != skyline_cc ]
+> systemctl restart skyline-speederd.service
+> ```
+>
+> enable unit 此前不是 active、且该主机应挂载 skyline_cc 的话，restart 后按第 5 节启动它。从 0.1.0 升级的完整注意事项见
+> `CHANGELOG.md` 的 *Upgrading from 0.1.0*。
+
 ---
 
 ## 4. 启动前验证（不留运行状态）
@@ -93,12 +116,12 @@ skyline-speederd --config /etc/skyline-speeder/speeder.toml --validate-only --ve
 该命令把三个 BPF 对象都过一遍内核验证器后退出，**不留下任何运行状态**。
 用它在正式启动前排除内核版本 / BTF 不匹配的问题。
 
-输出中 `capabilities` 的五项必须全为 `true`：
+输出中 `capabilities` 的六项硬性前提必须全为 `true`：
 
 ```bash
 skyline-speederd --config /etc/skyline-speeder/speeder.toml --validate-only --verify-bpf \
   | python3 -c 'import json,sys; c=json.load(sys.stdin)["capabilities"]; \
-      assert all(c[k] for k in ("btf","bpffs","cgroup_v2","fq_available","struct_ops")), c; \
+      assert all(c[k] for k in ("btf","bpffs","cgroup_v2","fq_available","struct_ops","fallback_cc_available")), c; \
       print("capabilities OK")'
 ```
 

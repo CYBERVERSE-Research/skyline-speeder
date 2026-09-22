@@ -382,7 +382,7 @@ ok "default qdisc: $(sysctl -n net.core.default_qdisc)"
 echo
 info "Skyline Speeder is installed."
 echo "  ssctl status    runtime state, capabilities and counters"
-echo "  ssctl flows     per-flow view"
+echo "  ssctl flows     number of active skyline_cc flows"
 echo "  ssctl drain     graceful detach"
 echo
 echo "  Note: the sockops policy (dynamic RTO) only sees processes inside"

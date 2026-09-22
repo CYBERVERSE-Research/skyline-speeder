@@ -123,9 +123,9 @@ struct Response {
 | 字段 | 含义 |
 |---|---|
 | `kernel_release` | `uname -r` |
-| `btf` / `bpffs` / `cgroup_v2` / `fq_available` / `struct_ops` | 五项硬性前提，任一为 `false` 则 `skyline-speederd` 拒绝启动 |
-| `fallback_cc_available` | `fallback_cc` 配置的算法名是否确实是内核已注册的拥塞控制 |
-| `rack_reo_hook` | 探测一个内核补丁专用的钩子是否存在，标准上游内核上恒为 `false`，仅记录不影响启动 |
+| `btf` / `bpffs` / `cgroup_v2` / `fq_available` / `struct_ops` | 硬性前提，任一为 `false` 则 `--validate-only`、`ssctl validate`、`ssctl enable` 直接拒绝（`skyline-speederd` 进程本身照常启动） |
+| `fallback_cc_available` | `fallback_cc` 配置的算法名是否确实是内核已注册的拥塞控制；也是硬性前提，为 `false` 时上述三处一样拒绝 |
+| `rack_reo_hook` | 探测一个内核补丁专用的钩子是否存在，标准上游内核上恒为 `false`；仅作记录，不参与上述门槛 |
 | `notes` | 自由文本，记录软性降级信息（例如某功能因内核能力不足而退化为纯观测） |
 
 `struct_ops` 与 `rack_reo_hook` 由 `skyline-speederd` 进程内直接解析
@@ -162,10 +162,19 @@ BPF 侧的三段配置各自独立维护自己的 ABI 版本号，互不联动�
 
 ## 6. 配置文件字段参考
 
-配置文件为 TOML 格式，路径通过 `skyline-speederd --config <path>` 指定。除 `[rack_tuning]`
-外的每一段都可以在不重启 `skyline-speederd` 的情况下用对应的 `ssctl set-*`/`reset-*`
-命令在线覆盖；配置文件里的值只是启动时的初始默认值，运行期实际生效值以
-`ssctl status` 为准。
+配置文件为 TOML 格式，路径通过 `skyline-speederd --config <path>` 指定。各部分的生效方式不同：
+
+- 顶层系数、`[adaptive_cwnd]`/`[loss_classifier]` 与 `enabled_modules`：daemon 启动时只读入内存，
+  并不加载 `skyline_cc`；`ssctl enable` 挂载它时下发的是 daemon 内存里的当前值（启动时读自文件，
+  之后改文件不生效；挂载前或 `drain` 之后用下面这些命令做的修改会保留）。挂载后系数可用
+  `ssctl set-module-config`/`reset-module-config`、模块可用 `ssctl enable --modules`/`disable --module`
+  在线覆盖；
+- `[rack_rto]` 与 `[retransmit_dscp]`：daemon 启动时 BPF 侧初始化为关闭，文件里的值要执行一次
+  `reset-rack-rto`/`reset-retransmit-dscp` 才下发（`set-*` 下发的是命令行给出的值）；在此之前
+  `ssctl status` 里这两段的 `config` 显示的是文件值，并不代表已经生效；
+- `[runtime]`、`[rack_tuning]` 与 `fallback_cc`：没有在线命令，修改后需重启 `skyline-speederd`。
+
+除上面注明的这一处例外，运行期实际生效值以 `ssctl status` 为准。
 
 ### 6.1 顶层字段
 
@@ -248,7 +257,7 @@ BPF 侧的三段配置各自独立维护自己的 ABI 版本号，互不联动�
 | `socket_path` | path | 控制面 Unix socket 路径 |
 | `state_path` | path | 运行期状态落盘路径（供外部监控读取，不是配置输入） |
 | `events_path` | path | 事件流落盘路径 |
-| `events_max_mib` | u32 | 事件日志的大小上限（MiB），默认 `8`。超过后轮转，最多占用约两倍；`0` 关闭事件日志。缺省时同样取 `8`，详见第 8 节 |
+| `events_max_mib` | u32 | 事件日志的大小上限（MiB），默认 `8`。超过后轮转，最多占用约两倍；`0` 关闭事件日志。缺省时同样取 `8`；修改需重启 daemon。详见第 8 节 |
 | `tc_interface` | Option\<string\> | TC 程序（统计 + DSCP 标记）挂载的网络接口名；不设置则两者都不加载 |
 
 生产环境示例见 `config/speeder-guest.toml`（`bpf_dir`/`pin_dir` 指向部署后的

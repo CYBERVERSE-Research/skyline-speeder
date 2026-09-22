@@ -75,10 +75,19 @@ sudo infra/install-guest.sh --confirm-install
 - `/opt/skyline-speeder/bpf/*.bpf.o`
 - `/opt/skyline-speeder/infra/*.sh`（`apply-guest-profile.sh`/`collect-guest-metrics.sh`/
   `snapshot-skyline-events.sh`/`run-in-skyline-cgroup.sh`）
-- `/etc/systemd/system/skyline-speederd.service`
+- `/etc/systemd/system/skyline-speederd.service`、`/etc/systemd/system/skyline-speeder-enable.service`
 
 只在 `/etc/skyline-speeder/speeder.toml` 尚不存在时才会用 `config/speeder-guest.toml` 创建它——
 已有配置文件不会被覆盖。
+
+**升级已有安装**：安装脚本只替换文件，**不会重启**已经在运行的 `skyline-speederd`，旧版本会
+继续留在内存里。装完先跑第 7 节的第一条命令（`--validate-only --verify-bpf`，不影响正在
+运行的 daemon），通过后 `sudo ssctl drain --timeout 60`（把默认算法写回 `fallback_cc`；
+单独停止 daemon 不会写回。经 SSH 执行时它总会等到超时并返回非零，这无害），最后
+`sudo systemctl restart skyline-speederd.service`。`skyline-speeder-enable.service` 处于 active
+时会随之重启并重新挂载；按本指南第 4、7 节安装的主机上它通常不是 active，重启后 `skyline_cc`
+处于未挂载状态，原来挂着的话再执行一次 `sudo ssctl enable`。从 0.1.0 升级的完整注意事项见
+`CHANGELOG.md` 的 *Upgrading from 0.1.0*。
 
 ## 5. 配置文件
 
@@ -154,8 +163,8 @@ sudo ssctl flows
 >
 > 回退是对称的：`ssctl drain` 会先把 sysctl 写回 `fallback_cc`，再等存量连接结束。
 
-`ssctl status` 的 `capabilities` 字段列出五项硬性前提
-（`btf`/`bpffs`/`cgroup_v2`/`fq_available`/`struct_ops`）——任一为 `false`，
+`ssctl status` 的 `capabilities` 字段列出六项硬性前提
+（`btf`/`bpffs`/`cgroup_v2`/`fq_available`/`struct_ops`/`fallback_cc_available`）——任一为 `false`，
 执行 `ssctl validate`/`ssctl enable` 时会直接拒绝，不会带着一个残缺的
 能力集运行；`skyline-speederd.service` 进程本身的启动不受这条门槛影响。
 
@@ -197,11 +206,15 @@ sudo ssctl drain --timeout 60
 需要单独用 `ssctl reset-rack-rto`/`reset-retransmit-dscp` 关闭。
 
 正常停止服务（`systemctl stop skyline-speederd.service`，等价于收到 SIGTERM/SIGINT）会
-正确注销全部 struct_ops 和 BPF 链接，不需要额外的清理步骤，重启服务前也不
-需要手动清理残留状态。
+正确注销全部 struct_ops 和 BPF 链接，重启服务前也不需要手动清理残留状态；但它**不会**把
+`net.ipv4.tcp_congestion_control` 写回 `fallback_cc`。`skyline-speeder-enable.service` 处于
+active 时，停止 daemon 会先停这个 unit，由它的 ExecStop 写回；按第 7 节用 `ssctl enable`
+挂载的主机上它不是 active，停止或重启 daemon 之前先执行 `sudo ssctl drain --timeout 60`
+（经 SSH 必然走到超时，无害，见上方说明）。
 
-彻底卸载：`systemctl disable --now skyline-speederd.service`，再删除第 4 节列出的全部
-安装路径。
+彻底卸载：先 `sudo ssctl drain --timeout 60`，再
+`sudo systemctl disable --now skyline-speeder-enable.service skyline-speederd.service`，然后删除
+第 4 节列出的全部安装路径。
 
 ## 10. 可观测性与排障
 

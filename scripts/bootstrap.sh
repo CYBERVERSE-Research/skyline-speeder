@@ -5,9 +5,12 @@
 #   curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash
 #
 # Fetches the source tree to a stable location and hands off to install.sh.
-# This exists because the BPF objects MUST be compiled against the target
-# machine's own kernel BTF -- there is no prebuilt binary to download, so a
-# remote installer necessarily means "fetch source, then build here".
+# By default install.sh then builds from source on this host. Forwarding
+# --prebuilt (or --release <tag>) makes it install the published release
+# artifacts instead: CO-RE objects built against a pinned reference header,
+# whose field offsets are fixed against this kernel's BTF at load time. Either
+# way the install.sh that runs comes from --ref, which defaults to main, not to
+# the latest release.
 #
 # Everything is wrapped in main() and invoked on the last line on purpose: if
 # `curl` dies mid-transfer, bash executes whatever bytes arrived. With the body
@@ -20,6 +23,7 @@
 #
 # Any other argument is forwarded to install.sh verbatim:
 #
+#   ... | sudo bash -s -- --prebuilt    # install published artifacts, no toolchain
 #   ... | sudo bash -s -- --check       # preflight only
 #   ... | sudo bash -s -- --no-enable   # install without attaching skyline_cc
 #   ... | sudo bash -s -- --uninstall   # remove

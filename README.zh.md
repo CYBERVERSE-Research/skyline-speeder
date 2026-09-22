@@ -69,6 +69,9 @@ Skyline Speeder 是一套**只需部署在 TCP 连接服务器发送端**的加�
 完整方法学见 [性能验证报告](docs/04-performance-report.md)。
 
 > [!NOTE]
+> 这些数字只来自一套上限 100 Mbit/s 的双 VM 测试床，不代表你的链路。复现步骤见
+> [research/experiments/README.md](research/experiments/README.md)。
+>
 > 上面的数字测的是**当时的**默认系数——那组系数针对随机丢包调校，现在以「高随机丢包档」的名字保留在
 > [使用与调参指南](docs/usage.md) 里。当前的默认系数是后来在一台生产部署上调出来的（那里的丢包主要来自
 > 瓶颈被挤满），**没有**在这套测试床上重跑过。链路确实是 10%-20% 随机丢包时，套用该档即可得到这里测的行为。
@@ -79,7 +82,9 @@ Skyline Speeder 是一套**只需部署在 TCP 连接服务器发送端**的加�
 
 `skyline_cc.bpf.c` 挂在 `tcp_congestion_ops.cong_control` 上的回调用 **4 个参数**声明（`sk, ack, flag, rs`）。该签名自 v6.10 才启用——v6.9 及更早版本该函数指针只有 2 个参数（`sk, rs`），BPF 验证器会在加载时直接拒绝，报错明确指向参数个数不匹配。
 
-> **`6.1.x` 和 `6.6.x` 两个 LTS 分支不支持**，两者都停留在旧的 2 参数签名。
+> **`6.1.x` 和 `6.6.x` 两个 LTS 分支不支持**，两者都停留在旧的 2 参数签名。Debian 12 与 Ubuntu 22.04/24.04 的原装内核也都低于 6.10，在这些系统上需要另装 6.12 及以上的内核。
+
+已验证：`6.12.101`、`6.18.42`、`7.1.6` 通过（含 IPv4/IPv6 数据路径冒烟测试）；`6.1.180` 和 `6.6.148` 按设计加载失败。
 
 ## 快速开始
 
@@ -115,6 +120,9 @@ sudo ./install.sh --no-enable  # 安装但不挂载 skyline_cc
 sudo ./install.sh --uninstall  # 卸载（保留 /etc/skyline-speeder 配置）
 ```
 
+> [!IMPORTANT]
+> **升级已有安装：** 重新运行安装器只会替换文件，不会重启已经在运行的 daemon，旧版本会继续运行。请先用 `sudo systemctl stop skyline-speeder-enable.service skyline-speederd.service` 停掉服务再安装，或者装完后重启 `skyline-speederd`。详见 [CHANGELOG.md](CHANGELOG.md) 的 *Upgrading from 0.1.0*。
+
 ### 不装编译工具链的安装方式
 
 `--prebuilt` 下载已发布的产物而不是现场编译，目标机**不需要 clang、LLVM、bpftool
@@ -123,7 +131,7 @@ sudo ./install.sh --uninstall  # 卸载（保留 /etc/skyline-speeder 配置）
 
 ```bash
 sudo ./install.sh --prebuilt                  # 最新 release
-sudo ./install.sh --release v0.1.0            # 指定 tag
+sudo ./install.sh --release v0.2.0            # 指定 tag
 
 # 镜像站、内网制品库，或者根本连不上 github.com 的机器：
 # 自己把 tarball 拷过去，然后指过去
@@ -132,7 +140,9 @@ SKYLINE_ARTIFACT_URL=/path/to/skyline-speeder-<tag>-x86_64.tar.gz \
 ```
 
 内核要求不变：6.12 LTS 以上，且 `/sys/kernel/btf/vmlinux` 必须存在——CO-RE 正是
-在加载时对着它做重定位。每个产物都带一份 `MANIFEST`，记录 commit、参考头指纹，以及
+在加载时对着它做重定位。预编译的 daemon 在 Ubuntu 24.04 上构建，还需要 glibc 2.38
+以上以及 `libelf.so.1`、`libz.so.1`（Debian 13、Ubuntu 24.04 及更新版本满足）；
+用户态更旧的系统，比如换了 backports 内核的 Debian 12，请从源码构建（这一组合尚未实测）。每个产物都带一份 `MANIFEST`，记录 commit、参考头指纹，以及
 每个二进制和对象的指纹。
 
 安装器会在改动任何东西之前记录当前的拥塞控制算法与默认 qdisc，`--uninstall`
@@ -145,7 +155,7 @@ SKYLINE_ARTIFACT_URL=/path/to/skyline-speeder-<tag>-x86_64.tar.gz \
 
 ```bash
 ssctl status    # 运行时状态、能力集与决策计数器
-ssctl flows     # 逐连接视图
+ssctl flows     # 当前 skyline_cc 活跃连接数
 ssctl drain     # 优雅摘除，等待存量连接自然结束
 ```
 

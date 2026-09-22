@@ -140,3 +140,20 @@ jobs:
 
             Kernel 6.12 LTS or newer is still required, and `/sys/kernel/btf/vmlinux`
             must be present: CO-RE resolves field offsets against it at load time.
+
+            The prebuilt `skyline-speederd` is built on Ubuntu 24.04 and needs glibc 2.38
+            or newer with `libelf.so.1` and `libz.so.1` (Debian 13, Ubuntu 24.04 and
+            later). On older userspace, such as Debian 12 with a backports kernel, build
+            from source instead (not yet tested on that combination).
+
+            Upgrading a host that already runs Skyline Speeder: `install.sh` replaces the
+            files but does not restart a running `skyline-speederd`, so the old version
+            keeps running. Stop the services first:
+
+            ```
+            sudo systemctl stop skyline-speeder-enable.service skyline-speederd.service
+            sudo ./install.sh --prebuilt   # add --no-enable if the host was installed with it
+            ```
+
+            or run `sudo systemctl restart skyline-speederd.service` afterwards. The
+            release's section of `CHANGELOG.md` has the full upgrade notes.

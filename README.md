@@ -75,7 +75,7 @@ Full methodology, validity boundaries and limitations: [docs/04-performance-repo
 
 `skyline_cc.bpf.c` hangs off `tcp_congestion_ops.cong_control` with a **four-argument** callback (`sk, ack, flag, rs`). That signature only exists from v6.10 — on v6.9 and earlier the function pointer takes two arguments (`sk, rs`) and the BPF verifier rejects the program at load time with an explicit arity mismatch.
 
-> **The `6.1.x` and `6.6.x` LTS branches are not supported.** Both are on the old 2-argument signature. That rules out stock Debian 12 and Ubuntu 22.04/24.04 kernels; you need a 6.12+ kernel installed.
+> **The `6.1.x` and `6.6.x` LTS branches are not supported.** Both are on the old 2-argument signature. The stock Debian 12 and Ubuntu 22.04/24.04 kernels are older than 6.10 as well, so on those you need a 6.12+ kernel installed.
 
 Verified: `6.12.101`, `6.18.42`, `7.1.6` pass (including IPv4/IPv6 data-path smoke tests). `6.1.180` and `6.6.148` fail to load, by design.
 
@@ -113,6 +113,9 @@ sudo ./install.sh --no-enable  # install without attaching skyline_cc
 sudo ./install.sh --uninstall  # remove (keeps /etc/skyline-speeder)
 ```
 
+> [!IMPORTANT]
+> **Upgrading an existing install:** re-running the installer replaces the files but does not restart a daemon that is already running, so the old version keeps running. Stop the services first with `sudo systemctl stop skyline-speeder-enable.service skyline-speederd.service`, or restart `skyline-speederd` afterwards. Details are in [CHANGELOG.md](CHANGELOG.md) under *Upgrading from 0.1.0*.
+
 ### Installing without a build toolchain
 
 `--prebuilt` downloads the published release artifacts instead of compiling, so
@@ -123,7 +126,7 @@ generated from a 6.12 LTS kernel, and CO-RE fixes the field offsets against
 
 ```bash
 sudo ./install.sh --prebuilt                  # latest release
-sudo ./install.sh --release v0.1.0            # a specific tag
+sudo ./install.sh --release v0.2.0            # a specific tag
 
 # From a mirror, an internal artifact store, or a host with no route to
 # github.com -- copy the tarball over and point at it:
@@ -133,8 +136,12 @@ SKYLINE_ARTIFACT_URL=/path/to/skyline-speeder-<tag>-x86_64.tar.gz \
 
 The kernel requirement is unchanged: 6.12 LTS or newer, with
 `/sys/kernel/btf/vmlinux` present, because that is what CO-RE relocates
-against at load time. Each artifact carries a `MANIFEST` recording the commit,
-the reference header digest and the digest of every shipped binary and object.
+against at load time. The prebuilt daemon is built on Ubuntu 24.04 and also
+needs glibc 2.38 or newer with `libelf.so.1` and `libz.so.1` (Debian 13,
+Ubuntu 24.04 and later); on older userspace, such as Debian 12 with a
+backports kernel, build from source (not yet tested on that combination). Each
+artifact carries a `MANIFEST` recording the commit, the reference header
+digest and the digest of every shipped binary and object.
 
 The installer records the congestion control and default qdisc in place before
 it changes anything, and `--uninstall` puts them back. Uninstalling a host that
@@ -147,7 +154,7 @@ Day-to-day:
 
 ```bash
 ssctl status    # runtime state, kernel capabilities, decision counters
-ssctl flows     # per-flow view
+ssctl flows     # number of active skyline_cc flows
 ssctl drain     # graceful detach, waits for existing flows to finish
 ```
 

@@ -12,9 +12,12 @@
 # same RTO tuning and quietly understate the difference being measured, so it is
 # switched with the algorithm: on for skyline_cc, off for everything else.
 #
-# The rack_rto values are config/speeder.toml's [rack_rto] block. install.sh's
-# source path installs config/speeder-guest.toml, which leaves [rack_rto] out
-# entirely, so they have to be sent explicitly. The rto_max half is sent as 0:
+# The rack_rto values are config/speeder.toml's [rack_rto] block. They have to be
+# sent explicitly: the daemon never applies [rack_rto] from its config file at
+# startup -- RTO tuning stays zeroed until an explicit set-rack-rto
+# (docs/usage.md, section 5) -- and the installed production template,
+# speeder-guest.toml, leaves the block out on purpose, because the experiment
+# matrix relies on reset-rack-rto meaning "off". The rto_max half is sent as 0:
 # it needs TCP_RTO_MAX_MS (Linux 6.15+), and on the 6.12 kernel this was measured
 # on every call was rejected. set-rack-rto is absolute-replace, so every field is
 # sent on every call.

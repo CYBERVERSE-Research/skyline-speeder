@@ -372,12 +372,13 @@ def _parse_retransmit_dscp(item: dict[str, Any]) -> RetransmitDscpSpec:
 
 
 def _parse_module_config(item: dict[str, Any]) -> ModuleConfigSpec:
-    # Defaults mirror config/speeder.toml's current values so an override
-    # table that only sets a handful of fields still produces a complete,
-    # absolute-replace ModuleConfigSpec for ssctl set-module-config. A key
-    # that doesn't map to a ModuleConfigSpec field is silently dropped
-    # rather than rejected -- see ModuleConfigSpec's doc comment for why
-    # staying permissive here is the deliberate choice, not an oversight.
+    # Defaults are the docs/04 `skyline-best` set (see the note below), so
+    # an override table that only sets a handful of fields still produces a
+    # complete, absolute-replace ModuleConfigSpec for ssctl
+    # set-module-config. A key that doesn't map to a ModuleConfigSpec field
+    # is silently dropped rather than rejected -- see ModuleConfigSpec's doc
+    # comment for why staying permissive here is the deliberate choice, not
+    # an oversight.
     return ModuleConfigSpec(
         max_pacing_mbps=int(item.get("max_pacing_mbps", 1200)),
         max_cwnd_packets=int(item.get("max_cwnd_packets", 50_000)),

@@ -22,11 +22,12 @@ min_cwnd_packets = 4
 # research/experiments/run_matrix.py 的 apply_module_config()）逐 case 覆盖；
 # 不像 [rack_tuning] 那样有"guest 必须整段省略"的强约束，因为这里走的是
 # skyline-speederd 自己管理的内存态配置，不存在被外部 sysctl 写入绕过的风险。
-# See config/speeder.toml's comment for the full rationale. The values below
-# only matter for a case that does not override them: the matrix's own
-# coefficient defaults (research/experiments/matrix_lib.py) stay pinned to the
-# set docs/04-performance-report.md measured, so that report stays
-# reproducible.
+# See config/speeder.toml's comment for the full rationale. On an installed
+# host these are the live defaults: both install paths ship this file as
+# /etc/skyline-speeder/speeder.toml. In the experiment matrix they only matter
+# for a case that does not override them: the matrix's own coefficient defaults
+# (research/experiments/matrix_lib.py) stay pinned to the set
+# docs/04-performance-report.md measured, so that report stays reproducible.
 [adaptive_cwnd]
 min_rtt_window_s = 30
 bw_window_rtts = 6
