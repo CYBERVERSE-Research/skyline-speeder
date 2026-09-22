@@ -51,11 +51,13 @@ jobs:
       - name: Formatting
         run: cargo fmt --all -- --check
 
+      # --locked: a Cargo.lock that no longer matches the manifests fails here,
+      # on the pull request, instead of at tag time in the release build.
       - name: Static check
-        run: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --locked
 
       - name: Unit tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   bpf:
     name: BPF (CO-RE compile only)

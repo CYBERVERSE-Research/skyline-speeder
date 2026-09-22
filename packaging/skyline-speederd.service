@@ -1,5 +1,6 @@
 [Unit]
 Description=Skyline Speeder experimental TCP congestion-control daemon
+Documentation=https://github.com/CYBERVERSE-Research/skyline-speeder/blob/main/docs/01-deployment-guide.md
 After=network.target
 ConditionPathExists=/etc/skyline-speeder/speeder.toml
 

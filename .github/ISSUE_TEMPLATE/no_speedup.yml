@@ -11,10 +11,10 @@ body:
         links with **non-congestive random loss** — 10-20% loss, 100-300 ms RTT,
         bandwidth to spare. On a genuinely congested bottleneck it will keep
         pushing, hurt itself, and hurt everything sharing the path. That is a
-        documented property, not a bug (`docs/04-performance-report.md`, section 9).
+        documented property, not a bug (`docs/04-performance-report.md`, section 8).
 
         Pure reordering is also a known weak spot: `reorder-dsack` measures about
-        9% below CUBIC and 13% below BBR.
+        13% below BBR.
 
   - type: checkboxes
     id: loss-nature

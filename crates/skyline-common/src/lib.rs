@@ -300,6 +300,63 @@ impl Default for RetransmitDscpConfig {
     }
 }
 
+/// `[guard]`: what skyline-speederd keeps in place while skyline_cc is enabled
+/// (between a successful `Request::Enable` and the next `Request::Drain`).
+///
+/// Ownership, which is an invariant -- each of these has exactly one writer so
+/// two places cannot drift apart:
+/// - `net.ipv4.tcp_congestion_control` = `skyline_cc` (always; skyline-speederd
+///   already owned this sysctl before the guard existed);
+/// - `net.core.default_qdisc` = `fq` and the root qdisc of
+///   `runtime.tc_interface` = `fq` (or `mq` whose every child is `fq` on a
+///   multi-queue device), only while `qdisc = true`. When `tc_interface` is a
+///   VLAN, bond or bridge (root `noqueue`, the kernel default there) that
+///   means the NICs under it instead; a shaped cake and classful/shaping
+///   qdiscs are left alone. `infra/boot-enable.sh` used to write the qdisc
+///   sysctl once at boot; it no longer does.
+///
+/// Why a periodic re-check and not a one-shot write: "one-click BBR" scripts
+/// persist `tcp_congestion_control=bbr` and `default_qdisc=cake|fq_pie` in
+/// /etc/sysctl.d, and anything that re-runs `sysctl --system` flips the host
+/// back silently -- every new connection then bypasses skyline_cc and nothing
+/// reports it. And `default_qdisc` only affects qdiscs created afterwards, so a
+/// NIC brought up before that sysctl ran keeps whatever it got (fq_codel on a
+/// stock Debian host), which is why the interface's root qdisc is replaced too.
+///
+/// Independent of `KernelConfig`/`ABI_VERSION`: nothing here reaches BPF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuardConfig {
+    /// Seconds between re-checks while skyline_cc is enabled. 0 turns the
+    /// periodic re-check off; `ssctl enable` still applies everything once.
+    #[serde(default = "default_guard_interval_s")]
+    pub interval_s: u32,
+    /// `false` leaves every qdisc alone: skyline-speederd then owns only the
+    /// congestion control.
+    #[serde(default = "default_true")]
+    pub qdisc: bool,
+}
+
+impl Default for GuardConfig {
+    fn default() -> Self {
+        Self {
+            interval_s: DEFAULT_GUARD_INTERVAL_S,
+            qdisc: true,
+        }
+    }
+}
+
+/// See `GuardConfig::interval_s`.
+pub const DEFAULT_GUARD_INTERVAL_S: u32 = 5;
+
+/// Upper bound on `GuardConfig::interval_s`. A re-check an hour apart is
+/// already too slow to be worth calling a guard; anything beyond that is far
+/// more likely a typo (milliseconds for seconds) than intent.
+pub const MAX_GUARD_INTERVAL_S: u32 = 3600;
+
+fn default_guard_interval_s() -> u32 {
+    DEFAULT_GUARD_INTERVAL_S
+}
+
 /// Live-tunable mirror of every M2 (`[adaptive_cwnd]`)/M3 (`[loss_classifier]`)
 /// coefficient plus the top-level safety limits (`max_pacing_mbps`/
 /// `max_cwnd_packets`/`max_queue_delay_ms`/`initial_cwnd_packets`). This
@@ -443,6 +500,10 @@ pub struct SkylineConfig {
     pub rack_rto: RackRtoConfig,
     #[serde(default)]
     pub retransmit_dscp: RetransmitDscpConfig,
+    /// Defaulted so an installed 0.2.0 configuration (never overwritten on
+    /// upgrade, and without the table) still gets the guard.
+    #[serde(default)]
+    pub guard: GuardConfig,
     pub runtime: RuntimeConfig,
 }
 
@@ -591,6 +652,13 @@ impl SkylineConfig {
                 "retransmit_dscp.dscp_value",
                 "0..=63",
                 u32::from(self.retransmit_dscp.dscp_value),
+            ));
+        }
+        if self.guard.interval_s > MAX_GUARD_INTERVAL_S {
+            return Err(ConfigError::Range(
+                "guard.interval_s",
+                "0..=3600 (0 = no periodic re-check)",
+                self.guard.interval_s,
             ));
         }
         Ok(())
@@ -855,8 +923,85 @@ pub struct RetransmitDscpStatus {
     pub stats: Option<RetransmitDscpStats>,
 }
 
+/// `[guard]` at run time (see `GuardConfig`). JSON only, not ABI.
+/// Defaulted field by field so a newer ssctl can decode an older daemon's
+/// reply, and the other way round.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuardStatus {
+    /// True between a successful `Enable` and the next `Drain`. Starts false
+    /// at daemon start even when a killed previous instance left skyline_cc
+    /// registered: only an `Enable` in this process arms it.
+    pub armed: bool,
+    /// Echo of `[guard]`.
+    pub interval_s: u32,
+    pub qdisc: bool,
+    /// Periodic re-checks run while armed (the pass `Enable` runs itself is
+    /// not counted here).
+    pub checks: u64,
+    /// Times `tcp_congestion_control` was put back to skyline_cc.
+    pub cc_restored: u64,
+    /// Times `default_qdisc` was put back to fq.
+    pub default_qdisc_restored: u64,
+    /// Times the root qdisc of a managed device (`runtime.tc_interface`, or
+    /// a NIC under it -- see `GuardLive::devices`) was replaced.
+    pub interface_qdisc_replaced: u64,
+    /// Human-readable, e.g. "tcp_congestion_control bbr -> skyline_cc".
+    pub last_correction: Option<String>,
+    pub last_correction_unix_s: Option<u64>,
+    /// Most recent failure (tc missing or stuck, a write refused, a replace
+    /// that failed or did not take). Kept until the next one: it is history,
+    /// `notes` is now.
+    pub last_error: Option<String>,
+    /// Fresh read at status time.
+    pub live: GuardLive,
+    /// What the latest pass found and deliberately did not change, and what
+    /// it could not do -- e.g. "eth0 root qdisc htb looks deliberate; left
+    /// alone", "eth0 root qdisc cake: the last replace failed; retrying in
+    /// 30 s".
+    pub notes: Vec<String>,
+}
+
+/// The values `GuardStatus` is about, read fresh at status time whether or
+/// not the guard is armed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuardLive {
+    pub tcp_congestion_control: String,
+    pub default_qdisc: String,
+    /// `runtime.tc_interface`.
+    pub interface: Option<String>,
+    /// Summary of that interface's own root qdisc: "fq", "mq/fq", "cake",
+    /// "mq/cake,fq" (mq followed by its children's distinct kinds, sorted),
+    /// "noqueue" on a VLAN/bond/bridge. `None` when there is no interface or
+    /// `tc` could not be read.
+    pub interface_qdisc: Option<String>,
+    /// The devices whose root qdisc the guard manages, with their live
+    /// summaries: `[tc_interface]` itself, or -- when its root is noqueue --
+    /// the NICs found under it through lower_* links (bond slaves, a VLAN's
+    /// real device, a bridge's physical ports; never a tap or veth). Empty
+    /// with `[guard] qdisc = false`, for a tunnel with no NIC under it, and
+    /// from a daemon older than the field.
+    #[serde(default)]
+    pub devices: Vec<GuardDevice>,
+}
+
+/// One entry of `GuardLive::devices`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuardDevice {
+    pub name: String,
+    /// Same format as `GuardLive::interface_qdisc`; `None` when `tc` could
+    /// not read it or it shows no root qdisc (a device that is down).
+    pub qdisc: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeStatus {
+    /// The daemon's own version (`CARGO_PKG_VERSION`). Empty when decoded
+    /// from a daemon older than the field.
+    #[serde(default)]
+    pub version: String,
     pub enabled: bool,
     pub generation: u32,
     pub modules: Vec<Module>,
@@ -876,6 +1021,10 @@ pub struct RuntimeStatus {
     /// is no external sysctl-style tampering vector to reconcile against.
     pub module_tuning: ModuleTuningConfig,
     pub capabilities: CapabilityReport,
+    /// `[guard]` state; defaulted (disarmed, zero counters) when decoded from
+    /// a daemon older than the guard.
+    #[serde(default)]
+    pub guard: GuardStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -996,6 +1145,94 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    const SHIPPED_CONFIGS: [&str; 2] = [
+        "../../config/speeder.toml",
+        "../../config/speeder-guest.toml",
+    ];
+
+    #[test]
+    fn guard_defaults_apply_when_config_predates_the_table() {
+        // Same situation as events_max_mib: an installed
+        // /etc/skyline-speeder/speeder.toml from 0.2.0 has no [guard] and is
+        // never overwritten, and it must get the guard anyway.
+        for path in SHIPPED_CONFIGS {
+            let content = fs::read_to_string(path).expect("read config");
+            let mut value: toml::Value = toml::from_str(&content).expect("parse as TOML");
+            value
+                .as_table_mut()
+                .expect("top-level table")
+                .remove("guard")
+                .unwrap_or_else(|| panic!("{path} should declare [guard]"));
+            let legacy: SkylineConfig = value.try_into().expect("parse without [guard]");
+            legacy.validate().expect("still valid");
+            assert_eq!(legacy.guard, GuardConfig::default(), "{path}");
+        }
+    }
+
+    #[test]
+    fn shipped_configs_declare_the_guard_defaults() {
+        assert_eq!(
+            GuardConfig::default(),
+            GuardConfig {
+                interval_s: DEFAULT_GUARD_INTERVAL_S,
+                qdisc: true,
+            }
+        );
+        for path in SHIPPED_CONFIGS {
+            // Declared explicitly, not merely defaulted: the file is where an
+            // operator looks for the knob.
+            let content = fs::read_to_string(path).expect("read config");
+            let value: toml::Value = toml::from_str(&content).expect("parse as TOML");
+            let table = value
+                .get("guard")
+                .and_then(toml::Value::as_table)
+                .unwrap_or_else(|| panic!("{path} should declare [guard]"));
+            assert!(table.contains_key("interval_s"), "{path}");
+            assert!(table.contains_key("qdisc"), "{path}");
+
+            let shipped = SkylineConfig::load(path).expect("load shipped config");
+            assert_eq!(shipped.guard, GuardConfig::default(), "{path}");
+        }
+    }
+
+    #[test]
+    fn guard_interval_is_bounded() {
+        let mut config = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        config.guard.interval_s = MAX_GUARD_INTERVAL_S + 1;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::Range("guard.interval_s", _, 3601))
+        ));
+
+        config.guard.interval_s = MAX_GUARD_INTERVAL_S;
+        config.validate().expect("an hour is the upper bound");
+        config.guard.interval_s = 0;
+        config
+            .validate()
+            .expect("0 turns the periodic re-check off");
+    }
+
+    #[test]
+    fn guard_status_decodes_from_a_partial_table() {
+        // A daemon one field behind (or ahead) must not make the whole status
+        // undecodable.
+        let status: GuardStatus =
+            toml::from_str("armed = true\ncc_restored = 2\n").expect("parse partial status");
+        assert!(status.armed);
+        assert_eq!(status.cc_restored, 2);
+        assert_eq!(status.live, GuardLive::default());
+        assert!(status.last_error.is_none());
+
+        // A daemon from before `live.devices`.
+        let live: GuardLive = toml::from_str(
+            "tcp_congestion_control = \"skyline_cc\"\ninterface = \"eth0\"\n\
+             interface_qdisc = \"mq/fq\"\n",
+        )
+        .expect("parse live without devices");
+        assert!(live.devices.is_empty());
+        assert_eq!(live.interface_qdisc.as_deref(), Some("mq/fq"));
     }
 
     #[test]

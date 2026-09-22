@@ -73,12 +73,37 @@ vmlinux.h 只需要**定义**代码用到的类型，不必来自最终运行的
    `net.ipv4.tcp_congestion_control` 写成 `skyline_cc`。**sysctl 的写入顺序是不变量**——
    `enable` 必须在附加之后写（内核拒绝未注册的算法名），`drain` 必须在注销之前写回
    `fallback_cc`（否则会出现"注销一个正被当作默认算法的 struct_ops"）。这个 sysctl
-   只有 `crates/skyline-speederd/src/main.rs` 一处所有者，`infra/boot-enable.sh`
-   刻意不再写它；`infra/boot-disable.sh` 里那次写入是 daemon 已死时的兜底，不是重复。
+   只有 `skyline-speederd` 一处所有者（每次写入都经过 `crates/skyline-speederd/src/main.rs`
+   的 `set_default_congestion_control`），`infra/boot-enable.sh` 刻意不写任何 sysctl；
+   `infra/boot-disable.sh` 先 drain，之后那次写入只在默认仍是 `skyline_cc` 时发生，是 daemon
+   已死时的兜底，不是重复（它若抢在 drain 之前写，仍处于 armed 的 guard 会把 `skyline_cc` 写回去）。
+
+   **挂载之后被悄悄改回，同样是静默失效**：VPS 上"一键 BBR"脚本留在 `/etc/sysctl.d`
+   的 `bbr` 一旦被 `sysctl --system` 重新应用，新连接就全部绕开 `skyline_cc`，不报任何错。
+   所以从 `enable` 到 `drain`，guard（`crates/skyline-speederd/src/guard.rs`，配置
+   `[guard]`）守住三项：默认拥塞控制，以及 `[guard] qdisc = true`（默认）时的
+   `net.core.default_qdisc = fq` 与 `runtime.tc_interface` 的根 qdisc（`fq`，多队列网卡上
+   是子队列全为 `fq` 的 `mq`；它是根为 `noqueue` 的 VLAN/bond/网桥时，改为它下面有
+   `device` 链接的物理网卡，tap/veth 从不碰）。这三项同样只有 daemon 一个写入者——
+   `boot-enable.sh` 过去开机时写一次 `default_qdisc=fq`，现在不写了，**不要加回去**（它改
+   不到网卡已有的根 qdisc，还会和 daemon 各说各话）。相关不变量：
+   - `enable` 写完 `skyline_cc` 之后才武装 guard；`drain` 先解除武装，并在**仍持有 guard
+     的锁**时写回 `fallback_cc`，否则一次周期检查可能在 drain 写回之后又把 `skyline_cc`
+     写回去。drain 超时报错也保持解除（实验矩阵 `drain --timeout 0` 后自己设 qdisc）。
+   - daemon 停止时先停掉并 join guard 线程，再让 `BpfRuntime` drop 注销 struct_ops
+     （`impl Drop for Daemon`），否则已武装的检查会去写一个内核已不认识的 `skyline_cc`。
+   - **daemon 停止不写任何 sysctl。** 维护者明确不要"停止时写回 `fallback_cc`"，不要加；
+     写回由 `drain` 和 enable unit 的 `ExecStop` 负责。
+   - guard 只替换没有配置值得保留的 qdisc（`pfifo_fast`/`fq_codel`/未整形的 `cake`/`fq_pie`
+     等），`htb`/`tbf`/`netem`/`mqprio` 等分类、整形、卸载类、设了带宽或 `autorate-ingress`
+     的 `cake`、`noqueue` 和不认识的种类一律不动——替换它们会悄悄毁掉运维的整形配置。
 
 3. **`tc_interface` 指向错误网卡**：`config/speeder-guest.toml` 的默认值是测试床的
-   接口名，真实主机上几乎必然不匹配。`install.sh` 会自动探测默认路由网卡改写，
-   但仅在首次安装时（不覆盖运维已编辑的配置）。
+   接口名，真实主机上几乎必然不匹配。`install.sh` 会自动探测默认路由（先 IPv4、再 IPv6）
+   上的第一块以太网网卡改写，但仅在首次安装时（不覆盖运维已编辑的配置）；默认路由只走
+   WireGuard/tun 这类隧道时不改写，保留模板值并告警——`skyline_tc` 只挂在以太网设备上。
+   guard 维护的也是这块网卡的根 qdisc：指错了，真正的出口网卡保持原来的 qdisc，而被指到
+   的那块网卡被换成 `fq`。
 
 ## 控制面语义
 
@@ -119,6 +144,7 @@ daemon 重启会把 per-case 精确值悄悄覆盖回默认值。
 | README 里任何面向用户的内容 | **`README.md`（英文）和 `README.zh.md`（中文）必须同时改** |
 | 硬性不变量 / 贡献流程 | `CONTRIBUTING.md`（本文件的不变量表在那里有一份面向外部贡献者的英文版）|
 | 算法行为 | `docs/03-design.md`，性能声明须有 `docs/04-performance-report.md` 数据支撑 |
+| 发版（打 `v*` tag） | `Cargo.toml` 的 `[workspace.package] version` + `CHANGELOG.md` 的 `## [<版本>]` 小节——`release.yml` 校验 tag 恰为 `v<版本>` 且该小节存在，否则拒绝构建 |
 
 ## 性能声明纪律
 

@@ -113,16 +113,17 @@ cd skyline-speeder
 sudo ./install.sh              # 从源码构建
 sudo ./install.sh --prebuilt   # 安装已发布的产物，不需要编译工具链
 sudo ./install.sh --check      # 只做前置检查，不改动任何东西
-sudo ./install.sh --no-enable  # 安装但不挂载 skyline_cc
+sudo ./install.sh --no-enable  # 安装，但不挂载此前没挂载的 skyline_cc
+sudo ./install.sh --verbose    # 不显示进度条，改为打印每条命令的输出
 sudo ./install.sh --uninstall  # 卸载（保留 /etc/skyline-speeder）
 ```
 
-安装器会检查内核，构建或下载三个 BPF 对象和 daemon，把 TC 程序指向默认路由所在的网卡，让每个对象过一遍内核验证器，然后启动 daemon、挂载 `skyline_cc`，并把两者设为开机自启。它会先记录当前使用的拥塞控制与 qdisc，`--uninstall` 时还原。**不安装任何代理，不监听任何端口。**
+安装器会检查内核，构建或下载三个 BPF 对象和 daemon，把 TC 程序指向默认路由所在的网卡（IPv4 或 IPv6；默认路由走 WireGuard 这类隧道时，它会请你自己指定网卡），让每个对象过一遍内核验证器，然后启动 daemon、挂载 `skyline_cc`，并把两者设为开机自启。安装过程中终端只显示一行进度，所有命令的输出都保存在 `/var/log/skyline-speeder-install.log`；装完会列出拥塞控制与 qdisc 改动前后的值，再给出 `ssctl` 用法与调参的简短指南。它会先记录当前使用的拥塞控制与 qdisc（包括出口网卡的根 qdisc），`--uninstall` 时还原。**不安装任何代理，不监听任何端口。**
 
-`--prebuilt` 只需要 `curl` 和 `tar`：对象是 CO-RE 的，用固定的 6.12 参考头编译，加载时再按这台机器的内核重定位。预编译的 daemon 在 Ubuntu 24.04 上构建，需要 glibc 2.38 以上以及 `libelf.so.1`、`libz.so.1`（Debian 13、Ubuntu 24.04 及更新版本满足）；用户态更旧的系统请从源码构建。`--release <tag>` 指定版本；连不上 GitHub 的机器，把产物拷过去后用 `SKYLINE_ARTIFACT_URL=/path/to/tarball sudo -E ./install.sh --prebuilt` 安装。
+`--prebuilt` 不需要编译工具链，只需要 `curl`、`tar` 和 `iproute2`（安装器会自动安装）：对象是 CO-RE 的，用固定的 6.12 参考头编译，加载时再按这台机器的内核重定位。预编译的 daemon 在 Ubuntu 24.04 上构建，需要 glibc 2.38 以上以及 `libelf.so.1`、`libz.so.1`（Debian 13、Ubuntu 24.04 及更新版本满足）；用户态更旧的系统请从源码构建。`--release <tag>` 指定版本；连不上 GitHub 的机器，把产物拷过去后用 `SKYLINE_ARTIFACT_URL=/path/to/tarball sudo -E ./install.sh --prebuilt` 安装。它装的是已发布的 release，可能比这份 README 旧：例如 v0.2.0 这个 release 还没有下文「配置」里说的 qdisc 守护，遇到这种情况安装器会明确提示。
 
 > [!IMPORTANT]
-> **升级：** 重新运行安装器只会替换文件，不会重启已经在运行的 daemon，旧版本会继续运行。请先用 `sudo systemctl stop skyline-speeder-enable.service skyline-speederd.service` 停掉服务再安装，或者装完后重启 `skyline-speederd`。详见 [CHANGELOG.md](CHANGELOG.md) 的 *Upgrading from 0.1.0*。
+> **升级：** 按原来的方式再运行一次安装器即可。新对象通过内核验证器后，它会自己重启 `skyline-speederd`：先让现有连接排空（最多 60 秒），再重新挂载 `skyline_cc`；原先是手工 `ssctl enable` 挂载的主机也一样。用 `ssctl` 做的修改不会保留到重启之后。详见 [CHANGELOG.md](CHANGELOG.md) 的 *Upgrading from 0.2.0*。
 
 日常操作：
 
@@ -153,7 +154,7 @@ ssctl enable --modules adaptive-cwnd,pacing   # 只开指定模块
 ssctl enable --all-off                        # 全关，作为对照基准
 ```
 
-`ssctl enable` 是全机生效的：挂载成功后会写 `net.ipv4.tcp_congestion_control = skyline_cc`，这台机器上所有新建 TCP 连接都会用它。
+`ssctl enable` 是全机生效的：挂载成功后会写 `net.ipv4.tcp_congestion_control = skyline_cc`，这台机器上所有新建 TCP 连接都会用它。它还会把 pacing 所依赖的 `fq` 设为 `net.core.default_qdisc` 和出口网卡的根 qdisc（VLAN、bond、网桥则是它下面的物理网卡）。在 `ssctl drain` 之前，这三项被别的东西改掉（例如"一键 BBR"脚本的 sysctl 文件被再次应用）时，daemon 都会改回来，并逐条记日志。刻意搭建的 qdisc（`htb`、`tbf`、`netem`、设了带宽的 `cake` 等）不会被动；在配置里设 `[guard] qdisc = false` 则 qdisc 完全交给你自己。
 
 **系数。** 十七个参数（各类增益、护栏、丢包补偿上限、排队时延阈值、起步行为、速率与窗口上限）可用 `ssctl set-module-config` 在线调整，无需重启。[使用与调参指南](docs/usage.md) 逐个解释了这些参数，并给出四档现成配方，其中「高随机丢包档」适用于确实有 10%-20% 随机丢包的链路。
 
@@ -223,7 +224,7 @@ skyline-speederd --config config/speeder.toml --validate-only --verify-bpf
 | [docs/01-deployment-guide.md](docs/01-deployment-guide.md) | 构建、安装、配置、验证、调参、回滚 |
 | [docs/02-interface-reference.md](docs/02-interface-reference.md) | `ssctl` 命令、控制面线协议、配置字段、事件码 |
 | [docs/03-design.md](docs/03-design.md) | 架构与各模块的实现原理 |
-| [docs/04-performance-report.md](docs/04-performance-report.md) | 受控测试床：环境、结果、中性性、局限性 |
+| [docs/04-performance-report.md](docs/04-performance-report.md) | 受控测试床：环境、与 bbr 对比的结果、局限性 |
 | [research/experiments/README.md](research/experiments/README.md) | 复现性能测试 |
 | [DEPLOY.md](DEPLOY.md) | 面向自动化 agent 的确定性部署手册 |
 

@@ -7,11 +7,16 @@
 # comes back with the daemon running and every new flow on `fallback_cc` -- a
 # silent regression, since nothing reports an error.
 #
-# `ssctl enable` owns both halves of activation: it attaches the struct_ops and
-# then switches net.ipv4.tcp_congestion_control to skyline_cc itself. This script
-# therefore does NOT write that sysctl -- two places writing the same setting is
-# how they drift apart. The one sysctl left here is the qdisc, which ssctl has no
-# business touching.
+# `ssctl enable` owns all of activation: it attaches the struct_ops, then
+# switches net.ipv4.tcp_congestion_control to skyline_cc, and -- with [guard]
+# qdisc = true, the default -- sets net.core.default_qdisc=fq and puts fq on the
+# root of runtime.tc_interface (or, when that is a VLAN, bond or bridge, of the
+# NICs under it). skyline-speederd then keeps all of it in place until the next
+# drain. This script therefore writes NO sysctl: two places writing the same
+# setting is how they drift apart. (It used to write default_qdisc=fq itself,
+# once, here. That only shapes qdiscs created afterwards, so the NIC kept
+# whatever root qdisc it had come up with, and a later `sysctl --system`
+# re-applying a "one-click BBR" file undid it anyway.)
 #
 # skyline-speederd.service has no systemd readiness notification, so the control
 # socket may not exist yet when this runs; wait for it rather than racing it.
@@ -29,9 +34,6 @@ while [ ! -S "$SOCKET" ]; do
     sleep 1
 done
 
-modprobe sch_fq 2>/dev/null || true
-sysctl -qw net.core.default_qdisc=fq
-
 /usr/local/bin/ssctl enable >/dev/null
 
 # Read the sysctl back rather than trusting the exit status: this is the line
@@ -43,4 +45,4 @@ if [ "$ACTIVE" != skyline_cc ]; then
     exit 1
 fi
 
-echo "Skyline Speeder enabled: cc=$ACTIVE qdisc=$(sysctl -n net.core.default_qdisc)"
+echo "Skyline Speeder enabled: cc=$ACTIVE default_qdisc=$(sysctl -n net.core.default_qdisc)"

@@ -37,6 +37,31 @@ jobs:
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
+      # A tag that disagrees with the crate version would publish binaries whose
+      # `--version`, and the version in `ssctl status`, name another release --
+      # and install.sh reports upgrades from exactly that string. Catch it here,
+      # before anything is built, rather than on a host after the fact.
+      - name: Check the tag against the crate version and CHANGELOG.md
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "skyline-speederd") | .version')
+          if [ -z "$VERSION" ]; then
+            echo "::error::could not read the skyline-speederd version from cargo metadata"
+            exit 1
+          fi
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::tag $TAG does not match the workspace version $VERSION: tag v$VERSION, or bump [workspace.package] version in Cargo.toml first"
+            exit 1
+          fi
+          if ! awk -v h="## [$VERSION]" 'index($0, h) == 1 { found = 1 } END { exit !found }' CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$VERSION]' section; add the release notes before tagging"
+            exit 1
+          fi
+          echo "tag $TAG matches skyline-speederd $VERSION and CHANGELOG.md"
+
       - name: Install build dependencies
         run: |
           sudo apt-get update -qq
@@ -76,8 +101,10 @@ jobs:
             echo "ok   $object"
           done
 
+      # --locked: build exactly the dependency versions Cargo.lock records. CI
+      # checks and tests with --locked too, so a stale lock fails there first.
       - name: Build the control plane
-        run: cargo build --workspace --release
+        run: cargo build --workspace --release --locked
 
       # Layout matches what infra/install-prebuilt-guest.sh already expects, so
       # the test bed and `install.sh --prebuilt` consume the same tarball rather
@@ -146,14 +173,22 @@ jobs:
             later). On older userspace, such as Debian 12 with a backports kernel, build
             from source instead (not yet tested on that combination).
 
-            Upgrading a host that already runs Skyline Speeder: `install.sh` replaces the
-            files but does not restart a running `skyline-speederd`, so the old version
-            keeps running. Stop the services first:
+            Upgrading a host that already runs Skyline Speeder: run the new `install.sh`
+            the same way the host was installed. It checks the new objects with the
+            kernel verifier first and then restarts `skyline-speederd` itself: live flows
+            are drained for up to 60 s and skyline_cc is attached again. That includes a
+            host where skyline_cc was attached by hand with `sudo ssctl enable` rather
+            than by `skyline-speeder-enable.service`: the installer drains it before the
+            restart and attaches it again afterwards (with `--no-enable`, by hand as
+            before, so not at boot). This works on hosts installed with 0.2.0 or earlier
+            too, since what matters is the `install.sh` that runs, not the version it
+            replaces:
 
             ```
-            sudo systemctl stop skyline-speeder-enable.service skyline-speederd.service
             sudo ./install.sh --prebuilt   # add --no-enable if the host was installed with it
             ```
 
-            or run `sudo systemctl restart skyline-speederd.service` afterwards. The
-            release's section of `CHANGELOG.md` has the full upgrade notes.
+            Settings made with `ssctl` live only in the daemon's memory and do not carry
+            over the restart; the installer writes the old `ssctl status` into
+            `/var/log/skyline-speeder-install.log`. The release's section of
+            `CHANGELOG.md` has the full upgrade notes.

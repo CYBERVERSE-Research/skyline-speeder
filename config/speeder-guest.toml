@@ -53,6 +53,24 @@ loss_inflation_max_ratio = 0.10
 # research/experiments/run_matrix.py 的 apply_profile()），这里同样保持默认
 # 关闭（enabled=false），不在配置文件里设置具体数值。
 
+# While skyline_cc is enabled, skyline-speederd re-checks every interval_s
+# seconds that the host default congestion control is still skyline_cc and (if
+# qdisc = true) that net.core.default_qdisc and the root qdisc of
+# runtime.tc_interface are still fq, and puts back whatever something else
+# changed -- a `sysctl --system` that re-applies a "one-click BBR" file, a tc
+# command that installs cake/fq_pie. `ssctl enable` applies all of it once
+# regardless. 0 turns the periodic re-check off. A root qdisc that looks built
+# on purpose (htb, tbf, netem, prio, mqprio, a cake with a bandwidth, ...) is
+# left alone and reported under "guard" in `ssctl status`; `ssctl drain` stops
+# the guard. When runtime.tc_interface is a VLAN, bond or bridge (root noqueue,
+# the kernel default there), the NICs under it are checked instead -- never a
+# VM's tap or a container's veth.
+[guard]
+interval_s = 5
+# false leaves every qdisc alone (skyline-speederd then owns only the
+# congestion control).
+qdisc = true
+
 [runtime]
 bpf_dir = "/opt/skyline-speeder/bpf"
 pin_dir = "/sys/fs/bpf/skyline-speeder"

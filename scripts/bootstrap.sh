@@ -26,6 +26,7 @@
 #   ... | sudo bash -s -- --prebuilt    # install published artifacts, no toolchain
 #   ... | sudo bash -s -- --check       # preflight only
 #   ... | sudo bash -s -- --no-enable   # install without attaching skyline_cc
+#   ... | sudo bash -s -- --verbose     # show every build command's output
 #   ... | sudo bash -s -- --uninstall   # remove
 #
 set -euo pipefail
@@ -40,8 +41,12 @@ main() {
     local SRC_DIR="${SKYLINE_SRC_DIR:-/usr/local/src/skyline-speeder}"
     local -a FORWARD=()
 
-    local CSI=$'\033' RED GRN YLW BLD RST
-    RED="${CSI}[31m"; GRN="${CSI}[32m"; YLW="${CSI}[33m"; BLD="${CSI}[1m"; RST="${CSI}[0m"
+    local CSI=$'\033' RED= GRN= YLW= BLD= RST=
+    # No escape codes when the output goes to a file or a CI log (install.sh
+    # follows the same rule).
+    if [ -t 1 ]; then
+        RED="${CSI}[31m"; GRN="${CSI}[32m"; YLW="${CSI}[33m"; BLD="${CSI}[1m"; RST="${CSI}[0m"
+    fi
     info() { printf '%s==>%s %s\n' "$BLD" "$RST" "$*"; }
     ok()   { printf '%s  ok%s  %s\n' "$GRN" "$RST" "$*"; }
     warn() { printf '%s warn%s %s\n' "$YLW" "$RST" "$*" >&2; }
@@ -52,7 +57,7 @@ main() {
             --ref)     [ "$#" -ge 2 ] || die "--ref needs a value";     REF="$2";     shift 2 ;;
             --repo)    [ "$#" -ge 2 ] || die "--repo needs a value";    REPO="$2";    shift 2 ;;
             --src-dir) [ "$#" -ge 2 ] || die "--src-dir needs a value"; SRC_DIR="$2"; shift 2 ;;
-            -h|--help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+            -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
             *)         FORWARD+=("$1"); shift ;;
         esac
     done
@@ -67,6 +72,11 @@ main() {
         exec "$SRC_DIR/install.sh" "${FORWARD[@]}"
     fi
 
+    local TMP
+    TMP="$(mktemp -d)"
+    # shellcheck disable=SC2064  # $TMP must expand now, not at trap time
+    trap "rm -rf '$TMP'" EXIT
+
     # --- fetch prerequisites -----------------------------------------------
     # curl got this script here, but the pipe may have been wget, and tar is
     # not guaranteed on a minimal image. Install only what is missing; the full
@@ -78,17 +88,18 @@ main() {
         info "installing fetch prerequisites: ${NEED[*]}"
         command -v apt-get >/dev/null 2>&1 \
             || die "missing ${NEED[*]} and no apt-get to install them (Debian/Ubuntu only)"
-        DEBIAN_FRONTEND=noninteractive apt-get update -qq
-        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${NEED[@]}" \
-            || die "failed to install ${NEED[*]}"
+        # Same quiet style as install.sh: apt's and dpkg's chatter goes to a
+        # log that is only shown when something actually fails.
+        if ! { DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+               && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o Dpkg::Use-Pty=0 \
+                    "${NEED[@]}"; } >"$TMP/apt.log" 2>&1 </dev/null; then
+            cat "$TMP/apt.log" >&2
+            die "failed to install ${NEED[*]}"
+        fi
+        ok "installed ${NEED[*]}"
     fi
 
     # --- download -----------------------------------------------------------
-    local TMP
-    TMP="$(mktemp -d)"
-    # shellcheck disable=SC2064  # $TMP must expand now, not at trap time
-    trap "rm -rf '$TMP'" EXIT
-
     local URL="https://codeload.github.com/${REPO}/tar.gz/${REF}"
     info "fetching ${REPO}@${REF}"
     curl -fsSL --proto '=https' --tlsv1.2 -o "$TMP/src.tar.gz" "$URL" \

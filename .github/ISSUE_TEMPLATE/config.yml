@@ -8,4 +8,4 @@ contact_links:
     about: What every switch and parameter does, and what happens when you raise or lower it (Chinese).
   - name: Is this even the right tool for my link?
     url: https://github.com/CYBERVERSE-Research/skyline-speeder/blob/main/docs/04-performance-report.md
-    about: Target environment, validity boundaries and limitations. Read section 9 before reporting that it did not help.
+    about: Target environment, validity boundaries and limitations. Read section 8 before reporting that it did not help.

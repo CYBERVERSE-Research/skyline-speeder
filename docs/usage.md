@@ -48,6 +48,11 @@ iperf3 -c <对端IP> -u -b 400M -t 10
 | 动态 RTO 调节 | **关闭** | 需要手动开，见第五节 |
 | 重传包 DSCP 标记 | **关闭，且值为 0** | ⚠️ 见第六节，**开之前必须先问网络管理员** |
 | 摘除后回落算法 | `cubic` | 出问题时自动退回的系统默认算法 |
+| 拥塞控制与 qdisc 守护（guard） | **开**，每 5 秒检查一次 | 被别的脚本改回 bbr / cake 会自动改回来，见第七节 |
+
+安装脚本结束时会打印一份摘要：拥塞控制和 qdisc 改之前、之后各是什么，常用命令，以及
+几个最常用参数的当前值。装的过程中所有命令的输出都在 `/var/log/skyline-speeder-install.log`，
+出错时先看它。
 
 检查当前状态：
 
@@ -89,7 +94,8 @@ sudo ssctl enable --modules adaptive-cwnd,pacing
 sudo ssctl enable --all-off
 ```
 
-> 全关时它的表现和系统原生 CUBIC 差异 <0.01%，可以放心当作对照基准。
+> 全关时它不做任何加速，是一个中性基准，可以放心当作对照组（验证数据见
+> [docs/03-design.md](03-design.md) 第 4 节）。
 
 ---
 
@@ -439,6 +445,9 @@ sudo ssctl reset-retransmit-dscp
 ### 补充说明
 
 - 它挂在网卡出方向上，对该网卡**所有 TCP 流量**一致生效，不区分用的是哪种拥塞控制算法。
+- 它只挂在以太网网卡上。配置里的 `runtime.tc_interface` 是 WireGuard / WARP、tun 这类隧道时
+  不会挂载，上面这条开启命令会报错（`ssctl status` 的 `capabilities` → `notes` 里写明原因）：
+  把 `tc_interface` 改成承载隧道流量的那块物理网卡，再重启 `skyline-speederd`。
 - 它**不受** `ssctl drain` 影响。摘除加速功能时，这个标记仍然在工作，要单独关。
 - IPv4 和 IPv6 都支持，我们实测零误标记。
 
@@ -450,12 +459,13 @@ sudo ssctl reset-retransmit-dscp
 sudo ssctl status
 ```
 
-三件事要对：
+四件事要对：
 
 ```
 "enabled": true                      <- 加速已挂载
 "capabilities": { ... 六项硬性前提全 true }   <- 环境满足要求
 "active_flows": 大于 0                <- 有连接在用
+"armed": true（在 "guard" 里）        <- 拥塞控制和 qdisc 正被守着
 ```
 
 **光看这个还不够**，再确认真实连接确实在用它（服务器有流量时执行）：
@@ -468,6 +478,45 @@ ss -tin | grep -c skyline_cc
 
 > `capabilities` 里 `rack_reo_hook: false` 是**正常的**，不影响使用。
 
+### 之前装过「一键 BBR」、改过 qdisc 的机器
+
+不用先卸载它们，也不用手动改回来。`ssctl enable`（安装脚本会自动执行）会：
+
+- 把拥塞控制改成 `skyline_cc`；
+- 把默认 qdisc（`net.core.default_qdisc`）改成 `fq`；
+- 把出口网卡上的 qdisc（`cake`、`fq_pie`、`fq_codel` 等）换成 `fq`——`skyline_cc` 靠 `fq`
+  把数据均匀发出去。出口是 VLAN、bond 或网桥时，换的是它下面的物理网卡（网桥上虚拟机、
+  容器的端口不碰）。
+
+之后 `skyline-speederd` 每 5 秒检查一次，谁改回去就再改过来（比如有脚本又执行了
+`sysctl --system`），并在日志里记一笔：
+
+```bash
+journalctl -u skyline-speederd | grep 'guard:'
+```
+
+带 `something else on this host changed it` 的行反复出现，说明机器上有东西一直在改。
+不影响加速；想根除，就去 `/etc/sysctl.conf`、`/etc/sysctl.d/` 里找写着 `bbr`、`cake` 的
+那一行删掉（安装结束时的摘要会列出这些文件）。
+
+以下情况它**不会动**：
+
+- 网卡上是你自己搭的限速 / 整形 qdisc（`htb`、`tbf`、`netem` 等，以及设了带宽的 `cake`，
+  比如 `cake bandwidth 90Mbit`）——替换会把你的限速配置弄没。`ssctl status` 的 `guard` →
+  `notes` 里会写明它没动；
+- 出口是 WireGuard / WARP 这类隧道、下面找不到物理网卡时——`notes` 里会写
+  `is a virtual device ... no qdisc checked`。想让它管，就把配置里的 `runtime.tc_interface`
+  改成真正的物理网卡；
+- 执行过 `ssctl drain` 之后——摘除即停止守护，qdisc 保持现状（仍是 `fq`）。
+
+不想让它管 qdisc：把 `/etc/skyline-speeder/speeder.toml` 里 `[guard]` 段的 `qdisc` 改成
+`false`，然后：
+
+```bash
+sudo skyline-speederd --config /etc/skyline-speeder/speeder.toml --validate-only
+sudo systemctl restart skyline-speederd.service
+```
+
 ---
 
 ## 八、常见场景配方
@@ -479,7 +528,7 @@ ss -tin | grep -c skyline_cc
 ### 场景 2：想验证到底有没有效果
 
 ```bash
-# 基准：把模块全关（等价于系统原生 CUBIC）
+# 基准：把模块全关（不做任何加速的中性基准）
 sudo ssctl enable --all-off
 # ... 测速 ...
 
@@ -605,7 +654,7 @@ sudo ssctl drain --timeout 60
 # 3. 完全停掉
 sudo systemctl stop skyline-speeder-enable.service skyline-speederd.service
 
-# 4. 彻底卸载（配置文件会保留）
+# 4. 彻底卸载（配置文件会保留；安装前的拥塞控制和 qdisc 会还原回去）
 sudo ./install.sh --uninstall
 ```
 

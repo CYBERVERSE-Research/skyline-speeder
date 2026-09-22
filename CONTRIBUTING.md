@@ -93,11 +93,56 @@ careful around the code that touches them.
    grounds that `install-guest.sh` does not enable it** — that is deliberate:
    attaching changes congestion control for every new connection on the host,
    which is an operational decision, made explicitly by `install.sh`.
+
+   `ssctl enable` is host-wide by itself: after a successful struct_ops attach
+   it writes `net.ipv4.tcp_congestion_control = skyline_cc`. **The order of the
+   sysctl writes is an invariant**: `enable` writes after the attach (the kernel
+   rejects a name that is not registered), and `drain` writes `fallback_cc`
+   back before it unregisters. skyline-speederd is that sysctl's single owner
+   (every write goes through `set_default_congestion_control` in
+   `crates/skyline-speederd/src/main.rs`); `infra/boot-enable.sh` writes no
+   sysctl, and `infra/boot-disable.sh` drains first and writes the sysctl only
+   if the default is still `skyline_cc` afterwards -- the fallback for when the
+   daemon is already gone (written before the drain, the still-armed guard would
+   put `skyline_cc` back).
+
+   **Being switched back after the attach is just as silent.** A "one-click
+   BBR" script's `bbr` line in `/etc/sysctl.d`, re-applied by
+   `sysctl --system`, moves every new connection off `skyline_cc` without an
+   error. So between `enable` and `drain` the guard
+   (`crates/skyline-speederd/src/guard.rs`, config `[guard]`) keeps three
+   things in place: the default congestion control and, with
+   `[guard] qdisc = true` (the default), `net.core.default_qdisc = fq` and the
+   root qdisc of `runtime.tc_interface` (`fq`, or `mq` over `fq` on a
+   multi-queue NIC; when that is a VLAN, bond or bridge whose root is
+   `noqueue`, the NICs with a `device` link under it instead, never a tap or
+   veth). The daemon is the only writer of all three:
+   `boot-enable.sh` used to write `default_qdisc=fq` once at boot and no longer
+   does -- do not add it back. Related invariants:
+   - `enable` arms the guard only after it has written `skyline_cc`. `drain`
+     disarms it first and writes `fallback_cc` **while still holding the
+     guard's lock**; otherwise a periodic check could write `skyline_cc` back
+     after the drain. A drain that times out leaves it disarmed too.
+   - On stop, the guard thread is stopped and joined before `BpfRuntime` drops
+     and unregisters the struct_ops (`impl Drop for Daemon`).
+   - **Stopping the daemon writes no sysctl.** The maintainer explicitly does
+     not want `fallback_cc` written on stop; `drain` and the enable unit's
+     `ExecStop` do that.
+   - The guard replaces only qdisc kinds with no configuration worth keeping
+     (`pfifo_fast`, `fq_codel`, an unshaped `cake`, `fq_pie`, ...). Classful,
+     shaping and offload kinds (`htb`, `tbf`, `netem`, `mqprio`, ...), a
+     `cake` with a bandwidth or `autorate-ingress`, `noqueue` and unknown kinds
+     are left alone: replacing them would silently destroy an operator's
+     shaping.
 3. **`tc_interface` pointing at the wrong NIC.** The default in
    `config/speeder-guest.toml` is the test bed's interface name and will almost
-   never match a real host. `install.sh` detects the default-route interface and
-   rewrites it, but only on first install — it never overwrites an
-   operator-edited config.
+   never match a real host. `install.sh` rewrites it with the first Ethernet
+   device a default route (IPv4, then IPv6) leaves through, but only on first
+   install — it never overwrites an operator-edited config. When the default
+   route only goes through a tunnel (WireGuard, tun, ...) it keeps the
+   placeholder and warns: skyline_tc is only attached to an Ethernet device. The guard keeps the root qdisc of that same NIC on
+   `fq`: pointed at the wrong one, the real egress NIC keeps whatever qdisc it
+   had, and the other NIC gets `fq` instead.
 
 ## Naming landmine
 
@@ -132,7 +177,7 @@ and **must not be used to draw performance conclusions**.
 | ABI struct | `skyline_abi.h` + `crates/skyline-common` + `SKYLINE_ABI_VERSION` |
 | `ssctl` command or field | `docs/02-interface-reference.md` |
 | Config field | `config/*.toml` + `docs/02-interface-reference.md` section 6 |
-| Install flow | `docs/01-deployment-guide.md` + `DEPLOY.md` + `install.sh` |
+| Install flow | `docs/01-deployment-guide.md` + `DEPLOY.md` + `install.sh` + `scripts/bootstrap.sh` |
 | Algorithm behaviour | `docs/03-design.md`; performance claims need data in `docs/04-performance-report.md` |
 | Anything user-facing in the README | Both `README.md` and `README.zh.md` |
 
@@ -149,7 +194,13 @@ and **must not be used to draw performance conclusions**.
 ## Cutting a release
 
 Release artifacts are built by `.github/workflows/release.yml` when a `v*` tag
-is pushed. It compiles the BPF objects against a **pinned reference header**
+is pushed. Before building anything it checks that the tag is exactly `v`
+followed by the workspace version in `Cargo.toml`, and that `CHANGELOG.md` has a
+`## [<version>]` heading for it; otherwise it stops. So bump
+`[workspace.package] version` and turn `## [Unreleased]` into the release's
+section before tagging: the version is what `--version`, `ssctl status` and the
+installer's upgrade summary report. The build uses `--locked`, as CI does. It
+compiles the BPF objects against a **pinned reference header**
 generated from the oldest supported kernel, not against whatever the runner
 boots — CO-RE fixes field offsets, but it cannot conjure a field that does not
 exist, so an object built against a 6.17 header can reference something absent

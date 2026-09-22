@@ -111,16 +111,17 @@ cd skyline-speeder
 sudo ./install.sh              # build from source
 sudo ./install.sh --prebuilt   # published release artifacts, no toolchain
 sudo ./install.sh --check      # preflight only, changes nothing
-sudo ./install.sh --no-enable  # install without attaching skyline_cc
+sudo ./install.sh --no-enable  # install, but attach nothing that was not attached
+sudo ./install.sh --verbose    # every command's output instead of the progress line
 sudo ./install.sh --uninstall  # remove (keeps /etc/skyline-speeder)
 ```
 
-The installer checks the kernel, builds or downloads the three BPF objects and the daemon, points the TC program at the default-route interface, runs every object through the kernel verifier, then starts the daemon, attaches `skyline_cc` and enables both at boot. It records the congestion control and qdisc in use beforehand, and `--uninstall` restores them. **It installs no proxy and opens no port.**
+The installer checks the kernel, builds or downloads the three BPF objects and the daemon, points the TC program at the default-route interface (IPv4 or IPv6; when that route leaves through a tunnel such as WireGuard, it asks you to name the NIC), runs every object through the kernel verifier, then starts the daemon, attaches `skyline_cc` and enables both at boot. It shows one progress line and keeps every command's output in `/var/log/skyline-speeder-install.log`; when it finishes it prints the congestion control and qdisc before and after, then a short guide to `ssctl` and tuning. It records the congestion control and qdiscs in use beforehand, including the egress interface's root qdisc, and `--uninstall` restores them. **It installs no proxy and opens no port.**
 
-`--prebuilt` needs only `curl` and `tar`: the objects are CO-RE, compiled against a pinned 6.12 header and relocated against this kernel when they load. The prebuilt daemon is built on Ubuntu 24.04 and needs glibc 2.38 or newer with `libelf.so.1` and `libz.so.1` (Debian 13, Ubuntu 24.04 and later); on older userspace, build from source. `--release <tag>` pins a version, and `SKYLINE_ARTIFACT_URL=/path/to/tarball sudo -E ./install.sh --prebuilt` installs a copied artifact on a host with no route to GitHub.
+`--prebuilt` needs no toolchain, only `curl`, `tar` and `iproute2` (the installer installs them): the objects are CO-RE, compiled against a pinned 6.12 header and relocated against this kernel when they load. The prebuilt daemon is built on Ubuntu 24.04 and needs glibc 2.38 or newer with `libelf.so.1` and `libz.so.1` (Debian 13, Ubuntu 24.04 and later); on older userspace, build from source. `--release <tag>` pins a version, and `SKYLINE_ARTIFACT_URL=/path/to/tarball sudo -E ./install.sh --prebuilt` installs a copied artifact on a host with no route to GitHub. It installs a published release, which can be older than this README: the v0.2.0 release, for one, predates the qdisc guard described under Configuration, and the installer says so when that is the case.
 
 > [!IMPORTANT]
-> **Upgrading:** re-running the installer replaces the files but does not restart a daemon that is already running, so the old version keeps running. Stop the services first with `sudo systemctl stop skyline-speeder-enable.service skyline-speederd.service`, or restart `skyline-speederd` afterwards. Details: [CHANGELOG.md](CHANGELOG.md), *Upgrading from 0.1.0*.
+> **Upgrading:** run the installer again, the same way. Once the new objects pass the kernel verifier it restarts `skyline-speederd` itself, draining live flows for up to 60 seconds, and attaches `skyline_cc` again, also on a host where it was attached by hand with `ssctl enable`. Settings changed with `ssctl` do not survive the restart. Details: [CHANGELOG.md](CHANGELOG.md), *Upgrading from 0.2.0*.
 
 Day-to-day:
 
@@ -151,7 +152,7 @@ ssctl enable --modules adaptive-cwnd,pacing   # selected modules only
 ssctl enable --all-off                        # everything off, as a control baseline
 ```
 
-`ssctl enable` takes effect host-wide: on a successful attach it sets `net.ipv4.tcp_congestion_control = skyline_cc`, so every new TCP connection on the machine uses it.
+`ssctl enable` takes effect host-wide: on a successful attach it sets `net.ipv4.tcp_congestion_control = skyline_cc`, so every new TCP connection on the machine uses it. It also sets `fq`, the qdisc pacing goes through, as `net.core.default_qdisc` and as the egress NIC's root qdisc (for a VLAN, bond or bridge, that of the physical NICs under it). Until `ssctl drain`, the daemon puts all three back whenever something else changes them, for instance a "one-click BBR" script's sysctl file being applied again, and logs each correction. A qdisc built on purpose (`htb`, `tbf`, `netem`, a `cake` with a bandwidth set, ...) is left alone, and `[guard] qdisc = false` in the config leaves qdiscs to you.
 
 **Coefficients.** Seventeen parameters (gains, guardrail, loss-compensation ceiling, queueing-delay threshold, startup behaviour, rate and window caps) change online with `ssctl set-module-config`, no restart. [docs/usage.md](docs/usage.md) (Chinese) explains each one and has four ready-made presets, including a "high random loss" preset for links that really do lose 10-20% at random.
 
@@ -223,7 +224,7 @@ The documents under `docs/` are in Chinese.
 | [docs/01-deployment-guide.md](docs/01-deployment-guide.md) | Build, install, configure, verify, tune, roll back |
 | [docs/02-interface-reference.md](docs/02-interface-reference.md) | `ssctl` commands, wire protocol, config fields, event codes |
 | [docs/03-design.md](docs/03-design.md) | Architecture and how each module works |
-| [docs/04-performance-report.md](docs/04-performance-report.md) | Controlled test bed: environment, results, neutrality, limitations |
+| [docs/04-performance-report.md](docs/04-performance-report.md) | Controlled test bed: environment, results against bbr, limitations |
 | [research/experiments/README.md](research/experiments/README.md) | Reproducing the performance tests |
 | [DEPLOY.md](DEPLOY.md) | Deterministic deployment manual for automation agents |
 

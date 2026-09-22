@@ -126,6 +126,23 @@ friendliness 地板，防止极短拥塞周期下增长长期趋近于 0）。
 这三块合起来保证：无论 M1-M4 开关如何组合，只要 M2/M4 关闭，cwnd 增长和
 pacing 行为都精确对齐内核原生实现。
 
+**验证**（双 VM 测试床，`research/experiments/manifests/neutrality.toml`，
+`n=2`，中位数，单位 Mbit/s；与 `docs/04-performance-report.md` 的主数据是同
+一次构建——内核 6.18.40，`skyline_cc.bpf.o` SHA-256 前 12 位
+`1cb1d581c4f7`，见该报告附录 A）：
+
+| 场景 | `b1-controlled-cubic`（内核 CUBIC + `fq`） | `b2-skyline-base`（模块全关） | `skyline-best`（模块全开） |
+|---|---:|---:|---:|
+| `dc-lowrtt`（RTT 2ms、1000 Mbit/s、0% 丢包） | 956.41 | 956.39 | 956.41 |
+| `line-rate`（RTT 20ms、1000 Mbit/s、0% 丢包） | 956.41 | 956.41 | 956.40 |
+
+两个零丢包场景下三者差异全部 <0.01%：模块全关这条路径没有引入可测的系统
+性偏差。BPF 代码注释里的 "B1/B2 neutrality" 指的就是 `b1`/`b2` 这两个
+profile 在这里的对等。这是一条正确性检查，不是性能对比，门槛只看零丢包场景：
+同一 manifest 里另有两个轻丢包场景（`light-loss`/`primary`），`b1`/`b2` 在那
+个区间本身高度不稳定、`n=2` 下方差偏大，不用于这条门槛。表中 `skyline-best`
+用的是第 12 节所说的第一代系数。
+
 ## 5. M1：早期丢包感知
 
 Linux 内核自带的 RACK（Recent Acknowledgment）+ TLP（Tail Loss Probe）用
@@ -298,6 +315,10 @@ M3 关闭或 `loss_inflation_max_ratio=0.0` 时补偿系数恒为 1.0（完全�
 pacing 速率 = 带宽估计 × 增益 × M3 的丢包补偿系数，并被 `max_pacing_mbps`
 硬性封顶；M4 关闭时退化为第 4 节的 auto-pacing 或完全交还内核默认行为。
 
+出口网卡上的根 qdisc 是 `fq`，这件事由控制面负责（第 11 节的 guard），而不是假定
+主机本来就这样：`net.core.default_qdisc` 只影响之后新建的 qdisc，网卡的根 qdisc
+常在它生效之前就已建好，很多 VPS 上还被"一键加速"脚本换成了 `cake`/`fq_pie`。
+
 **增益选择**：M2 开启且处于 STARTUP 用 `startup_gain`；其余情况（M2 开启
 且 CRUISE，或 M2 关闭）用 `cruise_pacing_gain`。护栏触发时不管前面算出多
 少，强制钳位到 `guardrail_gain`——这是唯一还存在的"低于正常值"的增益路
@@ -327,6 +348,12 @@ pacing 速率 = 带宽估计 × 增益 × M3 的丢包补偿系数，并被 `max
   是独立实现的函数，不共用同一段校验和修正逻辑。IPv6 路径遇到分片/认证头/
   未知扩展头/超过扩展头层数上限一律放行不处理（fail-open）。
 
+两件事都从报文偏移 0 处的以太网帧头开始解析，所以 TC 程序只挂在以太网设备上
+（`/sys/class/net/<网卡>/type` 为 1；VLAN、bond、网桥也是）。WireGuard/WARP、tun、
+gre、ppp 这类三层隧道上没有这个帧头：统计会悄悄什么都数不到，启用的 DSCP 标记则会按
+以太网偏移写进 IP 头内部。`tc_interface` 是这类设备时，控制面直接拒绝挂载 TC 程序并在
+状态里说明原因，而不是带着告警挂上去。
+
 ## 10. 模块间数据流小结
 
 M2 开启时直接掌管 cwnd（每次 ACK、每种 CA 状态都赋值），绕开 PRR；M3 只提
@@ -354,10 +381,67 @@ enable=生效。`--validate-only --verify-bpf` 是一次性健康检查：把 BP
 开始——因为 M2 状态机的很多判断以整轮为单位累积，允许轮中途切换参数会出
 现"这轮的窗口用旧参数算的，退出阈值却已是新参数"的自相矛盾。
 
-**Drain**：按顺序执行——先关闭"给新连接分配 Skyline Speeder"的开关，之后新建立的连接
-沿用 `fallback_cc`；然后轮询等待现有 Skyline Speeder 连接数归零（默认超时 300 秒，超
+**Drain**：按顺序执行——先解除 guard（见下），再关闭"给新连接分配 Skyline Speeder"的
+开关（全局默认算法写回 `fallback_cc`，然后是 cgroup 派发），之后新建立的连接沿用
+`fallback_cc`；然后轮询等待现有 Skyline Speeder 连接数归零（默认超时 300 秒，超
 时报错退出，不强制摘除）；确认归零后才真正注销 struct_ops。只影响 M2/M3/
 M4，M1 的两层（若已启用）不受影响。
+
+**Guard（拥塞控制与 qdisc 守护）**：`enable` 把全机默认算法写成 `skyline_cc`，但这只是
+一次写入，主机上别的东西随时可能把它改掉——典型是"一键 BBR"脚本留在 `/etc/sysctl.d`
+里的 `bbr` 被下一次 `sysctl --system` 重新应用。改掉之后每条新连接都悄悄绕开
+`skyline_cc`，没有任何报错，属于本项目最怕的那类静默失效。所以从 `enable` 到 `drain`，
+控制面独占三项设置并周期性（`[guard] interval_s`，默认 5 秒）核对：默认拥塞控制、
+`net.core.default_qdisc`、出口网卡的根 qdisc（后两项可用 `[guard] qdisc = false`
+放手）。设计上的几个取舍：
+
+- **只有一个写入者。** 这三项此前分散在 daemon（拥塞控制）与开机脚本
+  `boot-enable.sh`（`default_qdisc`，开机时写一次）两处；两处写同一个设置就会各说各话，
+  所以 qdisc 也收归 daemon，开机脚本不再写任何 sysctl。
+- **替换根 qdisc，而不只是改 sysctl。** `default_qdisc` 只决定之后新建的 qdisc；一台
+  全新的 Debian 13 主机上实测，`/etc/sysctl.d` 写着 `fq`，`eth0` 仍是 `fq_codel`。
+  多队列网卡换成 `mq`（子队列按刚设好的默认 `fq` 创建），不换成单个 `fq`——那会把
+  所有发送队列压到一把锁上。新 `mq` 的子队列只看 `default_qdisc`，所以它读回来不是
+  `fq` 时就不建：从 `cake` 的默认值建出来的新 `mq`，装上的恰恰是要去掉的东西。
+- **尽量只让网卡停发一次。** 逐个替换 `mq` 的子队列，每换一个都让整块网卡停发一次
+  （`mq_graft`），64 队列就是连续 64 次；而对 `tc` 建的 `mq` 执行 `replace root mq` 是内核接受却不改任何
+  东西的空操作。所以要换多个子队列时，用一个没被占用的句柄新建整棵 `mq`（`root handle
+  <M>: mq`），一次嫁接完成；只有一个子队列要换、或 `default_qdisc` 不是 `fq`（新 `mq`
+  会按它建子队列）时才逐个替换。
+- **找真正排队的那块网卡。** VLAN、bond、网桥的根是内核默认的 `noqueue`，它们自己不排队，
+  一键脚本的 `cake` 装在下面的物理网卡上。所以 `tc_interface` 的根是 `noqueue` 时，guard
+  顺着 `lower_*` 链接往下找有 `device` 链接的物理/virtio 网卡去管；tap、veth 这类端口
+  一律不碰——网桥上虚拟机和容器的端口不是本机的出口。下面找不到网卡的隧道设备
+  （例如内核 WireGuard）只说明，不当成"有人刻意设的 `noqueue`"；tun、PPP 设备有自己的
+  qdisc，当作 `tc_interface` 时 guard 管它自己的根。
+- **刻意搭建的东西不碰。** 只替换"没有值得保留的配置"的种类（内核默认的 `pfifo_fast`、
+  `fq_codel`，以及一键脚本常装的 `cake`/`fq_pie` 等 AQM）；`htb`/`tbf`/`netem`/`mqprio`
+  这类分类、整形、硬件卸载 qdisc，设了带宽（或 `autorate-ingress`）的 `cake`——那是有人
+  设的限速器，和 `tbf` 一样——以及物理网卡上被人设成的 `noqueue`，一律保留并在状态里
+  说明：替换它们会悄悄毁掉运维的整形配置，代价远大于没有 `fq`。不认识的种类同样保留。
+- **失败后退避，而不是放弃或死磕。** 每次替换都会让网卡短暂停发，不能每个周期都试；但多数
+  失败是暂时的（一次 netlink 内存不足、一个超时被杀的 `tc`），就此不再重试会让网卡一直
+  留在 `cake` 上，直到有人想起来执行 `enable`。所以同一块网卡替换失败后按 30 秒（或
+  `interval_s`，取大者）起步、每次翻倍、最长 5 分钟（或一个 `interval_s`，取大者）重试，并取整到
+  `interval_s` 的整数倍；根 qdisc 变样、`enable` 都立即重试。
+- **卡住的 `tc` 不能卡住 drain。** 每次调用 `tc` 有 10 秒上限；卡在 rtnl 锁上的 `tc`
+  处于不可中断睡眠，SIGKILL 要等锁释放才生效，阻塞地等它退出就会一直占着 guard 的锁——
+  而 `drain` 写回 `fallback_cc` 之前要拿的正是这把锁。所以超时的 `tc` 杀掉后交给后台
+  线程回收，在它退出之前后续的 `tc` 一律立即失败，一次卡住的 rtnl 最多让一次检查（和排在
+  它后面的 `drain`、`status`）多等约 10 秒。
+- **与 drain 无竞态。** 周期检查、`enable` 的武装和 `drain` 的解除共用一把锁，`drain`
+  在持锁状态下写回 `fallback_cc`，因此不存在"drain 刚写回、检查又把 `skyline_cc` 写回去"
+  的交错；drain 超时报错时 guard 同样保持解除，不和随后接手的人（例如实验矩阵）抢设置。
+- **停止时不写 sysctl。** daemon 退出时先停掉并等待 guard 线程结束，再注销 struct_ops
+  （否则一次已武装的检查可能去写一个内核已不认识的 `skyline_cc`）；它不把 `fallback_cc`
+  写回去——这是刻意的决定，写回由 `drain` 和 enable unit 的 `ExecStop` 负责。`ExecStop`
+  （`boot-disable.sh`）先执行 `drain`，之后只在默认仍是 `skyline_cc` 时（daemon 已经不在）
+  才自己写一次：先写 sysctl 再 drain 的话，仍处于武装状态的 guard 会把它改回
+  `skyline_cc`，还在日志里记成"主机上有别的东西改了它"。
+
+每次改动都记一行 `guard: ...` 到 journald，这是运维发现"主机上有东西在跟我抢设置"的唯一
+线索；刻意没动的东西只在内容变化时记一次。字段与规则见
+`docs/02-interface-reference.md` 第 4、6.8、9 节。
 
 **TOML 配置 → BPF 二进制格式**：配置文件里的值是给人看的（比如 0.25 这种
 小数），BPF 程序里不能用浮点数（内核验证器不允许），Rust 侧统一做换算：

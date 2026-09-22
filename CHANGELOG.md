@@ -10,6 +10,240 @@ for anyone holding a prebuilt `.bpf.o`.
 
 ## [Unreleased]
 
+### Upgrading from 0.2.0
+
+- **Re-run the new `install.sh` the way the host was installed** (with
+  `--prebuilt` or `--no-enable` if it was installed with them). It now restarts
+  `skyline-speederd` itself once the new objects have passed the kernel
+  verifier, so the stop/restart steps in the 0.2.0 notes below are no longer
+  needed. When `skyline-speeder-enable.service` is active the restart drains
+  live flows for up to 60 seconds (over SSH it always runs into that timeout,
+  which is harmless) and attaches skyline_cc again. This works on a host
+  installed with 0.2.0 or earlier: what matters is the `install.sh` that runs,
+  not the version it replaces. `scripts/bootstrap.sh` still fetches `main`
+  unless given `--ref`.
+- **A host where skyline_cc was attached with a bare `ssctl enable`**
+  (`skyline-speeder-enable.service` not active, while the old daemon reports
+  `enabled` or the default is `skyline_cc`) needs no manual drain any more.
+  No `ExecStop` drains it and stopping the daemon still writes no sysctl, so
+  the installer runs `ssctl drain --timeout 60` itself before the restart (a
+  failure is only logged). Afterwards the enable unit attaches skyline_cc, and
+  from then on at every boot; with `--no-enable` the installer runs
+  `ssctl enable` once more instead, so the host ends as it was: attached by
+  hand, not at boot.
+- **Settings made with `ssctl` do not survive the restart**, as before. The
+  installer now writes the old daemon's `ssctl status` into
+  `/var/log/skyline-speeder-install.log`; re-apply from there what the host
+  depends on (see *Upgrading from 0.1.0* for which commands).
+- **`ssctl enable` now also changes qdiscs.** An installed
+  `/etc/skyline-speeder/speeder.toml` from 0.2.0 has no `[guard]` table and is
+  never overwritten, so it gets the defaults, `interval_s = 5` and
+  `qdisc = true`: after the upgrade, attaching skyline_cc also sets
+  `net.core.default_qdisc = fq` and replaces the root qdisc of
+  `runtime.tc_interface` with `fq` (of the physical NICs under it, when it is a
+  VLAN, bond or bridge), and the daemon keeps them there until the next drain.
+  A root qdisc that looks built on purpose (`htb`, `tbf`, `netem`, `mqprio`, a
+  `cake` with a bandwidth set, ...) is left alone. To keep 0.2.0's behaviour,
+  add `[guard]` with `qdisc = false` to the installed file; a 0.2.0 daemon
+  ignores the table, so it can go in before the upgrade.
+- **`runtime.tc_interface` has to be an Ethernet device.** skyline_tc is no
+  longer attached to a WireGuard/WARP, tun, GRE or PPP device (see Changed). An
+  existing config is never rewritten, but the installer now warns when
+  `tc_interface` names no device on the host (for instance the `link` that
+  0.2.0's installer wrote on a host whose default route was
+  `default dev wg0 scope link`) or a device that is not Ethernet: set it to the
+  NIC that carries the traffic, then `sudo systemctl restart skyline-speederd`.
+- `infra/boot-enable.sh` no longer writes `net.core.default_qdisc=fq` at boot.
+  With `[guard] qdisc = false` nothing in Skyline Speeder sets a qdisc any
+  more; set it in `/etc/sysctl.d` if the host relies on it.
+
+### Added
+
+- **The guard: skyline-speederd keeps the host on skyline_cc and fq.**
+  "One-click BBR" scripts write `tcp_congestion_control=bbr` and
+  `default_qdisc=cake` or `fq_pie` into `/etc/sysctl.conf` or
+  `/etc/sysctl.d`. Anything that re-runs `sysctl --system` then flips the
+  default back to bbr, and every new connection bypasses skyline_cc with no
+  error anywhere. `default_qdisc` also only shapes qdiscs created afterwards,
+  so a NIC set up before it keeps `fq_codel` or `cake`. From a successful
+  `ssctl enable` until the next `ssctl drain`, the daemon is now the single
+  owner of `net.ipv4.tcp_congestion_control`, `net.core.default_qdisc` and the
+  root qdisc of the egress NIC (`fq`, or `mq` over `fq` on a multi-queue NIC).
+  It checks them when `enable` runs and then every `[guard] interval_s`
+  seconds, and puts back whatever something else changed. Every correction is
+  logged to the journal as a `guard: <what> <old> -> <new>` line, and the
+  `enable` response lists what that enable changed. A qdisc it cannot fix never
+  fails `enable`. Drain disarms it before writing `fallback_cc`, under the same
+  lock, so a check cannot put skyline_cc back after a drain; the daemon's own
+  stop still writes no sysctl.
+  - *Which NIC.* `runtime.tc_interface` itself, unless its root is the kernel's
+    default `noqueue` (a VLAN, bond, bridge or macvlan, which queue nothing):
+    then the physical or virtio NICs found under it through `lower_*` links, up
+    to four levels (bond slaves, a VLAN's real device, a bridge's physical
+    ports). A VM's tap or a container's veth is never touched. A noqueue
+    device with no NIC under it (a kernel WireGuard device, or a bridge of
+    taps only) is noted in the status, and no qdisc is checked; a tun or PPP
+    device has a qdisc of its own and is managed itself, like a NIC.
+  - *What is replaced.* Only kinds with nothing worth keeping (`pfifo_fast`,
+    `fq_codel`, `fq_pie`, an unshaped `cake` and the like). Classful, shaping
+    and offload qdiscs, a `cake` with a `bandwidth` or `autorate-ingress`,
+    `noqueue` set on a NIC by hand, and unknown kinds are left alone and named
+    in the status (`eth0 root qdisc cake (bandwidth 90Mbit) looks deliberate;
+    left alone`).
+  - *How.* A single-queue NIC gets `root fq`. A multi-queue NIC gets a fresh
+    `root mq`, whose children the kernel builds from `default_qdisc`, and only
+    while that reads back `fq`; otherwise the root is left alone with an error.
+    An `mq` that `tc` created is replaced in one step by a new `mq` under a
+    handle nothing on the device uses, rather than child by child, which would
+    stop the whole NIC once per queue.
+  - *When it fails.* A failed replace is retried after 30 seconds (or one
+    interval, if longer), doubling on each consecutive failure up to five
+    minutes; `ssctl enable` retries at once. Every `tc` call is bounded by 10
+    seconds; one that is killed is reaped in the background, and until it has
+    exited further `tc` calls fail at once, so a stuck rtnl lock delays a pass,
+    and a drain or status request waiting behind it, by about ten seconds
+    rather than indefinitely.
+- `[guard]` in `speeder.toml`: `interval_s` (default 5, `0`..=`3600`; `0` means
+  no periodic check, `enable` still checks once) and `qdisc` (default `true`;
+  `false` leaves every qdisc alone). A config without the table gets the
+  defaults.
+- `guard` in `ssctl status`: whether it is armed, the counters
+  (`checks`, `cc_restored`, `default_qdisc_restored`,
+  `interface_qdisc_replaced`), the last correction and error, notes on what it
+  left alone or is backing off from, and a live read of the congestion
+  control, `default_qdisc`, the interface's own root qdisc (`fq`, `mq/fq`,
+  `cake`, ...) and `devices`, the NICs it manages with their root qdiscs.
+- `skyline-speederd --version`, `ssctl --version`, and `version` in
+  `ssctl status`, which is the running daemon's version. A mismatch with
+  `skyline-speederd --version` means the daemon was not restarted after an
+  upgrade. A newer `ssctl` still decodes a status without `version` or `guard`.
+- **A quiet installer with a guide at the end.** `install.sh` shows one
+  progress line redrawn in place, with the step, elapsed time and a spinner,
+  plus warnings. Everything the steps print goes to
+  `/var/log/skyline-speeder-install.log`, which is kept. Piped into a file or
+  a CI log it prints one plain line as each step starts and ends; `--verbose`
+  (or `SKYLINE_VERBOSE=1`) streams all output instead. A failure shows the
+  error, the failing step's last lines of the log and the log's path. The end
+  of an install shows the congestion control and qdiscs before and after (one
+  row per managed NIC, with the reason for any it left alone), the sysctl
+  files that still set something else (reported, never edited), the everyday
+  `ssctl` commands, and how to tune the most common parameters live and
+  persistently, with their current values. Which files count at boot follows
+  systemd-sysctl: a same-named file in `/etc`, including a `/dev/null` link or
+  an empty file, masks the others, and `/etc/sysctl.conf` counts only through
+  a `sysctl.d` entry that links to it; otherwise it is reported as applied by
+  `sysctl -p` / `sysctl --system` only. `--check` also prints the current
+  congestion control, qdiscs and these settings.
+- The installer's last step asks the new daemon, not just the sysctl, whether
+  skyline_cc is attached: `enabled` must be true, the guard armed (when the
+  daemon has one) and the default `skyline_cc`. If not, it restarts
+  `skyline-speeder-enable.service` once and otherwise fails, pointing at
+  `sudo ssctl enable` and the unit's journal. (After skyline-speederd was
+  killed out of band, the enable unit stays `active (exited)`, so a plain
+  `enable --now` attached nothing while the default still named the dead
+  daemon's skyline_cc.)
+- The pre-install snapshot also records the root qdisc of every NIC the guard
+  will manage (`PRE_INSTALL_QDISC_DEV` and `PRE_INSTALL_ROOT_QDISC`, two
+  space-separated lists in step; one NIC looks like a plain name and summary),
+  and `--uninstall` puts each one's kind back, with default parameters, if it
+  still has the `fq` or `mq/fq` Skyline Speeder left there. An `mq` is rebuilt
+  with `tc qdisc del` of the root (a `replace root mq` over the guard's
+  `tc`-made `mq` changes nothing), falling back to `replace root mq` over the
+  kernel's own handle-0 `mq`. A new snapshot always carries both keys, empty
+  when no NIC is known; only a 0.2.0 snapshot, which has neither, gets them
+  added on upgrade, and its existing keys are not touched.
+- `release.yml` refuses to build unless the tag is `v` plus the workspace
+  version and `CHANGELOG.md` has a `## [<version>]` section for it, so a
+  release can no longer ship binaries whose `--version` names another release.
+
+### Changed
+
+- **A bare `ssctl enable` now also sets `fq`.** With the default
+  `[guard] qdisc = true` it writes `net.core.default_qdisc = fq` and replaces
+  the root qdisc of `runtime.tc_interface` (or of the NICs under it); before,
+  it touched no qdisc. Set `[guard] qdisc = false` to opt out.
+- **skyline_tc is only attached to an Ethernet device**
+  (`/sys/class/net/<if>/type` 1; VLANs, bonds and bridges qualify). It parses
+  an Ethernet header at offset 0, so on an L3 tunnel its counters silently
+  counted nothing and an enabled DSCP writer would have written inside the IP
+  header. On any other device the daemon now refuses to attach it: the status
+  says why under `capabilities.notes`, `--validate-only` prints it too, and
+  `set-retransmit-dscp` fails.
+- `infra/boot-enable.sh` writes no sysctl at all and no longer runs
+  `modprobe sch_fq`: the daemon owns `default_qdisc` now, and the kernel loads
+  `sch_fq` itself when it is written. The one-shot write at boot was not
+  enough anyway, since it never reached the NIC's root qdisc and the next
+  `sysctl --system` undid it.
+- `infra/boot-disable.sh` (the enable unit's `ExecStop`) runs `ssctl drain`
+  first and writes `fallback_cc` itself only if the default is still
+  `skyline_cc` afterwards, that is when the daemon was already gone. Writing it
+  before the drain, as it did, let the still-armed guard put skyline_cc back
+  and log a misleading "something else on this host changed it".
+- **`install.sh` restarts a running `skyline-speederd` on upgrade**, after the
+  verifier has passed, instead of leaving the old daemon in memory, and drains
+  a host attached with a bare `ssctl enable` first (see Upgrading). The
+  summary shows the version it upgraded from.
+- `install.sh --no-enable` attaches nothing that was not attached: it enables
+  no unit and disables none, re-attaches after the upgrade restart only what a
+  bare `ssctl enable` had attached, and reports the attach state the new
+  daemon and the host default actually show.
+- `install.sh` points `runtime.tc_interface` at the first Ethernet device a
+  default route leaves through, IPv4 routes first, then IPv6. When the only
+  default route goes through a tunnel it keeps the placeholder and warns that
+  the NIC has to be set by hand; a configured `tc_interface` that does not
+  exist or is not Ethernet is warned about, never rewritten.
+- Both install paths, source and `--prebuilt`, install `iproute2`, which the
+  guard needs for `tc`. apt waits up to five minutes for the dpkg lock (a
+  fresh cloud VM is often still running unattended-upgrades) and keeps an
+  operator's changed configuration files instead of prompting.
+- `--prebuilt` installs a published release, which can be older than the
+  `install.sh` that runs it: 0.2.0, for one, has no guard. The installer now
+  recognises such a daemon (no `guard` in its status), says so in one warning,
+  marks the qdisc row "(not managed by this release)" and claims nothing about
+  keeping settings in place.
+- `scripts/bootstrap.sh` prints apt's output only when apt fails, and uses
+  colours only on a terminal.
+- `release.yml` builds with `cargo build --locked`, and CI runs `cargo check`
+  and `cargo test` with `--locked`, so a stale `Cargo.lock` fails on the pull
+  request rather than at tag time.
+- `docs/04-performance-report.md` compares only with BBR. The acceptance
+  criteria are now stated against `bbr-fq` alone; BBR was the strongest
+  baseline wherever a criterion was evaluated, so no outcome changes. The
+  check that all modules off matches the kernel's built-in congestion control,
+  which is a correctness test rather than a performance comparison, moved to
+  `docs/03-design.md` section 4, and the report's later sections are
+  renumbered.
+- `DEPLOY.md` and `docs/01-deployment-guide.md` cover the `--prebuilt` path
+  (glibc and library requirements, `--release`, `SKYLINE_ARTIFACT_URL`,
+  checksums) next to the source build.
+
+### Fixed
+
+- `skyline-speeder-enable.service` pointed `Documentation=` at
+  `file:/usr/share/doc/skyline-speeder/01-deployment-guide.md`, which nothing
+  installs. Both units now link to the deployment guide on GitHub.
+- `install.sh` took the default-route interface from the fifth field of
+  `ip -o route show default`, which is not the device on a route without a
+  gateway (`default dev wg0 scope link`). It now takes the word after `dev`;
+  the same command in `DEPLOY.md` is fixed too.
+- `install.sh` found no egress interface on an IPv6-only host, since it only
+  read the IPv4 default route; it now falls back to `ip -6 route`, and so does
+  the command in `DEPLOY.md`.
+- `install.sh --prebuilt` stopped with no error message when the release had
+  no artifact for the host's architecture: `set -e` ended it on the failed
+  lookup before it could print "no prebuilt artifact for <arch>".
+
+### Known issues
+
+- Stopping or restarting `skyline-speederd` by hand while skyline_cc was
+  attached with a bare `ssctl enable` (`skyline-speeder-enable.service` not
+  active) still does not write `fallback_cc` back to
+  `net.ipv4.tcp_congestion_control`; this is deliberate. `ssctl drain` does,
+  and so does that unit's `ExecStop` when it is active. `install.sh` drains
+  such a host itself before its upgrade restart.
+- The prebuilt `skyline-speederd` still needs glibc 2.38 or newer with
+  `libelf.so.1` and `libz.so.1` (see 0.2.0).
+
 ## [0.2.0] - 2026-09-22
 
 ### Upgrading from 0.1.0

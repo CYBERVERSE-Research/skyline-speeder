@@ -43,7 +43,7 @@
 # 的权威依据**（发送端抓包直接看 wire，不受这个口径问题影响）；这五组
 # case 里 false_positives 全部是 0，标记机制本身没有问题。gso_packets 这
 # 个计数器在这个环境下是否测的是别的东西是一个更大范围、跟这次 DSCP 功能
-# 无关的独立问题，见 docs/04-performance-report.md 第 9 节。
+# 无关的独立问题，见 docs/04-performance-report.md 第 8 节。
 name = "retransmit-dscp-mechanism"
 execution_class = "formal-kvm"
 performance_valid = true

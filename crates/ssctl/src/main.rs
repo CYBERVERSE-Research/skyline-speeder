@@ -10,7 +10,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(about = "Control the Skyline Speeder experimental daemon")]
+#[command(version, about = "Control the Skyline Speeder experimental daemon")]
 struct Arguments {
     #[arg(long, default_value = "/run/skyline-speeder/speeder.sock")]
     socket: PathBuf,
@@ -21,6 +21,12 @@ struct Arguments {
 #[derive(Debug, Subcommand)]
 enum Command {
     Validate,
+    /// Attach skyline_cc, make it the host default, and arm the guard.
+    ///
+    /// The guard puts the congestion control -- and, with [guard] qdisc =
+    /// true, net.core.default_qdisc and runtime.tc_interface's root qdisc
+    /// (fq) -- back whenever something else changes them, until `drain`. The
+    /// response message lists everything this enable corrected.
     Enable {
         #[arg(long, value_delimiter = ',')]
         modules: Option<Vec<Module>>,
@@ -36,6 +42,10 @@ enum Command {
     Snapshot {
         path: PathBuf,
     },
+    /// Move new connections back to fallback_cc, disarm the guard, detach.
+    ///
+    /// Waits up to --timeout seconds for skyline_cc flows to finish before
+    /// unregistering it. Qdiscs are left as they are.
     Drain {
         #[arg(long, default_value_t = 300)]
         timeout: u64,
@@ -273,7 +283,78 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use skyline_common::SkylineConfig;
+    use skyline_common::{
+        CapabilityReport, GuardStatus, RackRtoStatus, RackTuningConfig, RackTuningStatus,
+        RetransmitDscpStatus, RuntimeStatus, SkylineConfig,
+    };
+
+    #[test]
+    fn version_flag_is_recognised() {
+        let error = Arguments::try_parse_from(["ssctl", "--version"])
+            .expect_err("--version exits through clap");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+    }
+
+    /// A new ssctl talking to a daemon from before `version`/`guard` existed
+    /// (an upgrade in progress, a daemon not restarted yet) must still decode
+    /// the reply instead of failing on the missing fields.
+    #[test]
+    fn decodes_a_status_from_a_daemon_older_than_the_guard() {
+        let shipped = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        let status = RuntimeStatus {
+            version: "0.3.0".to_owned(),
+            enabled: true,
+            generation: 2,
+            modules: shipped.enabled_modules.clone(),
+            fallback_cc: shipped.fallback_cc.clone(),
+            active_flows: 0,
+            tc_stats: None,
+            metrics: None,
+            rack_tuning: RackTuningStatus {
+                managed: RackTuningConfig::default(),
+                live: RackTuningConfig::default(),
+            },
+            rack_rto: RackRtoStatus {
+                config: shipped.rack_rto,
+                stats: None,
+            },
+            retransmit_dscp: RetransmitDscpStatus {
+                config: shipped.retransmit_dscp,
+                stats: None,
+            },
+            module_tuning: ModuleTuningConfig::from_config(&shipped),
+            capabilities: CapabilityReport {
+                kernel_release: "6.12.0".to_owned(),
+                btf: true,
+                bpffs: true,
+                cgroup_v2: true,
+                fq_available: true,
+                struct_ops: true,
+                rack_reo_hook: false,
+                fallback_cc_available: true,
+                notes: Vec::new(),
+            },
+            guard: GuardStatus {
+                armed: true,
+                ..GuardStatus::default()
+            },
+        };
+        let response = Response {
+            ok: true,
+            message: "status returned".to_owned(),
+            status: Some(status),
+        };
+        let mut wire = serde_json::to_value(&response).expect("encode");
+        let fields = wire["status"].as_object_mut().expect("status object");
+        assert!(fields.remove("version").is_some());
+        assert!(fields.remove("guard").is_some());
+
+        let decoded: Response = serde_json::from_value(wire).expect("decode an older reply");
+        let decoded = decoded.status.expect("status");
+        assert_eq!(decoded.version, "");
+        assert_eq!(decoded.guard, GuardStatus::default());
+        assert!(decoded.enabled);
+    }
 
     /// `set-module-config` is absolute-replace: a flag left off the command
     /// line is sent as its built-in default, not left alone. If those

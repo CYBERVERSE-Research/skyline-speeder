@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (c) 2026 CYBERVERSE LLC
+mod guard;
+
 use anyhow::{anyhow, bail, Context, Result};
 use bytemuck::{bytes_of, try_from_bytes, try_pod_read_unaligned};
 use clap::Parser;
+use guard::Guard;
 use libbpf_rs::btf::{types::Struct, Btf, BtfKind, BtfType, TypeId};
 use libbpf_rs::{
     Link, MapCore, MapFlags, Object, ObjectBuilder, RingBufferBuilder, TcHook, TcHookBuilder,
@@ -28,7 +31,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Parser)]
-#[command(about = "Skyline Speeder eBPF control daemon")]
+#[command(version, about = "Skyline Speeder eBPF control daemon")]
 struct Arguments {
     #[arg(long, default_value = "config/speeder.toml")]
     config: PathBuf,
@@ -379,6 +382,11 @@ impl TcRuntime {
         };
 
         if let Some(interface) = &config.runtime.tc_interface {
+            // Refused, not attached with a warning: see require_ethernet().
+            // The error becomes tc_error, so status says why, and
+            // set-retransmit-dscp then fails instead of enabling a writer
+            // that would write inside the IP header.
+            require_ethernet(interface, interface_type(interface))?;
             let tc_path = config.runtime.bpf_dir.join("skyline_tc.bpf.o");
             match load_tc_observer(&tc_path, interface) {
                 Ok((mut object, hook)) => {
@@ -618,6 +626,37 @@ fn interface_index(interface: &str) -> Result<i32> {
         .with_context(|| format!("parse interface index for {interface}"))
 }
 
+/// `ARPHRD_ETHER` in /sys/class/net/<if>/type. VLANs, bonds, bridges, veths
+/// and taps report it too; WireGuard, tun, GRE/IPIP and PPP do not.
+const ARPHRD_ETHER: u32 = 1;
+
+/// /sys/class/net/<if>/type; `None` when it cannot be read (no such
+/// interface, say -- attaching then fails with its own error).
+fn interface_type(interface: &str) -> Option<u32> {
+    fs::read_to_string(Path::new("/sys/class/net").join(interface).join("type"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// skyline_tc.bpf.c parses an Ethernet header at offset 0 of every egress
+/// packet (`struct ethhdr *eth = data`, then ETH_HLEN offsets). On an L3
+/// device -- a WireGuard/WARP tunnel, tun, GRE, PPP -- there is no such
+/// header: its stats would silently count nothing, and an enabled DSCP
+/// writer would write at ETH_HLEN offsets inside the IP header. So it is
+/// only attached to an Ethernet device. An unreadable type is let through:
+/// the attach reports a missing interface better than this could.
+fn require_ethernet(interface: &str, device_type: Option<u32>) -> Result<()> {
+    match device_type {
+        Some(device_type) if device_type != ARPHRD_ETHER => bail!(
+            "{interface} is not an Ethernet device (type {device_type}, e.g. a tunnel); \
+             skyline_tc is not attached"
+        ),
+        _ => Ok(()),
+    }
+}
+
 fn load_tc_observer(path: &Path, interface: &str) -> Result<(Object, TcHook)> {
     let object = load_object(path)?;
     let ifindex = interface_index(interface)?;
@@ -648,13 +687,22 @@ fn load_tc_observer(path: &Path, interface: &str) -> Result<(Object, TcHook)> {
 /// couple two things that are free to diverge.
 const SKYLINE_CC_NAME: &str = "skyline_cc";
 
+const CONGESTION_CONTROL_SYSCTL: &str = "/proc/sys/net/ipv4/tcp_congestion_control";
+
 /// Writes the network namespace's default congestion control, which is what
 /// decides the algorithm for every new connection on the machine that does not
 /// ask for something specific. This is the global half of activation; the
 /// cgroup sockops policy is the per-connection half, and the two are
 /// independent (see `Request::Enable`).
+///
+/// skyline-speederd is this sysctl's single owner, and every write goes
+/// through here: `BpfRuntime::load` (fallback_cc, before attach),
+/// `Request::Enable` (skyline_cc, after attach), the guard (skyline_cc, while
+/// armed -- see guard.rs) and `Request::Drain` (fallback_cc, before unregister,
+/// under the guard's lock). infra/boot-disable.sh writes it only as the
+/// fallback for when the daemon is already gone.
 fn set_default_congestion_control(name: &str) -> Result<()> {
-    fs::write("/proc/sys/net/ipv4/tcp_congestion_control", name)
+    fs::write(CONGESTION_CONTROL_SYSCTL, name)
         .with_context(|| format!("set default congestion control to {name}"))
 }
 
@@ -744,6 +792,10 @@ fn update_config_maps(object: &mut Object, config: &SkylineConfig, slot: u32) ->
 struct Daemon {
     config: SkylineConfig,
     capabilities: CapabilityReport,
+    /// Keeps skyline_cc/fq in place between `Enable` and `Drain`. Its thread
+    /// is stopped by `Daemon`'s own `Drop`, which runs before any field drops
+    /// -- see there for why that order matters.
+    guard: Guard,
     runtime: Option<BpfRuntime>,
     tc: Option<TcRuntime>,
     tc_error: Option<String>,
@@ -781,9 +833,11 @@ impl Daemon {
                 Some(Arc::new(Mutex::new(EventLog::open(path, max_bytes)?)))
             }
         };
+        let guard = Guard::new(&config);
         Ok(Self {
             config,
             capabilities,
+            guard,
             runtime: None,
             tc: None,
             tc_error: None,
@@ -793,6 +847,13 @@ impl Daemon {
             retransmit_dscp_defaults,
             event_log,
         })
+    }
+
+    fn active_flows(&self) -> u64 {
+        self.runtime
+            .as_ref()
+            .map(BpfRuntime::active_flows)
+            .unwrap_or(0)
     }
 
     fn start_tc(&mut self) {
@@ -825,16 +886,13 @@ impl Daemon {
         if let Some(policy) = &self.policy {
             capabilities.notes.extend(policy.errors.iter().cloned());
         }
-        let active_flows = self
-            .runtime
-            .as_ref()
-            .map(BpfRuntime::active_flows)
-            .unwrap_or(0);
+        let active_flows = self.active_flows();
         let tc_stats = self.tc.as_ref().and_then(TcRuntime::tc_stats);
         let rack_rto_stats = self.policy.as_ref().and_then(PolicyRuntime::rto_stats);
         let retransmit_dscp_stats = self.tc.as_ref().and_then(TcRuntime::retransmit_dscp_stats);
         let metrics = self.runtime.as_ref().and_then(BpfRuntime::metrics);
         RuntimeStatus {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
             enabled: self.runtime.is_some(),
             generation: self.config.generation,
             modules: self.config.enabled_modules.clone(),
@@ -856,6 +914,7 @@ impl Daemon {
             },
             module_tuning: ModuleTuningConfig::from_config(&self.config),
             capabilities,
+            guard: self.guard.status(),
         }
     }
 
@@ -910,11 +969,26 @@ impl Daemon {
                 // so the reverse order would turn a failed attach into a failed
                 // enable that also left the default pointing at nothing.
                 set_default_congestion_control(SKYLINE_CC_NAME)?;
-                Ok(format!(
+                // Only now, with skyline_cc attached and already the default,
+                // is there anything for the guard to keep: arm it and run one
+                // full pass right away (default_qdisc, then the root qdisc of
+                // tc_interface or of the NICs under it), also when [guard]
+                // interval_s = 0. It also retries at once a replace the
+                // periodic pass is backing off from. Nothing it does can
+                // fail the enable -- skyline_cc is live at this point, and a
+                // qdisc it could not fix is reported in this message and in
+                // `guard.last_error` instead.
+                let report = self.guard.arm_and_enforce();
+                let mut message = format!(
                     "Skyline Speeder enabled with modules: {} -- {SKYLINE_CC_NAME} is now the \
                      default congestion control for every new connection on this host",
                     display_modules(&self.config.enabled_modules)
-                ))
+                );
+                for line in report.lines() {
+                    message.push_str("; ");
+                    message.push_str(line);
+                }
+                Ok(message)
             }
             Request::DisableModule { module } => {
                 self.config.enabled_modules.retain(|item| *item != module);
@@ -944,15 +1018,31 @@ impl Daemon {
                 //
                 // Doing this first also means the struct_ops unregister below
                 // never runs while the namespace default still names it.
-                set_default_congestion_control(&self.config.fallback_cc)?;
+                //
+                // The guard is disarmed before that write and the write happens
+                // while its lock is still held: a periodic pass already running
+                // finishes first (its skyline_cc write, if any, is overwritten
+                // here), and none can start in between and put skyline_cc back
+                // after drain wrote fallback_cc. Waiting for that pass is
+                // bounded by about one guard.rs TC_TIMEOUT even while the rtnl
+                // lock is stuck: a tc killed at the timeout is reaped in the
+                // background, and every later tc of the pass fails at once.
+                // It stays disarmed whatever the rest of the drain returns: the
+                // experiment harness drains with --timeout 0, which bails
+                // below, and then installs its own qdisc -- the guard must not
+                // fight it. Drain touches no qdisc.
+                self.guard
+                    .disarm_and(|| set_default_congestion_control(&self.config.fallback_cc))?;
                 if let Some(policy) = &mut self.policy {
                     policy.set_policy_enabled(false)?;
                 }
+                // active_flows() rather than status(): status() now also runs
+                // `tc` for the guard's live view, five times a second here.
                 let deadline = Instant::now() + Duration::from_secs(timeout_s);
-                while self.status().active_flows > 0 && Instant::now() < deadline {
+                while self.active_flows() > 0 && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(200));
                 }
-                if self.status().active_flows > 0 {
+                if self.active_flows() > 0 {
                     bail!(
                         "drain timeout expired; struct_ops remains attached, but the default \
                          congestion control is already back on {} so no new connection is \
@@ -1080,6 +1170,20 @@ impl Daemon {
     }
 }
 
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        // Runs before any field drops. The guard's thread must be stopped and
+        // joined before `BpfRuntime` drops: that Drop unregisters the
+        // struct_ops, and an armed pass after it would try to write a
+        // skyline_cc the kernel no longer knows. Stopping it here, rather than
+        // relying on field declaration order, keeps a reordered field list from
+        // quietly breaking that. No sysctl is written on stop -- the operator
+        // explicitly does not want fallback_cc written when the daemon stops;
+        // `ssctl drain` (and infra/boot-disable.sh) is how that happens.
+        self.guard.stop();
+    }
+}
+
 fn display_modules(modules: &[Module]) -> String {
     if modules.is_empty() {
         return "none".to_owned();
@@ -1202,6 +1306,18 @@ fn probe_capabilities(config: &SkylineConfig) -> CapabilityReport {
         if !Path::new("/sys/class/net").join(interface).is_dir() {
             notes.push(format!("TC interface {interface} does not exist"));
         }
+        // Said here too, so `--validate-only` shows it before a start does.
+        if let Err(error) = require_ethernet(interface, interface_type(interface)) {
+            notes.push(format!("TC interface {error:#}"));
+        }
+        // Not a capability failure: skyline_cc works without tc, only the
+        // guard's root-qdisc half does not -- say so before an enable finds out.
+        if config.guard.qdisc && !command_success("tc", &["-V"]) {
+            notes.push(format!(
+                "tc (iproute2) is not installed; the guard cannot keep the root qdisc of \
+                 {interface} (or of the NICs under it) on fq"
+            ));
+        }
     }
     CapabilityReport {
         kernel_release,
@@ -1287,6 +1403,9 @@ fn serve(mut daemon: Daemon) -> Result<()> {
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("bind Unix socket {}", socket_path.display()))?;
     daemon.persist_state()?;
+    // Here and not in Daemon::new(): `--validate-only` must not start a
+    // thread. It does nothing until an `Enable` arms it.
+    daemon.guard.start()?;
     // `listener.incoming()` below blocks in accept(2) with no timeout.
     // Without a signal handler, systemctl stop's default SIGTERM would kill
     // the process without ever returning to safe Rust code, so `Daemon`'s
@@ -1311,10 +1430,11 @@ fn serve(mut daemon: Daemon) -> Result<()> {
             Err(error) => eprintln!("accept failed: {error}"),
         }
     }
-    // `daemon` drops here, running BpfRuntime/PolicyRuntime/TcRuntime's
-    // Drop impls and cleanly detaching every link -- this is the ONLY
-    // path (besides a fatal accept error) that reaches this point, so
-    // shutdown cleanup and the loop's normal exit are the same code path.
+    // `daemon` drops here: Daemon's own Drop stops the guard thread first,
+    // then BpfRuntime/PolicyRuntime/TcRuntime's Drop impls run, cleanly
+    // detaching every link -- this is the ONLY path (besides a fatal accept
+    // error) that reaches this point, so shutdown cleanup and the loop's
+    // normal exit are the same code path.
     Ok(())
 }
 
@@ -1563,6 +1683,48 @@ mod tests {
         btf.structure("tcp_sock", &[(RACK_REO_HOOK_MEMBER, int)]);
 
         assert!(!probe_btf_capabilities(&btf.parse("rack-scalar")).rack_reo_hook);
+    }
+
+    #[test]
+    fn version_flag_is_recognised() {
+        let error = Arguments::try_parse_from(["skyline-speederd", "--version"])
+            .expect_err("--version exits through clap");
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+    }
+
+    #[test]
+    fn skyline_tc_is_only_attached_to_an_ethernet_device() {
+        require_ethernet("eth0", Some(ARPHRD_ETHER)).expect("Ethernet");
+        // Unreadable: the attach says what is wrong.
+        require_ethernet("eth9", None).expect("left to the attach");
+        // 65534 = ARPHRD_NONE: WireGuard, tun.
+        let error = require_ethernet("wg0", Some(65534)).expect_err("a tunnel");
+        assert_eq!(
+            format!("{error:#}"),
+            "wg0 is not an Ethernet device (type 65534, e.g. a tunnel); skyline_tc is not \
+             attached"
+        );
+        // The loopback device every network namespace has: 772 =
+        // ARPHRD_LOOPBACK, read the same way TcRuntime::load reads it.
+        if Path::new("/sys/class/net/lo").is_dir() {
+            assert_eq!(interface_type("lo"), Some(772));
+            assert!(require_ethernet("lo", interface_type("lo")).is_err());
+        }
+        assert_eq!(interface_type("skyline-no-such-if"), None);
+    }
+
+    #[test]
+    fn guard_settings_follow_the_config() {
+        let mut config = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        config.guard.interval_s = 0;
+        config.guard.qdisc = false;
+        let mut guard = Guard::new(&config);
+        // interval_s = 0: no thread, and nothing armed before an Enable.
+        guard.start().expect("start");
+        let status = guard.status();
+        assert!(!status.armed);
+        assert_eq!((status.interval_s, status.qdisc), (0, false));
+        assert_eq!(status.live.interface, config.runtime.tc_interface);
     }
 
     /// A fresh directory per test; the crate has no tempfile dependency and
