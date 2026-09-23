@@ -219,6 +219,25 @@ for anyone holding a prebuilt `.bpf.o`.
 
 ### Fixed
 
+- **`install.sh` could not install the build toolchain on a Debian 12 host
+  running a 6.12 kernel from `bookworm-backports`**, which is the usual way to
+  reach this project's 6.12 kernel floor on bookworm. Installing
+  `linux-headers-cloud-amd64` from backports (for a DKMS module, say) brings
+  `libelf1 0.192` with it, bookworm's `libelf-dev` depends on
+  `libelf1 (= 0.188-2.1)`, and apt could satisfy nothing:
+  `E: Unable to correct problems, you have held broken packages`. The
+  installer now has apt plan the install first, and when a package cannot be
+  placed it offers that package's other versions until the request resolves --
+  here `libelf-dev 0.192-4~bpo12+1`, the version matching the library the host
+  already has. One package, not the whole toolchain out of another suite. The
+  same plan finishes an interrupted `dpkg` run first (`dpkg --configure -a`,
+  `apt-get -f install --no-remove`) when that is what is blocking apt, and
+  `--check` now reports whether apt can install the packages at all.
+- `install.sh` stopped at `apt-get update failed` when a single repository on
+  the host was unreachable -- a "one-click BBR" script's leftover source, a
+  moved mirror -- even though every suite it needed had refreshed. It now
+  names the repositories that failed and carries on; the package plan decides
+  whether the host can install what the build needs.
 - `skyline-speeder-enable.service` pointed `Documentation=` at
   `file:/usr/share/doc/skyline-speeder/01-deployment-guide.md`, which nothing
   installs. Both units now link to the deployment guide on GitHub.

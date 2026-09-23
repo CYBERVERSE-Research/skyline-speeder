@@ -87,7 +87,7 @@ BAR=0           # 1: the redrawn progress line is in use (QUIET on a terminal)
 LOG_READY=0     # 1: $LOG has been started for this run
 BAR_SHOWN=0     # 1: the progress line is on screen and must be cleared first
 STEP_NO=0 STEP_TOTAL=0 STEP_NAME= STEP_T0=0 STEP_OPEN=0 STEP_RAN=0 STEP_LOG_LINE=0
-SPIN_I=0 COLS=80 BG_PID= WORK= FAILED=0 INTERRUPTED=0
+SPIN_I=0 COLS=80 BG_PID= WORK= FAILED=0 INTERRUPTED=0 APT_SIM=
 
 log()  { if [ "$LOG_READY" -eq 1 ]; then printf '%s\n' "$*" >>"$LOG"; fi; }
 info() { log "==> $*"; [ "$QUIET" -eq 1 ] || printf '%s==>%s %s\n' "$BLD" "$RST" "$*" >&3; }
@@ -267,6 +267,7 @@ on_exit() {
     bar_clear
     [ "$BAR" -eq 0 ] || printf '\033[?25h' >&3
     [ -z "$WORK" ] || rm -rf "$WORK"
+    [ -z "$APT_SIM" ] || rm -f "$APT_SIM"
 }
 trap on_exit EXIT
 trap on_interrupt INT TERM
@@ -871,6 +872,198 @@ else
     PKGS=(build-essential pkg-config clang llvm libbpf-dev libelf-dev zlib1g-dev bpftool curl iproute2)
 fi
 
+# `-qq` silences apt but not dpkg, which still prints an unpack line per
+# package plus a "Reading database" progress bar. Dpkg::Use-Pty=0 stops the
+# progress redraw; the log keeps the detail for when something actually fails.
+# A fresh cloud VM is often still running unattended-upgrades: wait for the
+# dpkg lock instead of failing on it. confdef/confold answer a changed-conffile
+# prompt the way an operator almost always would -- keep their file -- since
+# nobody can answer it from behind a progress bar.
+APT_OPTS=(-y -qq -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=300
+          -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+APT_SPEC=()     # $PKGS, carrying an explicit version where this host needs one
+APT_PINNED=0    # 1 once a version of our own choosing is in APT_SPEC
+
+# apt_sim <package|package=version ...>: have apt plan the install without
+# performing it, leaving the plan in $APT_SIM. A request that cannot be
+# satisfied fails here, before anything on the host has changed, and the
+# rejected plan names the package apt could not place -- which is what
+# apt_plan works from.
+#
+# Not "${APT_OPTS[@]}": `-qq` reduces a failure to its last line,
+# "E: Unable to correct problems, you have held broken packages", and throws
+# away the "pkg : Depends: ..." lines that say which package and why.
+apt_sim() {
+    local rc=0
+    STEP_RAN=1
+    [ -n "$APT_SIM" ] || APT_SIM=$(mktemp)
+    log "apt: planning $*"
+    apt-get -y -s install "$@" >"$APT_SIM" 2>&1 || rc=$?
+    [ "$LOG_READY" -eq 0 ] || cat "$APT_SIM" >>"$LOG"
+    return "$rc"
+}
+
+# The first package in a rejected plan that this installer may do something
+# about: one it asked for, or one apt would have to install anyway. apt prints
+# one line per relationship it could not satisfy --
+#
+#   libelf-dev : Depends: libelf1 (= 0.188-2.1) but 0.192-4~bpo12+1 is to be installed
+#
+# -- and the same block also names packages that are merely installed and
+# would break if apt went ahead --
+#
+#   linux-headers-6.12.95+deb12-cloud-amd64 : Depends: libelf1 (= 0.192-4~bpo12+1) but 0.188-2.1 is to be installed
+#
+# -- and giving one of those a version would mean upgrading somebody's kernel
+# headers to get a toolchain installed. Never that; skip it and take the next.
+#
+# awk over the file rather than `sed ... | head -1`: head leaves the producer
+# to die of SIGPIPE, `pipefail` turns that into status 141, and
+# `pkg=$(apt_unmet)` would then end the script under `set -e` -- the trap the
+# qdisc helpers above document.
+apt_unmet() {
+    [ -n "$APT_SIM" ] || return 0
+    local p
+    # A package this run asked for comes first, whatever order apt listed the
+    # block in: that is the one a version may be chosen for.
+    for p in $(awk '$2 == ":" && $3 ~ /:$/ { print $1 }' "$APT_SIM"); do
+        case " ${APT_SPEC[*]} " in
+            *" $p "*|*" $p="*) printf '%s\n' "$p"; return 0 ;;
+        esac
+    done
+    # Then one apt would have to install anyway -- a dependency of the request
+    # that is not on the host yet. An installed one is left where it is.
+    for p in $(awk '$2 == ":" && $3 ~ /:$/ { print $1 }' "$APT_SIM"); do
+        if [ "$(dpkg-query -W -f='${db:Status-Status}' "$p" 2>/dev/null || true)" != installed ]; then
+            printf '%s\n' "$p"; return 0
+        fi
+    done
+}
+
+# The first error in the plan apt last rejected, without its "E: " prefix.
+apt_error() { awk 'sub(/^E: /, "") { print; exit }' "$APT_SIM" 2>/dev/null; }
+
+# Every version of <package> this host can reach, newest first. `apt-cache
+# madison` prints "name | version | origin"; a deb-src entry and the dpkg
+# status line do not end in "Packages" and are not versions apt can install.
+apt_versions() {
+    apt-cache madison "$1" 2>/dev/null |
+        awk -F '|' '$3 ~ /Packages/ { gsub(/^[ \t]+|[ \t]+$/, "", $2); if (!seen[$2]++) print $2 }'
+}
+
+# apt_pin <package> <version>: ask for that exact version in APT_SPEC. A
+# package that was only being pulled in as a dependency is added to the
+# request -- naming it is the only way to make apt take a version its
+# priorities would not have picked on their own (a backports one sits at
+# priority 100, below the 500 of the suite the host tracks).
+apt_pin() {
+    local i found=0
+    APT_PINNED=1
+    for i in "${!APT_SPEC[@]}"; do
+        case "${APT_SPEC[$i]}" in
+            "$1"|"$1"=*) APT_SPEC[$i]="$1=$2"; found=1 ;;
+        esac
+    done
+    [ "$found" -eq 1 ] || APT_SPEC+=("$1=$2")
+}
+
+# Finish what an earlier interrupted apt/dpkg run started. A VPS reset from
+# the provider's console mid-upgrade, or an unattended-upgrades killed with
+# it, leaves packages unpacked but unconfigured, and every install after that
+# fails until dpkg is allowed to finish. Neither branch runs unless dpkg or
+# apt says this host is in that state. --no-remove keeps the repair to
+# installing what is missing: deleting a package the operator installed, to
+# make the tree consistent, is not a decision an installer may take behind
+# their back -- if that is what it would take, this one stops and says so.
+apt_repair() {
+    if [ "$MODE" = check ]; then return 0; fi   # preflight changes nothing
+    if [ -n "$(dpkg -C 2>/dev/null || true)" ]; then
+        warn "an earlier apt/dpkg run on this host never finished; completing it first"
+        # DPkg::Lock::Timeout is an apt-level wait, so dpkg called directly
+        # gives up at once against a running unattended-upgrades. Say so and
+        # go on: the install below waits for that lock, and if the state is
+        # still unfinished by then apt reports it.
+        run dpkg --configure -a \
+            || warn "dpkg could not finish; something else may hold its lock"
+    fi
+    if ! apt-get check >>"$LOG" 2>&1; then
+        warn "this host has unsatisfied package dependencies; letting apt repair them first"
+        run apt-get "${APT_OPTS[@]}" --no-remove -f install || true
+    fi
+}
+
+# The first error apt just wrote to the log, without its "E: " ("The
+# repository 'http://deb.debian.org/debian nosuchsuite Release' does not have
+# a Release file"). Not its warnings: apt carries on by itself past a source
+# it could not reach, and only fails the run when the failure changed what the
+# host can install.
+apt_update_error() {
+    awk -v from="$STEP_LOG_LINE" 'NR > from && sub(/^E: /, "") { print; exit }' \
+        "$LOG" 2>/dev/null
+}
+
+# apt_plan <package...>: leave in APT_SPEC a request apt says it can satisfy,
+# or return 1 with the plan it rejected in $APT_SIM and in the log.
+#
+# Two host shapes land here regularly, neither of them the operator's mistake:
+#
+#   1. The interrupted apt/dpkg run apt_repair above finishes.
+#
+#   2. A library that came from a different suite than the one apt would take
+#      the matching -dev package from. Debian 12 with a 6.12 kernel out of
+#      bookworm-backports is the common one -- the kernel this project needs
+#      on a bookworm host. Installing linux-headers-cloud-amd64 from backports
+#      (for DKMS modules, or just because a guide said to) brings libelf1
+#      0.192 with it, bookworm's libelf-dev depends on libelf1 (= 0.188-2.1),
+#      and the request is then not satisfiable at all:
+#
+#        libelf-dev : Depends: libelf1 (= 0.188-2.1) but 0.192-4~bpo12+1 is to be installed
+#        E: Unable to correct problems, you have held broken packages.
+#
+#      The answer is to take that one package from the suite the library on
+#      the host came from. The loop finds it by asking apt which package it
+#      could not place, then offering that package's other versions, newest
+#      first, until the whole request plans cleanly.
+#
+# Deliberately not `apt-get -t bookworm-backports install ...`, the remedy
+# that gets passed around for this: it re-resolves the entire request against
+# backports and, on that same host, changes 55 packages -- curl, iproute2,
+# bpftool and libbpf1 among them -- to fix one. Nothing here names a suite or
+# a distribution, so the same loop covers an Ubuntu host whose libraries came
+# from an HWE stack or a PPA.
+apt_plan() {
+    local pkg ver fitted moved
+    APT_SPEC=("$@") APT_PINNED=0
+    if apt_sim "${APT_SPEC[@]}"; then return 0; fi
+    apt_repair
+    if apt_sim "${APT_SPEC[@]}"; then return 0; fi
+    # One package per round, three rounds: a host that needs more than three
+    # substitutions is in a state an installer must not paper over.
+    for _ in 1 2 3; do
+        pkg=$(apt_unmet)
+        [ -n "$pkg" ] || return 1
+        # Asked for by version already and still unplaceable: nothing left to
+        # try for it, and repeating the round would loop.
+        case " ${APT_SPEC[*]} " in *" $pkg="*) return 1 ;; esac
+        fitted= moved=
+        for ver in $(apt_versions "$pkg"); do
+            apt_pin "$pkg" "$ver"
+            if apt_sim "${APT_SPEC[@]}"; then fitted=$ver; break; fi
+            # Not the whole request, but apt no longer trips over THIS
+            # package: remember the first version that gets that far, in case
+            # the host has a second library out of the same other suite.
+            if [ -z "$moved" ] && [ "$(apt_unmet)" != "$pkg" ]; then moved=$ver; fi
+        done
+        ver=${fitted:-$moved}
+        [ -n "$ver" ] || return 1
+        warn "this host needs $pkg $ver, the version matching libraries it already has"
+        apt_pin "$pkg" "$ver"
+        if [ -n "$fitted" ]; then return 0; fi
+        if apt_sim "${APT_SPEC[@]}"; then return 0; fi
+    done
+    return 1
+}
+
 if [ "$MODE" = check ]; then
     info "preflight only; no changes will be made"
     if [ "$SOURCE" = prebuilt ]; then
@@ -884,6 +1077,17 @@ if [ "$MODE" = check ]; then
             command -v "$c" >/dev/null 2>&1 || MISSING+=("$c")
         done
         [ ${#MISSING[@]} -eq 0 ] && ok "toolchain present" || warn "missing: ${MISSING[*]}"
+    fi
+    # Whether apt can place those packages at all, which is a different
+    # question from whether they are installed: on a host whose libraries came
+    # from another suite the distribution's own -dev packages cannot be
+    # installed as they stand. An install works around it (apt_plan); a
+    # preflight only reports what it sees, and changes nothing while it looks.
+    if apt_plan "${PKGS[@]}"; then
+        ok "apt can install the packages the install needs"
+    else
+        warn "apt cannot install ${PKGS[*]} on this host as it stands:"
+        warn "$(apt_error)"
     fi
     describe_egress
     info "now: congestion control $BEFORE_CC, default_qdisc $BEFORE_DQ, $REPLY"
@@ -936,17 +1140,52 @@ if systemctl is-active --quiet skyline-speederd.service 2>/dev/null; then
 fi
 
 step "Installing packages"
-# `-qq` silences apt but not dpkg, which still prints an unpack line per
-# package plus a "Reading database" progress bar. Dpkg::Use-Pty=0 stops the
-# progress redraw; the log keeps the detail for when something actually fails.
-# A fresh cloud VM is often still running unattended-upgrades: wait for the
-# dpkg lock instead of failing on it. confdef/confold answer a changed-conffile
-# prompt the way an operator almost always would -- keep their file -- since
-# nobody can answer it from behind a progress bar.
-APT_OPTS=(-y -qq -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=300
-          -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
-run apt-get "${APT_OPTS[@]}" update || die "apt-get update failed"
-run apt-get "${APT_OPTS[@]}" install "${PKGS[@]}" || die "failed to install build prerequisites"
+if ! run apt-get "${APT_OPTS[@]}" update; then
+    # One unusable source fails the whole update even when every suite that
+    # matters refreshed -- a suite that no longer exists ("does not have a
+    # Release file"), a PPA for a release the host has left behind, a
+    # "one-click BBR" script's leftover repository. Say what apt said and
+    # carry on: the plan below is what decides whether this host can install
+    # what the build needs, and it fails loudly if it cannot. (A source apt
+    # merely could not reach does not even get here: apt keeps the lists it
+    # has and exits 0.)
+    REPLY=$(apt_update_error)
+    warn "apt-get update failed${REPLY:+: $REPLY}"
+    warn "continuing with the package lists this host already has"
+fi
+# The plan first, then the install: apt_plan turns the two failures an
+# installer can do something about -- an interrupted dpkg run, a library from
+# another suite -- into a request that resolves, and everything else into this
+# message with apt's own reasoning in the log under it.
+if ! apt_plan "${PKGS[@]}"; then
+    # "held broken packages" is apt's wording whether or not anything is
+    # actually held, so say which packages really are: one held by hand is a
+    # cause this installer will not touch.
+    HELD=$(apt-mark showhold 2>/dev/null | tr '\n' ' '); HELD=${HELD% }
+    die "no set of packages apt can install covers what the build needs.
+   apt: $(apt_error)
+   The plan it rejected is below and in the full log. A host in this state
+   usually carries libraries from a suite its -dev packages do not match: a
+   vendor or backports kernel, or a third-party repository.${HELD:+
+   Held on this host, and left that way: $HELD}"
+fi
+# A version taken from the suite this host's libraries came from must not
+# quietly take something else off the host with it. On the plain request that
+# is apt resolving a conflict as it always has here, and it is only reported;
+# when a substitution of ours is what costs the operator a package, the trade
+# is not one an installer may make on its own.
+if grep -q '^Remv ' "$APT_SIM" 2>/dev/null; then
+    REPLY=$(sed -n 's/^Remv \([^ ]*\).*/\1/p' "$APT_SIM" | tr '\n' ' '); REPLY=${REPLY% }
+    if [ "$APT_PINNED" -eq 1 ]; then
+        die "installing the build prerequisites would remove: $REPLY
+   That is what it would cost to take a package from the suite this host's
+   libraries came from, and it is not a trade this installer may make for you.
+   Install the development packages by hand, or take the repository that put
+   the mismatched library here out of the picture, and run this again."
+    fi
+    warn "apt will remove: $REPLY"
+fi
+run apt-get "${APT_OPTS[@]}" install "${APT_SPEC[@]}" || die "failed to install build prerequisites"
 ok "prerequisites installed"
 
 # --- 6. Rust ---------------------------------------------------------------

@@ -94,7 +94,10 @@ main() {
                && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o Dpkg::Use-Pty=0 \
                     "${NEED[@]}"; } >"$TMP/apt.log" 2>&1 </dev/null; then
             cat "$TMP/apt.log" >&2
-            die "failed to install ${NEED[*]}"
+            die "failed to install ${NEED[*]}
+   An interrupted dpkg run blocks every install until it is finished:
+   'sudo dpkg --configure -a', then run this again. install.sh repairs that
+   itself at its package step; this bootstrap deliberately stays small."
         fi
         ok "installed ${NEED[*]}"
     fi

@@ -214,6 +214,8 @@ make check                        # 格式、静态检查与单元测试
 skyline-speederd --config config/speeder.toml --validate-only --verify-bpf
 ```
 
+Debian 12 上跑 `bookworm-backports` 的 6.12 内核时，`libelf-dev` 也要取 backports 那一份：backports 的 `linux-headers` 会把 `libelf1` 带到 0.192，而 bookworm 的 `libelf-dev` 把 `libelf1` 钉在 0.188，两者装不到一起（该取哪个版本看 `apt-cache madison libelf-dev`）。`install.sh` 会自己算出这一点。
+
 `make bpf` 默认从本机 `/sys/kernel/btf/vmlinux` 读取类型信息；要用别的内核的 BTF，用 `make VMLINUX_BTF=<路径> bpf`；已有生成好的头，用 `make PREBUILT_VMLINUX_H=<路径> bpf`。
 
 ## 文档

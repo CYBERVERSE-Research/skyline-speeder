@@ -50,6 +50,20 @@ rustup override set 1.75.0
 因发行版而异。`iproute2` 是运行期依赖：`skyline-speederd` 用其中的 `tc` 维护出口
 网卡的根 qdisc，见第 7 节。）
 
+Debian 12 上用 `bookworm-backports` 的 6.12 内核时（在 bookworm 上够到 6.12 门槛的
+常规做法），这条 `apt-get install` 会直接失败：`linux-headers-*` 把 `libelf1` 带到了
+0.192，而 bookworm 的 `libelf-dev` 依赖 `libelf1 (= 0.188-2.1)`，apt 只报一句
+`E: Unable to correct problems, you have held broken packages`。取与机上那份库同源的
+版本即可，**只换这一个包**：
+
+```bash
+apt-cache madison libelf-dev                      # 看这台机器能拿到哪些版本
+apt-get install -y libelf-dev=0.192-4~bpo12+1     # 与已装的 libelf1 同源的那个
+```
+
+不要用 `-t bookworm-backports` 整体换源：那会把 curl、iproute2、bpftool、libbpf1
+一并换成 backports 版（实测 55 个包）。`install.sh` 自己会做这件事，见第 4.1 节。
+
 ```bash
 make bpf    # 生成 bpf/include/vmlinux.h 并编译三个 CO-RE BPF 对象
 cargo build --workspace --release
@@ -103,6 +117,18 @@ cargo build --workspace --release
 `/var/log/skyline-speeder-install.log`（每次运行开头清空，结束后保留）。某一步失败时打印
 `error <原因>`、这一步在日志里的最后至多 25 行和日志路径，退出码非零；Ctrl-C 中断时退出码
 为 130，后台的构建进程一并结束。
+
+**软件包。** 先让 apt 出一份计划（`apt-get -s install`），确认解得开再真正安装；计划
+解不开时不立即失败。上一次 `dpkg` 被打断（VPS 在升级中途被重置）就先
+`dpkg --configure -a` / `apt-get -f install --no-remove` 补完它——`--no-remove` 是刻意的，
+为了让依赖自洽而卸掉运维装的包不是安装器可以替他做的决定。某个包 apt 放不下去，就按
+`apt-cache madison` 从新到旧试它的其他版本，直到整份计划成立：Debian 12 上装了
+`bookworm-backports` 的 6.12 内核时，`linux-headers-*` 把 `libelf1` 带到 0.192，而
+bookworm 的 `libelf-dev` 依赖 `libelf1 (= 0.188-2.1)`，安装器改取 `libelf-dev
+0.192-4~bpo12+1`，**只换这一个包**（刻意不用 `-t bookworm-backports`，见第 3 节）。
+换版本若牵连卸载，先把要卸载的包名告警出来。`apt-get update` 因为某个仓库不可达而失败
+（一键 BBR 脚本留下的源、搬走的镜像）时只告警并继续——能不能装由计划决定。`--check`
+同样跑这份计划，报告 apt 到底能不能装上这些包。
 
 **选择出口网卡。** 只在配置里还是模板值 `data0` 时改写，运维改过的配置不动（它指向的网卡
 不存在也只告警，不替你改）。取默认路由经过的第一块**以太网**设备
