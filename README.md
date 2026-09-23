@@ -212,6 +212,8 @@ make check                        # formatting, static checks, unit tests
 skyline-speederd --config config/speeder.toml --validate-only --verify-bpf
 ```
 
+On a Debian 12 host running a 6.12 kernel from `bookworm-backports`, `libelf-dev` has to come from backports as well — the backports `linux-headers` bring `libelf1 0.192` with them and bookworm's `libelf-dev` pins `libelf1` to 0.188, so apt can install neither (`apt-cache madison libelf-dev` lists the version to ask for). `install.sh` works that out on its own.
+
 `make bpf` reads type information from this machine's `/sys/kernel/btf/vmlinux`. Use `make VMLINUX_BTF=<path> bpf` for another kernel's BTF, or `make PREBUILT_VMLINUX_H=<path> bpf` for a ready-made header.
 
 ## Documentation

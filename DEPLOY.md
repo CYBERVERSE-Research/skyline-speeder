@@ -137,6 +137,14 @@ apt-get update -qq
 apt-get install -y -qq build-essential pkg-config clang llvm \
     libbpf-dev libelf-dev zlib1g-dev bpftool curl iproute2   # guard 用 tc 维护网卡 qdisc
 
+# Debian 12 + bookworm-backports 的 6.12 内核：linux-headers-* 把 libelf1 带到 0.192，
+# bookworm 的 libelf-dev 依赖 libelf1 (= 0.188-2.1)，上面这条会以
+# "E: Unable to correct problems, you have held broken packages" 失败。
+# 只换这一个包，取与机上库同源的版本（版本号以 apt-cache madison 为准）：
+#   apt-get install -y libelf-dev=0.192-4~bpo12+1
+# 不要用 -t bookworm-backports：那会连 curl/iproute2/bpftool/libbpf1 一起换源。
+# install.sh 会自动做这件事（先让 apt 出计划，只替换放不下去的那个包）。
+
 # 3.2 Rust（rust-toolchain.toml 已固定 channel，rustup 会自动遵循）
 command -v cargo >/dev/null || {
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
