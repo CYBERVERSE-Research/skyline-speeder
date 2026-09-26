@@ -27,9 +27,13 @@ make、cargo、验证器）的输出写入 `/var/log/skyline-speeder-install.log
 ```bash
 v=$(skyline-speederd --version 2>/dev/null | awk '{print $2}')
 [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = "skyline_cc" ] \
-  && ssctl status | grep -q '"enabled": true' \
-  && { [ -z "$v" ] || ssctl status | grep -q "\"version\": \"$v\""; }
+  && ssctl status --json | grep -q '"enabled": true' \
+  && { [ -z "$v" ] || ssctl status --json | grep -q "\"version\": \"$v\""; }
 ```
+
+> `--json` 是 0.3.0 起的写法：`ssctl status` 默认打印的是人类可读报告，`--json` 打印
+> 0.2.0 那份逐字节一致的 JSON。对着 0.2.0 及更早的 `ssctl` 要去掉 `--json`（它不认识这个
+> 选项）。下面所有 grep/python 判据同理。
 
 第三条确认内存里跑的就是刚装上的 daemon：`skyline-speederd --version` 读的是磁盘上的
 二进制，`status` 里的 `version` 来自正在运行的进程。已发布的 v0.2.0 及更早的二进制没有
@@ -43,7 +47,7 @@ guard 看 `status` 里有没有 `"guard"` 键，不要只看版本号。
 > 之后自己重启 daemon：enable unit 处于 active 时随之重启——其 ExecStop
 > （`boot-disable.sh`）执行 `ssctl drain`：drain 先解除 guard、写回 `fallback_cc`，再等存量
 > 连接至多 60 秒（经 SSH 必然走到超时，无害），新 daemon 起来后重新挂载。用 `ssctl` 做的在线
-> 修改只存在旧 daemon 的内存里，重启后不保留；安装器把旧的 `ssctl status` 写进了安装日志，
+> 修改只存在旧 daemon 的内存里，重启后不保留；安装器把旧的 `ssctl status --json` 写进了安装日志，
 > 需要时照着重新下发。
 >
 > `skyline_cc` 是用裸 `ssctl enable` 挂载的主机（enable unit 不是 active，而旧 daemon 报告
@@ -104,7 +108,7 @@ SKYLINE_ARTIFACT_URL=/path/to/skyline-speeder-<tag>-x86_64.tar.gz ./install.sh -
 安装摘要里只显示一行出处。
 
 **早于 guard 的 release。** 预编译产物是已发布的 release，可能比运行的 `install.sh` 旧。
-已发布的 v0.2.0 及更早的 release 没有 guard（§10）：`ssctl status` 里没有 `"guard"` 键（判断
+已发布的 v0.2.0 及更早的 release 没有 guard（§10）：`ssctl status --json` 里没有 `"guard"` 键（判断
 依据是这个键，不是版本号），`ssctl enable` 本身不碰 qdisc，之后也不守住默认拥塞控制；但同一
 release 附带的 enable unit（它自己的 `boot-enable.sh`）在每次挂载和每次开机时写一次
 `default_qdisc=fq`，不换网卡的根 qdisc，也没有谁守住这个值。安装器据此识别并告警
@@ -254,7 +258,7 @@ sysctl -n net.ipv4.tcp_available_congestion_control | grep -qw skyline_cc
 [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = "skyline_cc" ]
 
 # G5 控制面自述已启用
-ssctl status | grep -q '"enabled": true'
+ssctl status --json | grep -q '"enabled": true'
 
 # G6 开机自启
 systemctl is-enabled skyline-speederd.service skyline-speeder-enable.service
@@ -262,13 +266,14 @@ systemctl is-enabled skyline-speederd.service skyline-speeder-enable.service
 # G7 guard 已武装；qdisc 已就位（[guard] qdisc = false 时跳过后两条，
 #    没有设置 runtime.tc_interface 时跳过最后一条）。最后一条看 guard 实际维护的网卡
 #    （live.devices：tc_interface 自己，或它是 VLAN/bond/bridge 时下面的物理网卡）
-ssctl status | grep -q '"armed": true'
+ssctl status --json | grep -q '"armed": true'
 [ "$(sysctl -n net.core.default_qdisc)" = fq ]
-ssctl status | python3 -c 'import json,sys; d=json.load(sys.stdin)["status"]["guard"]["live"]["devices"]; \
+ssctl status --json | python3 -c 'import json,sys; d=json.load(sys.stdin)["status"]["guard"]["live"]["devices"]; \
     assert d and all(x["qdisc"] in ("fq", "mq/fq") for x in d), d; print("qdisc OK:", d)'
 ```
 
-G7 后两条失败时看 `ssctl status` 里 `guard` 的 `notes` 与 `last_error`（§10）：根 qdisc 是
+G7 后两条失败时看 `ssctl status` 的 DRIFT GUARD 段落（`--json` 里是 `guard` 的 `notes` 与
+`last_error`，§10）：根 qdisc 是
 `htb`/`tbf`/`netem` 等刻意搭建的整形结构、或设了带宽的 `cake` 时，guard 按设计不动它；
 `tc_interface` 是隧道、下面没有物理网卡时 `devices` 为空——这两种都不是部署失败。
 
@@ -283,8 +288,13 @@ systemctl reboot
 
 ```bash
 ss -tin | grep -c skyline_cc                       # 应 > 0
-ssctl status | grep -E 'active_flows|tc_stats'
+ssctl flows                                        # 逐条列出这些连接与它们的参数
+ssctl status --json | grep -E 'active_flows|tc_stats'
 ```
+
+`ssctl flows` 的 CONNECTIONS 段落直接给出同一份数据：coverage 那行是"主机上多少条 TCP
+连接跑在 skyline_cc 上"，下面是逐条的 RTT、cwnd、pacing、交付速率与重传占比。它和上面
+`ss -tin | grep -c` 数的是同一个东西——`ssctl flows` 就是 daemon 替你跑了那条 `ss`。
 
 ---
 
@@ -442,7 +452,7 @@ done
 `fq`（多队列网卡上是子队列全为 `fq` 的 `mq`），被改了就改回去。受管网卡是
 `runtime.tc_interface` 自己；它的根是内核默认的 `noqueue`（VLAN、bond、网桥）时，是顺着
 `lower_*` 找到的、有 `device` 链接的物理网卡（tap、veth 从不受管），`ssctl status` 的
-`guard.live.devices` 列出它们。它针对的是
+DRIFT GUARD 段落（`--json` 里是 `guard.live.devices`）列出它们。它针对的是
 "一键 BBR"脚本留下的 `/etc/sysctl.d` 文件被 `sysctl --system` 重新应用、或有人用 `tc`
 装了 `cake`/`fq_pie`——没有它，这类改动会让新连接悄悄绕开 `skyline_cc` 且不报任何错误。
 完整规则见 `docs/02-interface-reference.md` 第 9 节。
@@ -450,7 +460,8 @@ done
 判定命令：
 
 ```bash
-ssctl status | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["status"]["guard"], indent=2))'
+ssctl status                 # DRIFT GUARD 段落
+ssctl status --json | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["status"]["guard"], indent=2))'
 journalctl -u skyline-speederd.service | grep 'guard:'
 ```
 

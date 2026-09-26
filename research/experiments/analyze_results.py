@@ -88,7 +88,7 @@ RUN_FIELDS = [
     "error",
 ]
 
-# Fields of ssctl status's "metrics" object (mirrors struct skyline_metrics in
+# Fields of ssctl status --json's "metrics" object (mirrors struct skyline_metrics in
 # bpf/include/skyline_abi.h) that are worth surfacing as before/after deltas.
 # "ack_events" and "delivered_packets" are omitted from RUN_FIELDS (pure
 # volume counters, not diagnostic of "did this feature ever fire") but are
@@ -241,7 +241,7 @@ def parse_ss_samples(path):
 
 
 def skyline_metrics_delta(run_dir):
-    """Before/after delta of ssctl status's `metrics` field (struct
+    """Before/after delta of ssctl status --json's `metrics` field (struct
     skyline_metrics), the percpu counters that were populated from day one but
     never read by the Rust side until the feature-coverage debug pass. Used
     to directly confirm whether a given case actually exercised a specific
@@ -268,7 +268,7 @@ def skyline_metrics_delta(run_dir):
     }
 
 
-#: Fields of ssctl status's `rack_rto.stats` object (mirrors struct
+#: Fields of ssctl status --json's `rack_rto.stats` object (mirrors struct
 #: skyline_rto_stats in bpf/include/skyline_abi.h) surfaced as before/after deltas.
 #: The rto_max_* fields (since v2 of struct skyline_rto_tuning, the TCP_RTO_MAX_MS
 #: ceiling feature) are diagnostic-only, same role as applied/rejected below
@@ -284,7 +284,7 @@ RACK_RTO_STATS_DELTA_FIELDS = (
 
 
 def rack_rto_stats_delta(run_dir):
-    """M1 tier-2 diagnostic: before/after delta of ssctl status's
+    """M1 tier-2 diagnostic: before/after delta of ssctl status --json's
     `rack_rto.stats` field."""
 
     def stats_of(path):
@@ -306,7 +306,7 @@ def rack_rto_stats_delta(run_dir):
     }
 
 
-#: Fields of ssctl status's `retransmit_dscp.stats` object (mirrors struct
+#: Fields of ssctl status --json's `retransmit_dscp.stats` object (mirrors struct
 #: skyline_retransmit_dscp_stats in bpf/include/skyline_abi.h). In-kernel truth, zero
 #: parsing, always available even when case.scenario.capture_retransmits is
 #: off -- the right oracle for gating checks (enabled/disabled,
@@ -330,7 +330,7 @@ RETRANSMIT_DSCP_STATS_DELTA_FIELDS = (
 
 
 def retransmit_dscp_stats_delta(run_dir):
-    """Retransmit-DSCP diagnostic: before/after delta of ssctl status's
+    """Retransmit-DSCP diagnostic: before/after delta of ssctl status --json's
     `retransmit_dscp.stats` field."""
 
     def stats_of(path):

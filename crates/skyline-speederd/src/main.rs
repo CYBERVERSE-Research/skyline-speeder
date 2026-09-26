@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (c) 2026 CYBERVERSE LLC
+mod flows;
 mod guard;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -15,7 +16,7 @@ use skyline_common::{
     CapabilityReport, FeatureMask, Module, ModuleTuningConfig, RackRtoConfig, RackRtoStats,
     RackRtoStatus, RackTuningConfig, RackTuningStatus, Request, Response, RetransmitDscpConfig,
     RetransmitDscpStats, RetransmitDscpStatus, RuntimeStatus, SkylineConfig, SkylineEvent,
-    SkylineMetrics, TcStats,
+    SkylineMetrics, TcStats, SKYLINE_CC_NAME,
 };
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -678,15 +679,6 @@ fn load_tc_observer(path: &Path, interface: &str) -> Result<(Object, TcHook)> {
     Ok((object, hook))
 }
 
-/// The congestion control algorithm name skyline_cc registers under. Must stay
-/// byte-identical to `.name` in bpf/skyline_cc.bpf.c -- the kernel matches the
-/// sysctl write below against the registered name, and a mismatch fails with
-/// EINVAL rather than silently doing nothing. Deliberately NOT reused for the
-/// struct_ops *map* name lookups elsewhere in this file: those happen to be the
-/// same string today but are a different namespace, and collapsing them would
-/// couple two things that are free to diverge.
-const SKYLINE_CC_NAME: &str = "skyline_cc";
-
 const CONGESTION_CONTROL_SYSCTL: &str = "/proc/sys/net/ipv4/tcp_congestion_control";
 
 /// Writes the network namespace's default congestion control, which is what
@@ -813,6 +805,13 @@ struct Daemon {
     /// Opened once at startup by `Daemon::new()` -- see `BpfRuntime::load`'s
     /// doc comment. `None` when `events_max_mib = 0`.
     event_log: Option<Arc<Mutex<EventLog>>>,
+    /// When this process started, for `RuntimeStatus::uptime_s`.
+    started: Instant,
+    /// When the struct_ops currently loaded was attached, for
+    /// `RuntimeStatus::attached_s`. An `Enable` that only pushes new
+    /// coefficients into an already-attached runtime leaves it alone: it is
+    /// the age of the attachment, not of the last command.
+    attached_at: Option<Instant>,
 }
 
 impl Daemon {
@@ -846,6 +845,8 @@ impl Daemon {
             module_tuning_defaults,
             retransmit_dscp_defaults,
             event_log,
+            started: Instant::now(),
+            attached_at: None,
         })
     }
 
@@ -915,24 +916,28 @@ impl Daemon {
             module_tuning: ModuleTuningConfig::from_config(&self.config),
             capabilities,
             guard: self.guard.status(),
+            uptime_s: self.started.elapsed().as_secs(),
+            attached_s: self.attached_at.map(|at| at.elapsed().as_secs()),
         }
     }
 
     fn handle(&mut self, request: Request) -> Response {
-        match self.try_handle(request) {
+        // Enumerating sockets means walking every TCP connection on the host
+        // through `ss`; only the request that asks for the listing pays for
+        // it. Decided before `try_handle` consumes the request.
+        let wants_flows = matches!(request, Request::Flows);
+        let (ok, message) = match self.try_handle(request) {
             Ok(message) => {
                 let _ = self.persist_state();
-                Response {
-                    ok: true,
-                    message,
-                    status: Some(self.status()),
-                }
+                (true, message)
             }
-            Err(error) => Response {
-                ok: false,
-                message: format!("{error:#}"),
-                status: Some(self.status()),
-            },
+            Err(error) => (false, format!("{error:#}")),
+        };
+        Response {
+            ok,
+            message,
+            status: Some(self.status()),
+            flows: wants_flows.then(|| flows::collect(SKYLINE_CC_NAME)),
         }
     }
 
@@ -954,6 +959,7 @@ impl Daemon {
                     runtime.update_config(&self.config)?;
                 } else {
                     self.runtime = Some(BpfRuntime::load(&self.config, self.event_log.clone())?);
+                    self.attached_at = Some(Instant::now());
                 }
                 if let Some(policy) = &mut self.policy {
                     policy.set_policy_enabled(true)?;
@@ -999,9 +1005,10 @@ impl Daemon {
                 Ok(format!("module {module} disabled at the next RTT boundary"))
             }
             Request::Status => Ok("status returned".to_owned()),
-            Request::Flows => Ok(
-                "flow enumeration is intentionally local-only; aggregate count returned".to_owned(),
-            ),
+            // The listing itself is attached by `handle()`, not built here:
+            // `try_handle` returns only a message, and the `ss` this costs is
+            // worth running once, for this request alone.
+            Request::Flows => Ok("accelerated connections enumerated".to_owned()),
             Request::Snapshot { path } => {
                 let payload = serde_json::to_vec_pretty(&self.status())?;
                 fs::write(&path, payload)
@@ -1054,6 +1061,7 @@ impl Daemon {
                     runtime.unregister_struct_ops()?;
                 }
                 self.runtime = None;
+                self.attached_at = None;
                 Ok(format!(
                     "new sockets use {}; Skyline Speeder CC links detached (TC stats and RTO tuning, \
                      if enabled, remain active)",

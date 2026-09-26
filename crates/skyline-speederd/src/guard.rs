@@ -283,7 +283,7 @@ fn reap_later(mut child: process::Child, unreaped: &'static AtomicUsize) {
 /// non-zero exit is an error carrying its stderr. A program killed at the
 /// timeout (or that could not be waited for) is reaped in the background and
 /// counted in `unreaped` until it exits; this returns at once either way.
-fn run_bounded(
+pub(crate) fn run_bounded(
     program: &str,
     args: &[&str],
     timeout: Duration,

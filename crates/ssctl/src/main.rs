@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (c) 2026 CYBERVERSE LLC
+mod style;
+mod view;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use skyline_common::{
@@ -8,12 +11,29 @@ use skyline_common::{
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use style::{ColorChoice, Theme};
 
 #[derive(Debug, Parser)]
-#[command(version, about = "Control the Skyline Speeder experimental daemon")]
+#[command(
+    version,
+    about = "Control the Skyline Speeder daemon",
+    after_help = concat!(
+        "Skyline Speeder is exclusively sponsored by Skyline Connect -- ",
+        "https://www.skylineconnect.io"
+    )
+)]
 struct Arguments {
     #[arg(long, default_value = "/run/skyline-speeder/speeder.sock")]
     socket: PathBuf,
+    /// Print the daemon's reply as JSON instead of the readable report.
+    /// This is the pre-0.3.0 output, byte for byte, for scripts that parse
+    /// it.
+    #[arg(long, global = true)]
+    json: bool,
+    /// Colour and symbols: auto (a terminal, and NO_COLOR unset), always,
+    /// never.
+    #[arg(long, global = true, value_enum, default_value_t = ColorChoice::Auto)]
+    color: ColorChoice,
     #[command(subcommand)]
     command: Command,
 }
@@ -37,7 +57,19 @@ enum Command {
         #[arg(long)]
         module: Module,
     },
+    /// Is Skyline Speeder running, and has it taken this host over?
+    ///
+    /// Attachment, the host's default congestion control, the drift guard,
+    /// kernel support and the global sysctls -- the state of the takeover,
+    /// not of the traffic. For the traffic, see `flows`.
     Status,
+    /// What is being accelerated, and with which parameters?
+    ///
+    /// The TCP connections the kernel currently runs on skyline_cc, the
+    /// coefficients in force on them, and the counters showing what the
+    /// algorithm decided. For whether the takeover is healthy, see
+    /// `status`.
+    #[command(visible_alias = "flow")]
     Flows,
     Snapshot {
         path: PathBuf,
@@ -264,19 +296,65 @@ fn request(command: Command) -> Request {
 
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
-    let mut stream = UnixStream::connect(&arguments.socket)
-        .with_context(|| format!("connect to {}", arguments.socket.display()))?;
-    serde_json::to_writer(&mut stream, &request(arguments.command))?;
+    let theme = Theme::detect(arguments.color);
+    let mut stream = UnixStream::connect(&arguments.socket).with_context(|| {
+        format!(
+            "connect to {} (is skyline-speederd running?)",
+            arguments.socket.display()
+        )
+    })?;
+    let request = request(arguments.command);
+    let wants = View::of(&request);
+    serde_json::to_writer(&mut stream, &request)?;
     stream.write_all(b"\n")?;
 
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
     let response: Response = serde_json::from_str(line.trim()).context("decode daemon response")?;
-    println!("{}", serde_json::to_string_pretty(&response)?);
+
+    if arguments.json {
+        // Unchanged from 0.2.0, deliberately: this is what install.sh, the
+        // health checks in DEPLOY.md and any monitoring built on them read.
+        // The sponsor line goes to stderr so stdout stays pure JSON, and
+        // only to a terminal -- see `stderr_is_terminal`.
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        if theme.stderr_is_terminal() {
+            eprintln!("{}", view::sponsor(&theme));
+        }
+    } else {
+        print!("{}", wants.render(&theme, &response));
+    }
     if response.ok {
         Ok(())
     } else {
-        anyhow::bail!("{}", response.message)
+        // The message is already on screen in both modes; repeating it as
+        // the process error would print it twice.
+        std::process::exit(1);
+    }
+}
+
+/// Which report a request's reply is rendered as.
+enum View {
+    Status,
+    Flows,
+    Action,
+}
+
+impl View {
+    fn of(request: &Request) -> Self {
+        match request {
+            Request::Status => Self::Status,
+            Request::Flows => Self::Flows,
+            _ => Self::Action,
+        }
+    }
+
+    fn render(&self, theme: &Theme, response: &Response) -> String {
+        match self {
+            Self::Status => view::status(theme, response),
+            Self::Flows => view::flows(theme, response),
+            Self::Action => view::action(theme, response),
+        }
     }
 }
 
@@ -338,21 +416,34 @@ mod tests {
                 armed: true,
                 ..GuardStatus::default()
             },
+            uptime_s: 1234,
+            attached_s: Some(60),
         };
         let response = Response {
             ok: true,
             message: "status returned".to_owned(),
             status: Some(status),
+            flows: None,
         };
         let mut wire = serde_json::to_value(&response).expect("encode");
+        assert!(wire
+            .as_object_mut()
+            .expect("response object")
+            .remove("flows")
+            .is_some());
         let fields = wire["status"].as_object_mut().expect("status object");
         assert!(fields.remove("version").is_some());
         assert!(fields.remove("guard").is_some());
+        assert!(fields.remove("uptime_s").is_some());
+        assert!(fields.remove("attached_s").is_some());
 
         let decoded: Response = serde_json::from_value(wire).expect("decode an older reply");
+        assert!(decoded.flows.is_none());
         let decoded = decoded.status.expect("status");
         assert_eq!(decoded.version, "");
         assert_eq!(decoded.guard, GuardStatus::default());
+        assert_eq!(decoded.uptime_s, 0);
+        assert_eq!(decoded.attached_s, None);
         assert!(decoded.enabled);
     }
 

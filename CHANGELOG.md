@@ -8,9 +8,17 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 the layout of `bpf/include/skyline_abi.h` and any bump to it is a breaking change
 for anyone holding a prebuilt `.bpf.o`.
 
-## [Unreleased]
+## [0.3.0] - 2026-09-26
 
 ### Upgrading from 0.2.0
+
+- **`ssctl status` and `ssctl flows` print a report, not JSON.** Anything
+  that parses their output needs `--json`, which prints exactly what 0.2.0
+  printed. `install.sh` asks for `--json` and falls back to the bare command
+  when it meets an older `ssctl`, and the health checks in `DEPLOY.md` §2 and
+  §7 have been updated; a check of your own that greps for `"enabled": true`
+  has to be changed the same way. `ssctl snapshot` is unaffected -- it always
+  wrote JSON to a file and still does.
 
 - **Re-run the new `install.sh` the way the host was installed** (with
   `--prebuilt` or `--no-enable` if it was installed with them). It now restarts
@@ -68,6 +76,42 @@ for anyone holding a prebuilt `.bpf.o`.
   clean.
 
 ### Added
+
+- **`ssctl flows` lists the connections that are being accelerated.** It used
+  to answer with the same object every other command returned, plus the line
+  "flow enumeration is intentionally local-only; aggregate count returned" --
+  a count, and nothing about the traffic. It now shows, per connection, the
+  peer, RTT, congestion window, pacing rate, delivery rate, bytes sent and
+  the retransmitted share of them, sorted by bytes sent (at most 50 rows; the
+  counts stay exact above that). Under the table: what share of the host's
+  TCP connections skyline_cc is carrying, the coefficients in force on them
+  (pacing gains and cap, the window floor and ceiling, the queue-delay
+  guardrail, loss compensation, the dynamic RTO bounds, DSCP), and the BPF
+  counters showing what the algorithm decided, with the TC-layer and
+  dynamic-RTO counters beside them.
+  - The per-connection numbers are the kernel's own, read back through `ss`
+    (iproute2, which the guard already needs for `tc`) and filtered to the
+    sockets whose congestion control is `skyline_cc`. skyline_cc keeps its
+    per-flow state in an `SK_STORAGE` map, which user space cannot enumerate
+    without a file descriptor for every socket, so the daemon has never been
+    able to walk it -- but cwnd, pacing rate and RTT are exactly what
+    skyline_cc writes into the socket, so the kernel's view of them is a
+    faithful record of what the acceleration did. Mode (STARTUP/CRUISE),
+    bandwidth estimate and guardrail state stay aggregate, because `ss`
+    cannot see them. An `ss` that is missing or too slow costs the table and
+    nothing else: the report says so and everything from the daemon is still
+    there.
+- **`--json` on every `ssctl` command**, printing the reply exactly as 0.2.0
+  did, and `--color auto|always|never` (`NO_COLOR` and `TERM=dumb` are
+  honoured; symbols fall back to ASCII outside a UTF-8 locale).
+- `ssctl flow` as an alias for `ssctl flows`.
+- `uptime_s` and `attached_s` in `ssctl status`: how long the daemon has been
+  running, and how long the current struct_ops attachment has been in place.
+  `attached_s` is `null` while nothing is attached, and an `enable` that only
+  pushes new coefficients into a live attachment does not reset it.
+- Every `install.sh` run and every `ssctl` command names the project's
+  sponsor, Skyline Connect (https://www.skylineconnect.io), which funds this
+  work. In `--json` mode the line goes to stderr, so stdout stays parseable.
 
 - **`install.sh --uninstall` leaves the host on bbr + fq and takes the build
   toolchain with it.** A host that installed Skyline Speeder almost always
@@ -227,6 +271,23 @@ for anyone holding a prebuilt `.bpf.o`.
 
 ### Changed
 
+- **`ssctl status` and `ssctl flows` answer two different questions.** Both
+  used to print the whole `RuntimeStatus` as JSON -- the same object, differing
+  in one line of message -- so neither told an operator anything at a glance
+  and the two overlapped almost completely. `status` is now about the
+  takeover: whether skyline_cc is attached, whether it is the host's default
+  (attached but not the default is this project's worst silent failure, and it
+  is now stated in those words), what the guard holds and how often it has had
+  to put it back, kernel support, the global sysctls, and an `ATTENTION` block
+  listing everything wrong with a remedy. `flows` is about the traffic and is
+  described under Added. Colour, symbols and proportion bars are used where
+  they carry meaning -- a bar has its full scale written next to it -- and are
+  dropped entirely when stdout is not a terminal.
+- Commands that change something (`enable`, `drain`, `set-*`, `reset-*`)
+  print the daemon's sentence and then one line of where the host stands now,
+  instead of a screenful of JSON. `enable` and `drain` list each correction
+  they made on its own line.
+
 - **A bare `ssctl enable` now also sets `fq`.** With the default
   `[guard] qdisc = true` it writes `net.core.default_qdisc = fq` and replaces
   the root qdisc of `runtime.tc_interface` (or of the NICs under it); before,
@@ -287,6 +348,24 @@ for anyone holding a prebuilt `.bpf.o`.
   checksums) next to the source build.
 
 ### Fixed
+
+- **`ssctl status`'s `delivered_packets` was documented as "cumulative
+  acknowledged packets", which it is not.** It sums `rate_sample.delivered`
+  once per ack, and consecutive acks report overlapping windows, so it runs
+  about two orders of magnitude above the packets actually delivered
+  (measured on a 6.12.63 host: it advanced by 16,703,016 over the same 20
+  seconds in which the kernel's own `tp->delivered` advanced by 164,416 --
+  101x). The counter itself is unchanged: the experiment harness compares it
+  between runs of the same shape, which is sound, and deliberately keeps it
+  out of `RUN_FIELDS`, so no published number depends on it. What changed is
+  that it is now described accurately in
+  `docs/02-interface-reference.md` section 4, `ssctl flows` labels it
+  *delivery samples* rather than a packet count, and nothing derives a rate
+  from it -- the loss-event share is against `ack_events`, and the real
+  volume comes from the kernel's byte counters in the connection table.
+- `guardrail_hits` counts two things, not one: the queue-delay/ECN clamp and
+  the `max_cwnd_packets` ceiling. It was documented as the first alone, which
+  would send an operator looking for queueing that is not there.
 
 - **`install.sh` could not install the build toolchain on a Debian 12 host
   running a 6.12 kernel from `bookworm-backports`**, which is the usual way to
@@ -627,6 +706,7 @@ rather than as fixes to a version nobody could have installed.
   socket file permissions. Multi-tenant hosts need additional access control.
 - The experiment harness requires **Python 3.11 or newer** (`tomllib`).
 
-[Unreleased]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/CYBERVERSE-Research/skyline-speeder/releases/tag/v0.1.0

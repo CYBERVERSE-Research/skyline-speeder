@@ -133,10 +133,14 @@ sudo ./install.sh --uninstall --restore-pre-install   # 同上，但还原成
 日常操作：
 
 ```bash
-ssctl status    # 运行时状态、内核能力与决策计数器
-ssctl flows     # 当前 skyline_cc 活跃连接数
+ssctl status    # 这台机器被接管了吗？附加状态、全机默认拥塞控制、守护、内核能力
+ssctl flows     # 在加速什么？被加速的连接、它们上面的参数、算法决策计数器
 ssctl drain     # 优雅摘除：新连接改走 fallback_cc，再等存量连接结束
 ```
+
+两份报告都是给人看的：在终端上带颜色和符号，被管道接走时两样都没有。要给脚本解析就加 `--json`，打印 daemon 的原始应答。
+
+`ssctl flows` 逐条列出内核当前跑在 `skyline_cc` 上的每条 TCP 连接——对端、RTT、拥塞窗口、pacing 速率、交付速率、已发字节以及其中的重传占比——下面接着是这些连接上生效中的系数，以及算法决策计数器。逐条数据是**内核自己的**，通过 `ss` 读回：skyline_cc 的逐流状态存在 socket storage 里，用户态无法遍历，但 cwnd、pacing 速率和 RTT 恰好就是它写进套接字的那几项。
 
 通过 SSH 执行 `ssctl drain` 总会走到超时，因为你自己的会话就是一条 skyline_cc 连接。这无害：它在开始等待之前就已经让新连接改走 `fallback_cc`。
 
@@ -166,7 +170,7 @@ ssctl enable --all-off                        # 全关，作为对照基准
 > [!CAUTION]
 > `set-module-config` 是**全量覆盖**，不是增量修改：没写的参数都会被重置为命令行的内置默认值，而不是保持你配置文件里的值。
 
-**动态 RTO 上下限**（默认关闭）。只有 `/sys/fs/cgroup/skyline-speeder` 里的进程建立的连接才会经过 `skyline_policy`；进程不在其中**不会报任何错误**，只是 `ssctl status` 里的 `rack_rto.stats.applied` 一直停在 0。用下面的方式在该 cgroup 里启动服务：
+**动态 RTO 上下限**（默认关闭）。只有 `/sys/fs/cgroup/skyline-speeder` 里的进程建立的连接才会经过 `skyline_policy`；进程不在其中**不会报任何错误**，只是 `ssctl flows` 里 *connections seen* 一直是 0。用下面的方式在该 cgroup 里启动服务：
 
 ```bash
 sudo /opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <你的服务启动命令...>

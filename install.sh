@@ -2,6 +2,8 @@
 #
 # Skyline Speeder -- one-click installer for Debian / Ubuntu.
 #
+# Exclusively sponsored by Skyline Connect -- https://www.skylineconnect.io
+#
 # Installs the build toolchain, compiles the three CO-RE BPF objects against
 # THIS machine's kernel BTF, builds the Rust control plane, installs the systemd
 # units, and activates skyline_cc across reboots. Installs no proxy, no network
@@ -129,6 +131,14 @@ LOG_READY=0     # 1: $LOG has been started for this run
 BAR_SHOWN=0     # 1: the progress line is on screen and must be cleared first
 STEP_NO=0 STEP_TOTAL=0 STEP_NAME= STEP_T0=0 STEP_OPEN=0 STEP_RAN=0 STEP_LOG_LINE=0
 SPIN_I=0 COLS=80 BG_PID= WORK= FAILED=0 INTERRUPTED=0 APT_SIM=
+
+# Skyline Speeder has no revenue of its own. Every run of this script, and
+# every ssctl command, names who funds it -- once on the way in and once on
+# the way out, so it is there whether the operator watches the whole run or
+# only its last screen.
+SPONSOR_TEXT='Exclusively sponsored by Skyline Connect'
+SPONSOR_URL='https://www.skylineconnect.io'
+sponsor() { printf ' %s %s  %s%s%s\n' "$1" "$SPONSOR_TEXT" "$BLD" "$SPONSOR_URL" "$RST" >&3; }
 
 log()  { if [ "$LOG_READY" -eq 1 ]; then printf '%s\n' "$*" >>"$LOG"; fi; }
 info() { log "==> $*"; [ "$QUIET" -eq 1 ] || printf '%s==>%s %s\n' "$BLD" "$RST" "$*" >&3; }
@@ -316,7 +326,7 @@ trap on_interrupt INT TERM
 # --- what is in place now ----------------------------------------------------
 # Root qdisc of an interface as one word: "fq", "cake", "fq_codel", or "mq/"
 # followed by the distinct kinds under an mq root, sorted ("mq/fq_codel",
-# "mq/cake,fq"). The same format `ssctl status` shows as guard.live.
+# "mq/cake,fq"). The same format `ssctl status --json` shows as guard.live.
 # interface_qdisc. A default mq has handle 0 and its children print as
 # "parent :N"; one created by tc has a real handle and "parent 8001:N".
 # clsact/ingress hang off ffff:fff1 / ffff:, not the root, and are not part of
@@ -632,7 +642,7 @@ conf_sysctl_settings() {
     sysctl_key_settings /etc/sysctl.conf
 }
 
-# `ssctl status` pretty-prints one "key": value per line. awk rather than a
+# `ssctl status --json` pretty-prints one "key": value per line. awk rather than a
 # JSON parser for the same reason as the release lookup below: python3/jq are
 # not guaranteed on a minimal server image. First match only; no early `exit`,
 # which could SIGPIPE the printf and, under pipefail, fail the whole script.
@@ -672,8 +682,24 @@ classify_guard() {
     esac
 }
 
+# ssctl 0.3.0 and newer print a readable report by default and keep the JSON
+# this script parses behind --json. An older ssctl -- the one already on the
+# host during an upgrade -- does not know the flag, exits with a usage error
+# and prints nothing on stdout; its plain output is that same JSON. So: ask
+# for --json, and fall back to the bare command when the answer is not an
+# object. Trying the new form first means a host that has both never pays for
+# the old one.
+ssctl_status_json() {
+    local out
+    out=$(timeout 10 /usr/local/bin/ssctl status --json 2>>"$LOG" || true)
+    case "$out" in
+        '{'*) printf '%s' "$out"; return 0 ;;
+    esac
+    timeout 10 /usr/local/bin/ssctl status 2>>"$LOG" || true
+}
+
 read_status() {
-    STATUS_JSON=$(timeout 10 /usr/local/bin/ssctl status 2>>"$LOG" || true)
+    STATUS_JSON=$(ssctl_status_json)
     printf '%s\n' "$STATUS_JSON" >>"$LOG"
 }
 
@@ -1280,6 +1306,9 @@ done
 
 [ "$(id -u)" -eq 0 ] || die "must run as root (try: sudo $0)"
 
+printf '\n %sSkyline Speeder%s\n' "$BLD" "$RST" >&3
+sponsor '--'
+
 # Said here rather than ignored: a flag that does nothing on the mode it was
 # given with reads as a request that was honoured.
 if [ "$RESTORE" = pre-install ] && [ "$MODE" != uninstall ]; then
@@ -1315,6 +1344,7 @@ if [ "$MODE" = uninstall ]; then
     [ ! -e /etc/skyline-speeder ] || INSTALLED=1
     if [ "$INSTALLED" -eq 0 ]; then
         ok "nothing of Skyline Speeder is installed here; nothing was changed"
+        sponsor '--'
         exit 0
     fi
     info "removing Skyline Speeder"
@@ -1402,6 +1432,8 @@ if [ "$MODE" = uninstall ]; then
         warn "them once those connections close, or at the next reboot. New connections"
         warn "already use $(sysctl -n net.ipv4.tcp_congestion_control)."
     fi
+    printf '\n' >&3
+    sponsor '--'
     exit 0
 fi
 
@@ -1708,6 +1740,8 @@ if [ "$MODE" = check ]; then
         info "set in $file (by sysctl -p / sysctl --system, not at boot): ${key##*.} = $value"
     done <<<"$CONF_SETTINGS"
     info "preflight complete"
+    printf '\n' >&3
+    sponsor '--'
     exit 0
 fi
 
@@ -1724,8 +1758,8 @@ if systemctl is-active --quiet skyline-speederd.service 2>/dev/null; then
     UPGRADE=1
     # The restart drops every override made with ssctl (they live only in the
     # daemon's memory). Keep the old state in the log so it can be re-applied.
-    log "upgrade: skyline-speederd ${OLD_VERSION:-(version unknown)} is running; its ssctl status:"
-    OLD_STATUS=$(timeout 10 /usr/local/bin/ssctl status 2>>"$LOG" || true)
+    log "upgrade: skyline-speederd ${OLD_VERSION:-(version unknown)} is running; its ssctl status --json:"
+    OLD_STATUS=$(ssctl_status_json)
     printf '%s\n' "$OLD_STATUS" >>"$LOG"
     # skyline_cc attached with a bare `ssctl enable` (a --no-enable install
     # attached by hand), not by skyline-speeder-enable.service: then no
@@ -2272,6 +2306,8 @@ if [ "$ENABLE" -eq 0 ]; then
         fi
         printf ':\n       %s\n' "$ATTACH_CMD" >&3
     fi
+    printf '\n' >&3
+    sponsor '--'
     exit 0
 fi
 
@@ -2350,7 +2386,7 @@ ok "default qdisc: $AFTER_DQ; ${DEV:-no egress interface} root qdisc: ${AFTER_RO
 # was left alone -- with the default qdisc added to the first.
 QDISC_ROWS=()
 if [ "$HAS_GUARD" -eq 1 ] && [ "$GUARD_QDISC" != false ] && [ "$AFTER_DQ" != fq ]; then
-    warn "net.core.default_qdisc is $AFTER_DQ, not fq. See \"guard\" in: sudo ssctl status"
+    warn "net.core.default_qdisc is $AFTER_DQ, not fq. See DRIFT GUARD in: sudo ssctl status"
 fi
 for i in "${!AFTER_DEVS[@]}"; do
     d=${AFTER_DEVS[i]} now=${AFTER_ROOTS[i]}
@@ -2368,7 +2404,7 @@ for i in "${!AFTER_DEVS[@]}"; do
                     text="$now on $label ($shaping: it shapes, so it was left alone)"
                 elif qdisc_replaceable "$now"; then
                     text="$now on $label (not replaced)"
-                    warn "$label root qdisc is still $now, not fq. See \"last_error\" under \"guard\" in: sudo ssctl status"
+                    warn "$label root qdisc is still $now, not fq. See \"last error\" under DRIFT GUARD in: sudo ssctl status"
                 else
                     text="$now on $label (looks built on purpose, so it was left alone)"
                 fi ;;
@@ -2394,9 +2430,9 @@ elif [ "$GUARD_QDISC" = false ]; then
     QDISC_ROWS[0]="left alone ([guard] qdisc = false): ${QDISC_ROWS[0]}"
 fi
 case "$GUARD_INTERVAL" in
-    '') GUARD_ROW="skyline-speederd (see \"guard\" in ssctl status)" ;;
+    '') GUARD_ROW="skyline-speederd (see DRIFT GUARD in ssctl status)" ;;
     0)  GUARD_ROW="skyline-speederd, when it attaches only ([guard] interval_s = 0)" ;;
-    *)  GUARD_ROW="skyline-speederd, re-checked every $GUARD_INTERVAL s (\"guard\" in ssctl status)" ;;
+    *)  GUARD_ROW="skyline-speederd, re-checked every $GUARD_INTERVAL s (DRIFT GUARD in ssctl status)" ;;
 esac
 
 # --- 12. summary and guide ---------------------------------------------------
@@ -2444,7 +2480,7 @@ if [ "${#NOTE_FILES[@]}" -gt 0 ]; then
         printf '       %s  %s%s\n' "$file" "${NOTE_SETS[$file]}" "$origin" >&3
     done
 fi
-STATUS_WHAT="modules, live coefficients, counters"
+STATUS_WHAT="is it attached, is it the host default, kernel support"
 [ "$HAS_GUARD" -eq 0 ] || STATUS_WHAT="$STATUS_WHAT, guard"
 
 # The path this run came from, so the uninstall command in the guide is one the
@@ -2481,7 +2517,7 @@ RESTORE_DESC=$(
 )
 
 # A few of the common parameters docs/usage.md section 4 explains, each shown
-# with the value the daemon runs right now (module_tuning in ssctl status).
+# with the value the daemon runs right now (module_tuning in ssctl status --json).
 # Every description here is that guide's, shortened; keep them in step.
 knob() {
     local value
@@ -2494,7 +2530,9 @@ cat >&3 <<EOF
 
  ${BLD}Everyday commands${RST}
    sudo ssctl status               $STATUS_WHAT
-   sudo ssctl flows                connections on skyline_cc right now
+   sudo ssctl flows                the accelerated connections, the coefficients
+                                   in force on them, and what the algorithm did
+                                   (--json on either one for the raw reply)
    sudo ssctl drain --timeout 60   graceful detach: new connections use ${FALLBACK:-cubic};
                                    over SSH it ends in a harmless timeout error
    sudo ssctl enable               attach again after a drain
@@ -2513,7 +2551,7 @@ knob --max-pacing-mbps max_pacing_mbps "pacing cap per connection, not host-wide
 cat >&3 <<EOF
    Live:        sudo ssctl set-module-config --max-pacing-mbps 1200 ...
                 Absolute: each flag left out is sent as its built-in default --
-                copy the current values from sudo ssctl status first. Lost
+                copy the current values from sudo ssctl flows first. Lost
                 when skyline-speederd restarts.
                 sudo ssctl reset-module-config    back to the file's values
    Persistent:  edit $CFG, check it with
@@ -2555,3 +2593,6 @@ cat >&3 <<EOF
        /sys/fs/cgroup/skyline-speeder. Opt a service in with:
          sudo /opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <command...>
 EOF
+
+printf '\n' >&3
+sponsor '--'

@@ -147,7 +147,7 @@ IPv6（纯 IPv6 主机没有 IPv4 默认路由），各按 `ip route` 列出的�
 对比，并写入安装前快照，`--uninstall --restore-pre-install` 据此还原；默认的 `--uninstall`
 切到 bbr + fq，不读这份快照的 cc/qdisc 值（两者都见第 7 节）。
 
-**结束摘要与使用指南。** 核对步骤向新 daemon 确认 `skyline_cc` 真的挂上了：`ssctl status`
+**结束摘要与使用指南。** 核对步骤向新 daemon 确认 `skyline_cc` 真的挂上了：`ssctl status --json`
 要报告 `"enabled": true`（带 guard 的版本还要 `"armed": true`），默认拥塞控制也要确实是
 `skyline_cc`。只看 sysctl 不够：daemon 被外部杀掉之后，enable unit 仍显示
 `active (exited)`，`enable --now` 什么也不做，新 daemon 什么都没挂，默认值却还指着已经
@@ -167,7 +167,8 @@ IPv6（纯 IPv6 主机没有 IPv4 默认路由），各按 `ip route` 列出的�
   及更早、Ubuntu 上的 `99-sysctl.conf`）引用时才在开机生效，否则注明它只由
   `sysctl -p`/`sysctl --system` 应用。安装器**不修改**这些文件，它们先生效，随后被
   `skyline-speederd` 覆盖；
-- 日常命令（`ssctl status`/`flows`/`drain`/`enable`）与调参入口：几个最常用参数的当前值、
+- 日常命令（`ssctl status`/`flows`/`drain`/`enable`；前两条默认打印可读报告，`--json`
+  取回原始应答）与调参入口：几个最常用参数的当前值、
   在线修改（`set-module-config`，绝对覆盖）与持久修改（改配置文件、`--validate-only`
   校验、重启 daemon）两种做法，详见 `docs/usage.md`。
 
@@ -179,9 +180,9 @@ guard 并把默认算法写回 `fallback_cc`，再等存量连接至多 60 秒�
 无害）——新 daemon 起来后重新挂载。摘要里显示版本变化
 （`upgraded <旧> -> <新>`；已发布的 v0.2.0 及更早的二进制没有 `--version`，显示
 `from a release without --version (v0.2.0 or older)`。两个 release 之间从 main 构建的版本号
-可能仍是上一个 release 的，版本号本身不说明有没有 guard，看 `status` 里的 `guard`）。已有的 `/etc/skyline-speeder/speeder.toml` 不会被覆盖，缺少的新
+可能仍是上一个 release 的，版本号本身不说明有没有 guard，看 `status --json` 里的 `guard`）。已有的 `/etc/skyline-speeder/speeder.toml` 不会被覆盖，缺少的新
 配置段按默认值生效（例如 `[guard]`）。用 `ssctl` 做的在线修改只在旧 daemon 的内存里，
-重启后不保留；安装器已把旧的 `ssctl status` 写进安装日志，需要时照着重新下发。
+重启后不保留；安装器已把旧的 `ssctl status --json` 写进安装日志，需要时照着重新下发。
 
 `skyline_cc` 是用裸 `ssctl enable` 挂载的主机（enable unit 不是 active，而旧 daemon 报告
 `enabled: true` 或默认拥塞控制是 `skyline_cc`）：没有 ExecStop 替它 drain，daemon 自己
@@ -219,7 +220,7 @@ SKYLINE_ARTIFACT_URL=/path/to/skyline-speeder-<tag>-x86_64.tar.gz sudo -E ./inst
 
 **早于 guard 的 release。** `--prebuilt` 装的是已发布的 release（`--release <tag>` 则是指定
 的那一个），它可能比正在运行的 `install.sh` 旧。已发布的 v0.2.0 及更早的 release 没有
-guard（第 7 节）：`ssctl status` 里没有 `guard`（判断依据是这个键，不是版本号），`ssctl
+guard（第 7 节）：`ssctl status --json` 里没有 `guard`（判断依据是这个键，不是版本号），`ssctl
 enable` 本身不碰 qdisc，之后也不守住默认拥塞控制；但同一 release 附带的 enable unit（它自己
 的 `infra/boot-enable.sh`）会在每次挂载和每次开机时写一次 `net.core.default_qdisc=fq`，它不
 换网卡的根 qdisc，也没有谁守住这个值。安装器据此识别，打印一条告警（`... is a release older than the guard ...`），摘要
@@ -280,15 +281,16 @@ sudo infra/install-guest.sh --confirm-install
 的发送网卡名，再继续下一步——TC 程序挂在这块网卡上，guard 维护的也是这块网卡的根 qdisc
 （它是 VLAN、bond 或网桥时，维护的是它下面的物理网卡，见第 7 节）。它必须是以太网设备：
 `skyline_tc` 按以太网帧头解析每个报文，daemon 不会把它挂到 WireGuard/WARP、tun、gre、ppp
-这类三层隧道上（`ssctl status` 的 `capabilities.notes` 里写明原因，`set-retransmit-dscp`
-随之失败）。默认路由走隧道的主机，这里要填承载隧道流量的那块网卡。
+这类三层隧道上（原因写在 `ssctl status` 的 ATTENTION 段落里，`--json` 里是
+`capabilities.notes`；`set-retransmit-dscp` 随之失败）。默认路由走隧道的主机，这里要填承载隧道流量的那块网卡。
 
 ## 6. cgroup 前提
 
 **这是最容易被忽略、也最不容易被发现的一步**：M1 tier-2（动态 RTO 调节）
 挂在 `/sys/fs/cgroup/skyline-speeder` 这个 cgroup v2 路径上，只有被迁移进这个 cgroup 的
 进程建立的连接才会经过这段 BPF 代码。**进程不迁移进去不会报任何错误——只是
-静默不生效**，`ssctl status` 里 `rack_rto.stats.applied` 会一直停留在 0。
+静默不生效**，`ssctl flows` 的 DYNAMIC RTO 段落里 *connections seen* 会一直停留在 0
+（`--json` 里是 `rack_rto.stats.established_cb`）。
 
 用 `run-in-skyline-cgroup.sh` 包一层来启动需要被加速的服务进程：
 
@@ -313,6 +315,9 @@ sudo ssctl validate
 sudo ssctl status
 sudo ssctl flows
 ```
+
+`status` 报告标题右上角就是结论（`ACCELERATING` / `ATTACHED, NOT DEFAULT` / `STANDBY`），
+不满足时最下面的 ATTENTION 段落逐条写明问题与处理动作；脚本化校验用 `--json`。
 
 `--validate-only --verify-bpf` 会让三个 BPF 对象都过一遍内核验证器再退出，
 不留下任何运行状态——用它可以在正式启动前排除内核版本/BTF 不匹配的问题。
@@ -374,7 +379,7 @@ BBR"脚本把 `bbr` 与 `cake`/`fq_pie` 写进 `/etc/sysctl.d`，之后任何一
 检查一遍，此后每 `[guard] interval_s` 秒（默认 5）再查一次，被改了就改回，并在 journald
 里记一行 `guard: <项> <原值> -> <新值> (...)`。刻意搭建的整形/分类 qdisc（`htb`、`tbf`、
 `netem`、`mqprio` 等）以及设了带宽（或 `autorate-ingress`）的 `cake` 不动，只在
-`ssctl status` 的 `guard.notes` 里说明，例如
+`ssctl status` 的 DRIFT GUARD 段落里以 `note` 说明（`--json` 里是 `guard.notes`），例如
 `eth0 root qdisc cake (bandwidth 90Mbit) looks deliberate; left alone`。
 `drain` 立即解除守护，且不动任何 qdisc。完整规则见 `docs/02-interface-reference.md`
 第 9 节，退出方式见第 5 节的 `[guard]`。
@@ -391,7 +396,7 @@ bond 的从属网卡、VLAN 的真实网卡、网桥的物理端口），纠正�
 运维亲手把一块物理网卡设成 `noqueue` 的，按刻意搭建处理，不动。tun、PPP 设备（OpenVPN、WARP 客户端、
 PPPoE）有自己的默认 qdisc，被当作 `tc_interface` 时 guard 管的就是它自己的根。
 
-`ssctl status` 的 `capabilities` 字段列出六项硬性前提
+`ssctl status` 的 KERNEL 段落（`--json` 里是 `capabilities` 字段）列出六项硬性前提
 （`btf`/`bpffs`/`cgroup_v2`/`fq_available`/`struct_ops`/`fallback_cc_available`）——任一为 `false`，
 执行 `ssctl validate`/`ssctl enable` 时会直接拒绝，不会带着一个残缺的
 能力集运行；`skyline-speederd.service` 进程本身的启动不受这条门槛影响。
@@ -496,10 +501,10 @@ unit、二进制与 `/opt/skyline-speeder`，保留 `/etc/skyline-speeder`，然
 
 ## 10. 可观测性与排障
 
-`ssctl status` 的 `metrics` 字段（`skyline_cc` 从未启用过时为 `null`）暴露决策
-计数器；事件环形缓冲区落盘到配置里的 `runtime.events_path`，记录状态切换/
-护栏触发/配置代际切换等事件。完整字段与事件码含义见
-`docs/02-interface-reference.md` 第 4/8 节。
+`ssctl flows` 的 WHAT THE ALGORITHM DID 段落（`--json` 里是 `status.metrics`，`skyline_cc`
+从未启用过时为 `null`）暴露决策计数器，同一条命令还逐条列出当前被加速的连接；事件环形
+缓冲区落盘到配置里的 `runtime.events_path`，记录状态切换/护栏触发/配置代际切换等事件。
+完整字段与事件码含义见 `docs/02-interface-reference.md` 第 4/4.1/8 节。
 
 事件日志位于 `/run`（内存 tmpfs），大小受 `runtime.events_max_mib` 限制（默认 8 MiB，
 满了轮转为 `events.jsonl.1`，最多约占两倍）；不需要事件时设为 `0` 即可关闭。

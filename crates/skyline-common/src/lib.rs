@@ -17,6 +17,17 @@ use thiserror::Error;
 /// queue-delay/ECN guardrail's `guardrail_gain_permille`).
 pub const ABI_VERSION: u32 = 7;
 
+/// The congestion control algorithm name skyline_cc registers under. Must stay
+/// byte-identical to `.name` in bpf/skyline_cc.bpf.c -- the kernel matches the
+/// sysctl write in `skyline-speederd` against the registered name, and a mismatch
+/// fails with EINVAL rather than silently doing nothing. `ssctl` compares the
+/// live `tcp_congestion_control` against it to tell "attached" from "actually
+/// carrying the host's traffic". Deliberately NOT reused for struct_ops *map*
+/// name lookups: those happen to be the same string today but are a different
+/// namespace, and collapsing them would couple two things that are free to
+/// diverge.
+pub const SKYLINE_CC_NAME: &str = "skyline_cc";
+
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub struct FeatureMask: u32 {
@@ -1025,7 +1036,108 @@ pub struct RuntimeStatus {
     /// a daemon older than the guard.
     #[serde(default)]
     pub guard: GuardStatus,
+    /// Seconds since this `skyline-speederd` process started. 0 from a
+    /// daemon older than the field.
+    #[serde(default)]
+    pub uptime_s: u64,
+    /// Seconds since the `Enable` that attached the struct_ops currently
+    /// loaded. `None` while nothing is attached, and from a daemon older
+    /// than the field.
+    #[serde(default)]
+    pub attached_s: Option<u64>,
 }
+
+/// One TCP connection the kernel currently runs on `skyline_cc`, as
+/// `ss -tin` reports it.
+///
+/// Every measurement is the kernel's own (`struct tcp_info` plus what
+/// iproute2 derives from it), not skyline_cc's view of the flow: the BPF
+/// side keeps its per-flow state in an `SK_STORAGE` map, which user space
+/// cannot enumerate without a socket file descriptor. What the two have in
+/// common -- cwnd, pacing rate, RTT -- is exactly the part skyline_cc
+/// writes, so this is a faithful picture of what the acceleration did,
+/// arrived at from the other end.
+///
+/// Every field but `peer`/`local`/`state` is `Option`: iproute2 prints a
+/// key only when the kernel has a value for it, and which keys exist has
+/// changed between versions. A missing one renders as `-` rather than as a
+/// zero that would read like a measurement.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FlowRow {
+    /// `address:port`, numeric (`ss -n`); IPv6 in brackets.
+    pub peer: String,
+    pub local: String,
+    /// `ESTAB`, `CLOSE-WAIT`, ... as iproute2 spells it.
+    pub state: String,
+    /// Smoothed RTT and its variation, milliseconds (`rtt:13.5/6.2`).
+    pub rtt_ms: Option<f64>,
+    pub rtt_var_ms: Option<f64>,
+    /// `minrtt:` -- the floor skyline_cc's BDP target is built on.
+    pub min_rtt_ms: Option<f64>,
+    /// Congestion window, packets. What M2 drives.
+    pub cwnd_packets: Option<u64>,
+    pub ssthresh: Option<u64>,
+    /// Pacing rate in bits per second. What M2/M4 drive.
+    pub pacing_bps: Option<u64>,
+    /// Kernel's delivery-rate estimate, bits per second.
+    pub delivery_bps: Option<u64>,
+    /// Kernel's send-rate estimate (cwnd/rtt), bits per second.
+    pub send_bps: Option<u64>,
+    pub bytes_sent: Option<u64>,
+    pub bytes_acked: Option<u64>,
+    pub bytes_retrans: Option<u64>,
+    /// Cumulative retransmitted segments (`retrans:0/12`'s second number).
+    pub retrans_total: Option<u64>,
+    pub unacked: Option<u64>,
+    pub mss: Option<u32>,
+    /// Current retransmission timeout, milliseconds. M1 tier-2 moves its
+    /// floor and ceiling, so this is where that shows up.
+    pub rto_ms: Option<f64>,
+}
+
+impl FlowRow {
+    /// Retransmitted share of what was sent, 0.0-1.0, from the byte
+    /// counters. `None` unless both are known and something was sent.
+    pub fn retransmit_ratio(&self) -> Option<f64> {
+        match (self.bytes_sent, self.bytes_retrans) {
+            (Some(sent), Some(retrans)) if sent > 0 => Some(retrans as f64 / sent as f64),
+            _ => None,
+        }
+    }
+}
+
+/// What `ssctl flows` reports: the accelerated connections and how much of
+/// the host's TCP traffic they are.
+///
+/// `accelerated` is capped (see `FLOW_ROWS_MAX`); `on_skyline_cc` is the
+/// full count either way, so a host with thousands of connections still
+/// reports the truth about how many are accelerated.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FlowReport {
+    /// The accelerated connections, most bytes sent first, capped at
+    /// `FLOW_ROWS_MAX`.
+    pub accelerated: Vec<FlowRow>,
+    /// Connected TCP sockets on the host, whatever congestion control they
+    /// use. Listening sockets are not counted.
+    pub tcp_total: u64,
+    /// How many of those the kernel runs on `skyline_cc`. Can exceed
+    /// `accelerated.len()`, which is capped.
+    pub on_skyline_cc: u64,
+    /// Rows left out of `accelerated` by the cap.
+    pub truncated: u64,
+    /// Why the enumeration is empty or partial: `ss` missing, killed at its
+    /// timeout, or output that could not be parsed. `accelerated` is then
+    /// empty and the counts are 0, but the rest of the report (the
+    /// coefficients in force, the BPF counters) is still valid -- those come
+    /// from the daemon, not from `ss`.
+    pub source_error: Option<String>,
+}
+
+/// How many `FlowRow`s a `FlowReport` carries at most. A terminal cannot
+/// show more, and the counts above stay exact regardless.
+pub const FLOW_ROWS_MAX: usize = 50;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "kebab-case")]
@@ -1072,6 +1184,13 @@ pub struct Response {
     pub ok: bool,
     pub message: String,
     pub status: Option<RuntimeStatus>,
+    /// Only `Request::Flows` fills this in: enumerating sockets costs an
+    /// `ss` of its own, which every other request would pay for nothing.
+    /// Defaulted on the wire, so a daemon older than the field still
+    /// decodes here and a newer daemon's reply still decodes in an older
+    /// `ssctl`.
+    #[serde(default)]
+    pub flows: Option<FlowReport>,
 }
 
 #[derive(Debug, Error)]
