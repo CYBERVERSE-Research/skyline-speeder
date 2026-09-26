@@ -27,7 +27,11 @@
 #   ... | sudo bash -s -- --check       # preflight only
 #   ... | sudo bash -s -- --no-enable   # install without attaching skyline_cc
 #   ... | sudo bash -s -- --verbose     # show every build command's output
-#   ... | sudo bash -s -- --uninstall   # remove
+#   ... | sudo bash -s -- --uninstall   # remove, put the host on bbr + fq, and
+#                                       #   remove the packages the install added
+#   ... | sudo bash -s -- --uninstall --restore-pre-install
+#                                       # ... but restore the cc/qdisc from
+#                                       #   before the install instead
 #
 set -euo pipefail
 
@@ -57,7 +61,9 @@ main() {
             --ref)     [ "$#" -ge 2 ] || die "--ref needs a value";     REF="$2";     shift 2 ;;
             --repo)    [ "$#" -ge 2 ] || die "--repo needs a value";    REPO="$2";    shift 2 ;;
             --src-dir) [ "$#" -ge 2 ] || die "--src-dir needs a value"; SRC_DIR="$2"; shift 2 ;;
-            -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+            # The header comment, to its end, rather than a hand-counted line
+            # range that truncates the moment a flag is documented above.
+            -h|--help) awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
             *)         FORWARD+=("$1"); shift ;;
         esac
     done
@@ -67,7 +73,11 @@ main() {
     # Uninstalling from an existing tree needs no download. Re-fetching the
     # source just to delete the installation would be absurd, and would fail on
     # a host that has since lost network access.
-    if [ "${FORWARD[0]:-}" = --uninstall ] && [ -x "$SRC_DIR/install.sh" ]; then
+    # Anywhere in the forwarded arguments, not just first: --uninstall now takes
+    # a companion flag, and `--restore-pre-install --uninstall` means the same
+    # thing to install.sh as the other order.
+    case " ${FORWARD[*]-} " in *" --uninstall "*) UNINSTALLING=1 ;; *) UNINSTALLING=0 ;; esac
+    if [ "$UNINSTALLING" -eq 1 ] && [ -x "$SRC_DIR/install.sh" ]; then
         info "using existing tree at $SRC_DIR"
         exec "$SRC_DIR/install.sh" "${FORWARD[@]}"
     fi
@@ -155,7 +165,7 @@ main() {
 
     echo
     ok "source kept at $SRC_DIR -- rebuild or remove from there:"
-    echo "     sudo $SRC_DIR/install.sh --uninstall"
+    echo "     sudo $SRC_DIR/install.sh --uninstall   # also puts this host on bbr + fq"
 }
 
 main "$@"

@@ -56,9 +56,77 @@ for anyone holding a prebuilt `.bpf.o`.
 - `infra/boot-enable.sh` no longer writes `net.core.default_qdisc=fq` at boot.
   With `[guard] qdisc = false` nothing in Skyline Speeder sets a qdisc any
   more; set it in `/etc/sysctl.d` if the host relies on it.
+- **`--uninstall` now leaves the host on bbr + fq, not on what it ran before**,
+  and removes the build toolchain the install added (see Added).
+  `--uninstall --restore-pre-install` keeps the old cc/qdisc restore; the
+  toolchain removal has no opt-out flag -- delete lines from
+  `/etc/skyline-speeder/added-packages` to keep a package. A host installed by
+  0.2.0 or earlier has no such record, and running the new `install.sh` over it
+  does not make one either: only a run that actually installs a package records
+  it, and the toolchain is already there. Those hosts keep their toolchain
+  unless it is removed by hand, or unless the host is installed again from
+  clean.
 
 ### Added
 
+- **`install.sh --uninstall` leaves the host on bbr + fq and takes the build
+  toolchain with it.** A host that installed Skyline Speeder almost always
+  arrived from a "one-click BBR" setup, so being dropped to the daemon's
+  `fallback_cc` (cubic) on the way out was a downgrade nobody asked for that
+  nothing reported; and leaving clang, LLVM, bpftool and a Rust toolchain
+  behind is not "removed". The uninstall now, after the drain and after the
+  units, binaries and objects are gone:
+  - sets `net.ipv4.tcp_congestion_control = bbr` and
+    `net.core.default_qdisc = fq`, and puts `fq` back on the root qdisc of
+    every NIC `runtime.tc_interface` resolves to -- the NICs the guard manages
+    while it is armed, whether or not `[guard] qdisc` was ever turned off
+    (`mq` over `fq` on a multi-queue one).
+    One that is already `fq` is left as it is, and one that looks built on
+    purpose (`htb`, `tbf`, `netem`, a `cake` with a bandwidth) is named and
+    left exactly alone with the command to change it by hand -- the same rule
+    the guard follows. A kernel without bbr gets `modprobe tcp_bbr` first
+    (writing the sysctl does not load it: the kernel only accepts an algorithm
+    that is already registered), and if it still has none, the pre-install
+    value, then cubic, then reno, saying which. **For that boot only:** no file
+    under `/etc/sysctl.d` is written or edited, so those files decide again
+    after a reboot, and the uninstall says so.
+  - removes the packages the install added, and only those. An install now
+    records them in `/etc/skyline-speeder/added-packages` -- the difference
+    between dpkg's installed set before and after apt ran, so it names the
+    dependencies apt pulled in and can never name a package the host already
+    had, which is why the removal needs no `autoremove`. It is also intersected
+    with the plan apt accepted for that request, because a fresh cloud VM is
+    often still running unattended-upgrades while the installer waits for the
+    dpkg lock, and what that installed is not ours to remove. Four rails on
+    top: `iproute2`, `curl`, `ca-certificates` and `tar` are never removed, nor
+    is anything they still need transitively (keeping `curl` while removing the
+    library under it is a contradiction apt resolves by taking `curl`, and
+    without this rail the whole removal collapsed to nothing on the test host),
+    nor anything dpkg calls *required* or *important* for any architecture; and
+    apt plans the removal first, so a package something else on the host now
+    needs is kept and named, the rest is removed, and nothing is removed at all
+    only when no reduced plan stays inside the list (three rounds). (Measured
+    while writing it: on one host, treating `libelf1` as removable would have
+    taken 29 packages with it, `iproute2`, `ifupdown`, `isc-dhcp-client` and
+    `cloud-init` among them.) Every failure in this step is a warning and a
+    command to run by hand -- by then Skyline Speeder itself is already gone,
+    so stopping would leave more behind, not less.
+  - removes the rustup toolchain only when the installer is what installed it,
+    which it records in `/etc/skyline-speeder/added-rustup`; a toolchain the
+    operator had before is never touched. `rustup self uninstall` does the work
+    where it can, and the fallback only deletes directories that still look
+    like rustup's.
+  - `/etc/skyline-speeder` is kept, as before, so a reinstall keeps the
+    operator's settings. The two records above are consumed instead: each is
+    deleted once what it describes is gone, so a reinstall starts a fresh one,
+    and a removal that failed keeps its record for the next attempt.
+- `install.sh --uninstall --restore-pre-install` keeps the old behaviour: put
+  back the congestion control, `default_qdisc` and root qdiscs the host ran
+  before the install, from `/etc/skyline-speeder/pre-install-state`. For a host
+  that was on something else on purpose -- cubic for a comparison, a shaped
+  qdisc -- where bbr and fq would be as wrong as cubic is on the usual one.
+- The installer's closing guide has an `Uninstall` section, with the command
+  spelled out against the path this run came from.
 - **The guard: skyline-speederd keeps the host on skyline_cc and fq.**
   "One-click BBR" scripts write `tcp_congestion_control=bbr` and
   `default_qdisc=cake` or `fq_pie` into `/etc/sysctl.conf` or
@@ -145,8 +213,9 @@ for anyone holding a prebuilt `.bpf.o`.
 - The pre-install snapshot also records the root qdisc of every NIC the guard
   will manage (`PRE_INSTALL_QDISC_DEV` and `PRE_INSTALL_ROOT_QDISC`, two
   space-separated lists in step; one NIC looks like a plain name and summary),
-  and `--uninstall` puts each one's kind back, with default parameters, if it
-  still has the `fq` or `mq/fq` Skyline Speeder left there. An `mq` is rebuilt
+  and `--uninstall --restore-pre-install` puts each one's kind back, with
+  default parameters, if it still has the `fq` or `mq/fq` Skyline Speeder left
+  there (the default `--uninstall` leaves `fq` there on purpose). An `mq` is rebuilt
   with `tc qdisc del` of the root (a `replace root mq` over the guard's
   `tc`-made `mq` changes nothing), falling back to `replace root mq` over the
   kernel's own handle-0 `mq`. A new snapshot always carries both keys, empty

@@ -115,10 +115,15 @@ sudo ./install.sh --prebuilt   # 安装已发布的产物，不需要编译工�
 sudo ./install.sh --check      # 只做前置检查，不改动任何东西
 sudo ./install.sh --no-enable  # 安装，但不挂载此前没挂载的 skyline_cc
 sudo ./install.sh --verbose    # 不显示进度条，改为打印每条命令的输出
-sudo ./install.sh --uninstall  # 卸载（保留 /etc/skyline-speeder）
+sudo ./install.sh --uninstall  # 卸载，把本机切回 bbr + fq，并卸掉安装时装上的包
+                               #   （保留 /etc/skyline-speeder）
+sudo ./install.sh --uninstall --restore-pre-install   # 同上，但还原成
+                               #   安装前那台机器用的拥塞控制与 qdisc
 ```
 
-安装器会检查内核，构建或下载三个 BPF 对象和 daemon，把 TC 程序指向默认路由所在的网卡（IPv4 或 IPv6；默认路由走 WireGuard 这类隧道时，它会请你自己指定网卡），让每个对象过一遍内核验证器，然后启动 daemon、挂载 `skyline_cc`，并把两者设为开机自启。安装过程中终端只显示一行进度，所有命令的输出都保存在 `/var/log/skyline-speeder-install.log`；装完会列出拥塞控制与 qdisc 改动前后的值，再给出 `ssctl` 用法与调参的简短指南。它会先记录当前使用的拥塞控制与 qdisc（包括出口网卡的根 qdisc），`--uninstall` 时还原。**不安装任何代理，不监听任何端口。**
+安装器会检查内核，构建或下载三个 BPF 对象和 daemon，把 TC 程序指向默认路由所在的网卡（IPv4 或 IPv6；默认路由走 WireGuard 这类隧道时，它会请你自己指定网卡），让每个对象过一遍内核验证器，然后启动 daemon、挂载 `skyline_cc`，并把两者设为开机自启。安装过程中终端只显示一行进度，所有命令的输出都保存在 `/var/log/skyline-speeder-install.log`；装完会列出拥塞控制与 qdisc 改动前后的值，再给出 `ssctl` 用法、调参与卸载方法的简短指南。**不安装任何代理，不监听任何端口。**
+
+`--uninstall` 会先 drain 掉存量连接，删除两个 systemd 单元、二进制和 BPF 对象，把本机切到 **bbr + fq**，并卸掉安装时装上的包。装了哪些包是记录下来的（`/etc/skyline-speeder/added-packages`），也只卸这些：不碰 `iproute2`、`curl`、`ca-certificates`、`tar`，不碰这几个包**仍然依赖**的东西（保留 `curl` 却删掉它底下的库，apt 根本做不到），也不碰 dpkg 标为 *required*/*important* 的包。卸之前先让 apt 出计划：计划里如果要连带删掉主机上别的东西，就把造成这件事的那个包单独留下并说明，其余照卸；只有在怎么缩减都无法得到一个不越界的计划时，才一个都不卸、改为打印手工命令。rustup 工具链只在确实是安装器装的情况下才移除。`bbr` 与 `fq` 只在本次运行时生效——不写也不改 `/etc/sysctl.d` 下的任何文件，所以重启后仍由那些文件决定。加 `--restore-pre-install` 则还原成安装前那台机器用的拥塞控制与 qdisc（包括出口网卡的根 qdisc，安装时一并记录）。两种方式都保留 `/etc/skyline-speeder`，重装时你的配置还在。
 
 `--prebuilt` 不需要编译工具链，只需要 `curl`、`tar` 和 `iproute2`（安装器会自动安装）：对象是 CO-RE 的，用固定的 6.12 参考头编译，加载时再按这台机器的内核重定位。预编译的 daemon 在 Ubuntu 24.04 上构建，需要 glibc 2.38 以上以及 `libelf.so.1`、`libz.so.1`（Debian 13、Ubuntu 24.04 及更新版本满足）；用户态更旧的系统请从源码构建。`--release <tag>` 指定版本；连不上 GitHub 的机器，把产物拷过去后用 `SKYLINE_ARTIFACT_URL=/path/to/tarball sudo -E ./install.sh --prebuilt` 安装。它装的是已发布的 release，可能比这份 README 旧：例如 v0.2.0 这个 release 还没有下文「配置」里说的 qdisc 守护，遇到这种情况安装器会明确提示。
 

@@ -13,11 +13,26 @@
 #   sudo ./install.sh --check          # preflight only, change nothing
 #   sudo ./install.sh --no-enable      # install, but attach nothing that was not attached
 #   sudo ./install.sh --verbose        # show every command's output (or SKYLINE_VERBOSE=1)
-#   sudo ./install.sh --uninstall      # remove, and put back the pre-install cc/qdisc
+#   sudo ./install.sh --uninstall      # remove it, put this host on bbr + fq, and
+#                                      # remove the packages this installer added
+#   sudo ./install.sh --uninstall --restore-pre-install
+#                                      # ... but restore the cc/qdisc from before
+#                                      # the install instead of bbr + fq
 #
 # The terminal shows one progress line. Everything the steps print goes to
 # /var/log/skyline-speeder-install.log, which is kept; if a step fails, its
 # last lines are shown together with that path.
+#
+# --uninstall removes the build toolchain it installed (clang, LLVM, bpftool,
+# rustup and what came with them) and nothing else: only packages recorded as
+# added by an install of this host, never iproute2, curl, ca-certificates or
+# tar, never anything one of those still needs, and never one dpkg calls
+# required or important. apt plans the removal first; a package something else
+# on this host now needs is kept, named, and the rest is removed, and nothing
+# at all is removed when no reduced plan stays inside the recorded list. It
+# keeps /etc/skyline-speeder. bbr + fq is set for that boot; no file under
+# /etc/sysctl.d is written or edited, so those files decide again after a
+# reboot.
 #
 # Running it again on an installed host upgrades it: the new objects must pass
 # the kernel verifier first, and only then is skyline-speederd restarted (live
@@ -51,12 +66,38 @@ MODE=install
 ENABLE=1
 SOURCE=build          # build | prebuilt
 RELEASE_TAG=          # empty means "latest"
+RESTORE=bbr-fq        # bbr-fq | pre-install: what --uninstall leaves behind
 REPO_SLUG=${SKYLINE_REPO:-CYBERVERSE-Research/skyline-speeder}
 case "${SKYLINE_VERBOSE:-0}" in 1|yes|true) VERBOSE=1 ;; *) VERBOSE=0 ;; esac
 LOG=/var/log/skyline-speeder-install.log
 CFG=/etc/skyline-speeder/speeder.toml
 STATE=/etc/skyline-speeder/pre-install-state
+# What an install added to this host, so --uninstall can take exactly that
+# away again and nothing else. Separate files, not more keys in $STATE: that
+# one is written once and then closed forever (it must never record
+# skyline_cc as the "original"), while a later upgrade run can add packages.
+ADDED_PKGS=/etc/skyline-speeder/added-packages
+ADDED_RUSTUP=/etc/skyline-speeder/added-rustup
+# Recorded as added when they were, but never removed again: iproute2 and
+# curl are how an operator reaches the network and reads a qdisc, tar and
+# ca-certificates are what --prebuilt needed and what half the host uses.
+# A package dpkg calls required or important is skipped for the same reason,
+# whatever its name.
+KEEP_PKGS=(iproute2 curl ca-certificates tar)
+ADDED_COUNT=0      # packages recorded in $ADDED_PKGS after this run
+ADDED_REMOVABLE=0  # of those, the ones an uninstall would actually remove
 GUIDE_URL=https://github.com/CYBERVERSE-Research/skyline-speeder/blob/main/docs/usage.md
+
+# `-qq` silences apt but not dpkg, which still prints an unpack line per
+# package plus a "Reading database" progress bar. Dpkg::Use-Pty=0 stops the
+# progress redraw; the log keeps the detail for when something actually fails.
+# A fresh cloud VM is often still running unattended-upgrades: wait for the
+# dpkg lock instead of failing on it. confdef/confold answer a changed-conffile
+# prompt the way an operator almost always would -- keep their file -- since
+# nobody can answer it from behind a progress bar. Up here rather than beside
+# the package step, because --uninstall removes packages with it too.
+APT_OPTS=(-y -qq -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=300
+          -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 
 # --- output ----------------------------------------------------------------
 # An install used to scroll a screenful of apt, rustup, make and cargo output
@@ -693,22 +734,589 @@ restore_root_qdisc() {
     fi
 }
 
+# tx_queue_count <device>: its transmit queues, at least 1. More than one and
+# the root has to be mq over fq rather than a bare fq, the same choice the
+# guard makes (crates/skyline-speederd/src/guard.rs).
+tx_queue_count() {
+    local n=0 q
+    for q in "/sys/class/net/$1/queues"/tx-*; do
+        [ -d "$q" ] || continue
+        n=$((n + 1))
+    done
+    [ "$n" -ge 1 ] || n=1
+    printf '%s' "$n"
+}
+
+# ensure_fq_root <device>: leave fq on one NIC's root. Normally there is
+# nothing to do -- skyline-speederd's guard was holding fq there until the
+# drain a moment ago. A root that looks built on purpose (htb, tbf, netem, a
+# cake with a bandwidth) is left exactly alone and named, for the reason the
+# guard never replaces one either: overwriting it would silently destroy an
+# operator's shaping.
+ensure_fq_root() {
+    local dev=$1 now shaping queues
+    if [ ! -e "/sys/class/net/$dev" ]; then
+        warn "$dev: no such interface any more; no qdisc set there"
+        return 0
+    fi
+    if ! command -v tc >/dev/null 2>&1; then
+        warn "no tc (iproute2) on this host; $dev root qdisc left as it is"
+        return 0
+    fi
+    now=$(root_qdisc_summary "$dev")
+    case "$now" in
+        '')      warn "$dev: tc reports no root qdisc; left alone"; return 0 ;;
+        noqueue) log "$dev root qdisc is noqueue (it queues nothing); left alone"; return 0 ;;
+        fq|mq/fq) ok "$dev root qdisc is already $now"; return 0 ;;
+    esac
+    shaping=$(root_qdisc_shaping "$dev")
+    if [ -n "$shaping" ] || ! qdisc_replaceable "$now"; then
+        warn "$dev root qdisc is $now${shaping:+ ($shaping)}; it looks built on purpose, so it was left alone"
+        warn "  to put fq there: tc qdisc replace dev $dev root fq"
+        return 0
+    fi
+    queues=$(tx_queue_count "$dev")
+    if [ "$queues" -gt 1 ]; then
+        # A multi-queue NIC gets mq, whose children the kernel creates from
+        # net.core.default_qdisc -- so only while that actually reads fq, the
+        # same condition guard.rs's replace_plan insists on (default_is_fq).
+        # Without it a failed sysctl write above would turn into an mq of
+        # something else, which is worse than the root that is there now.
+        if [ "$(sysctl -n net.core.default_qdisc 2>/dev/null || true)" != fq ]; then
+            warn "$dev has $queues transmit queues and net.core.default_qdisc is not fq;"
+            warn "  its root qdisc ($now) was left alone. Set it by hand with:"
+            warn "  sysctl -w net.core.default_qdisc=fq && tc qdisc replace dev $dev root mq"
+            return 0
+        fi
+        # `replace root mq` over an mq that tc created -- which is what
+        # skyline-speederd leaves on a multi-queue NIC -- is a same-kind
+        # no-option "change" the kernel accepts and ignores (exit 0, the
+        # children stay; checked on 6.12). Deleting the root is what makes the
+        # kernel build a fresh mq from default_qdisc; its own handle-0 mq
+        # cannot be deleted, and there the replace is what works. Same two
+        # steps, same order, as restore_root_qdisc.
+        tc qdisc del dev "$dev" root >/dev/null 2>&1 \
+            || tc qdisc replace dev "$dev" root mq >/dev/null 2>&1 || true
+    else
+        # A single-queue NIC names fq itself, so the default does not matter.
+        tc qdisc replace dev "$dev" root fq >/dev/null 2>&1 || true
+    fi
+    now=$(root_qdisc_summary "$dev")
+    case "$now" in
+        fq|mq/fq) ok "$dev root qdisc set to $now" ;;
+        *) warn "could not set $dev root qdisc to fq (it is ${now:-unknown})" ;;
+    esac
+}
+
+# restore_bbr_fq: leave the host on bbr + fq. This is what --uninstall does
+# unless --restore-pre-install asks for the snapshot instead, because a host
+# that installed Skyline Speeder almost always arrived from a "one-click BBR"
+# setup: dropping it to the daemon's fallback_cc (cubic) on the way out would
+# be a downgrade nobody asked for and nothing would report it.
+#
+# For this boot only. No file under /etc/sysctl.d is written or edited -- the
+# same rule the guard follows while it is installed -- so after a reboot those
+# files decide again, and the caller says so in as many words.
+restore_bbr_fq() {
+    local avail cc=bbr dev want
+    avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    case " $avail " in
+        *" bbr "*) ;;
+        # tcp_bbr is a module on most distribution kernels, and on a host that
+        # has been running skyline_cc nothing has asked for it yet. Writing
+        # the sysctl does not load it: the kernel only accepts the name of an
+        # algorithm that is already registered.
+        *) modprobe tcp_bbr >/dev/null 2>&1 || true
+           avail=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true) ;;
+    esac
+    case " $avail " in
+        *" bbr "*) ;;
+        *) # No point insisting on a name this kernel does not have. Prefer
+           # what the host ran before the install, then the usual suspects.
+           cc=
+           for want in "${PRE_INSTALL_CC:-}" cubic reno; do
+               [ -n "$want" ] || continue
+               case " $avail " in *" $want "*) cc=$want; break ;; esac
+           done
+           if [ -n "$cc" ]; then
+               warn "bbr is not available on kernel $KVER; using $cc instead"
+           else
+               warn "bbr is not available on kernel $KVER and no fallback of ours is either;"
+               warn "  congestion control left at $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+           fi ;;
+    esac
+    if [ -n "$cc" ]; then
+        sysctl -qw "net.ipv4.tcp_congestion_control=$cc" 2>/dev/null \
+            && ok "congestion control set to $cc" \
+            || warn "could not set congestion control to $cc"
+    fi
+    # Writing this is also what makes the kernel load sch_fq
+    # (qdisc_set_default -> request_module), so there is no modprobe for it.
+    sysctl -qw net.core.default_qdisc=fq 2>/dev/null \
+        && ok "default qdisc set to fq" \
+        || warn "could not set net.core.default_qdisc to fq"
+    # default_qdisc only shapes qdiscs created after it, so the NICs that
+    # carried skyline-speederd's fq are set explicitly. They are resolved the
+    # way the guard resolved them, from the config --uninstall keeps; the
+    # snapshot's list is the fallback for a host whose config or NIC has since
+    # changed.
+    dev=$(planned_interface)
+    load_managed "$dev"
+    if [ "${#MANAGED_DEVS[@]}" -eq 0 ] && [ -n "${PRE_INSTALL_QDISC_DEV:-}" ]; then
+        read -ra MANAGED_DEVS <<<"$PRE_INSTALL_QDISC_DEV"
+    fi
+    if [ "${#MANAGED_DEVS[@]}" -eq 0 ]; then
+        warn "no egress interface is known here, so no NIC's root qdisc was set to fq"
+        warn "  net.core.default_qdisc = fq still applies to qdiscs created from now on"
+        return 0
+    fi
+    for dev in "${MANAGED_DEVS[@]}"; do
+        [ -n "$dev" ] || continue
+        ensure_fq_root "$dev"
+    done
+}
+
+# restore_pre_install: put back exactly what the host ran before the install,
+# from the snapshot $STATE. What --uninstall did before bbr + fq became its
+# default, and still what --restore-pre-install asks for -- on a host that was
+# deliberately on something else (cubic for a comparison, a shaped cake), bbr
+# and fq would be as wrong as cubic is on the usual one. The caller has
+# sourced $STATE already.
+restore_pre_install() {
+    local -a devs=() roots=()
+    local dflt i
+    if [ -n "${PRE_INSTALL_CC:-}" ]; then
+        if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null \
+            | grep -qw -- "$PRE_INSTALL_CC"; then
+            sysctl -qw "net.ipv4.tcp_congestion_control=$PRE_INSTALL_CC"
+            ok "congestion control restored to $PRE_INSTALL_CC"
+        else
+            warn "cannot restore '$PRE_INSTALL_CC': no longer available on this kernel"
+        fi
+    fi
+    if [ -n "${PRE_INSTALL_QDISC:-}" ]; then
+        sysctl -qw "net.core.default_qdisc=$PRE_INSTALL_QDISC" 2>/dev/null \
+            && ok "default qdisc restored to $PRE_INSTALL_QDISC" \
+            || warn "could not restore default qdisc to $PRE_INSTALL_QDISC"
+    fi
+    # default_qdisc only shapes qdiscs created later; the root qdiscs are
+    # what skyline-speederd actually replaced: runtime.tc_interface's, or
+    # those of the NICs under it (a VLAN, bond or bridge). Two parallel,
+    # space-separated lists. Snapshots written before the guard existed
+    # have neither key, and one that knew no interface has them empty;
+    # both are skipped.
+    [ -n "${PRE_INSTALL_QDISC_DEV:-}" ] && [ -n "${PRE_INSTALL_ROOT_QDISC:-}" ] || return 0
+    read -ra devs <<<"$PRE_INSTALL_QDISC_DEV"
+    read -ra roots <<<"$PRE_INSTALL_ROOT_QDISC"
+    if [ "${#devs[@]}" -ne "${#roots[@]}" ]; then
+        warn "$STATE lists ${#devs[@]} interface(s) but ${#roots[@]} root qdisc(s); no root qdisc restored"
+        return 0
+    fi
+    dflt=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "${PRE_INSTALL_QDISC:-fq_codel}")
+    for i in "${!devs[@]}"; do
+        restore_root_qdisc "${devs[i]}" "${roots[i]}" "$dflt"
+    done
+}
+
+# The packages dpkg has fully installed, one per line, sorted -- the input to
+# the difference an install records in $ADDED_PKGS.
+dpkg_installed_set() {
+    dpkg-query -W -f '${Package} ${Status}\n' 2>/dev/null \
+        | awk '$NF == "installed" { print $1 }' | sort || true
+}
+
+pkg_is_keeper() {
+    local k
+    for k in "${KEEP_PKGS[@]}"; do
+        [ "$k" != "$1" ] || return 0
+    done
+    return 1
+}
+
+# pkg_closure <package...>: every installed package those still need,
+# transitively, themselves included, one per line. apt-cache prints a package
+# name at the start of a line and its relations indented; an architecture
+# suffix (`dpkg:i386`) and a virtual package's angle brackets are stripped.
+# Recommends and Suggests are deliberately excluded -- "would be nice to have"
+# is not a reason to keep a compiler.
+pkg_closure() {
+    [ "$#" -gt 0 ] || return 0
+    command -v apt-cache >/dev/null 2>&1 || return 0
+    apt-cache depends --recurse --installed --no-recommends --no-suggests \
+        --no-conflicts --no-breaks --no-replaces --no-enhances "$@" 2>/dev/null \
+        | awk '/^[^[:space:]]/ { sub(/:[^:]*$/, ""); gsub(/[<>]/, ""); if ($0 != "") print }' \
+        | sort -u || true
+}
+
+# pkg_in_list <package> <list...>
+pkg_in_list() {
+    local needle=$1
+    shift
+    local p
+    for p in "$@"; do
+        [ "$p" != "$needle" ] || return 0
+    done
+    return 1
+}
+
+# record_added_packages <file holding the installed set from before apt ran>:
+# append what apt added to $ADDED_PKGS, as the union over every run (an
+# upgrade run can add more). It is the difference of two dpkg installed sets,
+# not apt's "Inst" lines, so it names the dependencies apt pulled in as well
+# and never names a package the host already had -- which is what makes it
+# safe for --uninstall to purge the list without an autoremove.
+#
+# Intersected with the plan apt accepted for THIS request, though, because the
+# difference spans a window in which another apt client is expected to be
+# running: a fresh cloud VM is often still running unattended-upgrades, which
+# is why APT_OPTS waits five minutes for the dpkg lock. Whatever that installed
+# in the meantime is in the difference and is not ours to remove. Inst lines
+# name apt's dependency closure too, so nothing of ours is lost by this.
+record_added_packages() {
+    local before=$1 added tmp planned
+    [ -r "$before" ] || return 0
+    added=$(dpkg_installed_set | comm -13 "$before" - || true)
+    if [ -n "$added" ] && [ -n "${APT_SIM:-}" ] && [ -r "${APT_SIM:-/nonexistent}" ]; then
+        planned=$(mktemp)
+        sed -n 's/^Inst \([^ :]*\).*/\1/p' "$APT_SIM" | sort -u >"$planned"
+        if [ -s "$planned" ]; then
+            REPLY=$(printf '%s\n' "$added" | grep -xF -f "$planned" || true)
+            if [ "$REPLY" != "$added" ]; then
+                log "not recorded (installed by something else while apt ran): $(printf '%s\n' "$added" | grep -vxF -f "$planned" | tr '\n' ' ' || true)"
+            fi
+            added=$REPLY
+        fi
+        rm -f "$planned"
+    fi
+    if [ -z "$added" ]; then
+        log "apt added no package that was not installed already"
+        [ ! -r "$ADDED_PKGS" ] || ADDED_COUNT=$(grep -cv '^#' "$ADDED_PKGS" || true)
+        count_removable_packages
+        return 0
+    fi
+    install -d /etc/skyline-speeder
+    tmp=$(mktemp)
+    { [ ! -r "$ADDED_PKGS" ] || sed 's/#.*//' "$ADDED_PKGS"
+      printf '%s\n' "$added"; } | sed '/^[[:space:]]*$/d' | sort -u >"$tmp"
+    { printf '%s\n' \
+        "# Packages an install of Skyline Speeder added to this host, one per line," \
+        "# as the union over every run of this installer. --uninstall removes them" \
+        "# again; delete a line to keep that package. iproute2, curl, ca-certificates" \
+        "# and tar are never removed even when listed here, and neither is anything" \
+        "# dpkg calls required or important."
+      cat "$tmp"; } >"$ADDED_PKGS"
+    ADDED_COUNT=$(grep -cv '^#' "$ADDED_PKGS" || true)
+    count_removable_packages
+    log "packages added by this run: $(tr '\n' ' ' <<<"$added")"
+    rm -f "$tmp"
+}
+
+# How many recorded packages an uninstall would actually remove, into
+# $ADDED_REMOVABLE. A --prebuilt install adds only curl, ca-certificates, tar
+# and iproute2, every one of them a keeper, so the closing guide must not tell
+# that operator their packages will be removed.
+count_removable_packages() {
+    local p
+    ADDED_REMOVABLE=0
+    [ -r "$ADDED_PKGS" ] || return 0
+    while IFS= read -r p; do
+        p=${p%%#*}
+        p=${p//[[:space:]]/}
+        [ -n "$p" ] || continue
+        pkg_is_keeper "$p" && continue
+        pkg_priority_protected "$p" && continue
+        ADDED_REMOVABLE=$((ADDED_REMOVABLE + 1))
+    done <"$ADDED_PKGS"
+}
+
+# pkg_installed <package>: whether dpkg has it installed, for any architecture.
+# `${Status}\n`, not `${Status}`: without the newline dpkg concatenates one
+# status per installed architecture into a single word, and a test over the
+# result then answers about a string no instance actually has. awk rather than
+# `grep -q` so nothing exits early on a producer this script pipes into --
+# SIGPIPE plus pipefail is the trap this file documents in four other places.
+pkg_installed() {
+    dpkg-query -W -f '${Status}\n' "$1" 2>/dev/null \
+        | awk '/ installed$/ { found = 1 } END { exit !found }'
+}
+
+# pkg_priority_protected <package>: whether dpkg calls it required or important
+# for any architecture -- in which case an uninstall never removes it, whatever
+# the record says. Same newline story as pkg_installed: measured on a host with
+# i386 enabled, `dpkg-query -W -f '${Priority}' libbz2-1.0` answers
+# "optionalimportant", which matches neither word and quietly turned this rail
+# off for every multi-arch package.
+pkg_priority_protected() {
+    local prio
+    prio=" $(dpkg-query -W -f '${Priority}\n' "$1" 2>/dev/null | tr '\n' ' ') "
+    case "$prio" in
+        *" required "*|*" important "*) return 0 ;;
+    esac
+    return 1
+}
+
+# purge_toolchain: remove the packages an install of this host added, and
+# nothing else. $ADDED_PKGS already names the dependencies apt pulled in, so
+# there is no autoremove here -- that would also take orphans this installer
+# never created.
+#
+# Three rails, because an uninstall must not become a way to lose a package
+# the host needs. KEEP_PKGS and dpkg's required/important priorities are never
+# touched. And apt plans the removal first: if the plan would take anything
+# that is not on the list, nothing is removed and the command is printed
+# instead. Measured while writing this, on a host where libelf1 happened to be
+# recorded: purging it would have taken 29 packages with it, iproute2,
+# ifupdown, isc-dhcp-client and cloud-init among them. By this point Skyline
+# Speeder itself is already gone, so every failure here is a warning and a
+# command to run by hand, never an error that stops the uninstall.
+purge_toolchain() {
+    local -a want=() extra=() keep=()
+    local p sim out protected round kept
+    if [ ! -r "$ADDED_PKGS" ]; then
+        log "no $ADDED_PKGS: this host has no record of packages an install added"
+        return 0
+    fi
+    if ! command -v apt-get >/dev/null 2>&1; then
+        warn "no apt-get here; the packages listed in $ADDED_PKGS were left installed"
+        return 0
+    fi
+    kept=0
+    while IFS= read -r p; do
+        p=${p%%#*}
+        p=${p//[[:space:]]/}
+        [ -n "$p" ] || continue
+        if pkg_is_keeper "$p"; then
+            kept=$((kept + 1))
+            continue
+        fi
+        # Not installed any more: somebody else removed it, or a previous
+        # uninstall did.
+        pkg_installed "$p" || continue
+        if pkg_priority_protected "$p"; then
+            kept=$((kept + 1))
+            continue
+        fi
+        want+=("$p")
+    done <"$ADDED_PKGS"
+    # Keeping curl while removing libcurl4 is not a thing apt can do, and it
+    # would resolve the contradiction by taking curl. So everything a package
+    # we keep still needs is kept too -- measured on a test host, where this is
+    # the difference between removing the whole toolchain and removing nothing
+    # at all.
+    #
+    # The closure goes to a file, and grep reads that file: `printf | grep -q`
+    # would let grep exit at the first match and SIGPIPE the printf, which
+    # under pipefail makes the whole test read as false -- silently dropping
+    # the protection this is here to apply.
+    protected=$(mktemp)
+    pkg_closure "${KEEP_PKGS[@]}" >"$protected"
+    if [ -s "$protected" ]; then
+        keep=()
+        for p in "${want[@]}"; do
+            if grep -qxF -- "$p" "$protected"; then
+                kept=$((kept + 1))
+            else
+                keep+=("$p")
+            fi
+        done
+        want=(${keep[@]+"${keep[@]}"})
+    fi
+    # One line rather than one per package: in uninstall mode $LOG is not
+    # started, so a `log` here would reach nobody at all, and ninety of them
+    # would bury the summary.
+    [ "$kept" -eq 0 ] || info "keeping $kept recorded package(s): a keeper, something a keeper needs, or required/important"
+    if [ "${#want[@]}" -eq 0 ]; then
+        ok "no packages to remove: nothing this installer added is still installed"
+        rm -f "$ADDED_PKGS" "$protected"
+        return 0
+    fi
+    sim=$(mktemp) out=$(mktemp)
+    # Ask apt to plan it, and keep asking: a package of ours that something the
+    # operator installed later depends on drags that something into the plan,
+    # and the answer is to leave that one package alone rather than to abandon
+    # the whole removal. Bounded, because each round must make the set smaller.
+    round=0
+    while :; do
+        round=$((round + 1))
+        extra=()
+        # `--purge remove` prints "Purg <pkg> [ver]" in a simulation, and
+        # "Remv" when a package is removed without purging its configuration;
+        # both count as a removal.
+        if ! apt-get -y -s --purge remove "${want[@]}" >"$sim" 2>&1; then
+            warn "apt cannot plan removing the packages this installer added, so none were removed:"
+            # No `sed | head -1`: head exits at the first line, sed dies of
+            # SIGPIPE, and under pipefail this bare assignment would end the
+            # uninstall before the message that explains it -- the trap this
+            # file documents beside apt_unmet. awk reads to the end instead.
+            REPLY=$(awk '!done && /^E: / { sub(/^E: /, ""); print; done = 1 }' "$sim")
+            [ -z "$REPLY" ] || warn "  apt: $REPLY"
+            warn "  to remove them by hand: apt-get --purge remove ${want[*]}"
+            rm -f "$sim" "$out" "$protected"
+            return 0
+        fi
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            pkg_in_list "$p" "${want[@]}" || extra+=("$p")
+        done < <(sed -n 's/^\(Purg\|Remv\) \([^ ]*\).*/\2/p' "$sim" | sort -u)
+        [ "${#extra[@]}" -gt 0 ] || break
+        if [ "$round" -ge 3 ]; then
+            warn "removing what this installer added would also remove: ${extra[*]}"
+            warn "  Something on this host depends on them now, so nothing was removed."
+            warn "  If that is what you want: apt-get --purge remove ${want[*]}"
+            rm -f "$sim" "$out" "$protected"
+            return 0
+        fi
+        # Whatever those extras still need, inside our own set, is what forces
+        # them out. Leave exactly those alone and plan again.
+        pkg_closure "${extra[@]}" >"$protected"
+        keep=()
+        for p in "${want[@]}"; do
+            if grep -qxF -- "$p" "$protected"; then
+                warn "keeping $p: ${extra[0]}$([ "${#extra[@]}" -gt 1 ] && printf ' and %d other package(s)' "$((${#extra[@]} - 1))") on this host still needs it"
+            else
+                keep+=("$p")
+            fi
+        done
+        if [ "${#keep[@]}" -eq "${#want[@]}" ]; then
+            warn "removing what this installer added would also remove: ${extra[*]}"
+            warn "  apt does not say which of ours they need, so nothing was removed."
+            warn "  If that is what you want: apt-get --purge remove ${want[*]}"
+            rm -f "$sim" "$out" "$protected"
+            return 0
+        fi
+        want=(${keep[@]+"${keep[@]}"})
+        if [ "${#want[@]}" -eq 0 ]; then
+            ok "no packages left to remove: this host needs all of them"
+            rm -f "$sim" "$out" "$protected"
+            return 0
+        fi
+    done
+    info "removing ${#want[@]} package(s) this installer added"
+    if apt-get "${APT_OPTS[@]}" --purge remove "${want[@]}" >"$out" 2>&1; then
+        ok "removed: ${want[*]}"
+        rm -f "$ADDED_PKGS"
+    else
+        warn "apt failed to remove these, and left them installed: ${want[*]}"
+        while IFS= read -r p; do warn "  $p"; done < <(tail -n 5 "$out")
+    fi
+    rm -f "$sim" "$out" "$protected"
+}
+
+# purge_rustup: undo the rustup installation an install of this host made.
+# Only that one: the paths come from $ADDED_RUSTUP, which is written only on
+# the run that installed rustup, so a toolchain the operator had before is
+# never touched. `rustup self uninstall` removes both directories itself; the
+# rm is the fallback for a broken installation, and it insists on directories
+# that still look like rustup's so a hand-edited file cannot point it at
+# something else.
+purge_rustup() {
+    # The file sets RUSTUP_HOME and CARGO_HOME; copied into locals of another
+    # name so the call below passes them as an environment without also
+    # expanding the same names in its own words.
+    local RUSTUP_HOME= CARGO_HOME= rustup_home cargo_home removed
+    [ -r "$ADDED_RUSTUP" ] || return 0
+    # shellcheck disable=SC1090  # a generated key=value file
+    . "$ADDED_RUSTUP"
+    rustup_home=${RUSTUP_HOME:-} cargo_home=${CARGO_HOME:-}
+    if [ -z "$cargo_home" ] || [ -z "$rustup_home" ]; then
+        warn "$ADDED_RUSTUP names no rustup directories; the Rust toolchain was left in place"
+        return 0
+    fi
+    if [ -x "$cargo_home/bin/rustup" ]; then
+        if env RUSTUP_HOME="$rustup_home" CARGO_HOME="$cargo_home" \
+            "$cargo_home/bin/rustup" self uninstall -y >/dev/null 2>&1; then
+            ok "Rust toolchain removed ($cargo_home)"
+            rm -f "$ADDED_RUSTUP"
+            return 0
+        fi
+        warn "rustup self uninstall failed; removing its directories instead"
+    fi
+    # A hand-edited file must not turn this into an arbitrary rm: an absolute
+    # path of at least two segments, and it still has to look like what rustup
+    # leaves behind.
+    case "$cargo_home" in /?*/?*) ;; *) warn "refusing to remove CARGO_HOME=$cargo_home"; return 0 ;; esac
+    case "$rustup_home" in /?*/?*) ;; *) warn "refusing to remove RUSTUP_HOME=$rustup_home"; return 0 ;; esac
+    # BOTH marks, not either: `bin/` alone is true of /usr, /usr/local, /opt and
+    # half the filesystem, so `||` would let a hand-edited record aim this rm at
+    # one of them. `env` is a file only rustup writes.
+    removed=0
+    if [ -e "$cargo_home/env" ] && [ -d "$cargo_home/bin" ]; then
+        rm -rf "$cargo_home"
+        removed=1
+    else
+        warn "$cargo_home does not look like a cargo home; left in place"
+    fi
+    if [ -d "$rustup_home/toolchains" ]; then
+        rm -rf "$rustup_home"
+        removed=1
+    else
+        warn "$rustup_home does not look like a rustup home; left in place"
+    fi
+    # Nothing was recognised, so nothing was removed: saying otherwise, and
+    # throwing away the record, would hide it from the next uninstall too.
+    if [ "$removed" -eq 1 ]; then
+        ok "Rust toolchain directories removed"
+        rm -f "$ADDED_RUSTUP"
+    else
+        warn "$ADDED_RUSTUP was kept, so a later uninstall can try again"
+    fi
+}
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --check) MODE=check; shift ;;
         --no-enable) ENABLE=0; shift ;;
         --uninstall) MODE=uninstall; shift ;;
+        --restore-pre-install) RESTORE=pre-install; shift ;;
         --prebuilt) SOURCE=prebuilt; shift ;;
         --release) [ "$#" -ge 2 ] || die "--release needs a tag"; SOURCE=prebuilt; RELEASE_TAG="$2"; shift 2 ;;
         --verbose) VERBOSE=1; shift ;;
-        -h|--help) sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        # The header comment, to its end, rather than a hand-counted line
+        # range that goes stale the moment a flag is documented above.
+        -h|--help) awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
     esac
 done
 
 [ "$(id -u)" -eq 0 ] || die "must run as root (try: sudo $0)"
 
+# Said here rather than ignored: a flag that does nothing on the mode it was
+# given with reads as a request that was honoured.
+if [ "$RESTORE" = pre-install ] && [ "$MODE" != uninstall ]; then
+    die "--restore-pre-install only applies to --uninstall"
+fi
+
 if [ "$MODE" = uninstall ]; then
+    # Nothing of an install here: say so and change nothing at all. Run on the
+    # wrong host -- or twice -- this must not reconfigure a NIC that Skyline
+    # Speeder never touched. A host still defaulting to skyline_cc counts as
+    # installed however little else is left, since that is the one state an
+    # uninstall has to get out of.
+    # Two questions, not one. ACTIVE: something is in place that changed how
+    # this host sends -- units, binaries, the objects, or skyline_cc still being
+    # the default. Only that earns a write to a sysctl or a qdisc, which is what
+    # makes running --uninstall a second time change nothing: the first run
+    # deliberately keeps /etc/skyline-speeder, and a lone configuration
+    # directory has changed nothing about the network.
+    # INSTALLED: anything at all, that directory included, because a half
+    # finished install leaves packages recorded there that must still be
+    # removable.
+    ACTIVE=0
+    for path in /etc/systemd/system/skyline-speederd.service \
+                /etc/systemd/system/skyline-speeder-enable.service \
+                /usr/local/sbin/skyline-speederd /usr/local/bin/ssctl \
+                /opt/skyline-speeder; do
+        [ ! -e "$path" ] || { ACTIVE=1; break; }
+    done
+    if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" = skyline_cc ]; then
+        ACTIVE=1
+    fi
+    INSTALLED=$ACTIVE
+    [ ! -e /etc/skyline-speeder ] || INSTALLED=1
+    if [ "$INSTALLED" -eq 0 ]; then
+        ok "nothing of Skyline Speeder is installed here; nothing was changed"
+        exit 0
+    fi
     info "removing Skyline Speeder"
     # Drain first so established flows migrate off skyline_cc before the daemon
     # goes away. A struct_ops map stays alive as long as any socket still
@@ -729,56 +1337,65 @@ if [ "$MODE" = uninstall ]; then
     rm -rf /opt/skyline-speeder
     systemctl daemon-reload
 
-    # Put back what was in place before the install. Without this an operator
-    # who ran BBR before installing is silently left on `fallback_cc` (cubic)
-    # after uninstalling -- a downgrade nobody asked for, and a confusing one
-    # because nothing reports it. The snapshot lives under /etc/skyline-speeder,
-    # which uninstall deliberately keeps.
+    # Counted HERE, before the toolchain goes: bpftool is one of the packages an
+    # install added, so asking after the purge would always answer "none" on the
+    # very hosts that have something to report. Reported further down, once the
+    # host is back on a congestion control this can name.
+    LEFT=$(bpftool struct_ops show 2>/dev/null | grep -c skyline_cc || true)
+
+    # Leave the host on something deliberate, and say which. By default bbr +
+    # fq: where a host that installed Skyline Speeder almost certainly came
+    # from, and not the daemon's `fallback_cc` (cubic), which is a downgrade
+    # nobody asked for that nothing would report. --restore-pre-install asks
+    # for the snapshot instead. Either way the snapshot is read first -- even
+    # the bbr path uses PRE_INSTALL_CC when this kernel has no bbr, and its
+    # device list as the fallback for a host whose config has since changed.
     if [ -r "$STATE" ]; then
         # shellcheck disable=SC1090  # a generated key=value file
         . "$STATE"
-        if [ -n "${PRE_INSTALL_CC:-}" ]; then
-            if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null \
-                | grep -qw -- "$PRE_INSTALL_CC"; then
-                sysctl -qw "net.ipv4.tcp_congestion_control=$PRE_INSTALL_CC"
-                ok "congestion control restored to $PRE_INSTALL_CC"
-            else
-                warn "cannot restore '$PRE_INSTALL_CC': no longer available on this kernel"
-            fi
-        fi
-        if [ -n "${PRE_INSTALL_QDISC:-}" ]; then
-            sysctl -qw "net.core.default_qdisc=$PRE_INSTALL_QDISC" 2>/dev/null \
-                && ok "default qdisc restored to $PRE_INSTALL_QDISC" \
-                || warn "could not restore default qdisc to $PRE_INSTALL_QDISC"
-        fi
-        # default_qdisc only shapes qdiscs created later; the root qdiscs are
-        # what skyline-speederd actually replaced: runtime.tc_interface's, or
-        # those of the NICs under it (a VLAN, bond or bridge). Two parallel,
-        # space-separated lists. Snapshots written before the guard existed
-        # have neither key, and one that knew no interface has them empty;
-        # both are skipped.
-        if [ -n "${PRE_INSTALL_QDISC_DEV:-}" ] && [ -n "${PRE_INSTALL_ROOT_QDISC:-}" ]; then
-            read -ra RESTORE_DEVS <<<"$PRE_INSTALL_QDISC_DEV"
-            read -ra RESTORE_ROOTS <<<"$PRE_INSTALL_ROOT_QDISC"
-            if [ "${#RESTORE_DEVS[@]}" -ne "${#RESTORE_ROOTS[@]}" ]; then
-                warn "$STATE lists ${#RESTORE_DEVS[@]} interface(s) but ${#RESTORE_ROOTS[@]} root qdisc(s); no root qdisc restored"
-            else
-                DFLT_NOW=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "${PRE_INSTALL_QDISC:-fq_codel}")
-                for i in "${!RESTORE_DEVS[@]}"; do
-                    restore_root_qdisc "${RESTORE_DEVS[i]}" "${RESTORE_ROOTS[i]}" "$DFLT_NOW"
-                done
-            fi
-        fi
-    else
-        warn "no pre-install snapshot at $STATE; leaving sysctls as they are."
+    elif [ "$RESTORE" = pre-install ]; then
+        warn "no pre-install snapshot at $STATE, so there is nothing to restore from."
         warn "Current: cc=$(sysctl -n net.ipv4.tcp_congestion_control) qdisc=$(sysctl -n net.core.default_qdisc)"
+        warn "Leaving both as they are; run without --restore-pre-install for bbr + fq."
+        RESTORE=none
     fi
+    if [ "$ACTIVE" -eq 0 ]; then
+        # Only the kept configuration directory was here: nothing of ours was
+        # in the path, so nothing of the host's networking is ours to rewrite.
+        RESTORE=none
+        info "only $(dirname "$CFG") was left here; no sysctl or qdisc was changed"
+    fi
+    case "$RESTORE" in
+        bbr-fq)      restore_bbr_fq ;;
+        pre-install) restore_pre_install ;;
+        *)           ;;
+    esac
+
+    # The build toolchain this installer put here, and the rustup it may have
+    # installed: removed by default, because leaving clang, LLVM and a Rust
+    # toolchain behind on a host somebody has finished with is not "removed".
+    # Both functions only ever touch what an install of this host recorded.
+    export DEBIAN_FRONTEND=noninteractive
+    purge_toolchain
+    purge_rustup
+
     # /etc/skyline-speeder is left in place on purpose: it holds operator-tuned
-    # configuration that a reinstall should not silently discard.
-    ok "removed (configuration kept at /etc/skyline-speeder)"
+    # configuration that a reinstall should not silently discard. Only claimed
+    # when it is actually there -- a half-installed host may have none.
+    if [ -d /etc/skyline-speeder ]; then
+        ok "removed (configuration kept at /etc/skyline-speeder)"
+    else
+        ok "removed"
+    fi
+    if [ "$RESTORE" = bbr-fq ]; then
+        # Nothing under /etc/sysctl.d was written or edited -- the rule the
+        # guard follows while it is installed -- so those files, not this run,
+        # decide what the host comes back as.
+        info "cc and qdisc are set for this boot only; after a reboot /etc/sysctl.d decides"
+    fi
     # Report, do not "fix": force-detaching a struct_ops that live sockets still
     # use is not something an uninstaller should do behind the operator's back.
-    LEFT=$(bpftool struct_ops show 2>/dev/null | grep -c skyline_cc || true)
+    # $LEFT was counted above, while bpftool was still installed.
     if [ "${LEFT:-0}" -gt 0 ]; then
         warn "$LEFT skyline_cc struct_ops map(s) are still held by established connections."
         warn "This is normal reference-counting behaviour, not a failure: the kernel frees"
@@ -872,15 +1489,6 @@ else
     PKGS=(build-essential pkg-config clang llvm libbpf-dev libelf-dev zlib1g-dev bpftool curl iproute2)
 fi
 
-# `-qq` silences apt but not dpkg, which still prints an unpack line per
-# package plus a "Reading database" progress bar. Dpkg::Use-Pty=0 stops the
-# progress redraw; the log keeps the detail for when something actually fails.
-# A fresh cloud VM is often still running unattended-upgrades: wait for the
-# dpkg lock instead of failing on it. confdef/confold answer a changed-conffile
-# prompt the way an operator almost always would -- keep their file -- since
-# nobody can answer it from behind a progress bar.
-APT_OPTS=(-y -qq -o Dpkg::Use-Pty=0 -o DPkg::Lock::Timeout=300
-          -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 APT_SPEC=()     # $PKGS, carrying an explicit version where this host needs one
 APT_PINNED=0    # 1 once a version of our own choosing is in APT_SPEC
 
@@ -1185,8 +1793,17 @@ if grep -q '^Remv ' "$APT_SIM" 2>/dev/null; then
     fi
     warn "apt will remove: $REPLY"
 fi
+# What dpkg has now, so what apt adds below can be recorded: --uninstall
+# removes exactly that set, and a package the host already had must never be
+# in it.
+dpkg_installed_set >"$WORK/pkgs-before"
 run apt-get "${APT_OPTS[@]}" install "${APT_SPEC[@]}" || die "failed to install build prerequisites"
-ok "prerequisites installed"
+record_added_packages "$WORK/pkgs-before"
+if [ "$ADDED_COUNT" -gt 0 ]; then
+    ok "prerequisites installed ($ADDED_COUNT package(s) recorded; --uninstall removes them again)"
+else
+    ok "prerequisites installed (this host already had all of them)"
+fi
 
 # --- 6. Rust ---------------------------------------------------------------
 # Skipped entirely for a prebuilt install -- the binaries are already built.
@@ -1203,6 +1820,14 @@ if ! command -v cargo >/dev/null 2>&1; then
             | sh -s -- -y --profile minimal --component rustfmt" \
             || die "installing the Rust toolchain via rustup failed"
         PATH="$HOME/.cargo/bin:$PATH"
+        # Only this branch installed it, so only this branch records it, and
+        # --uninstall therefore never removes a toolchain the operator had
+        # before. rustup honours RUSTUP_HOME/CARGO_HOME; nothing here sets
+        # them, so what it used is what it defaults to.
+        install -d /etc/skyline-speeder
+        printf 'RUSTUP_HOME=%q\nCARGO_HOME=%q\n' \
+            "${RUSTUP_HOME:-$HOME/.rustup}" "${CARGO_HOME:-$HOME/.cargo}" >"$ADDED_RUSTUP"
+        log "recorded the rustup installation at ${CARGO_HOME:-$HOME/.cargo} for --uninstall"
     fi
 fi
 export PATH
@@ -1822,6 +2447,39 @@ fi
 STATUS_WHAT="modules, live coefficients, counters"
 [ "$HAS_GUARD" -eq 0 ] || STATUS_WHAT="$STATUS_WHAT, guard"
 
+# The path this run came from, so the uninstall command in the guide is one the
+# operator can paste. scripts/bootstrap.sh leaves the tree in
+# /usr/local/src/skyline-speeder; somebody who piped this file straight into
+# bash has no tree at all and is told that is what it takes.
+if [ -r "$REPO_ROOT/install.sh" ]; then
+    UNINSTALL_CMD="sudo $REPO_ROOT/install.sh --uninstall"
+else
+    UNINSTALL_CMD="sudo <a Skyline Speeder source tree>/install.sh --uninstall"
+fi
+
+# What --restore-pre-install would put back, named value by value: on a host
+# that was already on bbr with default_qdisc fq, the NIC's root qdisc is the
+# only thing that differs, and "bbr + fq instead of bbr + fq" would read as a
+# bug rather than as the truth.
+#
+# Read from $STATE, in a subshell, because that is the file the restore itself
+# reads -- and on a reinstall it holds the FIRST install's values, which are not
+# what this run sees now. Without a snapshot yet, this run's own observation is
+# what is about to be written into one.
+RESTORE_DESC=$(
+    PRE_INSTALL_CC=$BEFORE_CC PRE_INSTALL_QDISC=$BEFORE_DQ
+    PRE_INSTALL_QDISC_DEV="${BEFORE_DEVS[*]}" PRE_INSTALL_ROOT_QDISC="${BEFORE_ROOTS[*]}"
+    # shellcheck disable=SC1090  # a generated key=value file
+    [ ! -r "$STATE" ] || . "$STATE"
+    desc="congestion control ${PRE_INSTALL_CC:-unknown}, default_qdisc ${PRE_INSTALL_QDISC:-unknown}"
+    read -ra devs <<<"${PRE_INSTALL_QDISC_DEV:-}"
+    read -ra roots <<<"${PRE_INSTALL_ROOT_QDISC:-}"
+    if [ "${#devs[@]}" -eq "${#roots[@]}" ]; then
+        for i in "${!devs[@]}"; do desc="$desc, ${devs[i]} root ${roots[i]}"; done
+    fi
+    printf '%s' "$desc"
+)
+
 # A few of the common parameters docs/usage.md section 4 explains, each shown
 # with the value the daemon runs right now (module_tuning in ssctl status).
 # Every description here is that guide's, shortened; keep them in step.
@@ -1861,6 +2519,37 @@ cat >&3 <<EOF
    Persistent:  edit $CFG, check it with
                 sudo skyline-speederd --config $CFG --validate-only
                 then sudo systemctl restart skyline-speederd
+EOF
+
+# Printed rather than put in the heredoc above: what it can honestly say about
+# packages depends on how many there are to remove, and the pre-install values
+# are worth naming one by one -- on the usual host the root qdisc is the only
+# one that differs from bbr + fq.
+printf '\n %sUninstall%s\n   %s\n' "$BLD" "$RST" "$UNINSTALL_CMD" >&3
+printf '%s\n' \
+    "                drains live flows, removes the units, binaries and BPF" \
+    "                objects, and puts this host on bbr + fq" >&3
+if [ "$ADDED_REMOVABLE" -gt 0 ]; then
+    printf '%s\n' \
+        "                It also removes the $ADDED_REMOVABLE package(s) this install added." \
+        "                iproute2, curl, ca-certificates and tar are never among" \
+        "                them; the list is in" \
+        "                $ADDED_PKGS" >&3
+else
+    printf '%s\n' \
+        "                This install added no package an uninstall would remove." >&3
+fi
+printf '   %s\n' "$UNINSTALL_CMD --restore-pre-install" >&3
+printf '%s\n' \
+    "                the same, but puts back what this host ran before the" \
+    "                install instead of bbr + fq:" \
+    "                $RESTORE_DESC" >&3
+printf '%s\n' \
+    "   The configuration is kept either way, so a reinstall keeps your settings." \
+    "   bbr and fq are set for that boot only: no file under /etc/sysctl.d is" \
+    "   written, so those files decide again after a reboot." >&3
+
+cat >&3 <<EOF
 
  ${BLD}Note${RST}  dynamic RTO (the sockops policy; off by default) only sees processes in
        /sys/fs/cgroup/skyline-speeder. Opt a service in with:
