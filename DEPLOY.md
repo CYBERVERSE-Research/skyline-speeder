@@ -330,8 +330,11 @@ ssctl drain --timeout 60
 # 停止（等价于 SIGTERM，会正确注销全部 struct_ops 与 BPF 链接）
 systemctl stop skyline-speeder-enable.service skyline-speederd.service
 
-# 彻底卸载（保留 /etc/skyline-speeder 配置，并还原安装前的 cc/qdisc）
+# 彻底卸载：切到 bbr + fq，卸掉安装时装上的工具链（保留 /etc/skyline-speeder 配置）
 sudo ./install.sh --uninstall
+
+# 同上，但还原安装前的 cc/qdisc 而不是 bbr + fq
+sudo ./install.sh --uninstall --restore-pre-install
 ```
 
 `drain` 经 SSH 执行必然超时（执行者的 SSH 连接本身就是一条 skyline_cc 存量流）；
@@ -345,7 +348,29 @@ sysctl 的话，仍处于武装状态的 guard 会把它改回 `skyline_cc`。`s
 `ssctl enable` 挂载的主机上，停止之前先 `ssctl drain`（`install.sh` 升级时会自己做这一步，
 见 §0）。
 
-`--uninstall` 先 drain（同时解除 guard），再从 `/etc/skyline-speeder/pre-install-state`
+`--uninstall` 先 drain（同时解除 guard），停用删除两个 unit、二进制与 `/opt/skyline-speeder`，
+然后做两件事：
+
+1. **切到 bbr + fq**（默认）：`net.ipv4.tcp_congestion_control=bbr`、
+   `net.core.default_qdisc=fq`，并把 `runtime.tc_interface` 解析出来的网卡（guard 武装时维护
+   的就是这些；与 `[guard] qdisc` 是否关过无关）根 qdisc 确认成 `fq`（多队列网卡是子队列全为
+   `fq` 的 `mq`）。已经是 `fq` 的不动；`htb`/`tbf`/`netem`/设了带宽的 `cake` 这类
+   看起来特意建的原样留下、只告警并给出手工命令（与 guard 不替换它们同理）。内核没有 bbr 时
+   先 `modprobe tcp_bbr`，仍然没有则退回 `PRE_INSTALL_CC` → cubic → reno，并告警用了哪个。
+   **只在本次运行时生效**：不写 `/etc/sysctl.d`，重启后仍由那里的文件决定，结束时会提示。
+2. **卸掉安装时装上的包**：按 `/etc/skyline-speeder/added-packages`（安装时取 apt 执行前后
+   dpkg 已安装集合的差集、再与 apt 为这次请求接受的计划取交集后写入，因此含 apt 顺带拉进来的
+   依赖，不含主机本来就有的包，也不含并行跑着的 unattended-upgrades 装的包）执行
+   `apt-get --purge remove`。四道护栏：`iproute2`/`curl`/`ca-certificates`/`tar` 永不移除；
+   **这几个包递归依赖的东西也永不移除**（否则「保留 curl、删掉它底下的 libcurl4t64」这个矛盾
+   会被 apt 用「连 curl 一起删」来解决，实测会导致整条工具链一个都卸不掉）；dpkg 优先级
+   `required`/`important` 的永不移除（按架构分别判断）；先用 `apt-get -s --purge remove`
+   出计划，其中 `Purg`/`Remv` 一旦出现清单之外的包，就把被它依赖的那个包单独留下并告警说明是
+   谁需要它，其余照卸、重新出计划（最多三轮），三轮后仍不干净才**一个都不卸**、改为打印手工
+   命令。rustup 仅在 `/etc/skyline-speeder/added-rustup` 存在时移除。这一步的失败一律只是
+   告警——此时本体已经卸完，中断卸载更糟。
+
+加 `--restore-pre-install` 时第 1 步换成从 `/etc/skyline-speeder/pre-install-state`
 还原安装前的拥塞控制算法与默认 qdisc；快照里记有网卡及其根 qdisc
 （`PRE_INSTALL_QDISC_DEV`/`PRE_INSTALL_ROOT_QDISC`：一一对应、以空格分隔的两个列表，
 guard 管几块网卡就有几项；两个列表长度不同时一块都不还原，只告警）时，逐块把根 qdisc 的

@@ -108,7 +108,8 @@ cargo build --workspace --release
 | `--check` | 只做前置检查，并打印当前的拥塞控制、qdisc（含 guard 将要维护的网卡）、开机时 systemd-sysctl 会写入的相关设置，以及 `/etc/sysctl.conf` 里只由 `sysctl -p`/`sysctl --system` 应用的设置；不改动任何东西 |
 | `--no-enable` | 安装并启动 daemon，但不新挂载 `skyline_cc`：不启用 `skyline-speeder-enable.service`，此前已经启用的也不停用；升级前用裸 `ssctl enable` 挂着的，重启后再 `ssctl enable` 一次，回到升级前的状态（仍是手工挂载，开机不会自动挂）。结束时按新 daemon 的 `enabled` 与当前默认拥塞控制报告实际的挂载状态 |
 | `--verbose` | 不画进度条，所有子命令的输出同时打到屏幕；环境变量 `SKYLINE_VERBOSE=1` 同效 |
-| `--uninstall` | 卸载，见第 9 节 |
+| `--uninstall` | 卸载：切回 bbr + fq，并卸掉安装时装上的包，见第 9 节 |
+| `--restore-pre-install` | 只配合 `--uninstall`：还原成安装前的拥塞控制与 qdisc，而不是 bbr + fq，见第 9 节 |
 
 **输出。** 终端上只有一行原地刷新的进度条，例如
 `[#######-------------]  36%  (5/11) Building the Rust control plane   1m12s ⠼`，警告单独
@@ -143,7 +144,8 @@ IPv6（纯 IPv6 主机没有 IPv4 默认路由），各按 `ip route` 列出的�
 **安装前记录。** 动手之前记下当前的拥塞控制、`net.core.default_qdisc`，以及 guard 将要
 维护的每块网卡的根 qdisc（`fq`、`cake`、`mq/fq_codel` 这样的摘要；这些网卡通常就是
 `runtime.tc_interface`，它是 VLAN、bond、网桥时则是它下面的物理网卡），用于结束时的前后
-对比，并写入安装前快照，`--uninstall` 据此还原（两者都见第 7 节）。
+对比，并写入安装前快照，`--uninstall --restore-pre-install` 据此还原；默认的 `--uninstall`
+切到 bbr + fq，不读这份快照的 cc/qdisc 值（两者都见第 7 节）。
 
 **结束摘要与使用指南。** 核对步骤向新 daemon 确认 `skyline_cc` 真的挂上了：`ssctl status`
 要报告 `"enabled": true`（带 guard 的版本还要 `"armed": true`），默认拥塞控制也要确实是
@@ -329,8 +331,18 @@ sudo ssctl flows
 `/etc/skyline-speeder/pre-install-state`。快照只写一次，重装不会把 `skyline_cc` 误记成
 "原值"；新写的快照总带着这两个键，不知道网卡时值为空。只有完全没有
 `PRE_INSTALL_ROOT_QDISC` 这一行的快照（0.2.0 写的）才会在升级时补上这两个键——那些版本
-从不碰根 qdisc，此时网卡上的还是原样——已有的键不动。`--uninstall` 读取它还原。装之前
-跑 BBR 的机器，卸载后回到 BBR，而不是停在 `fallback_cc`。
+从不碰根 qdisc，此时网卡上的还是原样——已有的键不动。
+
+`--uninstall` 默认并不按这份快照还原，而是把主机切到 **bbr + fq**（第 9 节）：装过本项目的
+机器几乎都是从「一键 BBR」那类脚本过来的，卸载后停在 `fallback_cc`（cubic）是没人要求过的
+降级，而且没有任何东西会报告它。快照仍然有两个用处：这台内核没有 bbr 时用 `PRE_INSTALL_CC`
+兜底，以及配置或网卡已经变了时用它记下的网卡清单。确实要回到安装前那套值（例如这台机器是
+为了对照而特意跑 cubic 的），用 `--uninstall --restore-pre-install`。
+
+安装器还会把「这次安装给主机装上了哪些包」记到 `/etc/skyline-speeder/added-packages`
+（取 apt 执行前后两次 dpkg 已安装集合的差集，所以连 apt 顺带拉进来的依赖也在里面，而主机
+本来就有的包一定不在），装了 rustup 的话把它的 `RUSTUP_HOME`/`CARGO_HOME` 记到
+`/etc/skyline-speeder/added-rustup`。`--uninstall` 据此把工具链卸掉。
 
 `skyline-speederd.service` 启动后只是常驻进程，不会自动挂载 `skyline_cc`——必须显式执行
 `ssctl enable` 才会真正附加拥塞控制算法、让 `enabled_modules` 里配置的
@@ -434,8 +446,43 @@ active 时，停止 daemon 会先停这个 unit，由它的 ExecStop（`boot-dis
 （第 4.1 节）。
 
 彻底卸载：`sudo ./install.sh --uninstall`。它先 drain（同时解除 guard），停用并删除两个
-unit、二进制与 `/opt/skyline-speeder`，保留 `/etc/skyline-speeder`，再按安装前快照还原
-拥塞控制与 `default_qdisc`；快照里记有网卡的根 qdisc 时，逐块把它的**种类**也还原回去——
+unit、二进制与 `/opt/skyline-speeder`，保留 `/etc/skyline-speeder`，然后：
+
+1. **切到 bbr + fq。** `net.ipv4.tcp_congestion_control=bbr`、`net.core.default_qdisc=fq`，
+   并把 `runtime.tc_interface` 解析出来的网卡（guard 武装时维护的正是这些；与 `[guard] qdisc`
+   是否被关过无关）根 qdisc 确认成 `fq`（多队列网卡是子队列全为 `fq` 的 `mq`）。
+   本来就是 `fq` 的（guard 刚才还在守着，所以通常如此）不动；是 `htb`/`tbf`/`netem`/设了带宽
+   的 `cake` 这类**看起来是特意建的**就原样留下、只报告，并给出手工设置 `fq` 的命令——和
+   guard 从不替换它们是同一个理由：覆盖掉会悄悄毁掉运维的整形配置。这台内核没有 bbr 时先
+   `modprobe tcp_bbr`（写 sysctl 本身不会加载它：内核只接受已注册的算法名），仍然没有就退回
+   `PRE_INSTALL_CC`、再退 cubic/reno，并明确告警用了哪一个。**只在本次运行时生效**：不写也
+   不改 `/etc/sysctl.d` 下的任何文件（installed 期间 guard 遵守的也是这条规矩），所以重启后
+   仍由那些文件决定，卸载结束时会专门提示这一点。
+2. **卸掉安装时装上的工具链。** 按 `/etc/skyline-speeder/added-packages`（见第 7 节）
+   `apt-get --purge remove`，四道护栏：
+   - `iproute2`/`curl`/`ca-certificates`/`tar` 永不移除；
+   - **这几个包递归依赖的东西也永不移除**——保留 `curl` 却删掉它底下的 `libcurl4t64`，apt
+     只会用「那就把 curl 一起删」来解决这个矛盾。实测：少了这一条，测试机上是「整条工具链
+     一个都卸不掉」，有了它是「93 个记录里卸掉 78 个」；
+   - dpkg 优先级为 `required`/`important` 的永不移除（按每个架构分别判断：多架构主机上
+     `dpkg-query -W -f '${Priority}'` 会把几个架构的优先级连成一个词，那样这道护栏会静默失效）；
+   - 先 `apt-get -s --purge remove` 让 apt 出计划，计划里的 `Purg`/`Remv` 一旦出现清单之外的
+     包，就把「被它依赖、因而造成这件事」的那个包单独留下并告警说明是谁需要它，其余照卸，
+     再重新出计划（最多三轮）；三轮之后仍不干净，或者根本找不出该留谁，才**一个都不卸**、
+     改为打印可自行执行的命令。写这段代码时实测：某台机器上如果把 `libelf1` 也当成可卸的，
+     apt 的计划会连带删掉 29 个包，其中有 `iproute2`、`ifupdown`、`isc-dhcp-client`、
+     `cloud-init`。
+
+   记录本身也只取 apt 为这次请求实际接受的计划（`Inst` 行）与前后 dpkg 差集的交集：装包时
+   往往有 unattended-upgrades 在并行跑（`install.sh` 会等 dpkg 锁最多五分钟正是因为这个），
+   它装的东西不是我们该卸的。此时 Skyline Speeder 本身已经卸完了，所以这一步的任何失败都只是
+   告警加一条手工命令，不会中断卸载。
+   记录里的包一个都不在了，或没有这份记录（例如 0.2.0 装的机器），这一步什么也不做。
+   rustup 只在 `/etc/skyline-speeder/added-rustup` 存在时移除（即确实是安装器装的），优先用
+   `rustup self uninstall`，它不可用时才删目录，且只删仍然长得像 rustup 留下的目录。
+
+加 `--restore-pre-install` 则把上面第 1 步换成按安装前快照还原：拥塞控制、`default_qdisc`；
+快照里记有网卡的根 qdisc 时，逐块把它的**种类**也还原回去——
 只在它仍是本项目留下的 `fq`/`mq/fq` 时才动（之后被别人改过的不碰），只还原种类、用默认
 参数（例如手工设过的 `cake` 带宽不会回来），`mq` 下混有多种 qdisc 的只告警不还原。还原
 `mq/<种类>` 时先把 `default_qdisc` 临时设成该种类，再 `tc qdisc del dev <网卡> root`，

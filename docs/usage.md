@@ -654,9 +654,32 @@ sudo ssctl drain --timeout 60
 # 3. 完全停掉
 sudo systemctl stop skyline-speeder-enable.service skyline-speederd.service
 
-# 4. 彻底卸载（配置文件会保留；安装前的拥塞控制和 qdisc 会还原回去）
+# 4. 彻底卸载：切回 bbr + fq，并卸掉安装时装上的编译工具链（配置文件会保留）
 sudo ./install.sh --uninstall
+
+# 4b. 想回到安装前那台机器用的拥塞控制和 qdisc，而不是 bbr + fq
+sudo ./install.sh --uninstall --restore-pre-install
 ```
+
+卸载做的事：断开前先 drain 掉存量连接，删掉两个 systemd 单元、二进制和 BPF 对象，把机器切到
+**bbr + fq**，再卸掉安装时装上的包（`clang`、`llvm`、`bpftool`、rustup 等）。只卸安装时记录在
+`/etc/skyline-speeder/added-packages` 里的那些，**不会**碰 `iproute2`、`curl`、
+`ca-certificates`、`tar`，不会碰这几个包仍然依赖的库，也不会碰系统标为必需的包；如果 apt 的
+计划显示会连带删掉清单之外的东西，就把造成这件事的那个包单独留下（并告警说明是谁需要它），
+其余照卸；实在凑不出一个不越界的方案时，才一个都不卸、改为把命令打给你自己决定。`/etc/skyline-speeder` 会保留，重装时你调过的
+参数还在。
+
+> [!NOTE]
+> `bbr` 和 `fq` 是**本次运行时**设置的。本项目从不改 `/etc/sysctl.d` 下的文件，所以重启后
+> 由那里的文件决定用什么。想让 bbr + fq 一直生效，自己写一个文件即可：
+> ```bash
+> printf 'net.ipv4.tcp_congestion_control = bbr\nnet.core.default_qdisc = fq\n' \
+>   | sudo tee /etc/sysctl.d/99-zz-skyline-bbr.conf
+> sudo sysctl --system
+> ```
+>
+> 名字要能排在最后：`/etc/sysctl.d` 是按文件名顺序应用的，同名键后写的赢。写完用
+> `sudo ./install.sh --check` 核对一下到底是哪个文件在开机时设这两个键。
 
 > [!NOTE]
 > 卸载后 `bpftool struct_ops show` 可能还能看到 `skyline_cc`。**这不是失败**——

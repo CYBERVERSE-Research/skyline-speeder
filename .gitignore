@@ -75,6 +75,23 @@ venv/
 *.egg-info/
 
 # ---------------------------------------------------------------------------
+# Backup copies and patch debris
+#
+# A stale copy of a file is never a change anyone means to commit, and it is
+# indistinguishable from the real file to a reviewer reading a diff. `patch` and
+# a failed `git apply` leave `.orig` and `.rej` behind; the `.bak` names are the
+# ones this repository's own instructions produce -- docs/usage.md has operators
+# back up speeder.toml as `speeder.toml.bak`, and scripts/bootstrap.sh moves an
+# existing source tree aside as `<dir>.bak-<timestamp>` rather than deleting it,
+# which `*.bak` alone does not match. Nothing here is named this way, so these
+# cost nothing.
+# ---------------------------------------------------------------------------
+*.bak
+*.bak-*
+*.orig
+*.rej
+
+# ---------------------------------------------------------------------------
 # Editor / OS / agent session state
 # ---------------------------------------------------------------------------
 .vscode/
