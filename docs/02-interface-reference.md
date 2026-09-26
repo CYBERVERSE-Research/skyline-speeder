@@ -32,9 +32,24 @@ Skyline Speeder 的运行期由一个守护进程 `skyline-speederd` 和一个�
 | 命令 | 作用 |
 |---|---|
 | `ssctl validate` | 校验当前配置文件语法与取值范围，不改变运行状态 |
-| `ssctl status` | 打印完整运行期状态：daemon 版本、已启用模块、当前系数、M1 tier-1/tier-2 状态、DSCP 标记状态、能力探测结果、guard 状态 |
-| `ssctl flows` | 打印当前活跃流数量（按设计只提供汇总计数，不枚举逐条连接的详细信息） |
-| `ssctl snapshot <path>` | 把 `status` 的完整内容写入指定文件，供外部脚本采集 |
+| `ssctl status` | **接管状态**：skyline_cc 是否已附加、是否是全机默认拥塞控制、guard 守住了什么又纠正过多少次、内核能力、M1 tier-1 全局 sysctl、daemon 运行时长，以及一个 `ATTENTION` 段落列出所有异常与对应处理动作 |
+| `ssctl flows`（别名 `ssctl flow`） | **被加速的流量**：逐条列出内核当前跑在 `skyline_cc` 上的 TCP 连接（对端、RTT、cwnd、pacing 速率、交付速率、已发字节、重传占比，按已发字节排序，最多 50 行），以及这些连接上生效中的系数与算法决策计数器。见第 4.1 节 |
+| `ssctl snapshot <path>` | 把 `status` 的完整 JSON 写入指定文件，供外部脚本采集（不受下面的输出格式影响，始终是 JSON） |
+
+#### 输出格式
+
+0.3.0 起，上面两条命令**默认打印人类可读的报告**，而不是 JSON。
+
+| 选项 | 作用 |
+|---|---|
+| `--json` | 打印 daemon 的原始应答，与 0.2.0 逐字节一致。解析输出的脚本一律加这个选项 |
+| `--color auto\|always\|never` | 默认 `auto`：stdout 是终端且未设 `NO_COLOR`、`TERM` 不是 `dumb` 时才上色。非 UTF-8 locale 下符号自动退化为 ASCII |
+
+`--json` 模式下赞助方提示行走 stderr，stdout 只有 JSON。
+
+> **升级注意**：`ssctl status | grep -q '"enabled": true'` 这类检查要改成
+> `ssctl status --json | grep -q '"enabled": true'`。`install.sh` 已经改好，并且在
+> 遇到旧版 `ssctl`（不认识 `--json`）时自动回退。
 
 ### 2.2 功能开关（M1-M4 消融）
 
@@ -89,12 +104,18 @@ struct Response {
     ok: bool,           // 请求是否成功
     message: String,    // 人类可读的结果描述，失败时是错误信息
     status: Option<RuntimeStatus>,  // 大多数请求都附带最新的完整状态
+    flows: Option<FlowReport>,      // 只有 flows 请求带，见第 4.1 节
 }
 ```
 
-## 4. 状态与计数器字段（`ssctl status` 的输出结构）
+`flows` 字段在线协议上是可选的（serde `default`），所以新 `ssctl` 能解码不带它的旧
+daemon 应答，旧 `ssctl` 也能解码新 daemon 的应答。`RuntimeStatus` 的 `version`、
+`guard`、`uptime_s`、`attached_s` 同理。
 
-`RuntimeStatus` 是 `status`/大多数写操作响应里 `status` 字段的完整结构：
+## 4. 状态与计数器字段（`ssctl status --json` 的输出结构）
+
+`RuntimeStatus` 是 `status`/大多数写操作响应里 `status` 字段的完整结构。默认的可读报告
+是它的一个视图，不是它的全部——要全部字段就加 `--json`（第 2.1 节）：
 
 | 字段 | 含义 |
 |---|---|
@@ -112,17 +133,19 @@ struct Response {
 | `module_tuning` | M2/M3/M4 当前生效系数的完整回显 |
 | `capabilities` | 内核能力探测结果，见下方"能力探测" |
 | `guard` | cc/qdisc 守护的状态与计数器，见下方 `guard` 表；来自不带此字段的旧 daemon 时解码为全默认值（未武装、计数为 0） |
+| `uptime_s` | 当前 `skyline-speederd` 进程启动至今的秒数；来自不带此字段的旧 daemon 时为 0 |
+| `attached_s` | 当前这次 struct_ops 附加至今的秒数；未附加时为 `null`。只推新系数、没有重新加载的 `enable` 不会重置它 |
 
 `metrics`（`SkylineMetrics`，percpu 计数器求和）：
 
 | 字段 | 含义 |
 |---|---|
 | `ack_events` | 处理过的 ACK 数 |
-| `delivered_packets` | 累计确认的包数 |
-| `loss_events` | 检测到的丢包事件数 |
+| `delivered_packets` | **不是包数**：它每个 ACK 累加一次 `rate_sample.delivered`，而相邻 ACK 的采样区间互相重叠，所以它比真实交付包数高出约两个数量级（6.12.63 实测：同一 20 秒里它涨了 16,703,016，内核自己的 `tp->delivered` 只涨了 164,416，约 101 倍）。**只能用于比较形状相同的两次运行**（实验矩阵就是这么用的，它刻意不进 `analyze_results.py` 的 `RUN_FIELDS`），不能当流量体积，也不能当任何比率的分母。真实体积看 `ssctl flows` 的 CONNECTIONS 段落，那是内核的字节计数器 |
+| `loss_events` | 检测到的丢包事件数。同一轮内的多次 RACK 标记只算一次（按 `tp->delivered` 是否前进去重），所以每个 ACK 最多 +1，可以直接除以 `ack_events` |
 | `state_transitions` | STARTUP→CRUISE 状态切换次数 |
 | `pacing_updates` | pacing 速率被重新计算的次数 |
-| `guardrail_hits` | 队列时延/ECN 护栏实际触发的次数 |
+| `guardrail_hits` | **两处安全限制合计**：队列时延/ECN 护栏触发（`flow->queue_clamped`），以及 cwnd 撞到 `max_cwnd_packets` 上限。两者都在每个 ACK 的路径上，同一个 ACK 可能同时命中 |
 | `hypothetical_early_loss` | `early-loss` 模块开启时，每次 `loss_events` 计数同步递增的观测计数器——只统计，不驱动任何决策（见 `docs/03-design.md` 第 5 节） |
 | `prr_adjustments` | 框架级 PRR 重实现介入的次数——M2 开启时该值应恒为 0（M2 会绕开这条路径），非零说明绕开逻辑未生效 |
 
@@ -156,6 +179,33 @@ struct Response {
 | `last_error` | 最近一次失败（没有 `tc`、`tc` 超时或上一个被杀掉的 `tc` 还没退出、写入被拒、`default_qdisc` 不是 `fq` 因而不新建 `mq`、替换后仍不是 `fq` 等，见第 9 节）；保留到下一次失败为止，是历史，不代表现在仍失败 |
 | `live` | 读 status 时现场读取的值，与是否武装无关：`tcp_congestion_control`、`default_qdisc`、`interface`（即 `tc_interface`）、`interface_qdisc`（该网卡自己的根 qdisc 摘要：`fq`、`cake`、`mq/fq`、`mq/cake,fq`——`mq/` 后是其子队列出现过的 qdisc 种类，去重后按字母序；VLAN、bond、网桥上是 `noqueue`；没有网卡或读不到时为 `null`）、`devices`（guard 实际维护的网卡，每项 `{"name": ..., "qdisc": ...}`，`qdisc` 与 `interface_qdisc` 同一格式，读不到或网卡 down 时为 `null`；就是 `tc_interface` 自己，或它是 VLAN、bond、网桥时它下面的物理网卡，见第 9 节"受管网卡"。`[guard] qdisc = false`、`tc_interface` 不存在或下面找不到网卡时为空列表；来自不带此字段的旧 daemon 时同样为空） |
 | `notes` | 最近一次检查刻意没动的东西和没做成的事，例如 `eth0 root qdisc htb looks deliberate; left alone`、`eth0 root qdisc cake (bandwidth 90Mbit) looks deliberate; left alone`、`eth0 (under bond0) root qdisc cake: the last replace failed; retrying in 30 s`、`wg0 is a virtual device (noqueue is its kernel default) and no NIC under it is visible to the guard; no qdisc checked` |
+
+### 4.1 `ssctl flows` 的逐流数据
+
+`ssctl flows --json` 的应答在 `status` 之外多一个 `flows` 字段（`FlowReport`），
+其他请求的应答里没有这个字段——枚举套接字要额外跑一次 `ss`，只有要它的那条命令才付这个代价。
+
+| 字段 | 含义 |
+|---|---|
+| `accelerated` | 跑在 `skyline_cc` 上的连接，按 `bytes_sent` 降序，最多 50 条（`FLOW_ROWS_MAX`） |
+| `tcp_total` | 主机上处于连接态的 TCP 套接字总数（不含 listen） |
+| `on_skyline_cc` | 其中拥塞控制是 `skyline_cc` 的条数。**不受 50 条上限影响**，始终是真实数量 |
+| `truncated` | 因上限没有列出的条数 |
+| `source_error` | 枚举失败的原因（没装 `ss`、超时被杀、输出格式无法识别）。此时前四项为空/0，但应答里来自 daemon 的部分（系数、计数器）不受影响 |
+
+`accelerated` 每条的字段：`peer`、`local`、`state`，以及 `rtt_ms`、`rtt_var_ms`、
+`min_rtt_ms`、`cwnd_packets`、`ssthresh`、`pacing_bps`、`delivery_bps`、`send_bps`、
+`bytes_sent`、`bytes_acked`、`bytes_retrans`、`retrans_total`、`unacked`、`mss`、
+`rto_ms`。除前三项外都是可空的：`ss` 只打印内核有值的键，缺失时渲染成 `-`，而不是渲染成
+一个看起来像测量结果的 0。
+
+**这些数字的来源与边界。** 它们是**内核自己的** `tcp_info`，由 daemon 调用 `ss -tin`
+读回（`iproute2` 本来就是 guard 跑 `tc` 的硬依赖），再按拥塞控制名筛选。`skyline_cc`
+的逐流状态存在 `flow_states` 这个 `BPF_MAP_TYPE_SK_STORAGE` 里，socket storage 按套接字
+寻址、不支持 `bpf_map_get_next_key`，用户态没有每个套接字的 fd 就无法遍历——这也是 0.2.0
+只能回一个计数的原因。但 cwnd、pacing 速率、RTT 恰好就是 `skyline_cc` 写进套接字的那几项，
+所以从内核这一侧读回来是对"加速做了什么"的忠实记录。`ss` 看不到的东西不在这里：模式
+（STARTUP/CRUISE）、带宽估计、护栏状态只有汇总值，来自 BPF 计数器 map。
 
 ## 5. ABI 版本
 
@@ -197,7 +247,7 @@ BPF 侧的三段配置各自独立维护自己的 ABI 版本号，互不联动�
   `ssctl status` 里这两段的 `config` 显示的是文件值，并不代表已经生效；
 - `[runtime]`、`[rack_tuning]`、`[guard]` 与 `fallback_cc`：没有在线命令，修改后需重启 `skyline-speederd`。
 
-除上面注明的这一处例外，运行期实际生效值以 `ssctl status` 为准。
+除上面注明的这一处例外，运行期实际生效值以 `ssctl status` / `ssctl flows` 为准。
 
 ### 6.1 顶层字段
 
@@ -400,7 +450,8 @@ tun、PPP 这类设备（OpenVPN、Cloudflare WARP 客户端、wireguard-go/Tail
 例外：有 `device` 链接、下面没有别的设备的网卡根是 `noqueue`——内核从不给物理网卡这个
 默认值，只能是有人设的——受管，并按刻意搭建处理（不动，记 note）。受管网卡在纠正记录
 和 note 里带上路径，由近及远：`eth0 (under bond0)`、`eth0 (under bond0 under vmbr0)`。
-`ssctl status` 的 `guard.live.devices` 列出当前受管的网卡与它们的根 qdisc。
+`ssctl status` 的 DRIFT GUARD 段落（`--json` 里是 `guard.live.devices`）列出当前受管的
+网卡与它们的根 qdisc。
 
 **一次检查做什么**（`enable` 时一次；武装期间每 `interval_s` 秒一次）：
 

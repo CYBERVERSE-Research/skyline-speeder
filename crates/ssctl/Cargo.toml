@@ -7,5 +7,6 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+libc.workspace = true
 serde_json.workspace = true
 skyline-common = { path = "../skyline-common" }

@@ -112,7 +112,7 @@ sudo ssctl enable --all-off
 > sudo ssctl set-module-config --guardrail-gain 0.5
 > ```
 >
-> **正确做法**：先 `ssctl status` 看当前值，然后把**所有**你想保留的参数一起写全。
+> **正确做法**：先 `ssctl flows` 看当前值（PARAMETERS IN FORCE 段落），然后把**所有**你想保留的参数一起写全。
 > 如果你从没改过配置文件，内置默认值恰好和出厂值一致，那么单独写一个是安全的。
 >
 > 例外：从 0.1.0 升级的主机。安装脚本不会覆盖已有的 `/etc/skyline-speeder/speeder.toml`，
@@ -275,8 +275,8 @@ sudo systemctl restart skyline-speeder-enable.service
 ### 改参数的正确姿势
 
 ```bash
-# 1. 先看现在是什么
-sudo ssctl status
+# 1. 先看现在是什么（PARAMETERS IN FORCE 段落）
+sudo ssctl flows
 
 # 2. 把所有要保留的值一起写全（这里示范：只想把护栏放松到 0.9）
 sudo ssctl set-module-config \
@@ -311,7 +311,7 @@ sudo ssctl reset-module-config
 > 这个功能靠 `TCP_RTO_MAX_MS`（socket 选项编号 **44**）下发。该编号在 Linux 6.12 里
 > **尚未分配**（该内核最大只到 43 = `TCP_IS_MPTCP`），内核会返回 `ENOPROTOOPT`。
 >
-> 表现是：命令能成功下发、配置也显示已生效，但 `ssctl status` 里
+> 表现是：命令能成功下发、配置也显示已生效，但 `ssctl flows --json` 里
 > **`rack_rto.stats.rto_max_rejected` 持续增长而 `rto_max_applied` 恒为 0**。
 > 我们在 Debian 6.12.101 上实测确认了这一点。
 >
@@ -387,7 +387,8 @@ sudo ssctl reset-rack-rto
 > [!IMPORTANT]
 > **这个功能有个前提：进程必须在指定的 cgroup 里，否则完全不生效，而且不报错。**
 >
-> 检查：`sudo ssctl status` 里如果 `rack_rto.stats.applied` 一直是 0，就是没生效。
+> 检查：`sudo ssctl flows` 的 DYNAMIC RTO 段落里，如果 *connections seen* 一直是 0，就是没生效
+> （它下面会直接写明这不是错误，而是没有进程在那个 cgroup 里）。
 >
 > 让你的服务进入 cgroup：
 > ```bash
@@ -446,7 +447,7 @@ sudo ssctl reset-retransmit-dscp
 
 - 它挂在网卡出方向上，对该网卡**所有 TCP 流量**一致生效，不区分用的是哪种拥塞控制算法。
 - 它只挂在以太网网卡上。配置里的 `runtime.tc_interface` 是 WireGuard / WARP、tun 这类隧道时
-  不会挂载，上面这条开启命令会报错（`ssctl status` 的 `capabilities` → `notes` 里写明原因）：
+  不会挂载，上面这条开启命令会报错（原因写在 `ssctl status` 的 ATTENTION 段落里）：
   把 `tc_interface` 改成承载隧道流量的那块物理网卡，再重启 `skyline-speederd`。
 - 它**不受** `ssctl drain` 影响。摘除加速功能时，这个标记仍然在工作，要单独关。
 - IPv4 和 IPv6 都支持，我们实测零误标记。
@@ -459,24 +460,35 @@ sudo ssctl reset-retransmit-dscp
 sudo ssctl status
 ```
 
-四件事要对：
+标题右上角直接给结论，只看这一处就够了：
 
 ```
-"enabled": true                      <- 加速已挂载
-"capabilities": { ... 六项硬性前提全 true }   <- 环境满足要求
-"active_flows": 大于 0                <- 有连接在用
-"armed": true（在 "guard" 里）        <- 拥塞控制和 qdisc 正被守着
+● ACCELERATING            <- 已挂载，而且是全机默认，新连接都走它
+● ATTACHED, NOT DEFAULT   <- 挂载了但新连接绕开了它，等于没生效（见下）
+○ STANDBY                 <- 没挂载，跑 sudo ssctl enable
 ```
 
-**光看这个还不够**，再确认真实连接确实在用它（服务器有流量时执行）：
+`ACCELERATING` 之外的两种，报告最下面的 **ATTENTION** 段落会逐条写明问题和对应的处理
+动作。四个关键行也各自带标记：
+
+```
+✔ skyline_cc struct_ops   attached, 3h 12m ago     <- 加速已挂载
+✔ host default cc         skyline_cc               <- 新连接确实走它
+✔ 状态 ARMED（DRIFT GUARD 段落）                    <- 拥塞控制和 qdisc 正被守着
+✔ KERNEL 段落 required 那行全是 ✔                   <- 环境满足要求
+```
+
+再确认真实连接确实在用它（服务器有流量时执行）：
 
 ```bash
-ss -tin | grep -c skyline_cc
+sudo ssctl flows
 ```
 
-大于 0 就说明真的生效了。是 0 的话，可能是已建立的老连接不会中途切换，等新连接即可。
+CONNECTIONS 段落的 coverage 那行会写「多少条 TCP 连接里有多少条跑在 skyline_cc 上」，
+下面逐条列出这些连接。是 0 的话，可能是已建立的老连接不会中途切换，等新连接即可。
 
-> `capabilities` 里 `rack_reo_hook: false` 是**正常的**，不影响使用。
+> KERNEL 段落 optional 那行里 `RACK reorder hook` 是灰点（未命中）是**正常的**，不影响使用。
+> 要原始 JSON（脚本解析、贴报告）就加 `--json`。
 
 ### 之前装过「一键 BBR」、改过 qdisc 的机器
 
@@ -502,8 +514,8 @@ journalctl -u skyline-speederd | grep 'guard:'
 以下情况它**不会动**：
 
 - 网卡上是你自己搭的限速 / 整形 qdisc（`htb`、`tbf`、`netem` 等，以及设了带宽的 `cake`，
-  比如 `cake bandwidth 90Mbit`）——替换会把你的限速配置弄没。`ssctl status` 的 `guard` →
-  `notes` 里会写明它没动；
+  比如 `cake bandwidth 90Mbit`）——替换会把你的限速配置弄没。`ssctl status` 的 DRIFT GUARD
+  段落里会以 `note` 写明它没动；
 - 出口是 WireGuard / WARP 这类隧道、下面找不到物理网卡时——`notes` 里会写
   `is a virtual device ... no qdisc checked`。想让它管，就把配置里的 `runtime.tc_interface`
   改成真正的物理网卡；

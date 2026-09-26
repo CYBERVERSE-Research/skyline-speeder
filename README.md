@@ -131,10 +131,14 @@ The installer checks the kernel, builds or downloads the three BPF objects and t
 Day-to-day:
 
 ```bash
-ssctl status    # runtime state, kernel capabilities, decision counters
-ssctl flows     # number of active skyline_cc flows
+ssctl status    # has this host been taken over? attachment, host default, guard, kernel
+ssctl flows     # what is being accelerated? the connections, their parameters, the counters
 ssctl drain     # graceful detach: fallback_cc for new connections, then wait for old ones
 ```
+
+Both reports are written to be read, with colour and symbols on a terminal and neither when piped. `--json` prints the daemon's raw reply instead, which is what a script should parse.
+
+`ssctl flows` lists every TCP connection the kernel currently runs on `skyline_cc` -- peer, RTT, congestion window, pacing rate, delivery rate, bytes sent and the retransmitted share of them -- followed by the coefficients in force on those connections and the counters showing what the algorithm decided. The per-connection numbers are the kernel's own, read back through `ss`: skyline_cc keeps its per-flow state in socket storage, which user space cannot enumerate, but cwnd, pacing rate and RTT are exactly what it writes into the socket.
 
 Over SSH, `ssctl drain` always runs into its timeout, because your own session is a skyline_cc flow. That is harmless: it switches new connections to `fallback_cc` before it starts waiting.
 
@@ -164,7 +168,7 @@ ssctl enable --all-off                        # everything off, as a control bas
 > [!CAUTION]
 > `set-module-config` is **absolute-overwrite**, not incremental: every parameter you leave out is reset to the CLI's built-in default, not to the value in your config file.
 
-**Dynamic RTO floor and ceiling** (off by default). Only connections from processes inside `/sys/fs/cgroup/skyline-speeder` pass through `skyline_policy`, and a process outside it reports **no error**: `rack_rto.stats.applied` in `ssctl status` simply stays at 0. Start the service inside it:
+**Dynamic RTO floor and ceiling** (off by default). Only connections from processes inside `/sys/fs/cgroup/skyline-speeder` pass through `skyline_policy`, and a process outside it reports **no error**: `ssctl flows` simply shows 0 under *connections seen*. Start the service inside it:
 
 ```bash
 sudo /opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <your service command...>
