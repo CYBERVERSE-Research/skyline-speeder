@@ -8,9 +8,9 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 the layout of `bpf/include/skyline_abi.h` and any bump to it is a breaking change
 for anyone holding a prebuilt `.bpf.o`.
 
-## [Unreleased]
+## [0.4.0] - 2026-09-29
 
-### Upgrading
+### Upgrading from 0.3.0
 
 - **First-flight redundancy is on after the upgrade**, also for an installed
   `/etc/skyline-speeder/speeder.toml` that has no `[redundancy]` table: an
@@ -799,7 +799,8 @@ rather than as fixes to a version nobody could have installed.
   socket file permissions. Multi-tenant hosts need additional access control.
 - The experiment harness requires **Python 3.11 or newer** (`tomllib`).
 
-[Unreleased]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/CYBERVERSE-Research/skyline-speeder/releases/tag/v0.1.0
