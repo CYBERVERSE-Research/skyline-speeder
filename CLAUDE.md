@@ -146,6 +146,25 @@ daemon 重启会把 per-case 精确值悄悄覆盖回默认值。
 | 算法行为 | `docs/03-design.md`，性能声明须有 `docs/04-performance-report.md` 数据支撑 |
 | 发版（打 `v*` tag） | `Cargo.toml` 的 `[workspace.package] version` + `CHANGELOG.md` 的 `## [<版本>]` 小节——`release.yml` 校验 tag 恰为 `v<版本>` 且该小节存在，否则拒绝构建 |
 
+## 预编译版本：每个 PR 都要回答"要不要发版"
+
+一键安装（`scripts/bootstrap.sh` → `install.sh`，不带参数）默认装的是 **GitHub 上最新
+release 的预编译产物**，不是 `main`。合并进 `main` 的改动，在下一个 release 之前**不会**
+到达默认安装的用户——这同样是静默的：不报错，只是没生效。
+
+所以**每个 PR 都必须**在描述的 "Prebuilt release" 一节（见 PR 模板）写明是否需要随之发布
+预编译版本，并给出理由：
+
+| 改动落在 | 要发版吗 | 原因 |
+|---|---|---|
+| `bpf/`、`crates/`、`config/speeder-guest.toml`、`packaging/`、`release.yml` 打进产物的 `infra/*.sh` | **要** | 它们就在产物里，不发版默认安装的用户拿不到 |
+| `install.sh`、`scripts/bootstrap.sh` | 通常不要 | 一键安装每次都从 `main` 取安装器，合并即生效；新安装器依赖产物里还没有的东西时除外，那就先发版 |
+| 文档、实验框架、CI、只影响源码构建的部分 | 不要 | 不进产物 |
+
+要发版时，合并后按上表"发版"一行走（版本号 + CHANGELOG 小节 + 打 `v*` tag），改过数据面的
+先重跑 `infra/kernel/core-portability.sh`。可以攒几个 PR 一起发，但 PR 里要写明"随下一版发布"，
+不能不提。
+
 ## 性能声明纪律
 
 **不要在文档里写没有测试数据支撑的性能数字。** 正式性能结论只能来自满足

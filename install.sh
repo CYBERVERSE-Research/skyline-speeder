@@ -4,13 +4,18 @@
 #
 # Exclusively sponsored by Skyline Connect -- https://www.skylineconnect.io
 #
-# Installs the build toolchain, compiles the three CO-RE BPF objects against
-# THIS machine's kernel BTF, builds the Rust control plane, installs the systemd
-# units, and activates skyline_cc across reboots. Installs no proxy, no network
-# service, and opens no port.
+# Installs the latest published release -- the three CO-RE BPF objects and the
+# Rust control plane, no build toolchain -- together with the systemd units,
+# and activates skyline_cc across reboots. A host that cannot run the published
+# binaries (another architecture, a C library older than they were built
+# against) is told why and gets a build from this source tree instead. Installs
+# no proxy, no network service, and opens no port.
 #
-#   sudo ./install.sh                  # build from source, install and activate
-#   sudo ./install.sh --prebuilt       # install published artifacts, no toolchain
+#   sudo ./install.sh                  # install the published release; a host that
+#                                      # cannot run it builds from source instead
+#   sudo ./install.sh --source         # build this source tree on this host
+#   sudo ./install.sh --prebuilt       # the published release, never a build: fails
+#                                      # on a host that cannot run it
 #   sudo ./install.sh --release <tag>  # --prebuilt, pinned to that release
 #   sudo ./install.sh --check          # preflight only, change nothing
 #   sudo ./install.sh --no-enable      # install, but attach nothing that was not attached
@@ -44,11 +49,14 @@
 # the egress NIC (config [guard]). A bbr / cake / fq_pie left behind by a
 # "one-click BBR" script is reported and overridden; its files are not edited.
 #
-# --prebuilt downloads the release artifacts instead of compiling. It needs no
-# clang, no LLVM, no bpftool and no Rust: the BPF objects were built against a
-# pinned reference header from the oldest supported kernel, and CO-RE fixes the
-# field offsets against THIS kernel when they load. Everything else about the
-# install is identical.
+# The published release needs no clang, no LLVM, no bpftool and no Rust: the
+# BPF objects were built against a pinned reference header from the oldest
+# supported kernel, and CO-RE fixes the field offsets against THIS kernel when
+# they load. It is what `main` has released, not what `main` holds: a change
+# merged after the latest tag reaches this path only with the next release.
+# --source compiles the objects against this machine's kernel BTF and the
+# control plane from this tree, installing the toolchain for it (--uninstall
+# takes that away again). Everything else about the install is identical.
 #
 set -euo pipefail
 
@@ -66,7 +74,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KVER="$(uname -r)"
 MODE=install
 ENABLE=1
-SOURCE=build          # build | prebuilt
+SOURCE=auto           # auto | build | prebuilt; auto is resolved below
 RELEASE_TAG=          # empty means "latest"
 RESTORE=bbr-fq        # bbr-fq | pre-install: what --uninstall leaves behind
 REPO_SLUG=${SKYLINE_REPO:-CYBERVERSE-Research/skyline-speeder}
@@ -89,6 +97,14 @@ KEEP_PKGS=(iproute2 curl ca-certificates tar)
 ADDED_COUNT=0      # packages recorded in $ADDED_PKGS after this run
 ADDED_REMOVABLE=0  # of those, the ones an uninstall would actually remove
 GUIDE_URL=https://github.com/CYBERVERSE-Research/skyline-speeder/blob/main/docs/usage.md
+# What the published artifact can run on. release.yml builds it on an
+# ubuntu-24.04 runner for x86_64 only, and the skyline-speederd that comes out
+# asks for GLIBC_2.38 (`objdump -T bin/skyline-speederd`). Both are a sync
+# point with release.yml: raise the floor when the runner moves on, and add an
+# architecture when a release starts publishing one, or the default install
+# breaks on exactly the hosts it used to fall back for.
+PREBUILT_ARCHES="x86_64"
+PREBUILT_GLIBC_MIN=2.38
 
 # `-qq` silences apt but not dpkg, which still prints an unpack line per
 # package plus a "Reading database" progress bar. Dpkg::Use-Pty=0 stops the
@@ -1288,12 +1304,34 @@ purge_rustup() {
     fi
 }
 
+# prebuilt_blocker: why the published artifact cannot run on this host, or
+# nothing when it can. The C library is the one thing a CO-RE object does not
+# care about and a prebuilt daemon does.
+prebuilt_blocker() {
+    local arch glibc lowest
+    arch=$(uname -m)
+    case " $PREBUILT_ARCHES " in
+        *" $arch "*) ;;
+        *) printf 'releases publish no %s artifact (only %s)' "$arch" "$PREBUILT_ARCHES"; return ;;
+    esac
+    glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}') || true
+    if [ -z "$glibc" ]; then
+        printf 'the C library is not glibc, or its version cannot be read'
+        return
+    fi
+    lowest=$(printf '%s\n%s\n' "$PREBUILT_GLIBC_MIN" "$glibc" | sort -V | head -1)
+    if [ "$lowest" != "$PREBUILT_GLIBC_MIN" ]; then
+        printf 'glibc %s is older than the %s the published binaries need' "$glibc" "$PREBUILT_GLIBC_MIN"
+    fi
+}
+
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --check) MODE=check; shift ;;
         --no-enable) ENABLE=0; shift ;;
         --uninstall) MODE=uninstall; shift ;;
         --restore-pre-install) RESTORE=pre-install; shift ;;
+        --source) SOURCE=build; shift ;;
         --prebuilt) SOURCE=prebuilt; shift ;;
         --release) [ "$#" -ge 2 ] || die "--release needs a tag"; SOURCE=prebuilt; RELEASE_TAG="$2"; shift 2 ;;
         --verbose) VERBOSE=1; shift ;;
@@ -1437,6 +1475,30 @@ if [ "$MODE" = uninstall ]; then
     exit 0
 fi
 
+# --- which install: the published release, unless this host cannot run it ---
+# The default is the release: no toolchain on the host, minutes instead of a
+# build, and the same objects every other prebuilt host runs. A host that
+# cannot run those binaries is told why and builds from source. --prebuilt and
+# --release asked for the artifact by name, so they stop there instead of
+# quietly compiling -- and stop now, not at the verifier step after the
+# download, where an old glibc used to surface.
+BLOCKER=$(prebuilt_blocker)
+SOURCE_REASON=
+case "$SOURCE" in
+    auto)
+        if [ -z "$BLOCKER" ]; then
+            SOURCE=prebuilt
+        else
+            SOURCE=build
+            SOURCE_REASON=$BLOCKER
+        fi
+        ;;
+    prebuilt)
+        [ -z "$BLOCKER" ] || die "--prebuilt/--release cannot install here: $BLOCKER.
+   Build from source instead: sudo $0 --source"
+        ;;
+esac
+
 if [ "$MODE" = install ]; then
     QUIET=$((1 - VERBOSE))
     # A terminal that cannot clear a line (TERM=dumb) gets the plain
@@ -1446,6 +1508,11 @@ if [ "$MODE" = install ]; then
     : >"$LOG" || die "cannot write $LOG"
     LOG_READY=1
     log "Skyline Speeder install, $(date '+%F %T %z'), source=$SOURCE${RELEASE_TAG:+ release=$RELEASE_TAG} enable=$ENABLE"
+    # The one fallback worth interrupting the progress line for: the operator
+    # asked for nothing and is about to wait for a compiler.
+    if [ -n "$SOURCE_REASON" ]; then
+        warn "building from source: $SOURCE_REASON. This installs a build toolchain and takes several minutes; --uninstall removes it again."
+    fi
     if [ "$SOURCE" = build ]; then STEP_TOTAL=11; else STEP_TOTAL=9; fi
     [ "$ENABLE" -eq 1 ] || STEP_TOTAL=$((STEP_TOTAL - 2))
     # No SIGWINCH trap for a resize: a trapped signal makes a pending `wait`
@@ -1706,6 +1773,13 @@ apt_plan() {
 
 if [ "$MODE" = check ]; then
     info "preflight only; no changes will be made"
+    if [ "$SOURCE" = prebuilt ]; then
+        ok "would install the published release${RELEASE_TAG:+ $RELEASE_TAG}"
+    elif [ -n "$SOURCE_REASON" ]; then
+        warn "would build from source: $SOURCE_REASON"
+    else
+        ok "would build from source (--source)"
+    fi
     if [ "$SOURCE" = prebuilt ]; then
         MISSING=()
         for c in curl tar; do command -v "$c" >/dev/null 2>&1 || MISSING+=("$c"); done

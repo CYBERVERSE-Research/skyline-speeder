@@ -11,8 +11,8 @@
 ## 0. 一句话路径
 
 ```bash
-sudo ./install.sh              # 在本机从源码构建
-sudo ./install.sh --prebuilt   # 或：安装已发布的产物，不需要工具链（两条路径的区别见 §2）
+sudo ./install.sh              # 默认：安装最新发布的预编译产物；本机跑不了时自动改为源码构建（§2）
+sudo ./install.sh --source     # 或：在本机从源码构建
 ```
 
 退出码非零即失败。输出约定（便于机器解析）：stdout 不是终端时，每一步开始、结束各打印
@@ -37,13 +37,13 @@ v=$(skyline-speederd --version 2>/dev/null | awk '{print $2}')
 
 第三条确认内存里跑的就是刚装上的 daemon：`skyline-speederd --version` 读的是磁盘上的
 二进制，`status` 里的 `version` 来自正在运行的进程。已发布的 v0.2.0 及更早的二进制没有
-`--version`，它们的 `ssctl status` 也没有 `version` 字段，所以对它们（`--prebuilt` 在出现
-更新的 release 之前装的就是 v0.2.0）第三条跳过；新的 `ssctl` 查询旧 daemon 时这个字段显示为
+`--version`，它们的 `ssctl status` 也没有 `version` 字段，所以对它们（`--release v0.2.0`
+或更早）第三条跳过；新的 `ssctl` 查询旧 daemon 时这个字段显示为
 空字符串。注意两个 release 之间从 main 构建的版本号可能仍与上一个 release 相同，判断有没有
 guard 看 `status` 里有没有 `"guard"` 键，不要只看版本号。
 
-> **升级已有安装**：按原来的方式重新运行 `install.sh`（当初带了 `--prebuilt`/`--no-enable`
-> 的照样带上）。检测到 `skyline-speederd.service` 处于 active 时，它在新对象通过内核验证器
+> **升级已有安装**：重新运行 `install.sh`（当初带了 `--source`/`--no-enable` 的照样带上；
+> 从源码构建的主机不带 `--source` 重跑，会换成已发布的产物）。检测到 `skyline-speederd.service` 处于 active 时，它在新对象通过内核验证器
 > 之后自己重启 daemon：enable unit 处于 active 时随之重启——其 ExecStop
 > （`boot-disable.sh`）执行 `ssctl drain`：drain 先解除 guard、写回 `fallback_cc`，再等存量
 > 连接至多 60 秒（经 SSH 必然走到超时，无害），新 daemon 起来后重新挂载。用 `ssctl` 做的在线
@@ -83,14 +83,22 @@ guard 看 `status` 里有没有 `"guard"` 键，不要只看版本号。
 
 ---
 
-## 2. 两条安装路径：源码构建与预编译产物
+## 2. 两条安装路径：预编译产物与源码构建
 
-| | 源码构建（默认） | 预编译产物（`--prebuilt`） |
+不带参数时安装器先判断本机能否运行发布的二进制：架构是发布流水线出产物的架构（目前只有
+x86_64），且 glibc ≥ 2.38（`getconf GNU_LIBC_VERSION`）。能则装预编译产物，否则打印一行
+`warn building from source: <原因>` 后改为源码构建。`--source` 无条件源码构建；`--prebuilt`
+与 `--release <tag>` 只装产物，本机跑不了时在第一步之前就以 `error --prebuilt/--release
+cannot install here: <原因>` 中止（退出码非零），不会改为构建。`--check` 会报告将走哪条路径
+（`would install the published release` / `would build from source: <原因>`）。
+
+| | 预编译产物（默认） | 源码构建（`--source`，或默认路径在本机跑不了产物时） |
 |---|---|---|
-| 命令 | `./install.sh` | `./install.sh --prebuilt`；`./install.sh --release <tag>` 固定到某个版本（隐含 `--prebuilt`） |
-| 目标机需要 | 编译工具链（clang/LLVM、bpftool、libbpf/libelf/zlib 开发包、Rust），安装器自动安装 | **不需要任何工具链**，只要 `curl`、`tar`、`iproute2`（安装器自动安装）；但预编译的 `skyline-speederd` 在 Ubuntu 24.04 上构建，需要 **glibc ≥ 2.38** 以及 `libelf.so.1`、`libz.so.1`（Debian 13、Ubuntu 24.04 及更新版本满足） |
-| BPF 对象的类型来源 | 本机 `/sys/kernel/btf/vmlinux` | 发布流水线固定的 6.12 LTS 参考头，加载时由 CO-RE 按本机内核的 BTF 修正字段偏移 |
-| 完整性校验 | 源码树本身（`scripts/bootstrap.sh` 可用 `SKYLINE_SHA256` 固定 tarball 摘要） | 产物旁的 `.sha256` 必须匹配，不匹配即中止；取不到 `.sha256` 时告警、只信任 TLS |
+| 命令 | `./install.sh`；`./install.sh --prebuilt`（只装产物）；`./install.sh --release <tag>` 固定到某个版本 | `./install.sh --source` |
+| 目标机需要 | **不需要任何工具链**，只要 `curl`、`tar`、`iproute2`（安装器自动安装）；但预编译的 `skyline-speederd` 在 Ubuntu 24.04 上构建，需要 **glibc ≥ 2.38** 以及 `libelf.so.1`、`libz.so.1`（Debian 13、Ubuntu 24.04 及更新版本满足） | 编译工具链（clang/LLVM、bpftool、libbpf/libelf/zlib 开发包、Rust），安装器自动安装，`--uninstall` 再卸掉 |
+| 装的是什么 | 最新（或 `--release` 指定的）release：`main` 上在它之后合并的改动不在其中 | 运行的这份源码树（一键安装时即 `--ref`，默认 `main`） |
+| BPF 对象的类型来源 | 发布流水线固定的 6.12 LTS 参考头，加载时由 CO-RE 按本机内核的 BTF 修正字段偏移 | 本机 `/sys/kernel/btf/vmlinux` |
+| 完整性校验 | 产物旁的 `.sha256` 必须匹配，不匹配即中止；取不到 `.sha256` 时告警、只信任 TLS | 源码树本身（`scripts/bootstrap.sh` 可用 `SKYLINE_SHA256` 固定 tarball 摘要） |
 
 两条路径的其余步骤完全相同（同样过验证器、同样的 systemd unit 与配置模板）。
 
@@ -113,9 +121,9 @@ SKYLINE_ARTIFACT_URL=/path/to/skyline-speeder-<tag>-x86_64.tar.gz ./install.sh -
 release 附带的 enable unit（它自己的 `boot-enable.sh`）在每次挂载和每次开机时写一次
 `default_qdisc=fq`，不换网卡的根 qdisc，也没有谁守住这个值。安装器据此识别并告警
 （`... is a release older than the guard ...`），摘要的 qdisc 行注明
-`(not managed by this release)`；此时 §6 的 G7 与 §0 成功判据的第三条不适用。需要 guard 就用源码构建。用户态早于 glibc 2.38 的主机（例如 Debian 12 + backports
-内核）上预编译的 daemon 起不来，`--prebuilt` 会在验证步骤失败——改用源码构建（这一组合
-尚未测试）。
+`(not managed by this release)`；此时 §6 的 G7 与 §0 成功判据的第三条不适用。需要 guard 就装更新的 release 或 `--source`。用户态早于 glibc 2.38 的主机（例如
+Debian 12 + backports 内核）跑不了预编译的 daemon：默认路径会改为源码构建，`--prebuilt`
+则直接中止（见本节开头）。
 
 **源码构建。** `make bpf` 默认从本机 `/sys/kernel/btf/vmlinux` 生成 `vmlinux.h`。对象是
 CO-RE 的：头文件只需定义代码用到的类型，字段偏移在加载时按运行内核修正——发布产物正是

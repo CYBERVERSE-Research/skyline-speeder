@@ -97,20 +97,27 @@ Verified: `6.12.101`, `6.18.42` and `7.1.6` pass, including IPv4/IPv6 data-path 
 ## Quick start
 
 ```bash
-# Build from source on this host
 curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash
-
-# Or install the published release, no build toolchain
-curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash -s -- --prebuilt
 ```
+
+> [!NOTE]
+> **The one-line install now installs the latest published release by default**: prebuilt BPF objects and daemon, with no compiler, LLVM or Rust put on the host. A host that cannot run the published binaries (not x86_64, or a glibc older than 2.38, such as Debian 12) is told why and builds from source instead. To build from source anyway, or to install a particular release:
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash -s -- --source           # build from source on this host
+> curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash -s -- --release v0.4.0   # that release, not the latest
+> ```
+>
+> Installers up to and including v0.4.0 built from source by default and needed `--prebuilt` for the release; the one-line install always runs the installer from `main`, so it has the new default already. `--prebuilt` still works and now means "the release or nothing": on a host that cannot run it, it stops instead of building.
 
 A minimal image may lack `curl` (`apt-get install -y curl`) or `sudo` (drop it if you are root). To read the scripts before running them, which is **recommended** since this changes the congestion control of every new connection on the machine:
 
 ```bash
 git clone https://github.com/CYBERVERSE-Research/skyline-speeder.git
 cd skyline-speeder
-sudo ./install.sh              # build from source
-sudo ./install.sh --prebuilt   # published release artifacts, no toolchain
+sudo ./install.sh              # the published release (builds only where it cannot run)
+sudo ./install.sh --source     # build this tree from source
+sudo ./install.sh --prebuilt   # the published release, or stop
 sudo ./install.sh --check      # preflight only, changes nothing
 sudo ./install.sh --no-enable  # install, but attach nothing that was not attached
 sudo ./install.sh --verbose    # every command's output instead of the progress line
@@ -124,10 +131,10 @@ The installer checks the kernel, builds or downloads the three BPF objects and t
 
 `--uninstall` drains live flows, removes the units, binaries and BPF objects, puts the host on **bbr + fq**, and removes the packages the install added. It records which packages those were (`/etc/skyline-speeder/added-packages`) and removes only those: never `iproute2`, `curl`, `ca-certificates` or `tar`, never anything one of those still needs (keeping `curl` while removing the library under it is not something apt can do), and never anything dpkg calls *required* or *important*. apt plans the removal first: a package something else on the host now needs is kept and named, and the rest is removed; only when no reduced plan stays inside the recorded list is nothing removed at all, and the command to do it by hand is printed instead. A rustup toolchain is removed only if the installer is the one that installed it. `bbr` and `fq` are set for that boot; no file under `/etc/sysctl.d` is written or edited, so those files decide again after a reboot. `--restore-pre-install` puts back the congestion control and qdiscs the host ran before instead — it also records those, including the egress interface's root qdisc. `/etc/skyline-speeder` is kept either way, so a reinstall keeps your settings.
 
-`--prebuilt` needs no toolchain, only `curl`, `tar` and `iproute2` (the installer installs them): the objects are CO-RE, compiled against a pinned 6.12 header and relocated against this kernel when they load. The prebuilt daemon is built on Ubuntu 24.04 and needs glibc 2.38 or newer with `libelf.so.1` and `libz.so.1` (Debian 13, Ubuntu 24.04 and later); on older userspace, build from source. `--release <tag>` pins a version, and `SKYLINE_ARTIFACT_URL=/path/to/tarball sudo -E ./install.sh --prebuilt` installs a copied artifact on a host with no route to GitHub. It installs a published release, which can be older than this README: the v0.2.0 release, for one, predates the qdisc guard described under Configuration, and the installer says so when that is the case.
+The published release needs no toolchain, only `curl`, `tar` and `iproute2` (the installer installs them): the objects are CO-RE, compiled against a pinned 6.12 header and relocated against this kernel when they load. The prebuilt daemon is built on Ubuntu 24.04 and needs glibc 2.38 or newer with `libelf.so.1` and `libz.so.1` (Debian 13, Ubuntu 24.04 and later); on older userspace the default install builds from source by itself, and `--source` does so anywhere. `--release <tag>` pins a version, and `SKYLINE_ARTIFACT_URL=/path/to/tarball sudo -E ./install.sh --prebuilt` installs a copied artifact on a host with no route to GitHub. What gets installed is a published release, which can be older than this README and than `main`: a change merged after the latest release reaches the one-line install only with the next one. A release that predates a feature described here (the v0.2.0 release has no qdisc guard, for one) is named as such by the installer.
 
 > [!IMPORTANT]
-> **Upgrading:** run the installer again, the same way. Once the new objects pass the kernel verifier it restarts `skyline-speederd` itself, draining live flows for up to 60 seconds, and attaches `skyline_cc` again, also on a host where it was attached by hand with `ssctl enable`. Settings changed with `ssctl` do not survive the restart. Details: [CHANGELOG.md](CHANGELOG.md), *Upgrading from 0.2.0*.
+> **Upgrading:** run the installer again. Once the new objects pass the kernel verifier it restarts `skyline-speederd` itself, draining live flows for up to 60 seconds, and attaches `skyline_cc` again, also on a host where it was attached by hand with `ssctl enable`. Settings changed with `ssctl` do not survive the restart. A host that was built from source moves to the published release unless you pass `--source` again. Details: [CHANGELOG.md](CHANGELOG.md), *Upgrading from 0.3.0*.
 
 Day-to-day:
 
@@ -210,6 +217,8 @@ skyline-speeder/
 ```
 
 ## Building from source
+
+`sudo ./install.sh --source` does all of this and installs the result. By hand:
 
 ```bash
 sudo apt-get install -y build-essential pkg-config clang llvm \

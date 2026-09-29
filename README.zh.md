@@ -99,20 +99,27 @@ RTT 70-73 ms、丢包 10%-30%，测于晚高峰。skyline_cc 使用 0.1.0 时随
 ## 快速开始
 
 ```bash
-# 在本机从源码构建
 curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash
-
-# 或者安装已发布的版本，不需要编译工具链
-curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash -s -- --prebuilt
 ```
+
+> [!NOTE]
+> **一键安装现在默认安装最新发布的预编译版本**：直接使用预编译好的 BPF 对象和 daemon，不会在本机安装编译器、LLVM 或 Rust。本机跑不了发布版的二进制时（不是 x86_64，或者 glibc 低于 2.38，例如 Debian 12），安装器会说明原因并自动改为从源码构建。想强制从源码构建，或者安装指定版本：
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash -s -- --source           # 在本机从源码构建
+> curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash -s -- --release v0.4.0   # 安装该版本，而不是最新版
+> ```
+>
+> v0.4.0 及更早的安装器，不带参数时从源码构建，要装发布版得加 `--prebuilt`；一键安装运行的始终是 `main` 上的安装器，所以已经是新的默认行为。`--prebuilt` 仍然可用，现在的含义是"只装发布版"：本机跑不了发布版时直接停下，不会改为源码构建。
 
 最小化镜像可能没有 `curl`（`apt-get install -y curl`）或 `sudo`（已经是 root 就去掉）。想先看过脚本再运行（**推荐**，因为它会改变这台机器上所有新建连接的拥塞控制）：
 
 ```bash
 git clone https://github.com/CYBERVERSE-Research/skyline-speeder.git
 cd skyline-speeder
-sudo ./install.sh              # 从源码构建
-sudo ./install.sh --prebuilt   # 安装已发布的产物，不需要编译工具链
+sudo ./install.sh              # 安装已发布的版本（本机跑不了时才从源码构建）
+sudo ./install.sh --source     # 从这份源码构建
+sudo ./install.sh --prebuilt   # 只装已发布的版本，装不了就停下
 sudo ./install.sh --check      # 只做前置检查，不改动任何东西
 sudo ./install.sh --no-enable  # 安装，但不挂载此前没挂载的 skyline_cc
 sudo ./install.sh --verbose    # 不显示进度条，改为打印每条命令的输出
@@ -126,10 +133,10 @@ sudo ./install.sh --uninstall --restore-pre-install   # 同上，但还原成
 
 `--uninstall` 会先 drain 掉存量连接，删除两个 systemd 单元、二进制和 BPF 对象，把本机切到 **bbr + fq**，并卸掉安装时装上的包。装了哪些包是记录下来的（`/etc/skyline-speeder/added-packages`），也只卸这些：不碰 `iproute2`、`curl`、`ca-certificates`、`tar`，不碰这几个包**仍然依赖**的东西（保留 `curl` 却删掉它底下的库，apt 根本做不到），也不碰 dpkg 标为 *required*/*important* 的包。卸之前先让 apt 出计划：计划里如果要连带删掉主机上别的东西，就把造成这件事的那个包单独留下并说明，其余照卸；只有在怎么缩减都无法得到一个不越界的计划时，才一个都不卸、改为打印手工命令。rustup 工具链只在确实是安装器装的情况下才移除。`bbr` 与 `fq` 只在本次运行时生效——不写也不改 `/etc/sysctl.d` 下的任何文件，所以重启后仍由那些文件决定。加 `--restore-pre-install` 则还原成安装前那台机器用的拥塞控制与 qdisc（包括出口网卡的根 qdisc，安装时一并记录）。两种方式都保留 `/etc/skyline-speeder`，重装时你的配置还在。
 
-`--prebuilt` 不需要编译工具链，只需要 `curl`、`tar` 和 `iproute2`（安装器会自动安装）：对象是 CO-RE 的，用固定的 6.12 参考头编译，加载时再按这台机器的内核重定位。预编译的 daemon 在 Ubuntu 24.04 上构建，需要 glibc 2.38 以上以及 `libelf.so.1`、`libz.so.1`（Debian 13、Ubuntu 24.04 及更新版本满足）；用户态更旧的系统请从源码构建。`--release <tag>` 指定版本；连不上 GitHub 的机器，把产物拷过去后用 `SKYLINE_ARTIFACT_URL=/path/to/tarball sudo -E ./install.sh --prebuilt` 安装。它装的是已发布的 release，可能比这份 README 旧：例如 v0.2.0 这个 release 还没有下文「配置」里说的 qdisc 守护，遇到这种情况安装器会明确提示。
+已发布的版本不需要编译工具链，只需要 `curl`、`tar` 和 `iproute2`（安装器会自动安装）：对象是 CO-RE 的，用固定的 6.12 参考头编译，加载时再按这台机器的内核重定位。预编译的 daemon 在 Ubuntu 24.04 上构建，需要 glibc 2.38 以上以及 `libelf.so.1`、`libz.so.1`（Debian 13、Ubuntu 24.04 及更新版本满足）；用户态更旧的系统，默认安装会自动改为从源码构建，`--source` 则在任何机器上都从源码构建。`--release <tag>` 指定版本；连不上 GitHub 的机器，把产物拷过去后用 `SKYLINE_ARTIFACT_URL=/path/to/tarball sudo -E ./install.sh --prebuilt` 安装。装上的是已发布的 release，可能比这份 README、也比 `main` 旧：`main` 上在最新 release 之后合并的改动，要等下一个 release 才会进入一键安装。装的 release 早于这里描述的某个功能时（例如 v0.2.0 这个 release 还没有 qdisc 守护），安装器会明确提示。
 
 > [!IMPORTANT]
-> **升级：** 按原来的方式再运行一次安装器即可。新对象通过内核验证器后，它会自己重启 `skyline-speederd`：先让现有连接排空（最多 60 秒），再重新挂载 `skyline_cc`；原先是手工 `ssctl enable` 挂载的主机也一样。用 `ssctl` 做的修改不会保留到重启之后。详见 [CHANGELOG.md](CHANGELOG.md) 的 *Upgrading from 0.2.0*。
+> **升级：** 再运行一次安装器即可。新对象通过内核验证器后，它会自己重启 `skyline-speederd`：先让现有连接排空（最多 60 秒），再重新挂载 `skyline_cc`；原先是手工 `ssctl enable` 挂载的主机也一样。用 `ssctl` 做的修改不会保留到重启之后。原先从源码构建的主机会换成已发布的版本，除非再次带上 `--source`。详见 [CHANGELOG.md](CHANGELOG.md) 的 *Upgrading from 0.3.0*。
 
 日常操作：
 
@@ -212,6 +219,8 @@ skyline-speeder/
 ```
 
 ## 从源码构建
+
+`sudo ./install.sh --source` 会把下面这些一步做完并装好。手工构建：
 
 ```bash
 sudo apt-get install -y build-essential pkg-config clang llvm \

@@ -5,12 +5,15 @@
 #   curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash
 #
 # Fetches the source tree to a stable location and hands off to install.sh.
-# By default install.sh then builds from source on this host. Forwarding
-# --prebuilt (or --release <tag>) makes it install the published release
-# artifacts instead: CO-RE objects built against a pinned reference header,
-# whose field offsets are fixed against this kernel's BTF at load time. Either
-# way the install.sh that runs comes from --ref, which defaults to main, not to
-# the latest release.
+# By default install.sh then installs the latest published release: CO-RE
+# objects built against a pinned reference header, whose field offsets are
+# fixed against this kernel's BTF at load time, and a prebuilt control plane,
+# with no build toolchain on this host. A host that cannot run the published
+# binaries (not x86_64, or a glibc older than 2.38) is told why and builds from
+# source instead. Forwarding --source builds from source unconditionally;
+# --release <tag> pins the artifact. Either way the install.sh that runs comes
+# from --ref, which defaults to main, while the artifact comes from the latest
+# release (or --release): --ref picks the installer, not the version installed.
 #
 # Everything is wrapped in main() and invoked on the last line on purpose: if
 # `curl` dies mid-transfer, bash executes whatever bytes arrived. With the body
@@ -23,7 +26,9 @@
 #
 # Any other argument is forwarded to install.sh verbatim:
 #
-#   ... | sudo bash -s -- --prebuilt    # install published artifacts, no toolchain
+#   ... | sudo bash -s -- --source      # build from source on this host instead
+#   ... | sudo bash -s -- --release v0.4.0
+#                                       # install that release, not the latest
 #   ... | sudo bash -s -- --check       # preflight only
 #   ... | sudo bash -s -- --no-enable   # install without attaching skyline_cc
 #   ... | sudo bash -s -- --verbose     # show every build command's output
@@ -164,7 +169,8 @@ main() {
     "$SRC_DIR/install.sh" "${FORWARD[@]+"${FORWARD[@]}"}"
 
     echo
-    ok "source kept at $SRC_DIR -- rebuild or remove from there:"
+    ok "installer kept at $SRC_DIR -- upgrade or remove from there:"
+    echo "     sudo $SRC_DIR/install.sh               # upgrade to the latest release"
     echo "     sudo $SRC_DIR/install.sh --uninstall   # also puts this host on bbr + fq"
 }
 

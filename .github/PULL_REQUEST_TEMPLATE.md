@@ -37,6 +37,15 @@ Kernel it ran on: `uname -r` =
 - [ ] Algorithm behaviour → `docs/03-design.md`
 - [ ] User-facing README change → **both** `README.md` and `README.zh.md`
 
+## Prebuilt release
+
+<!-- The one-line install installs the latest release's prebuilt artifact, not
+     main. A change in bpf/, crates/, config/speeder-guest.toml, packaging/ or
+     the infra/*.sh that release.yml ships reaches those users only with the
+     next release; install.sh and scripts/bootstrap.sh are fetched from main
+     and take effect on merge. Answer "needed" (now, or with the next release)
+     or "not needed", and why. -->
+
 ## Performance claims
 
 <!-- If this PR claims any throughput or latency effect, say what was measured,
