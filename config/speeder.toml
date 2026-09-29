@@ -37,10 +37,16 @@ initial_cwnd_packets = 100
 # min_cwnd_packets doc comment). A thin or app-limited flow's
 # bw_bps * base_rtt comes out below a handful of packets, and a window that
 # small can only recover from a loss through a tail-loss probe or an RTO.
-# Pacing (M4) still sets the send rate, so raising this does not make a flow
-# send faster. 4 is the floor this project always had; must stay within
-# [4, max_cwnd_packets]; only consulted while adaptive-cwnd (M2) is on.
-min_cwnd_packets = 4
+# It is also where a short response restarts after an RTO: such a flow
+# usually never gets a bandwidth estimate, and the kernel leaves it one
+# packet. Pacing (M4) still sets the send rate of any flow that has an
+# estimate, so raising this does not make one send faster. 32 packets
+# (about 46 KB) lets a 15-35 KB response finish in the flight after the
+# timeout, and stays under the roughly 44-packet initial receive window of
+# a Linux client. Omitting the field gives 4, the floor this project always
+# had; must stay within [4, max_cwnd_packets]; only consulted while
+# adaptive-cwnd (M2) is on.
+min_cwnd_packets = 32
 
 # 这两段（[adaptive_cwnd]/[loss_classifier]）的全部数值现在都可以在不重启
 # skyline-speederd 的情况下用 `ssctl set-module-config`/`reset-module-config` 在线覆盖
@@ -135,6 +141,26 @@ rto_max_congestion_ratio_permille = 0  # 0 = 使用内置默认 2000（即 srtt 
 [retransmit_dscp]
 enabled = false
 dscp_value = 0
+
+# First-flight redundancy. While skyline_cc is enabled, bpf/skyline_tc.bpf.c
+# (TC egress on runtime.tc_interface) sends every SYN-ACK, every SYN of a
+# skyline_cc socket and every segment that starts within the first first_kib
+# KiB a skyline_cc connection sends twice: the original at once, a copy
+# delay_ms later. On a lossy path a short response spends most of its time
+# waiting for loss recovery -- a tail-loss probe after about two RTTs, an RTO
+# after about three, the kernel's fixed one-second SYN-ACK timeout -- and a
+# late second copy turns most of those losses into a delay of delay_ms. The
+# price: a response that fits in first_kib is sent twice; a bulk transfer
+# pays for its first first_kib only. The copy is held back by the fq qdisc
+# (kept at the root by [guard]); two copies a few milliseconds apart are lost
+# together far less often than two back to back (delay_ms = 0). Connections
+# that do not run skyline_cc are never copied, and nothing is copied before
+# `ssctl enable` or after `ssctl drain`. Omitting the table keeps it on with
+# these values; `ssctl set-redundancy` / `reset-redundancy` change it live.
+[redundancy]
+enabled = true
+first_kib = 64   # 1..=1024
+delay_ms = 10    # 0..=100
 
 # While skyline_cc is enabled, skyline-speederd re-checks every interval_s
 # seconds that the host default congestion control is still skyline_cc and (if

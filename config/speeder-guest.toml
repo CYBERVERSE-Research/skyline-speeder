@@ -16,7 +16,7 @@ max_queue_delay_ratio = 0.6
 # See config/speeder.toml's comment: aggressive initial window.
 initial_cwnd_packets = 100
 # See config/speeder.toml's comment: floor under M2's cwnd target.
-min_cwnd_packets = 4
+min_cwnd_packets = 32
 
 # 这两段的默认值可能被实验矩阵通过 `ssctl set-module-config`（见
 # research/experiments/run_matrix.py 的 apply_module_config()）逐 case 覆盖；
@@ -52,6 +52,18 @@ loss_inflation_max_ratio = 0.10
 # [rack_rto] per-case 数值由实验矩阵通过 `ssctl set-rack-rto` 下发（见
 # research/experiments/run_matrix.py 的 apply_profile()），这里同样保持默认
 # 关闭（enabled=false），不在配置文件里设置具体数值。
+
+# First-flight redundancy: while skyline_cc is enabled, every SYN-ACK, every
+# SYN of a skyline_cc socket and every segment in the first first_kib KiB a
+# skyline_cc connection sends goes out twice, the copy delay_ms later (held
+# by fq). It trades those bytes for not waiting on loss recovery -- see
+# config/speeder.toml and docs/03-design.md section 9. The experiment matrix
+# turns it off per case (research/experiments/run_matrix.py), since every
+# docs/04-performance-report.md case ran without copies.
+[redundancy]
+enabled = true
+first_kib = 64   # 1..=1024
+delay_ms = 10    # 0..=100
 
 # While skyline_cc is enabled, skyline-speederd re-checks every interval_s
 # seconds that the host default congestion control is still skyline_cc and (if

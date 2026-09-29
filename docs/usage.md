@@ -47,6 +47,7 @@ iperf3 -c <对端IP> -u -b 400M -t 10
 | 四个加速模块 | **全开** | 见下一节 |
 | 动态 RTO 调节 | **关闭** | 需要手动开，见第五节 |
 | 重传包 DSCP 标记 | **关闭，且值为 0** | ⚠️ 见第六节，**开之前必须先问网络管理员** |
+| 首轮冗余 | **开**：握手包 + 每条连接前 64 KiB 发两份，第二份晚 10 ms | 丢包多的线路上短请求（网页、API）不用干等丢包恢复；代价是每条连接最多多发 64 KiB。关掉：`sudo ssctl set-redundancy --disable`，恢复配置文件的值：`sudo ssctl reset-redundancy`；要重启后也关着，在配置文件里写 `[redundancy]` `enabled = false` |
 | 摘除后回落算法 | `cubic` | 出问题时自动退回的系统默认算法 |
 | 拥塞控制与 qdisc 守护（guard） | **开**，每 5 秒检查一次 | 被别的脚本改回 bbr / cake 会自动改回来，见第七节 |
 
@@ -141,7 +142,7 @@ sudo ssctl reset-module-config
 | `--initial-cwnd-packets` | **一开始就发多少个包**（不用慢慢试探） | 小文件传输更快 | 更保守 | `100` |
 | `--max-pacing-mbps` | **速率硬上限**，单位 Mbps | 允许跑更快 | 限速 | `1200` |
 | `--max-cwnd-packets` | **未确认数据的硬上限**，单位包数 | 允许更多在途数据 | 省内存但限吞吐 | `50000` |
-| `--min-cwnd-packets` | **窗口的下限**，单位包数（只在 `adaptive-cwnd` 开启时生效） | 小流量连接丢包后窗口里还有足够的包触发快速恢复，不必干等超时；发送速率仍由 pacing 决定，不会因此发得更快 | 回到历史行为 | `4` |
+| `--min-cwnd-packets` | **窗口的下限**，单位包数（只在 `adaptive-cwnd` 开启时生效） | 小流量连接丢包后窗口里还有足够的包触发快速恢复，不必干等超时；短响应超时之后也从这个窗口重新发，不必从 1 个包爬起；发送速率仍由 pacing 决定，不会因此发得更快 | 回到历史行为（4） | `32` |
 
 **改完立刻生效，不用重启**，而且是在每条连接的 RTT 边界上平滑切换，不会传到一半出乱子。
 
@@ -156,7 +157,7 @@ Skyline Speeder 没有 BBR 那样的内置档位，只有裸参数。下面四�
 sudo ssctl set-module-config \
   --max-pacing-mbps 1200 --max-cwnd-packets 50000 \
   --max-queue-delay-ms 50 --max-queue-delay-ratio 0.5 \
-  --initial-cwnd-packets 50 --min-cwnd-packets 4 \
+  --initial-cwnd-packets 50 --min-cwnd-packets 32 \
   --min-rtt-window-s 30 --bw-window-rtts 6 \
   --startup-plateau-rtts 3 --startup-growth-ratio 0.25 --startup-gain 2.0 \
   --cruise-inflight-gain 1.5 --cruise-pacing-gain 1.05 \
@@ -175,7 +176,7 @@ sudo ssctl reset-module-config
 sudo ssctl set-module-config \
   --max-pacing-mbps 2000 --max-cwnd-packets 100000 \
   --max-queue-delay-ms 200 --max-queue-delay-ratio 2.0 \
-  --initial-cwnd-packets 200 --min-cwnd-packets 4 \
+  --initial-cwnd-packets 200 --min-cwnd-packets 32 \
   --min-rtt-window-s 30 --bw-window-rtts 10 \
   --startup-plateau-rtts 5 --startup-growth-ratio 0.15 --startup-gain 4.0 \
   --cruise-inflight-gain 3.0 --cruise-pacing-gain 1.3 \
@@ -282,7 +283,7 @@ sudo ssctl flows
 sudo ssctl set-module-config \
   --max-pacing-mbps 1200 --max-cwnd-packets 50000 \
   --max-queue-delay-ms 70 --max-queue-delay-ratio 0.6 \
-  --initial-cwnd-packets 100 --min-cwnd-packets 4 \
+  --initial-cwnd-packets 100 --min-cwnd-packets 32 \
   --min-rtt-window-s 30 --bw-window-rtts 6 \
   --startup-plateau-rtts 5 --startup-growth-ratio 0.20 --startup-gain 3.0 \
   --cruise-inflight-gain 3.0 --cruise-pacing-gain 1.25 \
@@ -558,7 +559,7 @@ sudo ssctl enable
 sudo ssctl set-module-config \
   --max-pacing-mbps 1200 --max-cwnd-packets 50000 \
   --max-queue-delay-ms 50 --max-queue-delay-ratio 0.5 \
-  --initial-cwnd-packets 100 --min-cwnd-packets 4 \
+  --initial-cwnd-packets 100 --min-cwnd-packets 32 \
   --min-rtt-window-s 30 --bw-window-rtts 6 \
   --startup-plateau-rtts 5 --startup-growth-ratio 0.20 --startup-gain 3.0 \
   --cruise-inflight-gain 3.0 --cruise-pacing-gain 1.05 \

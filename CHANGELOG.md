@@ -8,6 +8,99 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 the layout of `bpf/include/skyline_abi.h` and any bump to it is a breaking change
 for anyone holding a prebuilt `.bpf.o`.
 
+## [Unreleased]
+
+### Upgrading
+
+- **First-flight redundancy is on after the upgrade**, also for an installed
+  `/etc/skyline-speeder/speeder.toml` that has no `[redundancy]` table: an
+  omitted table means on, 64 KiB, 10 ms. It starts with the next
+  `ssctl enable` (the enable unit runs one at boot). To keep the old
+  behaviour, add `[redundancy]` with `enabled = false`, or run
+  `ssctl set-redundancy --disable` on the running host.
+- An installed `/etc/skyline-speeder/speeder.toml` is never overwritten, so a
+  host upgraded from 0.3.0 keeps `min_cwnd_packets = 4` until the line is
+  changed to 32 and `skyline-speederd` restarted. `ssctl set-module-config`
+  replaces the whole set and now sends 32 for a `--min-cwnd-packets` left
+  out, so any call without the flag raises the floor on a running host;
+  `ssctl reset-module-config` goes back to the file's value.
+
+### Added
+
+- **First-flight redundancy, on by default** (`[redundancy]`,
+  `ssctl set-redundancy` / `reset-redundancy`). While skyline_cc is enabled,
+  `skyline_tc` sends every SYN-ACK of the host, every SYN of a skyline_cc
+  socket and every segment that starts within the first `first_kib` KiB
+  (64) a skyline_cc connection sends twice, the copy `delay_ms` (10) after
+  the original. On a lossy long-haul path a short response mostly waits for
+  loss recovery -- a tail-loss probe after about two RTTs, an RTO after
+  about three, the kernel's fixed one-second SYN-ACK timeout -- none of which
+  a congestion control can shorten; a late second copy turns most of those
+  losses into a delay of `delay_ms`. The copy is made with
+  `bpf_clone_redirect()` and held back by an EDT timestamp that `fq` honours
+  (under another root qdisc it leaves at once); copies a few milliseconds
+  apart survive a burst of loss that takes out two back-to-back packets.
+  Connections on other congestion controls are never copied, and nothing is
+  copied before `ssctl enable` or after `ssctl drain`. The price is up to
+  `first_kib` extra per connection: a response that fits is sent twice, a
+  bulk transfer pays for its first `first_kib` only. `ssctl flows` shows
+  whether it is running and what it has sent; `ssctl status --json` has it
+  under `redundancy`.
+- The experiment matrix sends `ssctl set-redundancy --disable` for every
+  profile without a `[profiles.redundancy]` table -- not a reset, which
+  would restore the template's "on": every
+  `docs/04-performance-report.md` case ran without copies.
+
+### Changed
+
+- **`min_cwnd_packets` is 32 in the shipped templates and in
+  `ssctl set-module-config`'s built-in defaults** (was 4). A thin or
+  app-limited flow keeps enough window to recover from a loss without waiting
+  for an RTO, and with the fix below a short response that does time out
+  restarts with 32 packets, about 46 KB: enough to finish a 15-35 KB response
+  in one flight, and still under the roughly 44-packet initial receive window
+  of a Linux client, which caps a first flight anyway. Pacing still sets the
+  send rate of any flow that has a bandwidth estimate. A configuration that
+  omits the field still means 4. The usage guide's conservative and
+  aggressive presets and its examples follow the new default; the
+  "high random loss" preset keeps 4, the value it has always had.
+- The experiment matrix sends `--min-cwnd-packets` explicitly
+  (`ModuleConfigSpec.min_cwnd_packets`, default 4, the value every
+  `docs/04-performance-report.md` case ran with). It used to leave the flag
+  out and inherit ssctl's built-in default, which would have moved every
+  case to 32 without any manifest changing. A test now requires every
+  `ModuleConfigSpec` field to appear in the command, and a manifest whose
+  `min_cwnd_packets` falls outside 4..`max_cwnd_packets` fails at expansion,
+  the same bounds skyline-speederd enforces.
+
+### Fixed
+
+- **A connection that lost its first flight could be paced at a few kbit/s
+  for tens of seconds.** The bandwidth filter took every delivery-rate sample
+  that was not app-limited, including one whose interval spans a wait for a
+  timer: the SACK of a tail-loss probe covers one packet over PTO + RTT, the
+  ACK of an RTO's retransmission one packet over the backed-off timeout.
+  With nothing better in the filter -- at the start of a connection, or after
+  `bw_window_rtts` rounds of such samples -- M4 paced at a gain times that
+  estimate, a couple of packets every second or two, and every later round
+  measured only what that pace let through (on a lossy field path,
+  responses of tens of kilobytes took over ten seconds). Samples whose
+  interval is
+  longer than twice the smoothed RTT no longer enter the filter, and M4
+  never paces below one minimum window per base RTT
+  (`min_cwnd_packets` x MSS / base RTT with M2 on, 4 packets without it) --
+  applied after the guardrail, like the cwnd floor.
+- **A short response that hit an RTO slow-started back from one packet.**
+  `tcp_enter_loss()` sets cwnd to the packets in flight plus one, and
+  skyline_cc restores its window on the next ACK only from a bandwidth
+  estimate. A response that fits in its first flight usually never gets one
+  -- its rate samples are all app-limited, and the model ignores those -- so
+  after a timeout it fell back to standard slow start from a single packet,
+  the one place where "never reduce because of loss" did not hold. In
+  `TCP_CA_Loss` the no-estimate path now keeps cwnd at `min_cwnd_packets`
+  or above; outside Loss nothing changes, so the start of a connection still
+  gets exactly the initial window configured.
+
 ## [0.3.0] - 2026-09-26
 
 ### Upgrading from 0.2.0

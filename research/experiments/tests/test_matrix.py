@@ -489,6 +489,17 @@ parallel = 1
         with self.assertRaises(ValueError):
             validate_manifest(_minimal_manifest([profile]))
 
+    def test_manifest_rejects_out_of_range_module_config_cwnd_floor(self):
+        for floor in (3, 20_001):
+            with self.subTest(min_cwnd_packets=floor):
+                profile = _base_profile(
+                    kind="skyline",
+                    modules=("adaptive-cwnd",),
+                    module_config=_base_module_config(min_cwnd_packets=floor),
+                )
+                with self.assertRaises(ValueError):
+                    validate_manifest(_minimal_manifest([profile]))
+
     def test_manifest_allows_omitted_module_config(self):
         # module_config=None is the shape produced when a profile omits
         # [profiles.module_config] altogether -- must not raise, and must

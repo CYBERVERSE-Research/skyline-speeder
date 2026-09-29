@@ -174,7 +174,11 @@ struct skyline_config {
      * there are not enough packets behind the hole to produce the SACK
      * feedback RACK needs. Pacing (M4) still sets the send rate, so raising
      * this does not make a flow send faster; it only stops cwnd from being
-     * what holds back a retransmission. Never goes below SKYLINE_MIN_CWND
+     * what holds back a retransmission. It is also the floor after an RTO
+     * for a flow that has no bandwidth estimate yet -- typically a response
+     * that fits in its first flight, whose rate samples are all app-limited
+     * -- where tcp_enter_loss() would otherwise leave it slow-starting from
+     * a single packet. Never goes below SKYLINE_MIN_CWND
      * (skyline_min_cwnd() takes the max of the two), and is deliberately not
      * consulted on the M2-off path, which keeps the fixed SKYLINE_MIN_CWND so
      * this knob cannot perturb B1/B2 neutrality.
@@ -474,6 +478,63 @@ struct skyline_retransmit_dscp_stats {
                                    * shows genuine IPv6 TCP traffic exists, is the actual
                                    * signal worth investigating.
                                    */
+};
+
+/* First-flight redundancy, carried out by skyline_tc.bpf.c: every SYN-ACK
+ * this host sends, every SYN a skyline_cc socket sends, and every segment of
+ * a skyline_cc connection that starts within the first `bytes` of what the
+ * connection has sent goes out twice -- the original at once, a copy
+ * `delay_us` later.
+ *
+ * Why: on a lossy long-haul path a short response spends most of its life
+ * waiting for loss recovery, not transferring. A 15-35 KB response fits in
+ * the initial window and needs one RTT; a lost segment in it costs another
+ * RTT at best (fast retransmit), two or three when it is the tail (TLP after
+ * about two RTTs, RTO after about three), and a lost SYN-ACK costs the
+ * kernel's fixed one-second initial timeout. None of those timers belong to
+ * a congestion control. A second copy of the same segment turns "lost" into
+ * "arrived a little late" for everything but losses that hit both copies.
+ *
+ * Why the copy is late: back-to-back duplicates are dropped together by the
+ * same burst of loss far more often than two copies a few milliseconds
+ * apart. The delay is an EDT timestamp on the copy, which the fq qdisc holds
+ * it to (skyline-speederd keeps fq at the root while enabled, see [guard]);
+ * under any other qdisc the copy leaves at once.
+ *
+ * How the copy is made: bpf_clone_redirect() back to the same device. The
+ * clone has no socket and goes through this same egress hook again, marked
+ * in skb->cb[0] with SKYLINE_REDUNDANCY_TAG, which is where it gets its
+ * timestamp -- a packet with a socket is never taken for a copy, and a copy
+ * is never copied again.
+ *
+ * Cost: at most `bytes` extra per connection plus one SYN or SYN-ACK. A
+ * response that fits in `bytes` is sent twice; a bulk transfer pays for its
+ * first `bytes` only.
+ *
+ * `enabled` is what the program acts on and is written by skyline-speederd,
+ * not taken from the configuration file as-is: 1 only while skyline_cc is
+ * enabled and [redundancy] enabled = true, 0 at daemon start and from Drain
+ * on, so SYN-ACKs of a host that is back on fallback_cc are not copied.
+ * Independent of struct skyline_config / SKYLINE_ABI_VERSION for the same
+ * reason as struct skyline_retransmit_dscp_config above: a single
+ * fully-overwritten slot that changes at most once per command.
+ */
+#define SKYLINE_REDUNDANCY_ABI_VERSION 1
+#define SKYLINE_REDUNDANCY_TAG 0x5d0b1e5dU
+
+struct skyline_redundancy_config {
+    __u32 abi_version;
+    __u32 enabled;   /* 0 = off (safe default; also the zero-init value) */
+    __u32 bytes;     /* copy segments starting within the first `bytes` sent */
+    __u32 delay_us;  /* the copy leaves this long after the original */
+};
+
+struct skyline_redundancy_stats {
+    __u64 packets;       /* copies made (a GSO super-packet counts once) */
+    __u64 bytes;         /* skb->len of those copies: a GSO super-packet's headers once */
+    __u64 handshakes;    /* subset of packets: SYN-ACKs and SYNs */
+    __u64 clone_failed;  /* bpf_clone_redirect() refused -- no copy sent */
+    __u64 abi_mismatch;  /* config slot's abi_version didn't match; nothing copied */
 };
 
 #endif

@@ -80,6 +80,17 @@ Skyline Speeder 的运行期由一个守护进程 `skyline-speederd` 和一个�
 | `ssctl set-retransmit-dscp --dscp-value <0-63>` | 启用标记并指定 DSCP 编码值。这个值是占位参数——具体编码由网络侧策略决定，Skyline Speeder 本身不预设生产环境的取值；启用时必须提供非零值（0 在语义上等同于"剥除现有 DSCP"，不是无操作，因此被拒绝） |
 | `ssctl reset-retransmit-dscp` | 恢复为配置文件里声明的 `[retransmit_dscp]`（默认关闭） |
 
+### 2.6 首轮冗余
+
+skyline_cc 启用期间，TC 程序把本机发出的每个 SYN-ACK、skyline_cc 套接字发出的每个 SYN，
+以及 skyline_cc 连接里起点落在前 `first_kib` KiB 内的每个数据段发两份，副本晚 `delay_ms`
+发出（原理见 `docs/03-design.md` 第 9 节，配置见第 6.9 节）。默认开启。
+
+| 命令 | 作用 |
+|---|---|
+| `ssctl set-redundancy [--first-kib <1-1024>] [--delay-ms <0-100>] [--disable]` | 整体覆盖 `[redundancy]`：没写的参数取内置默认（`64`/`10`），不是"保持不变"；`--disable` 关闭。skyline_cc 已启用时立即生效，否则在下一次 `ssctl enable` 时生效 |
+| `ssctl reset-redundancy` | 恢复为配置文件里声明的 `[redundancy]`（整段省略时为开启、`64`/`10`） |
+
 ## 3. Unix socket 线协议
 
 传输格式是单行 JSON 请求 + 单行 JSON 响应，通过 Unix domain socket 交换：
@@ -95,7 +106,8 @@ Skyline Speeder 的运行期由一个守护进程 `skyline-speederd` 和一个�
 请求变体（与 `ssctl` 子命令一一对应，见第 2 节）：`validate` / `enable` /
 `disable-module` / `status` / `flows` / `snapshot` / `drain` /
 `set-rack-rto` / `reset-rack-rto` / `set-module-config` /
-`reset-module-config` / `set-retransmit-dscp` / `reset-retransmit-dscp`。
+`reset-module-config` / `set-retransmit-dscp` / `reset-retransmit-dscp` /
+`set-redundancy` / `reset-redundancy`。
 
 响应统一为：
 
@@ -110,7 +122,8 @@ struct Response {
 
 `flows` 字段在线协议上是可选的（serde `default`），所以新 `ssctl` 能解码不带它的旧
 daemon 应答，旧 `ssctl` 也能解码新 daemon 的应答。`RuntimeStatus` 的 `version`、
-`guard`、`uptime_s`、`attached_s` 同理。
+`guard`、`uptime_s`、`attached_s`、`redundancy` 同理（旧 daemon 的 `redundancy` 解码为
+未生效）。
 
 ## 4. 状态与计数器字段（`ssctl status --json` 的输出结构）
 
@@ -130,6 +143,7 @@ daemon 应答，旧 `ssctl` 也能解码新 daemon 的应答。`RuntimeStatus` �
 | `rack_tuning` | M1 tier-1 全局 sysctl 的"配置声明值"与"当前实际值"对照 |
 | `rack_rto` | M1 tier-2 配置 + 运行计数器 |
 | `retransmit_dscp` | DSCP 标记配置 + 运行计数器 |
+| `redundancy` | 首轮冗余：`config`（daemon 内存里的 `[redundancy]`）、`active`（TC 程序此刻是否在复制：skyline_cc 已启用、`enabled = true` 且 TC 程序已加载，三者同时成立）、`stats`（见下表；TC 程序未加载时为 `null`） |
 | `module_tuning` | M2/M3/M4 当前生效系数的完整回显 |
 | `capabilities` | 内核能力探测结果，见下方"能力探测" |
 | `guard` | cc/qdisc 守护的状态与计数器，见下方 `guard` 表；来自不带此字段的旧 daemon 时解码为全默认值（未武装、计数为 0） |
@@ -180,6 +194,16 @@ daemon 应答，旧 `ssctl` 也能解码新 daemon 的应答。`RuntimeStatus` �
 | `live` | 读 status 时现场读取的值，与是否武装无关：`tcp_congestion_control`、`default_qdisc`、`interface`（即 `tc_interface`）、`interface_qdisc`（该网卡自己的根 qdisc 摘要：`fq`、`cake`、`mq/fq`、`mq/cake,fq`——`mq/` 后是其子队列出现过的 qdisc 种类，去重后按字母序；VLAN、bond、网桥上是 `noqueue`；没有网卡或读不到时为 `null`）、`devices`（guard 实际维护的网卡，每项 `{"name": ..., "qdisc": ...}`，`qdisc` 与 `interface_qdisc` 同一格式，读不到或网卡 down 时为 `null`；就是 `tc_interface` 自己，或它是 VLAN、bond、网桥时它下面的物理网卡，见第 9 节"受管网卡"。`[guard] qdisc = false`、`tc_interface` 不存在或下面找不到网卡时为空列表；来自不带此字段的旧 daemon 时同样为空） |
 | `notes` | 最近一次检查刻意没动的东西和没做成的事，例如 `eth0 root qdisc htb looks deliberate; left alone`、`eth0 root qdisc cake (bandwidth 90Mbit) looks deliberate; left alone`、`eth0 (under bond0) root qdisc cake: the last replace failed; retrying in 30 s`、`wg0 is a virtual device (noqueue is its kernel default) and no NIC under it is visible to the guard; no qdisc checked` |
 
+`redundancy.stats`（各 CPU 求和）：
+
+| 字段 | 含义 |
+|---|---|
+| `packets` | 发出的副本数（一个 GSO 超级包算一个） |
+| `bytes` | 这些副本的 `skb->len` 之和：载荷全部计入，GSO 超级包的包头只算一次，所以比线上实际多出的字节略少 |
+| `handshakes` | `packets` 里 SYN-ACK 和 SYN 的个数 |
+| `clone_failed` | `bpf_clone_redirect()` 失败、没有发出副本的次数；应恒为 0 |
+| `abi_mismatch` | 配置槽的 ABI 版本与 BPF 对象不符、整段跳过的次数 |
+
 ### 4.1 `ssctl flows` 的逐流数据
 
 `ssctl flows --json` 的应答在 `status` 之外多一个 `flows` 字段（`FlowReport`），
@@ -209,17 +233,18 @@ daemon 应答，旧 `ssctl` 也能解码新 daemon 的应答。`RuntimeStatus` �
 
 ## 5. ABI 版本
 
-BPF 侧的三段配置各自独立维护自己的 ABI 版本号，互不联动——三者的生命周期
-不同（M2/M3/M4 系数几乎每次调参都变，M1 tier-2/DSCP 标记只在功能本身改动时
-才变），合并成一个版本号会让大多数改动被迫牵连另外两段：
+BPF 侧的四段配置各自独立维护自己的 ABI 版本号，互不联动——它们的生命周期
+不同（M2/M3/M4 系数几乎每次调参都变，M1 tier-2/DSCP 标记/首轮冗余只在功能本身
+改动时才变），合并成一个版本号会让大多数改动被迫牵连其他几段：
 
 | 常量 | 覆盖范围 |
 |---|---|
 | `SKYLINE_ABI_VERSION` | M2/M3/M4 系数结构（`KernelConfig`） |
 | `SKYLINE_RTO_TUNING_ABI_VERSION` | M1 tier-2 动态 RTO 结构（`KernelRtoTuning`） |
 | `SKYLINE_RETRANSMIT_DSCP_ABI_VERSION` | DSCP 标记结构（`KernelRetransmitDscpConfig`/`KernelRetransmitDscpStats`） |
+| `SKYLINE_REDUNDANCY_ABI_VERSION` | 首轮冗余结构（`KernelRedundancyConfig`/`RedundancyStats`） |
 
-三段配置的版本校验行为并不完全一致：
+各段配置的版本校验行为并不完全一致：
 
 - M2/M3/M4（`SKYLINE_ABI_VERSION`）：BPF 侧读取配置槽位时校验版本号，不匹配则
   整体拒绝，退回到未启用 M2 时的固定 CUBIC-beta 降窗行为，没有对应的计数
@@ -227,6 +252,8 @@ BPF 侧的三段配置各自独立维护自己的 ABI 版本号，互不联动�
 - DSCP 标记（`SKYLINE_RETRANSMIT_DSCP_ABI_VERSION`）：版本不匹配时跳过标记逻辑
   （相当于功能关闭），并递增 `retransmit_dscp.stats` 里的 `abi_mismatch`
   计数器。
+- 首轮冗余（`SKYLINE_REDUNDANCY_ABI_VERSION`）：与 DSCP 标记相同——不匹配时不复制，
+  递增 `redundancy.stats` 里的 `abi_mismatch`。
 - M1 tier-2 动态 RTO（`SKYLINE_RTO_TUNING_ABI_VERSION`）：BPF 侧当前不校验这个
   版本号。
 
@@ -245,6 +272,8 @@ BPF 侧的三段配置各自独立维护自己的 ABI 版本号，互不联动�
 - `[rack_rto]` 与 `[retransmit_dscp]`：daemon 启动时 BPF 侧初始化为关闭，文件里的值要执行一次
   `reset-rack-rto`/`reset-retransmit-dscp` 才下发（`set-*` 下发的是命令行给出的值）；在此之前
   `ssctl status` 里这两段的 `config` 显示的是文件值，并不代表已经生效；
+- `[redundancy]`：daemon 启动时同样读入内存、BPF 侧初始化为关闭；`ssctl enable` 成功后按内存里的值
+  下发（整段省略 = 开启），`ssctl drain` 一开始就关闭；`set-redundancy`/`reset-redundancy` 可在线修改；
 - `[runtime]`、`[rack_tuning]`、`[guard]` 与 `fallback_cc`：没有在线命令，修改后需重启 `skyline-speederd`。
 
 除上面注明的这一处例外，运行期实际生效值以 `ssctl status` / `ssctl flows` 为准。
@@ -263,7 +292,7 @@ BPF 侧的三段配置各自独立维护自己的 ABI 版本号，互不联动�
 | `max_queue_delay_ms` | u32 | 队列时延护栏的固定基准值（毫秒） | 是 |
 | `max_queue_delay_ratio` | f64 | 按基准 RTT 折算的护栏增量比例，实际护栏 = `max(max_queue_delay_ms, 基准RTT × 该比例)`，让护栏在高 RTT 路径上自动放宽而不是卡在固定毫秒数；`0.0` = 不放宽，恒等于 `max_queue_delay_ms` | 是 |
 | `initial_cwnd_packets` | u32 | 连接建立时的初始 cwnd（包），`0` = 不覆盖、使用内核自身的初始窗口 | 是 |
-| `min_cwnd_packets` | u32 | M2 的 cwnd 目标下限（包），取值范围 `4`–`max_cwnd_packets`，省略 = `4`（历史行为）。只在 `adaptive-cwnd` 开启时生效；M2 关闭的中性基线路径始终使用固定的 4 包下限，不受此字段影响。发送速率仍由 pacing 决定，见 `docs/03-design.md` 第 6 节 | 是 |
+| `min_cwnd_packets` | u32 | M2 的 cwnd 目标下限（包），取值范围 `4`–`max_cwnd_packets`，随附模板为 `32`，省略 = `4`（历史行为）。也是还没有带宽估计的流在 RTO 之后的 cwnd 下限——整个响应在第一轮就发完的短流通常一直没有估计，内核在 RTO 后只给它留 1 个包。只在 `adaptive-cwnd` 开启时生效；M2 关闭的中性基线路径始终使用固定的 4 包下限，不受此字段影响。发送速率仍由 pacing 决定，见 `docs/03-design.md` 第 6 节 | 是 |
 
 ### 6.2 `[adaptive_cwnd]`（M2 系数）
 
@@ -331,7 +360,7 @@ BPF 侧的三段配置各自独立维护自己的 ABI 版本号，互不联动�
 | `state_path` | path | 运行期状态落盘路径（供外部监控读取，不是配置输入） |
 | `events_path` | path | 事件流落盘路径 |
 | `events_max_mib` | u32 | 事件日志的大小上限（MiB），默认 `8`。超过后轮转，最多占用约两倍；`0` 关闭事件日志。缺省时同样取 `8`；修改需重启 daemon。详见第 8 节 |
-| `tc_interface` | Option\<string\> | TC 程序（统计 + DSCP 标记）挂载的网络接口名；不设置则两者都不加载。必须是以太网设备（`/sys/class/net/<网卡>/type` 为 1；VLAN、bond、网桥也是）：`skyline_tc` 在每个报文的偏移 0 处按以太网帧头解析，在 WireGuard/WARP、tun、gre、ppp 这类三层隧道上统计会失真，启用的 DSCP 标记还会写进 IP 头内部，所以 daemon 拒绝挂载，`capabilities.notes` 里写明原因，`set-retransmit-dscp` 随之失败——默认路由走隧道的主机，这里填承载隧道流量的物理网卡。它同时决定 guard 维护哪块网卡的根 qdisc（第 6.8、9 节）：它自己，或它是 VLAN、bond、网桥时它下面的物理网卡；不设置则 guard 不碰任何网卡的根 qdisc |
+| `tc_interface` | Option\<string\> | TC 程序（统计 + DSCP 标记 + 首轮冗余）挂载的网络接口名；不设置则三者都不加载。必须是以太网设备（`/sys/class/net/<网卡>/type` 为 1；VLAN、bond、网桥也是）：`skyline_tc` 在每个报文的偏移 0 处按以太网帧头解析，在 WireGuard/WARP、tun、gre、ppp 这类三层隧道上统计会失真，启用的 DSCP 标记还会写进 IP 头内部，所以 daemon 拒绝挂载，`capabilities.notes` 里写明原因，`set-retransmit-dscp` 随之失败——默认路由走隧道的主机，这里填承载隧道流量的物理网卡。它同时决定 guard 维护哪块网卡的根 qdisc（第 6.8、9 节）：它自己，或它是 VLAN、bond、网桥时它下面的物理网卡；不设置则 guard 不碰任何网卡的根 qdisc |
 
 生产环境示例见 `config/speeder-guest.toml`（`bpf_dir`/`pin_dir` 指向部署后的
 绝对路径 `/opt/skyline-speeder/bpf`，`[rack_tuning]`/`[rack_rto]` 整段留空）。
@@ -346,6 +375,20 @@ qdisc 守护。修改后需重启 daemon。
 |---|---|---|
 | `interval_s` | u32 | 周期检查间隔（秒），默认 `5`，取值 `0`–`3600`。`0` = 不做周期检查（没有后台线程），`ssctl enable` 仍然会做一次完整检查。替换失败后的重试退避从 max(`interval_s`, 30 秒) 起算（第 9 节） |
 | `qdisc` | bool | 默认 `true`：除拥塞控制外，还守住 `net.core.default_qdisc = fq` 和受管网卡（`runtime.tc_interface`，或它下面的物理网卡）的根 qdisc。`false` = 不碰任何 qdisc，guard 只守拥塞控制 |
+
+### 6.9 `[redundancy]`
+
+首轮冗余（第 2.6 节，原理见 `docs/03-design.md` 第 9 节）。整段省略时取下表默认值，即
+**开启**——升级后没有这一段的已装配置文件同样开启。实验矩阵
+（`research/experiments/run_matrix.py`）在每个 case 开始时显式下发
+`ssctl set-redundancy --disable`，除非 profile 自己带 `[profiles.redundancy]`：
+`docs/04-performance-report.md` 的数据都是在没有副本的情况下测的。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `enabled` | bool | 默认 `true`。只在 skyline_cc 启用期间生效；只复制 skyline_cc 连接的数据段和 SYN，外加本机发出的 SYN-ACK |
+| `first_kib` | u32 | 默认 `64`，取值 `1`–`1024`（`enabled = false` 时不校验）。起点落在连接发送流前这么多 KiB 内的数据段被复制，这段范围内的重传也复制 |
+| `delay_ms` | u32 | 默认 `10`，取值 `0`–`100`。副本比原包晚这么久发出，由 `fq` 按 EDT 时间戳扣住；`0` = 紧跟原包。根 qdisc 不是 `fq` 时副本立即发出 |
 
 ## 7. Feature mask 位表
 

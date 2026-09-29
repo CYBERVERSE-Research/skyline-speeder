@@ -78,6 +78,29 @@ struct {
     __type(value, struct skyline_retransmit_dscp_stats);
 } retransmit_dscp_stats SEC(".maps");
 
+/* First-flight redundancy config/stats -- see the doc comment on
+ * struct skyline_redundancy_config in skyline_abi.h.
+ */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct skyline_redundancy_config);
+} redundancy_config SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct skyline_redundancy_stats);
+} redundancy_stats SEC(".maps");
+
+/* BPF_SKB_CLOCK_MONOTONIC since 6.11, BPF_SKB_TSTAMP_DELIVERY_MONO before --
+ * the same value under two names, so the number is spelled out here rather
+ * than tying the build to whichever name this vmlinux.h happens to carry.
+ */
+#define SKYLINE_SKB_CLOCK_MONOTONIC 1
+
 /* Rewrites only the DSCP bits (iphdr.tos upper 6 bits), preserving the ECN
  * bits (lower 2) untouched, and fixes up the IPv4 header checksum
  * incrementally. iphdr.tos shares a 16-bit big-endian word with
@@ -423,6 +446,127 @@ static void skyline_check_retransmit(struct __sk_buff *skb,
     }
 }
 
+/* Whether a full TCP socket runs skyline_cc, by the name its congestion
+ * control registered under (bpf/skyline_cc.bpf.c's .name, and
+ * SKYLINE_CC_NAME in skyline-speederd). The name, not the ops pointer: a
+ * struct_ops registration has no address this program could know in
+ * advance, and a restart of skyline-speederd registers a new one.
+ */
+static __always_inline bool skyline_runs_skyline_cc(struct tcp_sock *tp)
+{
+    const struct tcp_congestion_ops *ops = tp->inet_conn.icsk_ca_ops;
+    const char expected[] = "skyline_cc";
+
+    if (!ops)
+        return false;
+#pragma unroll
+    for (int index = 0; index < (int)sizeof(expected); index++) {
+        if (ops->name[index] != expected[index])
+            return false;
+    }
+    return true;
+}
+
+/* The second pass of a copy made by skyline_redundancy_duplicate(): the
+ * clone comes straight back through this hook, without a socket, still
+ * carrying the tag and the delay written into cb[] before cloning. Stamping
+ * its departure time here is what makes the copy late -- the stamp cannot be
+ * set before the clone exists, and bpf_clone_redirect() clears skb->tstamp
+ * on the way out. Returns true when the packet was such a copy.
+ */
+static __always_inline bool skyline_redundancy_copy(struct __sk_buff *skb)
+{
+    __u32 delay_us;
+
+    if (skb->cb[0] != SKYLINE_REDUNDANCY_TAG || skb->sk)
+        return false;
+    delay_us = skb->cb[1];
+    skb->cb[0] = 0;
+    skb->cb[1] = 0;
+    if (delay_us)
+        bpf_skb_set_tstamp(skb, bpf_ktime_get_ns() + (__u64)delay_us * 1000ULL,
+                           SKYLINE_SKB_CLOCK_MONOTONIC);
+    return true;
+}
+
+/* First pass: decides whether this packet is one skyline_abi.h's
+ * struct skyline_redundancy_config says to send twice, and if so clones it
+ * back to the same device. Everything that is not clearly one of those --
+ * a packet this parser cannot place, a socket that is not skyline_cc, a
+ * segment past the first `bytes` -- goes out once, untouched.
+ *
+ * The data offset is where the segment starts within everything the
+ * connection has sent: snd_una - bytes_acked is the first data sequence
+ * number (ISN + 1) for the connection's whole life, so this needs no
+ * per-connection state. Retransmissions of that range are copied too.
+ */
+static __always_inline void skyline_redundancy_duplicate(struct __sk_buff *skb,
+                                                     struct skyline_redundancy_config *cfg,
+                                                     struct skyline_redundancy_stats *stats)
+{
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+    struct ethhdr *eth = data;
+    struct bpf_sock *sk;
+    struct tcp_sock *tp;
+    struct tcphdr *tcp;
+    __u32 l4_off, len;
+    __u8 old_tos;
+    __u16 old_hw;
+    bool handshake;
+
+    if ((void *)(eth + 1) > data_end)
+        return;
+    if (eth->h_proto == bpf_htons(ETH_P_IP)) {
+        if (!skyline_parse_ipv4(skb, &l4_off, &old_tos, &old_hw))
+            return;
+    } else if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+        if (!skyline_parse_ipv6(skb, &l4_off, 0))
+            return;
+    } else {
+        return;
+    }
+    tcp = (void *)(data + l4_off);
+    if ((void *)(tcp + 1) > data_end)
+        return;
+
+    handshake = tcp->syn;
+    sk = skb->sk;
+    if (!sk)
+        return;
+    if (!(tcp->syn && tcp->ack)) {
+        /* A SYN-ACK belongs to a request socket, which has no congestion
+         * control yet; everything else must come from a skyline_cc socket.
+         */
+        tp = bpf_skc_to_tcp_sock(sk);
+        if (!tp || !skyline_runs_skyline_cc(tp))
+            return;
+        if (!handshake) {
+            __u32 header_len = l4_off + tcp->doff * 4;
+
+            if (skb->len <= header_len)
+                return; /* pure ACK, bare FIN */
+            if (bpf_ntohl(tcp->seq) - (tp->snd_una - (__u32)tp->bytes_acked) >= cfg->bytes)
+                return;
+        }
+    }
+
+    len = skb->len;
+    skb->cb[0] = SKYLINE_REDUNDANCY_TAG;
+    skb->cb[1] = cfg->delay_us;
+    if (bpf_clone_redirect(skb, skb->ifindex, 0)) {
+        if (stats)
+            stats->clone_failed++;
+    } else if (stats) {
+        stats->packets++;
+        stats->bytes += len;
+        if (handshake)
+            stats->handshakes++;
+    }
+    skb->cb[0] = 0;
+    skb->cb[1] = 0;
+}
+
 SEC("tc")
 int skyline_tc_account(struct __sk_buff *skb)
 {
@@ -430,6 +574,8 @@ int skyline_tc_account(struct __sk_buff *skb)
     struct skyline_tc_stats *stats = bpf_map_lookup_elem(&tc_stats, &key);
     struct skyline_retransmit_dscp_config *dscp_cfg;
     struct skyline_retransmit_dscp_stats *dscp_stats;
+    struct skyline_redundancy_config *red_cfg;
+    struct skyline_redundancy_stats *red_stats;
 
     if (stats) {
         stats->packets++;
@@ -438,21 +584,37 @@ int skyline_tc_account(struct __sk_buff *skb)
             stats->gso_packets++;
     }
 
-    /* Config lookup first: enabled=0 (the safe zero-init default) costs
-     * exactly this one array lookup on top of the counting above -- no
-     * header parsing, no skb mutation -- so the feature is free when off.
+    /* A redundancy copy on its way out: nothing below applies to it. Its
+     * original was already DSCP-marked, if it was a retransmission, before
+     * it was cloned.
+     */
+    if (skyline_redundancy_copy(skb))
+        return TC_ACT_OK;
+
+    /* Config lookups first: enabled=0 (the safe zero-init default) costs
+     * exactly one array lookup per feature on top of the counting above --
+     * no header parsing, no skb mutation -- so each feature is free when off.
      */
     dscp_cfg = bpf_map_lookup_elem(&retransmit_dscp_config, &key);
-    if (!dscp_cfg || !dscp_cfg->enabled)
-        return TC_ACT_OK;
-
-    dscp_stats = bpf_map_lookup_elem(&retransmit_dscp_stats, &key);
-    if (dscp_cfg->abi_version != SKYLINE_RETRANSMIT_DSCP_ABI_VERSION) {
-        if (dscp_stats)
-            dscp_stats->abi_mismatch++;
-        return TC_ACT_OK;
+    if (dscp_cfg && dscp_cfg->enabled) {
+        dscp_stats = bpf_map_lookup_elem(&retransmit_dscp_stats, &key);
+        if (dscp_cfg->abi_version != SKYLINE_RETRANSMIT_DSCP_ABI_VERSION) {
+            if (dscp_stats)
+                dscp_stats->abi_mismatch++;
+        } else {
+            skyline_check_retransmit(skb, dscp_cfg, dscp_stats);
+        }
     }
 
-    skyline_check_retransmit(skb, dscp_cfg, dscp_stats);
+    red_cfg = bpf_map_lookup_elem(&redundancy_config, &key);
+    if (red_cfg && red_cfg->enabled) {
+        red_stats = bpf_map_lookup_elem(&redundancy_stats, &key);
+        if (red_cfg->abi_version != SKYLINE_REDUNDANCY_ABI_VERSION) {
+            if (red_stats)
+                red_stats->abi_mismatch++;
+        } else {
+            skyline_redundancy_duplicate(skb, red_cfg, red_stats);
+        }
+    }
     return TC_ACT_OK;
 }

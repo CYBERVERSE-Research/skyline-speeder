@@ -6,7 +6,8 @@ mod view;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use skyline_common::{
-    Module, ModuleTuningConfig, RackRtoConfig, Request, Response, RetransmitDscpConfig,
+    Module, ModuleTuningConfig, RackRtoConfig, RedundancyConfig, Request, Response,
+    RetransmitDscpConfig,
 };
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -143,8 +144,9 @@ enum Command {
         initial_cwnd_packets: u32,
         /// Floor under M2's BDP-derived cwnd target (packets), 4 or more.
         /// Pacing still sets the send rate; this only keeps a thin flow's
-        /// window large enough to recover from a loss without an RTO.
-        #[arg(long, default_value_t = 4)]
+        /// window large enough to recover from a loss without an RTO, and
+        /// is where a short response restarts after one.
+        #[arg(long, default_value_t = 32)]
         min_cwnd_packets: u32,
         #[arg(long, default_value_t = 30)]
         min_rtt_window_s: u32,
@@ -209,6 +211,28 @@ enum Command {
     /// Restore [retransmit_dscp] to whatever the configuration file
     /// declared at daemon startup (disabled, unless explicitly configured).
     ResetRetransmitDscp,
+    /// First-flight redundancy: while skyline_cc is enabled, send every
+    /// SYN-ACK, every SYN of a skyline_cc socket and every segment in the
+    /// first --first-kib KiB of a skyline_cc connection twice, the copy
+    /// --delay-ms after the original. Absolute-replace semantics, same as
+    /// SetRackRto: every field is sent, so an omitted flag means its default
+    /// here, not "unchanged".
+    SetRedundancy {
+        /// Turn it off.
+        #[arg(long)]
+        disable: bool,
+        /// Copy segments that start within this many KiB (1-1024) of what
+        /// the connection has sent.
+        #[arg(long, default_value_t = 64)]
+        first_kib: u32,
+        /// How long after the original the copy leaves (0-100; 0 = right
+        /// behind it).
+        #[arg(long, default_value_t = 10)]
+        delay_ms: u32,
+    },
+    /// Restore [redundancy] to whatever the configuration file declared at
+    /// daemon startup (on, unless explicitly configured otherwise).
+    ResetRedundancy,
 }
 
 fn request(command: Command) -> Request {
@@ -291,6 +315,18 @@ fn request(command: Command) -> Request {
             },
         },
         Command::ResetRetransmitDscp => Request::ResetRetransmitDscp,
+        Command::SetRedundancy {
+            disable,
+            first_kib,
+            delay_ms,
+        } => Request::SetRedundancy {
+            config: RedundancyConfig {
+                enabled: !disable,
+                first_kib,
+                delay_ms,
+            },
+        },
+        Command::ResetRedundancy => Request::ResetRedundancy,
     }
 }
 
@@ -363,7 +399,7 @@ mod tests {
     use super::*;
     use skyline_common::{
         CapabilityReport, GuardStatus, RackRtoStatus, RackTuningConfig, RackTuningStatus,
-        RetransmitDscpStatus, RuntimeStatus, SkylineConfig,
+        RedundancyStatus, RetransmitDscpStatus, RuntimeStatus, SkylineConfig,
     };
 
     #[test]
@@ -398,6 +434,11 @@ mod tests {
             },
             retransmit_dscp: RetransmitDscpStatus {
                 config: shipped.retransmit_dscp,
+                stats: None,
+            },
+            redundancy: RedundancyStatus {
+                config: shipped.redundancy,
+                active: true,
                 stats: None,
             },
             module_tuning: ModuleTuningConfig::from_config(&shipped),
@@ -436,6 +477,7 @@ mod tests {
         assert!(fields.remove("guard").is_some());
         assert!(fields.remove("uptime_s").is_some());
         assert!(fields.remove("attached_s").is_some());
+        assert!(fields.remove("redundancy").is_some());
 
         let decoded: Response = serde_json::from_value(wire).expect("decode an older reply");
         assert!(decoded.flows.is_none());
@@ -444,7 +486,28 @@ mod tests {
         assert_eq!(decoded.guard, GuardStatus::default());
         assert_eq!(decoded.uptime_s, 0);
         assert_eq!(decoded.attached_s, None);
+        // A daemon from before first-flight redundancy is not copying anything.
+        assert!(!decoded.redundancy.active);
         assert!(decoded.enabled);
+    }
+
+    /// Same absolute-replace trap as `set-module-config`: a bare
+    /// `set-redundancy` must reproduce the shipped `[redundancy]`, not some
+    /// other built-in default.
+    #[test]
+    fn set_redundancy_defaults_match_the_shipped_config() {
+        let arguments = Arguments::parse_from(["ssctl", "set-redundancy"]);
+        let Request::SetRedundancy { config: from_cli } = request(arguments.command) else {
+            panic!("set-redundancy did not build a SetRedundancy request");
+        };
+        let shipped = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        assert_eq!(from_cli, shipped.redundancy);
+
+        let arguments = Arguments::parse_from(["ssctl", "set-redundancy", "--disable"]);
+        let Request::SetRedundancy { config } = request(arguments.command) else {
+            panic!("set-redundancy --disable did not build a SetRedundancy request");
+        };
+        assert!(!config.enabled);
     }
 
     /// `set-module-config` is absolute-replace: a flag left off the command
