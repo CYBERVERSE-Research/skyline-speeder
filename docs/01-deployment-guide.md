@@ -83,27 +83,30 @@ cargo build --workspace --release
 
 | 路径 | 命令 | 适用 |
 |---|---|---|
-| 一键安装，源码构建（推荐） | `sudo ./install.sh` | 目标机可以安装编译工具链 |
-| 一键安装，预编译产物 | `sudo ./install.sh --prebuilt` | 不想在目标机上装任何工具链 |
+| 一键安装（默认，推荐） | `sudo ./install.sh` | 装最新发布的预编译产物；本机跑不了发布的二进制时自动改为源码构建 |
+| 一键安装，源码构建 | `sudo ./install.sh --source` | 要装这份源码树本身（例如含未发布的改动），或就是想在本机编译 |
 | 手动 | `sudo infra/install-guest.sh --confirm-install`，再按第 5–7 节 | 需要逐步控制 |
 
 没有仓库 checkout 的机器用 `scripts/bootstrap.sh`：
 `curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash`，
 它把源码树放到 `/usr/local/src/skyline-speeder` 后交给 `install.sh`，其余参数原样转交
-（例如 `... | sudo bash -s -- --prebuilt`）。它运行的 `install.sh` 来自 `--ref`（默认
-`main`），不是最新 release。
+（例如 `... | sudo bash -s -- --source`）。它运行的 `install.sh` 来自 `--ref`（默认
+`main`），装上的产物却来自最新 release（或 `--release` 指定的那个）：`--ref` 选的是安装器，
+不是安装的版本。
 
 ### 4.1 一键安装（`install.sh`）
 
-依次执行：检查系统（Debian/Ubuntu、内核 ≥ 6.12、BTF、cgroup v2）→ 安装软件包 →
-准备 Rust 工具链 → 编译 BPF 对象 → 编译控制面 → 安装文件（即第 4.3 节的
-`install-guest.sh`）→ 把 `runtime.tc_interface` 指向默认路由所在的网卡（见下文"选择
+依次执行：检查系统（Debian/Ubuntu、内核 ≥ 6.12、BTF、cgroup v2，以及本机能否运行发布的
+二进制）→ 安装软件包 → 下载并校验发布产物（源码构建时改为：准备 Rust 工具链 → 编译 BPF
+对象 → 编译控制面）→ 安装文件（即第 4.3 节的 `install-guest.sh`）→ 把 `runtime.tc_interface` 指向默认路由所在的网卡（见下文"选择
 出口网卡"）→ 过内核验证器 → 启动（升级时是重启）`skyline-speederd` → 挂载 `skyline_cc`
 并设为开机自启 → 核对结果。
 
 | 参数 | 作用 |
 |---|---|
-| `--prebuilt` | 安装已发布的产物，不编译，见第 4.2 节 |
+| （不带参数） | 本机能运行发布的二进制（x86_64、glibc ≥ 2.38）时安装最新发布的产物，否则打印原因并改为源码构建，见第 4.2 节 |
+| `--source` | 无条件从这份源码树构建 |
+| `--prebuilt` | 只装已发布的产物：本机跑不了时在第一步之前中止，不会改为构建 |
 | `--release <tag>` | 同 `--prebuilt`，固定到该版本 |
 | `--check` | 只做前置检查，并打印当前的拥塞控制、qdisc（含 guard 将要维护的网卡）、开机时 systemd-sysctl 会写入的相关设置，以及 `/etc/sysctl.conf` 里只由 `sysctl -p`/`sysctl --system` 应用的设置；不改动任何东西 |
 | `--no-enable` | 安装并启动 daemon，但不新挂载 `skyline_cc`：不启用 `skyline-speeder-enable.service`，此前已经启用的也不停用；升级前用裸 `ssctl enable` 挂着的，重启后再 `ssctl enable` 一次，回到升级前的状态（仍是手工挂载，开机不会自动挂）。结束时按新 daemon 的 `enabled` 与当前默认拥塞控制报告实际的挂载状态 |
@@ -172,8 +175,8 @@ IPv6（纯 IPv6 主机没有 IPv4 默认路由），各按 `ip route` 列出的�
   在线修改（`set-module-config`，绝对覆盖）与持久修改（改配置文件、`--validate-only`
   校验、重启 daemon）两种做法，详见 `docs/usage.md`。
 
-**升级。** 在已安装的主机上按原来的方式（`--prebuilt`/`--no-enable` 照样带上）再跑一次
-`install.sh` 就是升级。`skyline-speederd.service` 处于 active 时，新对象通过验证器之后
+**升级。** 在已安装的主机上再跑一次 `install.sh` 就是升级（`--source`/`--no-enable` 照样
+带上；原先从源码构建的主机不带 `--source` 重跑，会换成已发布的产物）。`skyline-speederd.service` 处于 active 时，新对象通过验证器之后
 安装器自己执行 `systemctl restart skyline-speederd.service`：`skyline-speeder-enable.service`
 处于 active 时随之重启——它的 ExecStop（`boot-disable.sh`）执行 `ssctl drain`：先解除
 guard 并把默认算法写回 `fallback_cc`，再等存量连接至多 60 秒（经 SSH 必然走到超时，
@@ -193,16 +196,21 @@ guard 并把默认算法写回 `fallback_cc`，再等存量连接至多 60 秒�
 开机不会自动挂。从 0.2.0 升级的其余注意事项（包括 `ssctl enable` 现在也会设置 `fq`）见 `CHANGELOG.md` 的
 *Upgrading from 0.2.0*。
 
-### 4.2 预编译产物（`--prebuilt`）
+### 4.2 预编译产物（默认路径）
 
-目标机上不需要 clang、LLVM、bpftool 或 Rust，安装器只装 `curl`、`tar`、`iproute2`。
+这是不带参数时的默认路径（v0.4.0 及更早的 `install.sh` 默认源码构建，要加 `--prebuilt`）。目标机上不需要
+clang、LLVM、bpftool 或 Rust，安装器只装 `curl`、`tar`、`iproute2`。
 BPF 对象由发布流水线在固定的 6.12 LTS 参考头上编译，加载时由 CO-RE 按本机内核的 BTF
 修正字段偏移，所以内核要求不变：6.12 LTS 或更新，且存在 `/sys/kernel/btf/vmlinux`。
 
 预编译的 `skyline-speederd` 在 Ubuntu 24.04 上构建，需要 **glibc 2.38 或更新**，以及
-`libelf.so.1` 和 `libz.so.1`：Debian 13、Ubuntu 24.04 及更新版本满足。用户态更旧的系统
-（例如 Debian 12 + backports 内核）上预编译的 daemon 起不来，`--prebuilt` 会在验证步骤
-失败——这种情况改用源码构建（该组合尚未测试）。
+`libelf.so.1` 和 `libz.so.1`：Debian 13、Ubuntu 24.04 及更新版本满足；产物目前只发布
+x86_64。安装器在动手之前检查这两点（`getconf GNU_LIBC_VERSION`、`uname -m`）：不满足时，
+默认路径打印 `building from source: <原因>` 并改为源码构建（例如 Debian 12 + backports
+内核），`--prebuilt`/`--release` 则直接中止。`--check` 会报告将走哪条路径。
+
+装上的是已发布的 release，不是 `main`：`main` 上在最新 release 之后合并的改动，要等下一个
+release 才会进入默认安装——所以每个 PR 都要考虑是否需要随之发布（见仓库 `CLAUDE.md`）。
 
 产物来源：
 

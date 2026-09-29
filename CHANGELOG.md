@@ -8,6 +8,31 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 the layout of `bpf/include/skyline_abi.h` and any bump to it is a breaking change
 for anyone holding a prebuilt `.bpf.o`.
 
+## [Unreleased]
+
+### Upgrading
+
+- **Running the installer again on a host that was built from source now
+  installs the published release** instead of rebuilding. Pass `--source` to
+  keep building from source.
+
+### Changed
+
+- **The one-line install installs the latest published release by default.**
+  `curl .../bootstrap.sh | sudo bash`, and `install.sh` without arguments,
+  first check whether this host can run the published binaries -- x86_64, the
+  only architecture a release carries, and glibc 2.38 or newer, what the
+  prebuilt `skyline-speederd` links against -- and install the release if it
+  can: no compiler, LLVM or Rust on the host. A host that cannot is told why
+  (`building from source: glibc 2.36 is older than the 2.38 the published
+  binaries need`) and builds from source as before. The new `--source` builds
+  from source unconditionally. `--prebuilt` and `--release <tag>` now stop
+  before the first step on a host that cannot run the artifact, instead of
+  failing at the verifier step after the download; `--check` reports which of
+  the two an install would do. The installer still comes from `--ref` (main),
+  while the artifact comes from the latest release, so a change merged after
+  that release reaches the one-line install only with the next one.
+
 ## [0.4.0] - 2026-09-29
 
 ### Upgrading from 0.3.0

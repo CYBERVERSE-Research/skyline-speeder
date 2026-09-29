@@ -244,6 +244,20 @@ See `.gitignore`. In particular:
 
 ## Pull requests
 
+- Say whether the change needs a new prebuilt release, and why (the "Prebuilt
+  release" section of the PR template). The one-line install installs the
+  latest release's prebuilt artifact, not `main`, so a change that lives in the
+  artifact reaches those users only with the next release -- and nothing fails
+  in the meantime; it just is not there:
+
+  | The change touches | Release needed? | Why |
+  |---|---|---|
+  | `bpf/`, `crates/`, `config/speeder-guest.toml`, `packaging/`, the `infra/*.sh` that `release.yml` ships | **yes** | it is in the artifact |
+  | `install.sh`, `scripts/bootstrap.sh` | usually not | the one-line install always runs the installer from `main`; unless the new installer needs something the released artifact does not have yet -- then release first |
+  | docs, the experiment harness, CI, anything only a source build uses | no | not in the artifact |
+
+  A release can wait and bundle several PRs, but the PR has to say that it goes
+  out with the next one. See "Cutting a release" above.
 - One logical change per PR.
 - Include the `--validate-only --verify-bpf` output, and say which kernel version
   you ran it on.
