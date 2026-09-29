@@ -909,6 +909,26 @@ fn parameters(page: &mut Page<'_>, theme: &Theme, status: &RuntimeStatus) {
     } else {
         page.row(Mark::Off, "retransmit DSCP", &theme.dim("off"));
     }
+
+    let redundancy = &status.redundancy;
+    if redundancy.active {
+        page.row(
+            Mark::Good,
+            "first-flight copies",
+            &format!(
+                "handshake + first {} KiB of each connection sent twice, the copy +{} ms",
+                redundancy.config.first_kib, redundancy.config.delay_ms
+            ),
+        );
+    } else if redundancy.config.enabled && status.enabled {
+        page.row(
+            Mark::Warn,
+            "first-flight copies",
+            "configured, not running: the TC program on runtime.tc_interface is not loaded",
+        );
+    } else {
+        page.row(Mark::Off, "first-flight copies", &theme.dim("off"));
+    }
 }
 
 /// The counters that prove the algorithm ran, and the two rates worth a bar.
@@ -1040,6 +1060,29 @@ fn decisions(page: &mut Page<'_>, theme: &Theme, status: &RuntimeStatus) {
                         "{} of {} detected",
                         count(dscp.retransmits_marked),
                         count(dscp.retransmits_detected)
+                    ),
+                );
+            }
+        }
+        if let Some(copies) = &status.redundancy.stats {
+            if status.redundancy.active || copies.packets > 0 {
+                page.row(
+                    if copies.clone_failed == 0 {
+                        Mark::Info
+                    } else {
+                        Mark::Warn
+                    },
+                    "first-flight copies",
+                    &format!(
+                        "{} sent, {} ({} handshakes){}",
+                        count(copies.packets),
+                        bytes(copies.bytes),
+                        count(copies.handshakes),
+                        if copies.clone_failed == 0 {
+                            String::new()
+                        } else {
+                            format!(", {} could not be made", count(copies.clone_failed))
+                        }
                     ),
                 );
             }
@@ -1192,8 +1235,8 @@ mod tests {
     use crate::style::ColorChoice;
     use skyline_common::{
         CapabilityReport, GuardDevice, GuardLive, RackRtoConfig, RackRtoStats, RackRtoStatus,
-        RackTuningConfig, RackTuningStatus, RetransmitDscpConfig, RetransmitDscpStatus,
-        SkylineConfig, SkylineMetrics, TcStats,
+        RackTuningConfig, RackTuningStatus, RedundancyStats, RedundancyStatus,
+        RetransmitDscpConfig, RetransmitDscpStatus, SkylineConfig, SkylineMetrics, TcStats,
     };
 
     fn theme() -> Theme {
@@ -1242,6 +1285,17 @@ mod tests {
             retransmit_dscp: RetransmitDscpStatus {
                 config: RetransmitDscpConfig::disabled(),
                 stats: None,
+            },
+            redundancy: RedundancyStatus {
+                config: shipped.redundancy,
+                active: true,
+                stats: Some(RedundancyStats {
+                    packets: 52_113,
+                    bytes: 61_004_551,
+                    handshakes: 9_870,
+                    clone_failed: 0,
+                    abi_mismatch: 0,
+                }),
             },
             module_tuning: ModuleTuningConfig::from_config(&shipped),
             capabilities: CapabilityReport {
@@ -1372,6 +1426,26 @@ mod tests {
                 "status should not repeat {expected}"
             );
         }
+    }
+
+    /// First-flight redundancy sends bytes twice; the flows report has to
+    /// say that it is on, what it covers, and what it has cost so far -- and
+    /// say "not running" rather than "off" when it is configured on but the
+    /// TC program is missing.
+    #[test]
+    fn first_flight_copies_are_reported_with_their_cost() {
+        let theme = theme();
+        let text = flows(&theme, &reply(healthy(), Some(sample_flows())));
+        assert!(text
+            .contains("handshake + first 64 KiB of each connection sent twice, the copy +10 ms"));
+        assert!(text.contains("52,113 sent"));
+        assert!(text.contains("9,870 handshakes"));
+
+        let mut missing_tc = healthy();
+        missing_tc.redundancy.active = false;
+        missing_tc.redundancy.stats = None;
+        let text = flows(&theme, &reply(missing_tc, Some(sample_flows())));
+        assert!(text.contains("configured, not running"));
     }
 
     /// Attached but not the host default is the project's worst silent

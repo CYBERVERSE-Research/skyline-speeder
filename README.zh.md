@@ -38,6 +38,7 @@ BBR 靠估计带宽而不是对每次丢包作出反应，但它仍会向丢包�
 - **两个阶段。** STARTUP 用较高的增益尽快摸到路径带宽；带宽连续几轮不再增长后，进入 CRUISE。
 - **拥塞护栏。** 只有两个信号算真实拥塞：排队时延超过阈值（固定值与基准 RTT 的一定比例取较大者），以及 ECN 标记。任一出现，这一轮的增益就降到 `guardrail_gain`，低于测得的带宽；下一轮信号消失即恢复。
 - **有上限的 RTO**（可选）。一个 cgroup sockops 程序按连接限制内核的重传超时，避免线路抖一下就让连接最长等上两分钟。
+- **首轮冗余**（默认开启）。在这样的链路上，拖慢短响应的不是窗口，而是等丢包恢复：尾丢探测约两个往返、重传超时约三个往返、丢了 SYN-ACK 固定等一秒。一个 TC 出方向程序把每条 skyline_cc 连接的握手包和前 64 KiB 各发两份，第二份比原包晚 10 ms，丢一个包只多等这几毫秒，而不是等一个计时器。代价是每条连接最多多发 64 KiB。
 
 Rust 编写的 `skyline-speederd` 负责加载 BPF 对象（每个对象加载时都要过内核验证器），并通过双缓冲槽在线下发新系数，每条流在 RTT 边界切换过去；`ssctl` 是它的命令行。
 
@@ -178,6 +179,8 @@ sudo /opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <你的服务启动命�
 
 `skyline_cc` 本身是全局的，不需要 cgroup。
 
+**首轮冗余**（默认开启）。在配置的 `[redundancy]` 里改（`first_kib`、`delay_ms`），或在运行中的主机上用 `ssctl set-redundancy`（`--disable` 关闭）和 `ssctl reset-redundancy`。它只在 skyline_cc 启用期间运行，从不复制跑其他拥塞控制的连接。副本由 daemon 守在根上的 `fq` 按时间扣住再发；`ssctl flows` 显示已经发了多少副本、花了多少字节。
+
 **重传包 DSCP 标记**（默认关闭）。
 
 > [!WARNING]
@@ -192,7 +195,7 @@ skyline-speeder/
 ├── bpf/
 │   ├── skyline_cc.bpf.c          struct_ops 拥塞控制，每个 ACK 执行
 │   ├── skyline_policy.bpf.c      cgroup sockops：选择拥塞控制，动态 RTO 上下限
-│   ├── skyline_tc.bpf.c          TC egress：统计与重传 DSCP 标记
+│   ├── skyline_tc.bpf.c          TC egress：统计、重传 DSCP 标记、首轮冗余
 │   └── include/skyline_abi.h     BPF 与用户态共享的 ABI
 ├── crates/
 │   ├── skyline-speederd/         常驻控制面

@@ -61,6 +61,22 @@ class RetransmitDscpSpec:
 
 
 @dataclasses.dataclass(frozen=True)
+class RedundancySpec:
+    """First-flight redundancy (bpf/skyline_tc.bpf.c), applied via `ssctl
+    set-redundancy`. Mirrors `RedundancyConfig` in
+    crates/skyline-common/src/lib.rs field-for-field. Unlike the other specs,
+    a profile WITHOUT one does not reset to the configuration file -- the
+    installed template turns redundancy on -- but is sent `--disable`
+    explicitly (see run_matrix.py's redundancy_command): every
+    docs/04-performance-report.md case ran without copies.
+    """
+
+    enabled: bool
+    first_kib: int = 64
+    delay_ms: int = 10
+
+
+@dataclasses.dataclass(frozen=True)
 class ModuleConfigSpec:
     """M2 ([adaptive_cwnd])/M3 ([loss_classifier]) coefficients plus the
     top-level safety limits, applied via `ssctl set-module-config`/
@@ -121,6 +137,14 @@ class ModuleConfigSpec:
     # same rationale/shape as prr_pacing_enabled, see
     # SkylineConfig::auto_pacing_enabled.
     auto_pacing_enabled: bool = True
+    # Floor under M2's cwnd target (packets), see
+    # SkylineConfig::min_cwnd_packets. Sent explicitly by
+    # module_config_command(): left out, ssctl would fill in its own built-in
+    # default, which follows the shipped templates (32 since they changed)
+    # rather than the 4 every docs/04 case ran with -- a case would change
+    # under the report without any manifest changing. Declared last only
+    # because a dataclass field with a default cannot precede the ones above.
+    min_cwnd_packets: int = 4
 
 
 @dataclasses.dataclass(frozen=True)
@@ -135,6 +159,7 @@ class Profile:
     rack_rto: RackRtoSpec | None = None
     module_config: ModuleConfigSpec | None = None
     retransmit_dscp: RetransmitDscpSpec | None = None
+    redundancy: RedundancySpec | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -327,6 +352,7 @@ def _parse_profile(item: dict[str, Any]) -> Profile:
     rack_rto_raw = item.get("rack_rto")
     module_config_raw = item.get("module_config")
     retransmit_dscp_raw = item.get("retransmit_dscp")
+    redundancy_raw = item.get("redundancy")
     return Profile(
         id=str(item["id"]),
         kind=str(item["kind"]),
@@ -345,6 +371,9 @@ def _parse_profile(item: dict[str, Any]) -> Profile:
             _parse_retransmit_dscp(retransmit_dscp_raw)
             if retransmit_dscp_raw is not None
             else None
+        ),
+        redundancy=(
+            _parse_redundancy(redundancy_raw) if redundancy_raw is not None else None
         ),
     )
 
@@ -368,6 +397,14 @@ def _parse_retransmit_dscp(item: dict[str, Any]) -> RetransmitDscpSpec:
     return RetransmitDscpSpec(
         enabled=bool(item.get("enabled", False)),
         dscp_value=int(item.get("dscp_value", 0)),
+    )
+
+
+def _parse_redundancy(item: dict[str, Any]) -> RedundancySpec:
+    return RedundancySpec(
+        enabled=bool(item.get("enabled", False)),
+        first_kib=int(item.get("first_kib", 64)),
+        delay_ms=int(item.get("delay_ms", 10)),
     )
 
 
@@ -402,6 +439,8 @@ def _parse_module_config(item: dict[str, Any]) -> ModuleConfigSpec:
         loss_inflation_max_ratio=float(item.get("loss_inflation_max_ratio", 0.5)),
         prr_pacing_enabled=bool(item.get("prr_pacing_enabled", True)),
         auto_pacing_enabled=bool(item.get("auto_pacing_enabled", True)),
+        # Same pin as the block above: 4 is what docs/04 ran with.
+        min_cwnd_packets=int(item.get("min_cwnd_packets", 4)),
     )
 
 
@@ -542,6 +581,16 @@ def validate_manifest(manifest: Manifest) -> None:
                     f"profile {profile.id} rack_rto.rto_max_congested_permille "
                     "must be >= rto_max_normal_permille"
                 )
+        if profile.redundancy is not None and profile.redundancy.enabled:
+            # Same bounds skyline-speederd enforces (SkylineConfig::validate).
+            if not 1 <= profile.redundancy.first_kib <= 1024:
+                raise ValueError(
+                    f"profile {profile.id} redundancy.first_kib must be between 1 and 1024"
+                )
+            if not 0 <= profile.redundancy.delay_ms <= 100:
+                raise ValueError(
+                    f"profile {profile.id} redundancy.delay_ms must be between 0 and 100"
+                )
         if profile.retransmit_dscp is not None:
             dscp = profile.retransmit_dscp
             # Mirrors RetransmitDscpConfig::validate() in
@@ -612,6 +661,14 @@ def validate_manifest(manifest: Manifest) -> None:
                 raise ValueError(
                     f"profile {profile.id} module_config.max_cwnd_packets "
                     "must be at least 4"
+                )
+            # Same bounds skyline-speederd enforces (SkylineConfig::validate):
+            # caught here, a bad manifest fails at expansion instead of partway
+            # through a run, when ssctl would reject the case.
+            if not 4 <= module_config.min_cwnd_packets <= module_config.max_cwnd_packets:
+                raise ValueError(
+                    f"profile {profile.id} module_config.min_cwnd_packets "
+                    "must be between 4 and max_cwnd_packets"
                 )
             if not 1 <= module_config.bw_window_rtts <= 10:
                 raise ValueError(

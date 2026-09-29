@@ -14,9 +14,10 @@ use libbpf_rs::{
 };
 use skyline_common::{
     CapabilityReport, FeatureMask, Module, ModuleTuningConfig, RackRtoConfig, RackRtoStats,
-    RackRtoStatus, RackTuningConfig, RackTuningStatus, Request, Response, RetransmitDscpConfig,
-    RetransmitDscpStats, RetransmitDscpStatus, RuntimeStatus, SkylineConfig, SkylineEvent,
-    SkylineMetrics, TcStats, SKYLINE_CC_NAME,
+    RackRtoStatus, RackTuningConfig, RackTuningStatus, RedundancyConfig, RedundancyStats,
+    RedundancyStatus, Request, Response, RetransmitDscpConfig, RetransmitDscpStats,
+    RetransmitDscpStatus, RuntimeStatus, SkylineConfig, SkylineEvent, SkylineMetrics, TcStats,
+    SKYLINE_CC_NAME,
 };
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -365,13 +366,31 @@ fn write_retransmit_dscp_config(object: &mut Object, config: &RetransmitDscpConf
     .context("update retransmit_dscp_config map")
 }
 
+fn write_redundancy_config(
+    object: &mut Object,
+    config: &RedundancyConfig,
+    active: bool,
+) -> Result<()> {
+    let kernel_config = config.kernel_config(active);
+    let map = find_map_mut(object, "redundancy_config")?;
+    map.update(
+        &0_u32.to_ne_bytes(),
+        bytes_of(&kernel_config),
+        MapFlags::ANY,
+    )
+    .context("update redundancy_config map")
+}
+
 /// Loads and tracks the TC (`skyline_tc.bpf.c`) object: interface-wide egress
 /// packet/byte/retransmit-DSCP accounting, independent of M1-M4 and of
-/// which congestion control a given flow runs.
+/// which congestion control a given flow runs, and first-flight redundancy
+/// for skyline_cc connections.
 struct TcRuntime {
     objects: Vec<Object>,
     tc_hook: Option<TcHook>,
     errors: Vec<String>,
+    /// Whether the redundancy slot currently says enabled=1.
+    redundancy_active: bool,
 }
 
 impl TcRuntime {
@@ -380,6 +399,7 @@ impl TcRuntime {
             objects: Vec::new(),
             tc_hook: None,
             errors: Vec::new(),
+            redundancy_active: false,
         };
 
         if let Some(interface) = &config.runtime.tc_interface {
@@ -406,6 +426,16 @@ impl TcRuntime {
                             "retransmit_dscp_config initialization failed: {error:#}"
                         ));
                     }
+                    // Same for redundancy: nothing is copied until an Enable
+                    // says skyline_cc is live, whatever a previous
+                    // incarnation left behind.
+                    if let Err(error) =
+                        write_redundancy_config(&mut object, &RedundancyConfig::disabled(), false)
+                    {
+                        runtime.errors.push(format!(
+                            "redundancy_config initialization failed: {error:#}"
+                        ));
+                    }
                     runtime.tc_hook = Some(hook);
                     runtime.objects.push(object);
                 }
@@ -428,6 +458,47 @@ impl TcRuntime {
             })
             .ok_or_else(|| anyhow!("TC object is not loaded (runtime.tc_interface unset?)"))?;
         write_retransmit_dscp_config(object, config)
+    }
+
+    /// `active` is whether skyline_cc is enabled; see
+    /// `RedundancyConfig::kernel_config`.
+    fn set_redundancy(&mut self, config: &RedundancyConfig, active: bool) -> Result<()> {
+        let object = self
+            .objects
+            .iter_mut()
+            .find(|object| {
+                object
+                    .maps()
+                    .any(|map| map.name() == OsStr::new("redundancy_config"))
+            })
+            .ok_or_else(|| anyhow!("TC object is not loaded (runtime.tc_interface unset?)"))?;
+        write_redundancy_config(object, config, active)?;
+        self.redundancy_active = config.enabled && active;
+        Ok(())
+    }
+
+    fn redundancy_stats(&self) -> Option<RedundancyStats> {
+        let map = self.objects.iter().find_map(|object| {
+            object
+                .maps()
+                .find(|map| map.name() == OsStr::new("redundancy_stats"))
+        })?;
+        let values = map
+            .lookup_percpu(&0_u32.to_ne_bytes(), MapFlags::ANY)
+            .ok()
+            .flatten()?;
+        let mut total = RedundancyStats::default();
+        for value in values {
+            let Ok(stats) = try_pod_read_unaligned::<RedundancyStats>(&value) else {
+                continue;
+            };
+            total.packets = total.packets.saturating_add(stats.packets);
+            total.bytes = total.bytes.saturating_add(stats.bytes);
+            total.handshakes = total.handshakes.saturating_add(stats.handshakes);
+            total.clone_failed = total.clone_failed.saturating_add(stats.clone_failed);
+            total.abi_mismatch = total.abi_mismatch.saturating_add(stats.abi_mismatch);
+        }
+        Some(total)
     }
 
     fn retransmit_dscp_stats(&self) -> Option<RetransmitDscpStats> {
@@ -781,6 +852,22 @@ fn update_config_maps(object: &mut Object, config: &SkylineConfig, slot: u32) ->
     update_u32_map(object, "active_config_slot", 0, slot)
 }
 
+fn redundancy_message(config: &RedundancyConfig, accelerating: bool) -> String {
+    if !config.enabled {
+        return "first-flight redundancy off".to_owned();
+    }
+    let what = format!(
+        "SYN-ACKs, SYNs and the first {} KiB of every skyline_cc connection are sent twice, \
+         the copy {} ms later",
+        config.first_kib, config.delay_ms
+    );
+    if accelerating {
+        what
+    } else {
+        format!("{what} -- from the next enable (skyline_cc is not enabled now)")
+    }
+}
+
 struct Daemon {
     config: SkylineConfig,
     capabilities: CapabilityReport,
@@ -802,6 +889,14 @@ struct Daemon {
     /// The `[retransmit_dscp]` value present in the configuration file at
     /// startup, restored by `Request::ResetRetransmitDscp`.
     retransmit_dscp_defaults: RetransmitDscpConfig,
+    /// The `[redundancy]` value present in the configuration file at
+    /// startup, restored by `Request::ResetRedundancy`.
+    redundancy_defaults: RedundancyConfig,
+    /// True from a successful `Enable` until the next `Drain` starts: while
+    /// skyline_cc is the default congestion control. What first-flight
+    /// redundancy is gated on -- the TC program copies SYN-ACKs by host
+    /// state, since a request socket has no congestion control yet.
+    accelerating: bool,
     /// Opened once at startup by `Daemon::new()` -- see `BpfRuntime::load`'s
     /// doc comment. `None` when `events_max_mib = 0`.
     event_log: Option<Arc<Mutex<EventLog>>>,
@@ -820,6 +915,7 @@ impl Daemon {
         let rack_rto_defaults = config.rack_rto;
         let module_tuning_defaults = ModuleTuningConfig::from_config(&config);
         let retransmit_dscp_defaults = config.retransmit_dscp;
+        let redundancy_defaults = config.redundancy;
         let event_log = match config.runtime.events_max_mib {
             0 => None,
             max_mib => {
@@ -844,6 +940,8 @@ impl Daemon {
             rack_rto_defaults,
             module_tuning_defaults,
             retransmit_dscp_defaults,
+            redundancy_defaults,
+            accelerating: false,
             event_log,
             started: Instant::now(),
             attached_at: None,
@@ -874,6 +972,21 @@ impl Daemon {
         self.policy = Some(PolicyRuntime::load(&self.config));
     }
 
+    /// Pushes `[redundancy]` to the TC program: copying only while
+    /// `accelerating`, so a change made while drained takes effect at the
+    /// next `Enable`.
+    fn apply_redundancy(&mut self) -> Result<()> {
+        let active = self.accelerating;
+        match &mut self.tc {
+            Some(tc) => tc.set_redundancy(&self.config.redundancy, active),
+            None if active && self.config.redundancy.enabled => bail!(
+                "TC runtime is not loaded, so nothing can be copied; check runtime.tc_interface \
+                 and tc_error in status"
+            ),
+            None => Ok(()),
+        }
+    }
+
     fn status(&self) -> RuntimeStatus {
         let mut capabilities = self.capabilities.clone();
         if let Some(error) = &self.tc_error {
@@ -891,6 +1004,7 @@ impl Daemon {
         let tc_stats = self.tc.as_ref().and_then(TcRuntime::tc_stats);
         let rack_rto_stats = self.policy.as_ref().and_then(PolicyRuntime::rto_stats);
         let retransmit_dscp_stats = self.tc.as_ref().and_then(TcRuntime::retransmit_dscp_stats);
+        let redundancy_stats = self.tc.as_ref().and_then(TcRuntime::redundancy_stats);
         let metrics = self.runtime.as_ref().and_then(BpfRuntime::metrics);
         RuntimeStatus {
             version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -912,6 +1026,11 @@ impl Daemon {
             retransmit_dscp: RetransmitDscpStatus {
                 config: self.config.retransmit_dscp,
                 stats: retransmit_dscp_stats,
+            },
+            redundancy: RedundancyStatus {
+                config: self.config.redundancy,
+                active: self.tc.as_ref().is_some_and(|tc| tc.redundancy_active),
+                stats: redundancy_stats,
             },
             module_tuning: ModuleTuningConfig::from_config(&self.config),
             capabilities,
@@ -994,6 +1113,15 @@ impl Daemon {
                     message.push_str("; ");
                     message.push_str(line);
                 }
+                // First-flight redundancy starts with skyline_cc and not
+                // before (see `accelerating`). Like the guard, it cannot fail
+                // the enable: the congestion control is live either way, and
+                // a redundancy that did not start is said here and shows as
+                // inactive in status.
+                self.accelerating = true;
+                if let Err(error) = self.apply_redundancy() {
+                    message.push_str(&format!("; first-flight redundancy not started: {error:#}"));
+                }
                 Ok(message)
             }
             Request::DisableModule { module } => {
@@ -1043,6 +1171,11 @@ impl Daemon {
                 if let Some(policy) = &mut self.policy {
                     policy.set_policy_enabled(false)?;
                 }
+                // And stop copying with it: a SYN-ACK now leads to a
+                // fallback_cc connection. Segments of the skyline_cc
+                // connections still draining are no longer copied either.
+                self.accelerating = false;
+                self.apply_redundancy()?;
                 // active_flows() rather than status(): status() now also runs
                 // `tc` for the guard's live view, five times a second here.
                 let deadline = Instant::now() + Duration::from_secs(timeout_s);
@@ -1151,6 +1284,32 @@ impl Daemon {
                     bail!("TC runtime is not loaded; check runtime.tc_interface and tc_error in status");
                 }
                 Ok("retransmit DSCP marking reset to configuration defaults".to_owned())
+            }
+            Request::SetRedundancy { config } => {
+                let previous = self.config.redundancy;
+                self.config.redundancy = config;
+                if let Err(error) = self.config.validate() {
+                    self.config.redundancy = previous;
+                    return Err(error.into());
+                }
+                // No generation bump, same as SetRetransmitDscp: a single
+                // fully-overwritten slot with no generation field.
+                if let Err(error) = self.apply_redundancy() {
+                    self.config.redundancy = previous;
+                    return Err(error);
+                }
+                Ok(redundancy_message(
+                    &self.config.redundancy,
+                    self.accelerating,
+                ))
+            }
+            Request::ResetRedundancy => {
+                self.config.redundancy = self.redundancy_defaults;
+                self.apply_redundancy()?;
+                Ok(format!(
+                    "first-flight redundancy reset to configuration defaults: {}",
+                    redundancy_message(&self.config.redundancy, self.accelerating)
+                ))
             }
             // Handled in `serve()`'s loop, which detects this variant before
             // dispatching here and breaks out instead -- see its doc comment.

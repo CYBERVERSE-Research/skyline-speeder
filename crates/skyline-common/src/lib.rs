@@ -311,6 +311,68 @@ impl Default for RetransmitDscpConfig {
     }
 }
 
+/// `[redundancy]`: first-flight redundancy, carried out by
+/// `bpf/skyline_tc.bpf.c` on `runtime.tc_interface` -- see the doc comment on
+/// `struct skyline_redundancy_config` in `bpf/include/skyline_abi.h`. While
+/// skyline_cc is enabled, every SYN-ACK this host sends, every SYN of a
+/// skyline_cc socket and every segment that starts within the first
+/// `first_kib` KiB a skyline_cc connection sends goes out twice, the copy
+/// `delay_ms` after the original.
+///
+/// On by default -- also for an installed configuration without the table,
+/// which is never overwritten on upgrade: a short response on a lossy path
+/// spends most of its life waiting for loss recovery (TLP, RTO, the fixed
+/// one-second SYN-ACK timeout), and a late second copy removes most of that
+/// wait for the price of sending the first `first_kib` KiB twice.
+/// `delay_ms = 0` sends the copy right behind the original, which two
+/// back-to-back packets survive together less often than two a few
+/// milliseconds apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RedundancyConfig {
+    pub enabled: bool,
+    /// Segments that start within this many KiB of what the connection has
+    /// sent are copied. 1..=1024 while `enabled`.
+    pub first_kib: u32,
+    /// How long after the original the copy leaves, held by the fq qdisc.
+    /// 0..=100.
+    pub delay_ms: u32,
+}
+
+impl RedundancyConfig {
+    pub const MAX_FIRST_KIB: u32 = 1024;
+    pub const MAX_DELAY_MS: u32 = 100;
+
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::default()
+        }
+    }
+
+    /// `active` is whether skyline_cc is enabled right now: the program only
+    /// copies while that and `enabled` both hold, so the SYN-ACKs of a host
+    /// that drained back to `fallback_cc` go out once.
+    pub fn kernel_config(&self, active: bool) -> KernelRedundancyConfig {
+        KernelRedundancyConfig {
+            abi_version: SKYLINE_REDUNDANCY_ABI_VERSION,
+            enabled: u32::from(self.enabled && active),
+            bytes: self.first_kib.saturating_mul(1024),
+            delay_us: self.delay_ms.saturating_mul(1000),
+        }
+    }
+}
+
+impl Default for RedundancyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            first_kib: 64,
+            delay_ms: 10,
+        }
+    }
+}
+
 /// `[guard]`: what skyline-speederd keeps in place while skyline_cc is enabled
 /// (between a successful `Request::Enable` and the next `Request::Drain`).
 ///
@@ -498,9 +560,12 @@ pub struct SkylineConfig {
     /// `bpf/include/skyline_abi.h`'s `min_cwnd_packets` doc comment). A thin
     /// or app-limited flow's `bw_bps * base_rtt` comes out below a handful
     /// of packets, and a window that small can only recover from a loss via
-    /// a tail-loss probe or an RTO. Pacing still sets the send rate, so this
-    /// does not make a flow send faster. Omitted = 4, the floor this project
-    /// always had; only consulted while M2 (`adaptive-cwnd`) is on.
+    /// a tail-loss probe or an RTO. It is also where a short response
+    /// restarts after an RTO, since such a flow usually never gets a
+    /// bandwidth estimate. Pacing still sets the send rate, so this does not
+    /// make a flow send faster. Omitted = 4, the floor this project always
+    /// had (the shipped templates set 32); only consulted while M2
+    /// (`adaptive-cwnd`) is on.
     #[serde(default = "default_min_cwnd_packets")]
     pub min_cwnd_packets: u32,
     pub adaptive_cwnd: AdaptiveCwndConfig,
@@ -511,6 +576,10 @@ pub struct SkylineConfig {
     pub rack_rto: RackRtoConfig,
     #[serde(default)]
     pub retransmit_dscp: RetransmitDscpConfig,
+    /// Defaulted -- to on -- so an installed configuration from before the
+    /// table gets it too; see `RedundancyConfig`.
+    #[serde(default)]
+    pub redundancy: RedundancyConfig,
     /// Defaulted so an installed 0.2.0 configuration (never overwritten on
     /// upgrade, and without the table) still gets the guard.
     #[serde(default)]
@@ -663,6 +732,22 @@ impl SkylineConfig {
                 "retransmit_dscp.dscp_value",
                 "0..=63",
                 u32::from(self.retransmit_dscp.dscp_value),
+            ));
+        }
+        if self.redundancy.enabled
+            && !(1..=RedundancyConfig::MAX_FIRST_KIB).contains(&self.redundancy.first_kib)
+        {
+            return Err(ConfigError::Range(
+                "redundancy.first_kib",
+                "1..=1024 while redundancy is enabled",
+                self.redundancy.first_kib,
+            ));
+        }
+        if self.redundancy.delay_ms > RedundancyConfig::MAX_DELAY_MS {
+            return Err(ConfigError::Range(
+                "redundancy.delay_ms",
+                "0..=100",
+                self.redundancy.delay_ms,
             ));
         }
         if self.guard.interval_s > MAX_GUARD_INTERVAL_S {
@@ -835,6 +920,36 @@ pub struct RetransmitDscpStats {
     pub ipv6_chain_bailout: u64,
 }
 
+/// Mirrors `struct skyline_redundancy_config` (`bpf/include/skyline_abi.h`).
+/// Independent of `KernelConfig`/`ABI_VERSION`, same as the retransmit-DSCP
+/// slot -- see `RedundancyConfig`.
+pub const SKYLINE_REDUNDANCY_ABI_VERSION: u32 = 1;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct KernelRedundancyConfig {
+    pub abi_version: u32,
+    pub enabled: u32,
+    pub bytes: u32,
+    pub delay_us: u32,
+}
+
+/// Mirrors `struct skyline_redundancy_stats` (`bpf/include/skyline_abi.h`),
+/// summed over CPUs. Field order must match the C struct exactly.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, Pod, Zeroable, Serialize, Deserialize)]
+pub struct RedundancyStats {
+    /// Copies sent (a GSO super-packet counts once).
+    pub packets: u64,
+    /// `skb->len` of those copies: all payload, but a GSO super-packet's
+    /// headers only once, so slightly under the bytes on the wire.
+    pub bytes: u64,
+    /// Subset of `packets`: SYN-ACKs and SYNs.
+    pub handshakes: u64,
+    pub clone_failed: u64,
+    pub abi_mismatch: u64,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct SkylineEvent {
@@ -934,6 +1049,18 @@ pub struct RetransmitDscpStatus {
     pub stats: Option<RetransmitDscpStats>,
 }
 
+/// `[redundancy]` at run time. Defaulted so a newer ssctl can decode the
+/// reply of a daemon older than the feature (which reports it inactive).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RedundancyStatus {
+    pub config: RedundancyConfig,
+    /// What the TC program is acting on: skyline_cc enabled, `[redundancy]`
+    /// on, and the TC object loaded on `runtime.tc_interface`.
+    pub active: bool,
+    pub stats: Option<RedundancyStats>,
+}
+
 /// `[guard]` at run time (see `GuardConfig`). JSON only, not ABI.
 /// Defaulted field by field so a newer ssctl can decode an older daemon's
 /// reply, and the other way round.
@@ -1025,6 +1152,10 @@ pub struct RuntimeStatus {
     pub rack_tuning: RackTuningStatus,
     pub rack_rto: RackRtoStatus,
     pub retransmit_dscp: RetransmitDscpStatus,
+    /// Inactive (and `[redundancy]`'s defaults) when decoded from a daemon
+    /// older than the feature.
+    #[serde(default)]
+    pub redundancy: RedundancyStatus,
     /// Live echo of the current M2/M3/M4 coefficients (see
     /// `ModuleTuningConfig`). Unlike `rack_tuning`'s `managed`/`live` split,
     /// a single value suffices here: these fields live entirely in `skyline-speederd`'s
@@ -1169,6 +1300,10 @@ pub enum Request {
         config: RetransmitDscpConfig,
     },
     ResetRetransmitDscp,
+    SetRedundancy {
+        config: RedundancyConfig,
+    },
+    ResetRedundancy,
     /// Sent by skyline-speederd's own SIGTERM/SIGINT handler (via a loopback connection
     /// to its own control socket) to unblock the blocking accept loop in
     /// `serve()` -- see that function's doc comment for why a real request
@@ -1657,6 +1792,76 @@ mod tests {
         config
             .validate()
             .expect("floor == cap is degenerate but consistent");
+    }
+
+    #[test]
+    fn redundancy_is_on_by_default_even_without_the_table() {
+        let shipped = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        assert_eq!(shipped.redundancy, RedundancyConfig::default());
+        assert!(shipped.redundancy.enabled);
+
+        // An installed configuration from before the table is never
+        // overwritten on upgrade; it must come out on, with the defaults.
+        let content = fs::read_to_string("../../config/speeder.toml").expect("read config");
+        let start = content
+            .find("[redundancy]")
+            .expect("shipped config has [redundancy]");
+        let end = content[start + 1..]
+            .find("\n[")
+            .map_or(content.len(), |offset| start + 1 + offset + 1);
+        let without = format!("{}{}", &content[..start], &content[end..]);
+        let config: SkylineConfig = toml::from_str(&without).expect("parse without [redundancy]");
+        assert_eq!(config.redundancy, RedundancyConfig::default());
+    }
+
+    /// speeder-guest.toml is the file every install puts in place (the
+    /// release artifact ships it as config/speeder.toml), so it carries the
+    /// shipped default. The experiment matrix, which must stay comparable
+    /// with docs/04, turns redundancy off per case instead.
+    #[test]
+    fn installed_template_ships_redundancy_on() {
+        let config =
+            SkylineConfig::load("../../config/speeder-guest.toml").expect("load guest config");
+        assert_eq!(config.redundancy, RedundancyConfig::default());
+    }
+
+    #[test]
+    fn redundancy_kernel_config_follows_enable_and_drain() {
+        let config = RedundancyConfig::default();
+        let live = config.kernel_config(true);
+        assert_eq!(live.abi_version, SKYLINE_REDUNDANCY_ABI_VERSION);
+        assert_eq!(live.enabled, 1);
+        assert_eq!(live.bytes, 64 * 1024);
+        assert_eq!(live.delay_us, 10_000);
+        assert_eq!(config.kernel_config(false).enabled, 0);
+        assert_eq!(RedundancyConfig::disabled().kernel_config(true).enabled, 0);
+        assert_eq!(std::mem::size_of::<KernelRedundancyConfig>(), 16);
+        assert_eq!(std::mem::size_of::<RedundancyStats>(), 40);
+    }
+
+    #[test]
+    fn redundancy_rejects_out_of_range_values() {
+        let mut config = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        config.redundancy.first_kib = 0;
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::Range("redundancy.first_kib", _, 0))
+        ));
+        config.redundancy.first_kib = RedundancyConfig::MAX_FIRST_KIB + 1;
+        assert!(config.validate().is_err());
+        // Off, the size does not matter.
+        config.redundancy.enabled = false;
+        config
+            .validate()
+            .expect("disabled redundancy ignores first_kib");
+        config.redundancy = RedundancyConfig {
+            delay_ms: RedundancyConfig::MAX_DELAY_MS + 1,
+            ..RedundancyConfig::default()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::Range("redundancy.delay_ms", _, 101))
+        ));
     }
 
     #[test]

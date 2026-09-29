@@ -36,6 +36,7 @@ BBR estimates bandwidth rather than reacting to each loss, yet it still gives gr
 - **Two phases.** STARTUP uses a high gain to find the path's bandwidth quickly. Once bandwidth stops growing for a few rounds, the flow settles into CRUISE.
 - **A congestion guardrail.** Only two signals count as real congestion: queueing delay rising above a threshold (a fixed value or a fraction of the base RTT, whichever is larger), and ECN marks. When either fires, that round's gain drops to `guardrail_gain`, below the measured bandwidth, and the next clean round restores it.
 - **A bounded RTO** (optional). A cgroup sockops program caps the kernel's retransmission timeout per connection, so a flap cannot leave a connection waiting up to two minutes.
+- **First-flight redundancy** (on by default). What holds a short response back on such a link is not the window but the wait for loss recovery: a tail-loss probe after about two round trips, a retransmission timeout after about three, a fixed second for a lost SYN-ACK. A TC egress program sends each skyline_cc connection's handshake and first 64 KiB twice, the copy 10 ms after the original, so one lost packet costs those milliseconds instead of a timer. The price is up to 64 KiB of extra traffic per connection.
 
 A Rust daemon, `skyline-speederd`, loads the BPF objects (the kernel verifier checks each one at load) and pushes new coefficients online through a double-buffered slot that each flow switches to at an RTT boundary. `ssctl` is its command line.
 
@@ -176,6 +177,8 @@ sudo /opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <your service command..
 
 `skyline_cc` itself is global and needs no cgroup.
 
+**First-flight redundancy** (on by default). Change it in `[redundancy]` (`first_kib`, `delay_ms`) or on a running host with `ssctl set-redundancy` (`--disable` turns it off) and `ssctl reset-redundancy`. It runs only while skyline_cc is enabled and never copies a connection on another congestion control. The copy is held back by the `fq` qdisc the daemon keeps at the root; `ssctl flows` shows how many copies it has sent and how many bytes they cost.
+
 **Retransmit DSCP marking** (off by default).
 
 > [!WARNING]
@@ -190,7 +193,7 @@ skyline-speeder/
 ├── bpf/
 │   ├── skyline_cc.bpf.c          struct_ops congestion control, runs on every ACK
 │   ├── skyline_policy.bpf.c      cgroup sockops: CC selection and dynamic RTO floor/ceiling
-│   ├── skyline_tc.bpf.c          TC egress: accounting and retransmit DSCP marking
+│   ├── skyline_tc.bpf.c          TC egress: accounting, retransmit DSCP marking, first-flight redundancy
 │   └── include/skyline_abi.h     ABI shared by BPF and userspace
 ├── crates/
 │   ├── skyline-speederd/         resident control plane

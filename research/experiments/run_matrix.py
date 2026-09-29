@@ -463,6 +463,10 @@ def module_config_command(spec):
         str(spec.max_queue_delay_ratio),
         "--initial-cwnd-packets",
         str(spec.initial_cwnd_packets),
+        # Always explicit: ssctl's built-in default follows the shipped
+        # templates, not the docs/04 set -- see ModuleConfigSpec.min_cwnd_packets.
+        "--min-cwnd-packets",
+        str(spec.min_cwnd_packets),
         "--min-rtt-window-s",
         str(spec.min_rtt_window_s),
         "--bw-window-rtts",
@@ -511,6 +515,30 @@ def retransmit_dscp_command(spec):
 
 def apply_retransmit_dscp(case, server):
     return server.run(retransmit_dscp_command(case.profile.retransmit_dscp), check=False)
+
+
+def redundancy_command(spec):
+    """Pure command construction, mirrors retransmit_dscp_command(). The one
+    spec whose absence does NOT mean a reset: the installed template turns
+    first-flight redundancy on, and every docs/04-performance-report.md case
+    ran without copies, so a profile that does not ask for them is sent
+    `--disable` explicitly -- a reset would quietly give it copies.
+    """
+    if spec is None or not spec.enabled:
+        return ["sudo", "ssctl", "set-redundancy", "--disable"]
+    return [
+        "sudo",
+        "ssctl",
+        "set-redundancy",
+        "--first-kib",
+        str(spec.first_kib),
+        "--delay-ms",
+        str(spec.delay_ms),
+    ]
+
+
+def apply_redundancy(case, server):
+    return server.run(redundancy_command(case.profile.redundancy), check=False)
 
 
 def restore_profile(manifest, server):
@@ -753,6 +781,14 @@ def cleanup_case(manifest, server, client, router_sudo):
             server.run(["sudo", "ssctl", "reset-retransmit-dscp"], check=False),
         )
     )
+    # Back to the configuration file's value, like the resets above; the
+    # next case's apply_redundancy() pins its own setting again.
+    records.append(
+        (
+            "server redundancy",
+            server.run(["sudo", "ssctl", "reset-redundancy"], check=False),
+        )
+    )
     records.append(("server offload", set_offload(manifest, server, "on")))
     records.append(("client offload", set_offload(manifest, client, "on")))
     records.append(("host path", clear_path(router_sudo)))
@@ -848,6 +884,12 @@ def run_case(
             if module_config_result is not None and module_config_result.returncode == 0
             else None
         )
+        redundancy_result = (
+            apply_redundancy(case, server)
+            if retransmit_dscp_result is not None
+            and retransmit_dscp_result.returncode == 0
+            else None
+        )
         profile_text = profile_result.stdout + profile_result.stderr
         if rack_rto_result is not None:
             profile_text += (
@@ -865,6 +907,10 @@ def run_case(
                 + retransmit_dscp_result.stdout
                 + retransmit_dscp_result.stderr
             )
+        if redundancy_result is not None:
+            profile_text += (
+                "\n[redundancy]\n" + redundancy_result.stdout + redundancy_result.stderr
+            )
         write_text(case_dir / "profile.txt", profile_text)
         if profile_result.returncode != 0:
             raise RuntimeError(
@@ -881,6 +927,10 @@ def run_case(
         if retransmit_dscp_result is not None and retransmit_dscp_result.returncode != 0:
             raise RuntimeError(
                 f"retransmit dscp config exited with {retransmit_dscp_result.returncode}"
+            )
+        if redundancy_result is not None and redundancy_result.returncode != 0:
+            raise RuntimeError(
+                f"redundancy config exited with {redundancy_result.returncode}"
             )
         client_buffers_result = raise_client_socket_buffers(client)
         write_text(

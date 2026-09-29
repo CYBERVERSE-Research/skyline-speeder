@@ -396,6 +396,30 @@ static __always_inline __u32 skyline_loss_inflation_permille(struct skyline_flow
     return 1000U * 1000U / (1000U - p);
 }
 
+/* Whether a delivery-rate sample that is not app-limited says anything about
+ * the path. One whose interval spans a wait for a timer does not: a
+ * tail-loss probe's SACK covers one packet over PTO + RTT, and the ACK of
+ * a retransmission an RTO sent covers one packet over the backed-off RTO
+ * plus an RTT, where an ACK-clocked sample covers about one RTT. Taken as
+ * bandwidth such a sample reads as a few kbit/s. That matters most at the
+ * start of a connection on a lossy path, when the max filter holds nothing
+ * better and adopts it, and again after bw_window_rtts rounds of nothing
+ * else: M4 then paces at a gain times it -- two packets every second or
+ * two -- and each round measures only what that pace let through, so the
+ * estimate never climbs back on its own (seen on a lossy field path: a
+ * 35 KB response took 20.8 s, a 256 KB one 13.3 s). Leaving the sample out
+ * keeps the filter either empty -- M2 slow-starts and M4 leaves pacing
+ * alone -- or holding the last real estimate. ACK-clocked samples taken in
+ * Recovery or Loss are kept: they cover about one RTT like any other.
+ */
+static __always_inline bool skyline_sample_measures_path(struct tcp_sock *tp,
+                                                     const struct rate_sample *sample)
+{
+    __u64 srtt_us = tp->srtt_us >> 3;
+
+    return !srtt_us || (__u64)sample->interval_us <= 2ULL * srtt_us;
+}
+
 static __always_inline bool skyline_update_model(struct sock *sk,
                                              struct tcp_sock *tp,
                                              struct skyline_flow_state *flow,
@@ -444,7 +468,8 @@ static __always_inline bool skyline_update_model(struct sock *sk,
         }
         flow->bw_bps = maximum;
     }
-    if (rate_bps && !sample->is_app_limited) {
+    if (rate_bps && !sample->is_app_limited &&
+        skyline_sample_measures_path(tp, sample)) {
         if (rate_bps > flow->round_rate_bps)
             flow->round_rate_bps = rate_bps;
         if (rate_bps > flow->bw_bps)
@@ -586,6 +611,33 @@ static __always_inline void skyline_apply_auto_pacing_rate(struct sock *sk, stru
     sk->sk_pacing_rate = rate;
 }
 
+/* M4's floor: never pace a flow below one minimum window per round trip --
+ * the pacing counterpart of the cwnd floor (skyline_min_cwnd() with M2 on,
+ * SKYLINE_MIN_CWND without it). skyline_sample_measures_path() keeps the
+ * known kinds of bogus sample out of the bandwidth filter; this is the
+ * backstop for whatever else leaves the filter holding a rate far below what
+ * the window already allows, so that a round M2 sized at min_cwnd packets is
+ * never spread over seconds by pacing. It is applied after the guardrail's
+ * gain, the same way skyline_set_cwnd_target() applies the cwnd floor last.
+ * 32 packets of 1448 bytes over 85 ms is 4.4 Mbit/s, so on the paths this
+ * controller targets it only binds when the estimate is broken.
+ */
+static __always_inline __u64 skyline_pacing_floor_bps(struct tcp_sock *tp,
+                                                  struct skyline_flow_state *flow,
+                                                  const struct skyline_config *config)
+{
+    __u64 rtt_us = skyline_base_rtt_us(flow);
+    __u32 packets = (config->feature_mask & SKYLINE_FEATURE_ADAPTIVE_CWND)
+                        ? skyline_min_cwnd(config)
+                        : SKYLINE_MIN_CWND;
+
+    if (!rtt_us)
+        rtt_us = tp->srtt_us >> 3;
+    if (!rtt_us)
+        return 0;
+    return (__u64)packets * max_t(__u32, tp->mss_cache, 1U) * 8ULL * USEC_PER_SEC / rtt_us;
+}
+
 static __always_inline void skyline_apply_pacing(struct sock *sk,
                                              struct tcp_sock *tp,
                                              struct skyline_flow_state *flow,
@@ -593,6 +645,7 @@ static __always_inline void skyline_apply_pacing(struct sock *sk,
 {
     __u32 gain = config->cruise_pacing_permille;
     __u64 rate;
+    __u64 floor_bps;
     struct skyline_metrics *metric;
 
     if (!(config->feature_mask & SKYLINE_FEATURE_PACING)) {
@@ -627,6 +680,9 @@ static __always_inline void skyline_apply_pacing(struct sock *sk,
         gain = config->guardrail_gain_permille ? config->guardrail_gain_permille : 1000U;
 
     rate = flow->bw_bps * gain / 1000U;
+    floor_bps = skyline_pacing_floor_bps(tp, flow, config);
+    if (rate < floor_bps)
+        rate = floor_bps;
     if (config->max_pacing_bps && rate > config->max_pacing_bps)
         rate = config->max_pacing_bps;
     rate /= 8ULL;
@@ -650,7 +706,7 @@ static __always_inline void skyline_apply_pacing(struct sock *sk,
 static __always_inline void skyline_set_cwnd_target(struct tcp_sock *tp,
                                                 struct skyline_flow_state *flow,
                                                 const struct skyline_config *config,
-                                                __u32 acked)
+                                                __u32 acked, bool after_rto)
 {
     __u32 gain;
     __u32 target;
@@ -663,6 +719,28 @@ static __always_inline void skyline_set_cwnd_target(struct tcp_sock *tp,
          */
         if (acked)
             tcp_slow_start(tp, acked);
+        /* ...but not from the single packet an RTO leaves behind.
+         * tcp_enter_loss() sets snd_cwnd to packets_in_flight + 1 before
+         * cong_control runs again, and a flow can spend its whole life in
+         * this branch: a response that fits in its first flight goes out
+         * with the window not full and nothing left to send, the kernel
+         * marks its rate samples app-limited, and skyline_update_model()
+         * only takes samples that are not -- so bw_bps typically stays zero
+         * for the life of the flow. Without this floor such a flow
+         * slow-starts the rest of its response back up from one packet
+         * after a timeout -- the one place where "never reduce because of
+         * loss" did not hold. The retransmissions this ACK releases
+         * (tcp_xmit_recovery() runs after cong_control) go out under the
+         * floor. Gated on TCP_CA_Loss so the start of a connection keeps
+         * whatever initial window the kernel or initial_cwnd_packets chose,
+         * a deliberately small one included. Outside Loss there is
+         * nothing to undo: for a cong_control algorithm the kernel skips
+         * PRR (tcp_cong_control()), the reset to ssthresh at the end of
+         * recovery (tcp_end_cwnd_reduction()) and both idle decays
+         * (tcp_slow_start_after_idle_check(), tcp_cwnd_validate()).
+         */
+        if (after_rto && tp->snd_cwnd < skyline_min_cwnd(config))
+            tp->snd_cwnd = skyline_min_cwnd(config);
         return;
     }
     gain = flow->mode == SKYLINE_MODE_STARTUP ? config->startup_gain_permille
@@ -930,7 +1008,8 @@ void BPF_PROG(skyline_cong_control, struct sock *sk, __u32 ack, int flag,
      * path unchanged (B1/B2 neutrality).
      */
     if (config->feature_mask & SKYLINE_FEATURE_ADAPTIVE_CWND) {
-        skyline_set_cwnd_target(tp, flow, config, sample->acked_sacked);
+        skyline_set_cwnd_target(tp, flow, config, sample->acked_sacked,
+                                icsk->icsk_ca_state == TCP_CA_Loss);
     } else if (icsk->icsk_ca_state < TCP_CA_CWR) {
         skyline_grow_cwnd(tp, flow, config, sample->acked_sacked);
     } else if (config->feature_mask & SKYLINE_FEATURE_PRR) {
