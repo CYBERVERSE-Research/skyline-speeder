@@ -10,6 +10,26 @@ for anyone holding a prebuilt `.bpf.o`.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-30
+
+### Upgrading from 0.4.1
+
+- **Re-run the installer the way the host was installed.** Only `ssctl`
+  changed: the BPF objects, the ABI and the configuration are as in 0.4.1 --
+  both artifacts again carry the 0.4.0 objects byte for byte -- and
+  `ssctl --json` prints what it printed.
+
+### Changed
+
+- **`ssctl` prints `sudo` in front of its remedies wherever the host has
+  sudo**, the rule the closing guide of `install.sh` follows, so the two no
+  longer disagree on one host. 0.4.1 printed it only when `ssctl` itself had
+  been started through sudo by another user: in a root shell on a host with
+  sudo it said `ssctl enable` where the installer's guide said
+  `sudo ssctl enable`. On a host without sudo -- Alpine unless somebody
+  installed it, the root shell of many cloud images -- the commands are still
+  printed bare. `--json` is unchanged.
+
 ## [0.4.1] - 2026-09-30
 
 ### Upgrading from 0.4.0
@@ -941,7 +961,8 @@ rather than as fixes to a version nobody could have installed.
   socket file permissions. Multi-tenant hosts need additional access control.
 - The experiment harness requires **Python 3.11 or newer** (`tomllib`).
 
-[Unreleased]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.2.0...v0.3.0

@@ -1257,8 +1257,8 @@ mod tests {
     fn theme() -> Theme {
         // Colour off: the assertions below look for text, and a test must
         // not depend on the terminal running it. sudo pinned on for the same
-        // reason: whether this machine has one, and whether the tests run
-        // under it, must not decide what the assertions see.
+        // reason: whether this machine has one must not decide what the
+        // assertions see.
         let mut theme = Theme::detect(ColorChoice::Never);
         theme.sudo = true;
         theme
@@ -1507,9 +1507,9 @@ mod tests {
         assert!(text.contains("nothing on this host is accelerated"));
     }
 
-    /// Every remedy the reports print is a command to paste. Where sudo does
-    /// not belong -- a root shell, Alpine without sudo -- the same commands
-    /// come out bare, and nothing else in either report moves.
+    /// Every remedy the reports print is a command to paste. On a host with
+    /// no sudo -- Alpine, the root shell of many cloud images -- the same
+    /// commands come out bare, and nothing else in either report moves.
     #[test]
     fn remedies_carry_sudo_only_where_it_belongs() {
         let with = theme();
