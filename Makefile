@@ -31,6 +31,17 @@ $(VMLINUX_H): $(PREBUILT_VMLINUX_H)
 	cp $< $@.part
 	mv $@.part $@
 else
+# A header generated here comes from whatever kernel and bpftool this machine
+# has, and bpftool 7.5 and later writes a prototype for every kfunc that kernel
+# exports. One of them can disagree with the declaration the distribution's
+# libbpf headers carry for the same kfunc, and bpf_helpers.h then does not
+# compile: Fedora 43's libbpf 1.6.1 declares bpf_stream_vprintk with four
+# arguments, its 6.17 kernel exports it with five. The sources declare the
+# kfuncs they call themselves (skyline_cc.bpf.c), so these prototypes are
+# switched off. Not for PREBUILT_VMLINUX_H: the pinned reference header a
+# release is built against keeps its prototypes, and the released objects
+# stay byte for byte what they were.
+VMLINUX_CFLAGS := -DBPF_NO_KFUNC_PROTOTYPES
 $(VMLINUX_H): $(VMLINUX_BTF)
 	@mkdir -p $(dir $@)
 	$(BPFTOOL) btf dump file $(VMLINUX_BTF) format c > $@.part
@@ -39,7 +50,7 @@ endif
 
 $(BPF_DIR)/%.bpf.o: bpf/%.bpf.c bpf/include/skyline_abi.h $(VMLINUX_H)
 	@mkdir -p $(BPF_DIR)
-	$(BPF_CLANG) $(BPF_CFLAGS) -I bpf/include -c $< -o $@
+	$(BPF_CLANG) $(BPF_CFLAGS) $(VMLINUX_CFLAGS) -I bpf/include -c $< -o $@
 
 bpf: $(BPF_OBJECTS)
 

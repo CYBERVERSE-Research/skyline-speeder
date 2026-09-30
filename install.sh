@@ -1,15 +1,21 @@
 #!/usr/bin/env bash
 #
-# Skyline Speeder -- one-click installer for Debian / Ubuntu.
+# Skyline Speeder -- one-click installer for Debian / Ubuntu, Fedora, the RHEL
+# family (Rocky Linux, AlmaLinux, CentOS Stream) and Alpine.
 #
 # Exclusively sponsored by Skyline Connect -- https://www.skylineconnect.io
 #
 # Installs the latest published release -- the three CO-RE BPF objects and the
-# Rust control plane, no build toolchain -- together with the systemd units,
-# and activates skyline_cc across reboots. A host that cannot run the published
-# binaries (another architecture, a C library older than they were built
-# against) is told why and gets a build from this source tree instead. Installs
-# no proxy, no network service, and opens no port.
+# Rust control plane, no build toolchain -- together with the systemd units
+# (OpenRC scripts on Alpine), and activates skyline_cc across reboots. A host
+# that cannot run the published binaries (another architecture, a C library
+# older than they were built against, or musl, as on Alpine) is told why and
+# gets a build from this source tree instead. Installs no proxy, no network
+# service, and opens no port.
+#
+# The distribution decides only the package manager and the service manager:
+# apt and systemd on Debian and Ubuntu, dnf and systemd on Fedora and the RHEL
+# family, apk and OpenRC on Alpine. Everything else is the same on all of them.
 #
 #   sudo ./install.sh                  # install the published release; a host that
 #                                      # cannot run it builds from source instead
@@ -32,12 +38,14 @@
 #
 # --uninstall removes the build toolchain it installed (clang, LLVM, bpftool,
 # rustup and what came with them) and nothing else: only packages recorded as
-# added by an install of this host, never iproute2, curl, ca-certificates or
-# tar, never anything one of those still needs, and never one dpkg calls
-# required or important. apt plans the removal first; a package something else
-# on this host now needs is kept, named, and the rest is removed, and nothing
-# at all is removed when no reduced plan stays inside the recorded list. It
-# keeps /etc/skyline-speeder. bbr + fq is set for that boot; no file under
+# added by an install of this host, never iproute2 (iproute on Fedora/RHEL),
+# curl, ca-certificates or tar, never anything one of those still needs, and
+# never one the package manager protects (dpkg's required and important, dnf's
+# protected packages). The removal is planned first (apt, rpm; apk never takes
+# a package something still needs); a package something else on this host now
+# needs is kept, named, and the rest is removed, and nothing at all is removed
+# when no reduced plan stays inside the recorded list. It keeps
+# /etc/skyline-speeder. bbr + fq is set for that boot; no file under
 # /etc/sysctl.d is written or edited, so those files decide again after a
 # reboot.
 #
@@ -91,9 +99,14 @@ ADDED_RUSTUP=/etc/skyline-speeder/added-rustup
 # Recorded as added when they were, but never removed again: iproute2 and
 # curl are how an operator reaches the network and reads a qdisc, tar and
 # ca-certificates are what --prebuilt needed and what half the host uses.
-# A package dpkg calls required or important is skipped for the same reason,
-# whatever its name.
+# A package the package manager protects (dpkg: required or important) is
+# skipped for the same reason, whatever its name. These are the apt names;
+# detect_platform sets the dnf and apk ones.
 KEEP_PKGS=(iproute2 curl ca-certificates tar)
+PKG=            # apt | dnf | apk, or empty: set by detect_platform
+INIT=           # systemd | openrc, or empty: set by detect_platform
+SVC_SUFFIX=     # ".service" under systemd, so messages name the unit as before
+SUDO=           # "sudo " where the host has sudo: the prefix of every command we print
 ADDED_COUNT=0      # packages recorded in $ADDED_PKGS after this run
 ADDED_REMOVABLE=0  # of those, the ones an uninstall would actually remove
 GUIDE_URL=https://github.com/CYBERVERSE-Research/skyline-speeder/blob/main/docs/usage.md
@@ -274,6 +287,10 @@ step_end() {
 # setsid: a background job of a non-interactive shell ignores SIGINT, so Ctrl-C
 # would stop the installer and leave cargo building behind the operator's back.
 # In a session of its own the whole job can be killed as one group instead.
+# util-linux's setsid, that is: busybox's (Alpine without util-linux-misc) has
+# no -w, and handed one it fails at once -- which would fail every step.
+SETSID_W=0
+if setsid -w true >/dev/null 2>&1; then SETSID_W=1; fi
 run() {
     STEP_RAN=1
     if [ "$VERBOSE" -eq 1 ]; then
@@ -284,7 +301,7 @@ run() {
         "$@" </dev/null >>"$LOG" 2>&1 3>&- 4>&-
         return
     fi
-    if command -v setsid >/dev/null 2>&1; then
+    if [ "$SETSID_W" -eq 1 ]; then
         setsid -w "$@" </dev/null >>"$LOG" 2>&1 3>&- 4>&- &
     else
         "$@" </dev/null >>"$LOG" 2>&1 3>&- 4>&- &
@@ -338,6 +355,179 @@ on_exit() {
 }
 trap on_exit EXIT
 trap on_interrupt INT TERM
+
+# --- platform ----------------------------------------------------------------
+# The package manager and the service manager, and nothing else: every step
+# below that differs between distributions branches on PKG and INIT only.
+#   PKG   apt (Debian, Ubuntu and their derivatives), dnf (Fedora, RHEL and its
+#         rebuilds: Rocky Linux, AlmaLinux, CentOS Stream, Oracle Linux), apk
+#         (Alpine); empty when none of those, or when its tool is missing.
+#   INIT  systemd when it is PID 1 (/run/systemd/system is how sd_booted()
+#         tells), openrc when OpenRC runs the host (Alpine); empty otherwise.
+# Called before --uninstall too, which has to stop the services and remove
+# packages the same way an install added them.
+detect_platform() {
+    local id= like=
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        id=$(. /etc/os-release && printf '%s' "${ID:-}")
+        # shellcheck disable=SC1091
+        like=$(. /etc/os-release && printf '%s' "${ID_LIKE:-}")
+    fi
+    PKG=
+    case " $id $like " in
+        *" debian "*|*" ubuntu "*) command -v apt-get >/dev/null 2>&1 && PKG=apt ;;
+        *" fedora "*|*" rhel "*|*" centos "*) command -v dnf >/dev/null 2>&1 && PKG=dnf ;;
+        *" alpine "*) command -v apk >/dev/null 2>&1 && PKG=apk ;;
+    esac
+    case "$PKG" in
+        dnf) KEEP_PKGS=(iproute iproute-tc curl ca-certificates tar) ;;
+        # bash as well: it is what runs this script, and on Alpine it is not
+        # there until something asks for it.
+        apk) KEEP_PKGS=(iproute2 curl ca-certificates tar bash) ;;
+    esac
+    if [ -d /run/systemd/system ]; then
+        INIT=systemd SVC_SUFFIX=.service
+    elif command -v openrc-run >/dev/null 2>&1; then
+        INIT=openrc SVC_SUFFIX=
+    else
+        INIT= SVC_SUFFIX=
+    fi
+    # Alpine has no sudo unless somebody installed it, and a root shell on a
+    # cloud Debian often has none either: the commands this prints are meant
+    # to be pasted, so they carry sudo only where there is one.
+    if command -v sudo >/dev/null 2>&1; then SUDO="sudo "; else SUDO=; fi
+}
+
+# The C library, as the published binaries care about it: musl or glibc.
+# getconf answers for glibc only; musl's loader is what gives Alpine away.
+host_is_musl() {
+    local f
+    for f in /lib/ld-musl-*.so.1; do
+        [ -e "$f" ] && return 0
+    done
+    return 1
+}
+
+# --- service manager ---------------------------------------------------------
+# The same two services everywhere -- skyline-speederd keeps the daemon
+# resident; skyline-speeder-enable attaches skyline_cc once it runs and drains
+# it before it stops -- as systemd units in /etc/systemd/system, or as OpenRC
+# scripts in /etc/init.d (packaging/openrc/). OpenRC's `need` gives the enable
+# service systemd's Requires= + After=: started after the daemon, stopped
+# before it, restarted with it. What differs is only the command for each
+# action, and that OpenRC restarts the dependent service in the background.
+
+# svc_state <service>: active, activating, failed or inactive, in systemd's
+# words; OpenRC's started / starting and stopping / crashed / stopped map onto
+# them. A service that is not installed is inactive.
+svc_state() {
+    local s
+    case "$INIT" in
+        systemd)
+            s=$(systemctl is-active "$1.service" 2>/dev/null || true)
+            case "$s" in
+                active|reloading|refreshing) printf active ;;
+                activating|deactivating) printf activating ;;
+                failed) printf failed ;;
+                *) printf inactive ;;
+            esac ;;
+        openrc)
+            s=$(rc-service "$1" status 2>&1 || true)
+            case "$s" in
+                *"status: started"*) printf active ;;
+                *"status: starting"*|*"status: stopping"*) printf activating ;;
+                *"status: crashed"*) printf failed ;;
+                *) printf inactive ;;
+            esac ;;
+        *) printf inactive ;;
+    esac
+}
+
+svc_active() { [ "$(svc_state "$1")" = active ]; }
+
+# svc_enabled <service>: started at boot. OpenRC's rc-update add is a link in
+# the runlevel's directory.
+svc_enabled() {
+    case "$INIT" in
+        systemd) systemctl is-enabled --quiet "$1.service" 2>/dev/null ;;
+        openrc) [ -e "/etc/runlevels/default/$1" ] ;;
+        *) return 1 ;;
+    esac
+}
+
+# svc_run <enable|enable-now|start|restart> <service>: that action through
+# run(), which takes an external command -- so the command is spelled out here
+# and run() gets it as words.
+svc_run() {
+    local -a cmd=()
+    case "$INIT:$1" in
+        systemd:enable)     cmd=(systemctl enable "$2.service") ;;
+        systemd:enable-now) cmd=(systemctl enable --now "$2.service") ;;
+        systemd:start)      cmd=(systemctl start "$2.service") ;;
+        systemd:restart)    cmd=(systemctl restart "$2.service") ;;
+        openrc:enable)      cmd=(rc-update add "$2" default) ;;
+        openrc:enable-now)  cmd=(sh -c 'rc-update add "$1" default && rc-service "$1" start' sh "$2") ;;
+        openrc:start)       cmd=(rc-service "$2" start) ;;
+        openrc:restart)     cmd=(rc-service "$2" restart) ;;
+        *) log "no service manager to $1 $2 with"; return 1 ;;
+    esac
+    run "${cmd[@]}"
+}
+
+# svc_remove <service>: stop it and take it out of the boot. Never fails:
+# --uninstall goes on either way.
+svc_remove() {
+    case "$INIT" in
+        systemd) systemctl disable --now "$1.service" >/dev/null 2>&1 || true ;;
+        openrc)  rc-service "$1" stop >/dev/null 2>&1 || true
+                 rc-update del "$1" default >/dev/null 2>&1 || true ;;
+    esac
+}
+
+# svc_settle <service> <seconds>: wait while it is starting or stopping. Under
+# systemd there is nothing to wait for here -- `systemctl start` joins a pending
+# job and returns when it is done. OpenRC's restart of skyline-speederd starts
+# skyline-speeder-enable again in the background and returns before
+# boot-enable.sh has attached anything.
+svc_settle() {
+    [ "$INIT" = openrc ] || return 0
+    local deadline=$((SECONDS + $2))
+    while [ "$(svc_state "$1")" = activating ] && [ "$SECONDS" -lt "$deadline" ]; do
+        SPIN_I=$((SPIN_I + 1)); bar_draw; sleep 0.2
+    done
+}
+
+# svc_journal <service>: its last lines into $LOG, for the error that follows.
+# OpenRC hands the daemon's output to syslog (packaging/openrc/skyline-speederd),
+# so that is where they are.
+svc_journal() {
+    case "$INIT" in
+        systemd) journalctl -u "$1.service" -n 40 --no-pager >>"$LOG" 2>&1 || true ;;
+        openrc)
+            if [ -r /var/log/messages ]; then
+                { grep -F "$1" /var/log/messages | tail -n 40 >>"$LOG"; } 2>/dev/null || true
+            fi ;;
+    esac
+}
+
+# svc_hint <action> <service>: the command an operator types for it, sudo
+# included where the host has one, into REPLY.
+svc_hint() {
+    case "$INIT:$1" in
+        systemd:enable-now)  REPLY="${SUDO}systemctl enable --now $2.service" ;;
+        systemd:enable)      REPLY="${SUDO}systemctl enable $2.service" ;;
+        systemd:restart)     REPLY="${SUDO}systemctl restart $2" ;;
+        systemd:disable-now) REPLY="${SUDO}systemctl disable --now $2.service" ;;
+        systemd:logs)        REPLY="journalctl -u $2.service" ;;
+        openrc:enable-now)   REPLY="${SUDO}rc-update add $2 default && ${SUDO}rc-service $2 start" ;;
+        openrc:enable)       REPLY="${SUDO}rc-update add $2 default" ;;
+        openrc:restart)      REPLY="${SUDO}rc-service $2 restart" ;;
+        openrc:disable-now)  REPLY="${SUDO}rc-service $2 stop && ${SUDO}rc-update del $2 default" ;;
+        openrc:logs)         REPLY="grep $2 /var/log/messages" ;;
+        *)                   REPLY="(no service manager on this host)" ;;
+    esac
+}
 
 # --- what is in place now ----------------------------------------------------
 # Root qdisc of an interface as one word: "fq", "cake", "fq_codel", or "mq/"
@@ -967,6 +1157,38 @@ dpkg_installed_set() {
         | awk '$NF == "installed" { print $1 }' | sort || true
 }
 
+# /etc/apk/world as bare names, sorted: an entry may pin a version
+# (`name=1.2`, `name<2`) or a repository (`name@edge`), and `!name` forbids one.
+apk_world() {
+    sed -e '/^!/d' -e 's/[=<>~@].*//' -e '/^[[:space:]]*$/d' /etc/apk/world 2>/dev/null \
+        | sort -u || true
+}
+
+# pkg_record_set: the set whose growth an install records in $ADDED_PKGS, one
+# name per line, sorted. For apt and dnf every installed package: the
+# difference then names the dependencies the install pulled in as well, which
+# is what lets --uninstall remove exactly that set with no autoremove. For apk
+# the world -- the names somebody asked for -- because apk removes a dependency
+# by itself once nothing in the world needs it, and never before.
+#
+# Never gpg-pubkey: that is how rpm stores a repository's signing key, which
+# dnf imports the first time it installs from that repository -- so on a fresh
+# host it "appears" during our install. It is the host's trust in its
+# repositories, not a package of ours, and every key carries the same name:
+# `rpm -e gpg-pubkey` would take them all.
+pkg_record_set() {
+    case "$PKG" in
+        apt) dpkg_installed_set ;;
+        dnf) rpm -qa --qf '%{NAME}\n' 2>/dev/null | awk '$0 != "gpg-pubkey"' | sort -u || true ;;
+        apk) apk_world ;;
+    esac
+}
+
+# The names $ADDED_PKGS records, one per line, comments and blanks dropped.
+recorded_packages() {
+    sed -e 's/#.*//' -e 's/[[:space:]]//g' -e '/^$/d' "$ADDED_PKGS" 2>/dev/null || true
+}
+
 pkg_is_keeper() {
     local k
     for k in "${KEEP_PKGS[@]}"; do
@@ -1014,10 +1236,17 @@ pkg_in_list() {
 # is why APT_OPTS waits five minutes for the dpkg lock. Whatever that installed
 # in the meantime is in the difference and is not ours to remove. Inst lines
 # name apt's dependency closure too, so nothing of ours is lost by this.
+#
+# dnf and apk have the same window, and their own ways of closing it:
+# dnf_own_transaction and apk_own_requests.
 record_added_packages() {
     local before=$1 added tmp planned
     [ -r "$before" ] || return 0
-    added=$(dpkg_installed_set | comm -13 "$before" - || true)
+    added=$(pkg_record_set | comm -13 "$before" - || true)
+    case "$PKG" in
+        dnf) [ -z "$added" ] || added=$(dnf_own_transaction "$added") ;;
+        apk) [ -z "$added" ] || added=$(apk_own_requests "$added") ;;
+    esac
     if [ -n "$added" ] && [ -n "${APT_SIM:-}" ] && [ -r "${APT_SIM:-/nonexistent}" ]; then
         planned=$(mktemp)
         sed -n 's/^Inst \([^ :]*\).*/\1/p' "$APT_SIM" | sort -u >"$planned"
@@ -1031,7 +1260,7 @@ record_added_packages() {
         rm -f "$planned"
     fi
     if [ -z "$added" ]; then
-        log "apt added no package that was not installed already"
+        log "$PKG added no package that was not installed already"
         [ ! -r "$ADDED_PKGS" ] || ADDED_COUNT=$(grep -cv '^#' "$ADDED_PKGS" || true)
         count_removable_packages
         return 0
@@ -1043,14 +1272,57 @@ record_added_packages() {
     { printf '%s\n' \
         "# Packages an install of Skyline Speeder added to this host, one per line," \
         "# as the union over every run of this installer. --uninstall removes them" \
-        "# again; delete a line to keep that package. iproute2, curl, ca-certificates" \
-        "# and tar are never removed even when listed here, and neither is anything" \
-        "# dpkg calls required or important."
+        "# again; delete a line to keep that package. Never removed even when listed" \
+        "# here: ${KEEP_PKGS[*]}, and anything $PKG protects."
+      [ "$PKG" != apk ] || printf '%s\n' \
+        "# These are the names it asked apk for; apk removes what came with them."
       cat "$tmp"; } >"$ADDED_PKGS"
     ADDED_COUNT=$(grep -cv '^#' "$ADDED_PKGS" || true)
     count_removable_packages
     log "packages added by this run: $(tr '\n' ' ' <<<"$added")"
     rm -f "$tmp"
+}
+
+# dnf_own_transaction <added>: of the packages that appeared while dnf ran,
+# the ones that came in with this run's request. rpm stamps every package with
+# the transaction that installed it (INSTALLTID), so another dnf run in the
+# window -- dnf-automatic, an operator in a second shell -- is told apart by
+# its stamp: ours is the one a package this run asked for carries. A request
+# named by what it provides ('libelf.so.1()(64bit)') is resolved to its package
+# first. Nothing asked for is new: then nothing that appeared is ours either.
+dnf_own_transaction() {
+    local added=$1 p want tids
+    tids=" "
+    for p in "${DNF_REQUEST[@]}"; do
+        while IFS= read -r want; do
+            case $'\n'"$added"$'\n' in
+                *$'\n'"$want"$'\n'*)
+                    tids="$tids$(rpm -q --qf '%{INSTALLTID} ' "$want" 2>/dev/null || true)" ;;
+            esac
+        done < <(rpm -q --whatprovides --qf '%{NAME}\n' "$p" 2>/dev/null || printf '%s\n' "$p")
+    done
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        case "$tids" in
+            *" $(rpm -q --qf '%{INSTALLTID}' "$p" 2>/dev/null || true) "*) printf '%s\n' "$p" ;;
+            *) log "not recorded (installed by another transaction while dnf ran): $p" ;;
+        esac
+    done <<<"$added"
+}
+
+# apk_own_requests <added>: of the names that appeared in the world while apk
+# ran, the ones this run asked for. Only a request puts a name there, so this
+# is exact.
+apk_own_requests() {
+    local p
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        if pkg_in_list "$p" "${PKGS[@]}"; then
+            printf '%s\n' "$p"
+        else
+            log "not recorded (added to the world by something else while apk ran): $p"
+        fi
+    done <<<"$1"
 }
 
 # How many recorded packages an uninstall would actually remove, into
@@ -1066,7 +1338,7 @@ count_removable_packages() {
         p=${p//[[:space:]]/}
         [ -n "$p" ] || continue
         pkg_is_keeper "$p" && continue
-        pkg_priority_protected "$p" && continue
+        pkg_protected "$p" && continue
         ADDED_REMOVABLE=$((ADDED_REMOVABLE + 1))
     done <"$ADDED_PKGS"
 }
@@ -1077,9 +1349,40 @@ count_removable_packages() {
 # result then answers about a string no instance actually has. awk rather than
 # `grep -q` so nothing exits early on a producer this script pipes into --
 # SIGPIPE plus pipefail is the trap this file documents in four other places.
+# rpm and apk answer the same question with an exit status of their own.
 pkg_installed() {
-    dpkg-query -W -f '${Status}\n' "$1" 2>/dev/null \
-        | awk '/ installed$/ { found = 1 } END { exit !found }'
+    case "$PKG" in
+        dnf) rpm -q --quiet "$1" 2>/dev/null ;;
+        apk) apk info -e "$1" >/dev/null 2>&1 ;;
+        *) dpkg-query -W -f '${Status}\n' "$1" 2>/dev/null \
+               | awk '/ installed$/ { found = 1 } END { exit !found }' ;;
+    esac
+}
+
+# pkg_protected <package>: whether the package manager keeps it whatever the
+# record says -- dpkg's required and important priorities, dnf's protected
+# packages (and gpg-pubkey, see pkg_record_set). apk has no such notion; its
+# world is what protects a package.
+pkg_protected() {
+    case "$PKG" in
+        apt) pkg_priority_protected "$1" ;;
+        dnf) [ "$1" = gpg-pubkey ] || dnf_protected "$1" ;;
+        *) return 1 ;;
+    esac
+}
+
+# dnf_protected <package>: named in dnf's protected_packages (the files under
+# /etc/dnf/protected.d: systemd, sudo, the boot loader), which dnf refuses to
+# remove -- and asking it to fails the whole removal, not just that package.
+dnf_protected() {
+    local f
+    for f in /etc/dnf/protected.d/*.conf; do
+        [ -r "$f" ] || continue
+        if awk -v p="$1" '{ sub(/#.*/, "") } $1 == p { found = 1 } END { exit !found }' "$f"; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 # pkg_priority_protected <package>: whether dpkg calls it required or important
@@ -1111,6 +1414,9 @@ pkg_priority_protected() {
 # ifupdown, isc-dhcp-client and cloud-init among them. By this point Skyline
 # Speeder itself is already gone, so every failure here is a warning and a
 # command to run by hand, never an error that stops the uninstall.
+#
+# dnf and apk get the same promise their own way: purge_toolchain_dnf and
+# purge_toolchain_apk.
 purge_toolchain() {
     local -a want=() extra=() keep=()
     local p sim out protected round kept
@@ -1118,6 +1424,10 @@ purge_toolchain() {
         log "no $ADDED_PKGS: this host has no record of packages an install added"
         return 0
     fi
+    case "$PKG" in
+        dnf) purge_toolchain_dnf; return 0 ;;
+        apk) purge_toolchain_apk; return 0 ;;
+    esac
     if ! command -v apt-get >/dev/null 2>&1; then
         warn "no apt-get here; the packages listed in $ADDED_PKGS were left installed"
         return 0
@@ -1244,6 +1554,133 @@ purge_toolchain() {
     rm -f "$sim" "$out" "$protected"
 }
 
+# purge_toolchain_dnf: the same removal where dnf installed the packages. The
+# record is the difference of two rpm databases, so it names what dnf pulled
+# in with the toolchain too, and rpm plans the removal: `rpm -e --test` over
+# exactly that set fails, naming the capability and who needs it, when a
+# package outside the set still needs one of ours -- curl a library of its own,
+# something installed since that links LLVM. The one of ours that provides it
+# is kept and the plan made again, until rpm finds nothing (or the rounds run
+# out, and nothing is removed). dnf then does the removal, with
+# clean_requirements_on_remove off: the set already is everything the install
+# added, and dnf's autoremove would take orphans this installer never created.
+purge_toolchain_dnf() {
+    local -a want=() keep=()
+    local p cap who prov out round=0 kept=0
+    while IFS= read -r p; do
+        if pkg_is_keeper "$p" || pkg_protected "$p"; then
+            kept=$((kept + 1))
+            continue
+        fi
+        # Not installed any more: somebody else removed it, or a previous
+        # uninstall did.
+        pkg_installed "$p" || continue
+        want+=("$p")
+    done < <(recorded_packages)
+    [ "$kept" -eq 0 ] || info "keeping $kept recorded package(s): a keeper, or one dnf protects"
+    if [ "${#want[@]}" -eq 0 ]; then
+        ok "no packages to remove: nothing this installer added is still installed"
+        rm -f "$ADDED_PKGS"
+        return 0
+    fi
+    out=$(mktemp)
+    while ! rpm -e --test "${want[@]}" >"$out" 2>&1; do
+        round=$((round + 1))
+        keep=()
+        # "	libclang-cpp.so.21()(64bit) is needed by (installed) foo-1.0-1.x86_64"
+        while IFS='|' read -r cap who; do
+            [ -n "$cap" ] || continue
+            while IFS= read -r prov; do
+                if pkg_in_list "$prov" "${want[@]}" && ! pkg_in_list "$prov" ${keep[@]+"${keep[@]}"}; then
+                    keep+=("$prov")
+                    warn "keeping $prov: $who on this host still needs it"
+                fi
+            done < <(rpm -q --whatprovides --qf '%{NAME}\n' "$cap" 2>/dev/null || true)
+        done < <(awk '/ is needed by / {
+                          line = $0; sub(/^[ \t]+/, "", line)
+                          cap = line; sub(/ .*/, "", cap)
+                          who = line; sub(/.* is needed by /, "", who); sub(/^\(installed\) /, "", who)
+                          print cap "|" who
+                      }' "$out")
+        if [ "${#keep[@]}" -eq 0 ] || [ "$round" -ge 10 ]; then
+            warn "rpm cannot plan removing the packages this installer added, so none were removed:"
+            while IFS= read -r p; do warn "  $p"; done < <(tail -n 5 "$out")
+            warn "  to remove them by hand: dnf remove ${want[*]}"
+            rm -f "$out"
+            return 0
+        fi
+        local -a left=()
+        for p in "${want[@]}"; do
+            pkg_in_list "$p" "${keep[@]}" || left+=("$p")
+        done
+        want=(${left[@]+"${left[@]}"})
+        if [ "${#want[@]}" -eq 0 ]; then
+            ok "no packages left to remove: this host needs all of them"
+            rm -f "$out"
+            return 0
+        fi
+    done
+    info "removing ${#want[@]} package(s) this installer added"
+    if dnf -y -q remove --setopt=clean_requirements_on_remove=False "${want[@]}" >"$out" 2>&1; then
+        ok "removed: ${want[*]}"
+        rm -f "$ADDED_PKGS"
+    else
+        warn "dnf failed to remove these, and left them installed: ${want[*]}"
+        while IFS= read -r p; do warn "  $p"; done < <(tail -n 5 "$out")
+    fi
+    rm -f "$out"
+}
+
+# purge_toolchain_apk: the same removal where apk installed the packages. The
+# record holds what the install put in /etc/apk/world -- the names it asked
+# for, not what came with them -- and `apk del` takes those out of the world
+# and then removes whatever nothing left in it still needs. So it cannot take a
+# library curl needs, or a package somebody asked for by name before or since:
+# the rail the apt path has to build for itself is how apk works. apk names
+# what it kept, and why.
+purge_toolchain_apk() {
+    local -a want=()
+    local p out world kept=0 n
+    # A file, not `apk_world | grep -q`: grep exiting at the first match would
+    # SIGPIPE the producer, and under pipefail the test would read false.
+    world=$(mktemp)
+    apk_world >"$world"
+    while IFS= read -r p; do
+        if pkg_is_keeper "$p"; then
+            kept=$((kept + 1))
+            continue
+        fi
+        # Out of the world already: somebody else removed it, or a previous
+        # uninstall did.
+        grep -qxF -- "$p" "$world" || continue
+        want+=("$p")
+    done < <(recorded_packages)
+    [ "$kept" -eq 0 ] || info "keeping $kept recorded package(s): ${KEEP_PKGS[*]} stay"
+    if [ "${#want[@]}" -eq 0 ]; then
+        ok "no packages to remove: nothing this installer added is still installed"
+        rm -f "$ADDED_PKGS" "$world"
+        return 0
+    fi
+    info "removing ${#want[@]} package(s) this installer added, and what only they needed"
+    out=$(mktemp)
+    if apk del --no-progress "${want[@]}" >"$out" 2>&1; then
+        n=$(grep -c ' Purging ' "$out" || true)
+        ok "removed: ${want[*]} ($n package(s) in all)"
+        # "World updated, but the following packages are not removed due to:",
+        # then "  pkg: what needs it" lines, a blank line, and the removal.
+        if grep -q 'not removed due to' "$out"; then
+            warn "apk kept some of them, because something else on this host needs them:"
+            while IFS= read -r p; do warn "  $p"; done \
+                < <(awk '/not removed due to/ { f = 1; next } f && !NF { exit } f { print }' "$out")
+        fi
+        rm -f "$ADDED_PKGS"
+    else
+        warn "apk failed to remove these, and left them installed: ${want[*]}"
+        while IFS= read -r p; do warn "  $p"; done < <(tail -n 5 "$out")
+    fi
+    rm -f "$out" "$world"
+}
+
 # purge_rustup: undo the rustup installation an install of this host made.
 # Only that one: the paths come from $ADDED_RUSTUP, which is written only on
 # the run that installed rustup, so a toolchain the operator had before is
@@ -1314,6 +1751,10 @@ prebuilt_blocker() {
         *" $arch "*) ;;
         *) printf 'releases publish no %s artifact (only %s)' "$arch" "$PREBUILT_ARCHES"; return ;;
     esac
+    if host_is_musl; then
+        printf 'the C library here is musl, and the published binaries are built against glibc'
+        return
+    fi
     glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}') || true
     if [ -z "$glibc" ]; then
         printf 'the C library is not glibc, or its version cannot be read'
@@ -1343,6 +1784,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ "$(id -u)" -eq 0 ] || die "must run as root (try: sudo $0)"
+detect_platform
 
 printf '\n %sSkyline Speeder%s\n' "$BLD" "$RST" >&3
 sponsor '--'
@@ -1371,6 +1813,7 @@ if [ "$MODE" = uninstall ]; then
     ACTIVE=0
     for path in /etc/systemd/system/skyline-speederd.service \
                 /etc/systemd/system/skyline-speeder-enable.service \
+                /etc/init.d/skyline-speederd /etc/init.d/skyline-speeder-enable \
                 /usr/local/sbin/skyline-speederd /usr/local/bin/ssctl \
                 /opt/skyline-speeder; do
         [ ! -e "$path" ] || { ACTIVE=1; break; }
@@ -1397,13 +1840,14 @@ if [ "$MODE" = uninstall ]; then
         info "draining active flows (up to 60s)"
         ssctl drain --timeout 60 >/dev/null 2>&1 || true
     fi
-    systemctl disable --now skyline-speeder-enable.service >/dev/null 2>&1 || true
-    systemctl disable --now skyline-speederd.service >/dev/null 2>&1 || true
+    svc_remove skyline-speeder-enable
+    svc_remove skyline-speederd
     rm -f /etc/systemd/system/skyline-speederd.service \
           /etc/systemd/system/skyline-speeder-enable.service \
+          /etc/init.d/skyline-speederd /etc/init.d/skyline-speeder-enable \
           /usr/local/sbin/skyline-speederd /usr/local/bin/ssctl
     rm -rf /opt/skyline-speeder
-    systemctl daemon-reload
+    [ "$INIT" != systemd ] || systemctl daemon-reload
 
     # Counted HERE, before the toolchain goes: bpftool is one of the packages an
     # install added, so asking after the purge would always answer "none" on the
@@ -1495,7 +1939,7 @@ case "$SOURCE" in
         ;;
     prebuilt)
         [ -z "$BLOCKER" ] || die "--prebuilt/--release cannot install here: $BLOCKER.
-   Build from source instead: sudo $0 --source"
+   Build from source instead: ${SUDO}$0 --source"
         ;;
 esac
 
@@ -1529,10 +1973,11 @@ fi
 [ -r /etc/os-release ] || die "/etc/os-release missing; unsupported system"
 # shellcheck disable=SC1091
 . /etc/os-release
-case "${ID:-}:${ID_LIKE:-}" in
-    debian:*|ubuntu:*|*:*debian*|*:*ubuntu*) ok "distribution: ${PRETTY_NAME:-$ID}" ;;
-    *) die "this installer supports Debian/Ubuntu only (found ID=${ID:-unknown})" ;;
-esac
+[ -n "$PKG" ] || die "this installer supports Debian/Ubuntu, Fedora, the RHEL family (Rocky Linux,
+   AlmaLinux, CentOS Stream) and Alpine (found ID=${ID:-unknown}${ID_LIKE:+, ID_LIKE=$ID_LIKE})"
+[ -n "$INIT" ] || die "neither systemd nor OpenRC runs this host (PID 1 is $(cat /proc/1/comm 2>/dev/null || echo unknown)).
+   skyline-speederd and the service that attaches skyline_cc need one of them."
+ok "distribution: ${PRETTY_NAME:-$ID} ($PKG, $INIT)"
 
 # --- 2. kernel version -----------------------------------------------------
 # Hard ABI floor. skyline_cc hangs off tcp_congestion_ops.cong_control declared
@@ -1556,7 +2001,26 @@ ok "kernel BTF present"
 if [ ! -d /sys/fs/cgroup ] || ! grep -qw cgroup2 /proc/filesystems; then
     die "cgroup v2 is required (the sockops policy attaches to a cgroup v2 path)"
 fi
-ok "cgroup v2 available"
+# Mounted, too, where skyline-speederd looks for it -- the unified hierarchy at
+# /sys/fs/cgroup; it refuses to start otherwise. systemd always mounts it
+# there. OpenRC does once its cgroups service runs, which on Alpine is in no
+# runlevel: skyline-speederd's service `need`s it from now on, at every boot,
+# and it is started here for the verifier step. A preflight starts nothing.
+if [ ! -e /sys/fs/cgroup/cgroup.controllers ] && [ "$INIT" = openrc ] && [ "$MODE" = install ]; then
+    rc-service cgroups start >>"$LOG" 2>&1 || true
+fi
+if [ -e /sys/fs/cgroup/cgroup.controllers ]; then
+    ok "cgroup v2 available"
+elif [ "$INIT" = openrc ] && [ "$MODE" = check ]; then
+    ok "cgroup v2 available (not mounted yet: an install starts OpenRC's cgroups service)"
+elif [ "$INIT" = openrc ]; then
+    die "cgroup v2 is not mounted at /sys/fs/cgroup.
+   OpenRC mounts it there only in its unified mode: set rc_cgroup_mode=\"unified\"
+   in /etc/rc.conf (what an unset one means), then reboot."
+else
+    die "cgroup v2 is not mounted at /sys/fs/cgroup (a hybrid or legacy cgroup
+   layout). Boot with the unified hierarchy (systemd.unified_cgroup_hierarchy=1)."
+fi
 
 # --- 4. what the host runs now ---------------------------------------------
 # Recorded before anything changes: the summary reports "was", the pre-install
@@ -1580,13 +2044,73 @@ log "before: tcp_congestion_control=$BEFORE_CC default_qdisc=$BEFORE_DQ egress: 
 export DEBIAN_FRONTEND=noninteractive
 # iproute2 on both paths: skyline-speederd runs `tc` to put fq on the egress
 # interface, and the steps below use `ip` and `tc` to find and report it.
-if [ "$SOURCE" = prebuilt ]; then
-    # The whole point of --prebuilt: no compiler, no LLVM, no bpftool, no Rust.
-    # Only what it takes to fetch and unpack an archive.
-    PKGS=(curl ca-certificates tar iproute2)
-else
-    PKGS=(build-essential pkg-config clang llvm libbpf-dev libelf-dev zlib1g-dev bpftool curl iproute2)
+# Fedora and the RHEL family split `tc` into iproute-tc, which a cloud image
+# of Fedora does not have.
+#
+# The whole point of --prebuilt: no compiler, no LLVM, no bpftool, no Rust.
+# Only what it takes to fetch and unpack an archive -- and, under dnf, the two
+# libraries the published skyline-speederd links, named by what they provide
+# so that zlib's move to zlib-ng does not matter. A source build needs the
+# same toolchain everywhere, under each distribution's own names; on Alpine
+# that includes linux-headers (musl has no kernel headers, and the libbpf that
+# libbpf-sys compiles includes them), bash, which this script runs in, and
+# libgcc: the musl build of skyline-speederd links libgcc_s for unwinding, and
+# nothing else in the list would keep it once the toolchain was removed by hand.
+case "$PKG:$SOURCE" in
+    apt:prebuilt) PKGS=(curl ca-certificates tar iproute2) ;;
+    apt:*)        PKGS=(build-essential pkg-config clang llvm libbpf-dev libelf-dev zlib1g-dev bpftool curl iproute2) ;;
+    dnf:prebuilt) PKGS=(curl ca-certificates tar iproute iproute-tc 'libelf.so.1()(64bit)' 'libz.so.1()(64bit)') ;;
+    dnf:*)        PKGS=(gcc make pkgconf-pkg-config clang llvm libbpf-devel elfutils-libelf-devel zlib-devel
+                        bpftool curl ca-certificates tar iproute iproute-tc) ;;
+    apk:prebuilt) PKGS=(curl ca-certificates tar iproute2 bash) ;;
+    apk:*)        PKGS=(build-base pkgconf clang llvm libbpf-dev elfutils-dev zlib-dev linux-headers
+                        bpftool curl ca-certificates tar iproute2 bash libgcc) ;;
+esac
+DNF_REQUEST=("${PKGS[@]}")  # what dnf_own_transaction recognises this run's transaction by
+
+# dnf: no weak dependencies (compiler-rt, libomp and the like come along with
+# clang otherwise). On RHEL and its rebuilds libbpf-devel lives in CodeReady
+# Builder, a repository every such host has defined and switched off: it is
+# switched on for this one transaction (--enablerepo), not in its .repo file.
+DNF_OPTS=(--setopt=install_weak_deps=False)
+# A switched-off CodeReady Builder repository by any of its names: crb (Rocky,
+# AlmaLinux, CentOS Stream), codeready-builder-for-rhel-N-ARCH-rpms (RHEL,
+# once registered), olN_codeready_builder (Oracle Linux).
+dnf_crb_repo() {
+    dnf -q repolist --disabled 2>/dev/null | awk '
+        !found && ($1 == "crb" || $1 ~ /^codeready-builder-for-rhel-[0-9]+-[a-z0-9_]+-rpms$/ ||
+                   $1 ~ /^ol[0-9]+_codeready_builder$/) { print $1; found = 1 }' || true
+}
+if [ "$PKG" = dnf ] && [ "$SOURCE" = build ]; then
+    CRB_REPO=$(dnf_crb_repo)
+    [ -z "$CRB_REPO" ] || DNF_OPTS+=(--enablerepo="$CRB_REPO")
 fi
+
+# apk: bpftool is in Alpine's community repository, which a host may not have
+# enabled. Then the community repository of the same mirror and release is
+# added for this one command (--repository), not to /etc/apk/repositories.
+# Printed only when community is not configured and a main repository is.
+apk_community_url() {
+    awk '
+        /^[[:space:]]*(#|$)/ { next }
+        $NF ~ /\/community\/?$/ { has = 1 }
+        main == "" && $NF ~ /\/main\/?$/ { main = $NF }
+        END { if (!has && main != "") { sub(/\/main\/?$/, "/community", main); print main } }
+    ' /etc/apk/repositories 2>/dev/null || true
+}
+APK_OPTS=(--no-progress)
+if [ "$PKG" = apk ] && [ "$SOURCE" = build ]; then
+    COMMUNITY_URL=$(apk_community_url)
+    [ -z "$COMMUNITY_URL" ] || APK_OPTS+=(--repository "$COMMUNITY_URL")
+fi
+
+# The first error line dnf or apk wrote to the log in this step, for the die
+# message: dnf says "Error: ..." (dnf5: "Failed to resolve the transaction:"
+# and the problem under it), apk "ERROR: ...".
+pkg_error() {
+    awk -v from="$STEP_LOG_LINE" 'NR > from && /^(Error|ERROR|Failed to resolve|Problem|No match for argument)/ {
+        if (n++ < 3) print }' "$LOG" 2>/dev/null | tr '\n' ' ' || true
+}
 
 APT_SPEC=()     # $PKGS, carrying an explicit version where this host needs one
 APT_PINNED=0    # 1 once a version of our own choosing is in APT_SPEC
@@ -1787,22 +2311,47 @@ if [ "$MODE" = check ]; then
         ok "prebuilt install needs no build toolchain on this host"
     else
         MISSING=()
-        for c in clang llvm-config bpftool cargo; do
+        # What the build runs: clang and bpftool for the BPF objects (make
+        # bpf), cargo for the control plane.
+        for c in clang bpftool cargo; do
             command -v "$c" >/dev/null 2>&1 || MISSING+=("$c")
         done
         [ ${#MISSING[@]} -eq 0 ] && ok "toolchain present" || warn "missing: ${MISSING[*]}"
     fi
-    # Whether apt can place those packages at all, which is a different
-    # question from whether they are installed: on a host whose libraries came
-    # from another suite the distribution's own -dev packages cannot be
-    # installed as they stand. An install works around it (apt_plan); a
-    # preflight only reports what it sees, and changes nothing while it looks.
-    if apt_plan "${PKGS[@]}"; then
-        ok "apt can install the packages the install needs"
-    else
-        warn "apt cannot install ${PKGS[*]} on this host as it stands:"
-        warn "$(apt_error)"
-    fi
+    # Whether the package manager can place those packages at all, which is a
+    # different question from whether they are installed: on a host whose
+    # libraries came from another suite the distribution's own -dev packages
+    # cannot be installed as they stand. An install works around it for apt
+    # (apt_plan); a preflight only reports what it sees, and changes nothing
+    # while it looks. dnf and apk resolve the whole request without doing it
+    # (--assumeno, --simulate).
+    case "$PKG" in
+        apt)
+            if apt_plan "${PKGS[@]}"; then
+                ok "apt can install the packages the install needs"
+            else
+                warn "apt cannot install ${PKGS[*]} on this host as it stands:"
+                warn "$(apt_error)"
+            fi ;;
+        dnf)
+            # --assumeno exits 1 whether or not the request resolved, so the
+            # answer is in what dnf printed: a transaction, or nothing to do.
+            DNF_SIM=$(dnf install --assumeno "${DNF_OPTS[@]}" "${PKGS[@]}" 2>&1 || true)
+            case "$DNF_SIM" in
+                *"Transaction Summary"*|*"Nothing to do"*)
+                    ok "dnf can install the packages the install needs${CRB_REPO:+ (with $CRB_REPO for this one transaction)}" ;;
+                *)
+                    warn "dnf cannot install ${PKGS[*]} on this host as it stands:"
+                    warn "$(printf '%s\n' "$DNF_SIM" | awk '/^(Error|Failed to resolve|Problem|No match for argument)/ { if (n++ < 3) print }' | tr '\n' ' ')" ;;
+            esac ;;
+        apk)
+            if APK_SIM=$(apk add --simulate "${APK_OPTS[@]}" "${PKGS[@]}" 2>&1); then
+                ok "apk can install the packages the install needs${COMMUNITY_URL:+ (with $COMMUNITY_URL for this one command)}"
+            else
+                warn "apk cannot install ${PKGS[*]} on this host as it stands:"
+                warn "$(printf '%s\n' "$APK_SIM" | awk '/^ERROR|no such package/ { if (n++ < 3) print }' | tr '\n' ' ')"
+            fi ;;
+    esac
     describe_egress
     info "now: congestion control $BEFORE_CC, default_qdisc $BEFORE_DQ, $REPLY"
     while IFS='|' read -r key value file; do
@@ -1828,7 +2377,7 @@ if [ -x /usr/local/sbin/skyline-speederd ]; then
     HAD_BINARY=1
     OLD_VERSION=$(daemon_version)
 fi
-if systemctl is-active --quiet skyline-speederd.service 2>/dev/null; then
+if svc_active skyline-speederd; then
     UPGRADE=1
     # The restart drops every override made with ssctl (they live only in the
     # daemon's memory). Keep the old state in the log so it can be re-applied.
@@ -1847,15 +2396,47 @@ if systemctl is-active --quiet skyline-speederd.service 2>/dev/null; then
     # daemon's `enabled`: a drain that timed out (over SSH it always does)
     # has already written fallback_cc but leaves `"enabled": true` behind.
     # That host was detached on purpose, and must not be attached again.
-    if systemctl is-active --quiet skyline-speeder-enable.service 2>/dev/null; then
+    if svc_active skyline-speeder-enable; then
         ENABLE_UNIT_WAS_ACTIVE=1
     elif [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" = skyline_cc ]; then
         BARE_ATTACHED=1
-        log "upgrade: skyline_cc is attached without skyline-speeder-enable.service (a bare ssctl enable)"
+        log "upgrade: skyline_cc is attached without skyline-speeder-enable$SVC_SUFFIX (a bare ssctl enable)"
     fi
 fi
 
 step "Installing packages"
+if [ "$PKG" = dnf ] || [ "$PKG" = apk ]; then
+    # No plan of our own for these two: dnf and apk resolve the request as a
+    # whole and either install all of it or nothing, and what they say when
+    # they cannot is the message. The index refresh first, like apt's update,
+    # and the same way: a repository that cannot be refreshed is reported,
+    # and the install tries with what the host has.
+    if [ "$PKG" = dnf ]; then
+        run dnf -q makecache "${DNF_OPTS[@]}" \
+            || warn "dnf could not refresh its metadata; continuing with what this host has"
+        [ -z "${CRB_REPO:-}" ] || info "libbpf-devel comes from $CRB_REPO, switched on for this one transaction"
+    else
+        run apk update "${APK_OPTS[@]}" \
+            || warn "apk could not refresh its index; continuing with what this host has"
+        [ -z "${COMMUNITY_URL:-}" ] || warn "bpftool comes from $COMMUNITY_URL, which /etc/apk/repositories does not list; used for this one command, the file is not changed"
+    fi
+    # What the host has now, so what the install adds can be recorded:
+    # --uninstall removes exactly that, and never a package the host had.
+    pkg_record_set >"$WORK/pkgs-before"
+    if [ "$PKG" = dnf ]; then
+        run dnf -y install "${DNF_OPTS[@]}" "${PKGS[@]}" \
+            || die "dnf could not install the packages this install needs: $(pkg_error)"
+    else
+        run apk add "${APK_OPTS[@]}" "${PKGS[@]}" \
+            || die "apk could not install the packages this install needs: $(pkg_error)"
+    fi
+    record_added_packages "$WORK/pkgs-before"
+    if [ "$ADDED_COUNT" -gt 0 ]; then
+        ok "prerequisites installed ($ADDED_COUNT package(s) recorded; --uninstall removes them again)"
+    else
+        ok "prerequisites installed (this host already had all of them)"
+    fi
+else
 if ! run apt-get "${APT_OPTS[@]}" update; then
     # One unusable source fails the whole update even when every suite that
     # matters refreshed -- a suite that no longer exists ("does not have a
@@ -1912,6 +2493,7 @@ if [ "$ADDED_COUNT" -gt 0 ]; then
 else
     ok "prerequisites installed (this host already had all of them)"
 fi
+fi
 
 # --- 6. Rust ---------------------------------------------------------------
 # Skipped entirely for a prebuilt install -- the binaries are already built.
@@ -1940,17 +2522,21 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 export PATH
 command -v cargo >/dev/null 2>&1 || die "cargo is still not on PATH after rustup install"
+# cargo runs from inside the tree, because that is where rustup finds
+# rust-toolchain.toml (and cargo its .cargo/config.toml). Through sh rather
+# than `env -C`, which is GNU coreutils: busybox's env (Alpine) has no -C.
+IN_TREE=(sh -c 'cd "$0" && exec "$@"' "$REPO_ROOT")
 # The first cargo run inside the tree is where rustup fetches the pinned
 # toolchain. Make it happen here, so the download is not hidden inside the build.
-run env -C "$REPO_ROOT" cargo --version \
+run "${IN_TREE[@]}" cargo --version \
     || die "cargo cannot run the toolchain rust-toolchain.toml pins"
-ok "rust: $(env -C "$REPO_ROOT" cargo --version 2>/dev/null || cargo --version)"
+ok "rust: $(cd "$REPO_ROOT" && cargo --version 2>/dev/null || cargo --version)"
 
 step "Building the BPF objects"
 run make -C "$REPO_ROOT" bpf || die "building the BPF objects failed"
 
 step "Building the Rust control plane"
-run env -C "$REPO_ROOT" cargo build --workspace --release \
+run "${IN_TREE[@]}" cargo build --workspace --release \
     || die "building the Rust control plane failed"
 fi
 
@@ -2049,16 +2635,27 @@ fetch_prebuilt() {
 install_prebuilt_files() {
     local root=$PREBUILT_ROOT
     install -d /opt/skyline-speeder/bpf /opt/skyline-speeder/infra \
-        /etc/skyline-speeder /run/skyline-speeder /sys/fs/bpf/skyline-speeder
+        /etc/skyline-speeder /run/skyline-speeder /sys/fs/bpf/skyline-speeder \
+        /usr/local/sbin /usr/local/bin
     install -m 0755 "$root/bin/skyline-speederd" /usr/local/sbin/skyline-speederd
     install -m 0755 "$root/bin/ssctl" /usr/local/bin/ssctl
     install -m 0644 "$root"/bpf/*.bpf.o /opt/skyline-speeder/bpf/
     install -m 0755 "$root"/infra/*.sh /opt/skyline-speeder/infra/
-    install -m 0644 "$root"/packaging/*.service /etc/systemd/system/
+    if [ "$INIT" = systemd ]; then
+        install -m 0644 "$root"/packaging/*.service /etc/systemd/system/
+    else
+        # The published artifact carries the systemd units only, so an OpenRC
+        # host takes its two scripts from this installer's own tree -- the
+        # same two a source build installs.
+        [ -r "$REPO_ROOT/packaging/openrc/skyline-speederd" ] \
+            || die "no packaging/openrc/ beside this install.sh: run it from a Skyline Speeder source tree"
+        install -m 0755 "$REPO_ROOT/packaging/openrc/skyline-speederd" /etc/init.d/skyline-speederd
+        install -m 0755 "$REPO_ROOT/packaging/openrc/skyline-speeder-enable" /etc/init.d/skyline-speeder-enable
+    fi
     [ -e /etc/skyline-speeder/speeder.toml ] \
         || install -m 0644 "$root/config/speeder.toml" /etc/skyline-speeder/speeder.toml
     mkdir -p /sys/fs/cgroup/skyline-speeder
-    systemctl daemon-reload
+    [ "$INIT" != systemd ] || systemctl daemon-reload
     ok "prebuilt artifacts installed (no toolchain was used)"
 }
 
@@ -2108,7 +2705,8 @@ fi
 # NIC, or the bogus "link" 0.2.0's route parser wrote for `default dev wg0
 # scope link`) silently leaves skyline_tc detached and no NIC qdisc managed,
 # and skyline-speederd refuses a non-Ethernet one. Say which, once.
-TC_FIX="set it in $CFG, then: sudo systemctl restart skyline-speederd"
+svc_hint restart skyline-speederd
+TC_FIX="set it in $CFG, then: $REPLY"
 TC_TYPE=
 [ -z "$DEV" ] || TC_TYPE=$(cat "/sys/class/net/$DEV/type" 2>/dev/null || true)
 if [ -z "$DEV" ]; then
@@ -2181,12 +2779,14 @@ SOCKET=$(awk -F'"' '/^socket_path[[:space:]]*=/ { print $2; exit }' "$CFG" 2>/de
 SOCKET=${SOCKET:-/run/skyline-speeder/speeder.sock}
 
 # skyline-speederd.service has no readiness notification: `systemctl start`
-# returns once the process exists, not once the control socket does.
+# returns once the process exists, not once the control socket does. Neither
+# does OpenRC's supervise-daemon, which answers "started" as soon as it runs.
 wait_for_daemon() {
     local deadline=$((SECONDS + 60)) state
     while [ ! -S "$SOCKET" ]; do
         # "activating" is Restart=on-failure between attempts: keep waiting.
-        state=$(systemctl is-active skyline-speederd.service 2>/dev/null || true)
+        # (supervise-daemon respawning it still reads "started".)
+        state=$(svc_state skyline-speederd)
         case "$state" in failed|inactive) return 1 ;; esac
         [ "$SECONDS" -lt "$deadline" ] || return 1
         SPIN_I=$((SPIN_I + 1)); bar_draw; sleep 0.2
@@ -2194,9 +2794,10 @@ wait_for_daemon() {
 }
 
 daemon_failed() {
-    journalctl -u skyline-speederd.service -n 40 --no-pager >>"$LOG" 2>&1 || true
+    svc_journal skyline-speederd
     STEP_RAN=1
-    die "$1. Check: journalctl -u skyline-speederd.service"
+    svc_hint logs skyline-speederd
+    die "$1. Check: $REPLY"
 }
 
 if [ "$UPGRADE" -eq 1 ]; then
@@ -2216,23 +2817,34 @@ if [ "$UPGRADE" -eq 1 ]; then
         run timeout 75 /usr/local/bin/ssctl drain --timeout 60 \
             || log "drain ended with an error (over SSH a timeout is expected; fallback_cc was written first)"
     fi
-    run systemctl enable skyline-speederd.service || die "systemctl enable skyline-speederd.service failed"
-    run systemctl restart skyline-speederd.service || daemon_failed "restarting skyline-speederd failed"
+    svc_run enable skyline-speederd || die "enabling skyline-speederd$SVC_SUFFIX failed"
+    svc_run restart skyline-speederd || daemon_failed "restarting skyline-speederd failed"
 else
     step "Starting skyline-speederd"
-    run systemctl enable --now skyline-speederd.service || daemon_failed "starting skyline-speederd failed"
+    svc_run enable-now skyline-speederd || daemon_failed "starting skyline-speederd failed"
 fi
 wait_for_daemon || daemon_failed "skyline-speederd did not open $SOCKET within 60 s"
-ok "skyline-speederd.service running"
+ok "skyline-speederd$SVC_SUFFIX running"
 NEW_VERSION=$(daemon_version)
+# OpenRC restarted the enable service with the daemon, in the background:
+# wait for it to have attached (or failed) before anything reads the state.
+[ "$ENABLE_UNIT_WAS_ACTIVE" -eq 0 ] || svc_settle skyline-speeder-enable 130
 if [ "$ENABLE" -eq 0 ] && [ "$ENABLE_UNIT_WAS_ACTIVE" -eq 1 ]; then
     # The restart propagated to the enable unit, but `systemctl restart` only
     # waits for skyline-speederd's own job: boot-enable.sh may still be
     # polling for the socket. `start` joins that pending job and waits for it
     # (and attaches nothing that was not attached before the upgrade), so the
-    # summary below reads the state the host actually ends up in.
-    run timeout 130 systemctl start skyline-speeder-enable.service \
-        || warn "skyline-speeder-enable.service did not come back after the restart; check: journalctl -u skyline-speeder-enable.service"
+    # summary below reads the state the host actually ends up in. Under
+    # OpenRC svc_settle above did the waiting, and start is a no-op unless
+    # the service did not come back.
+    svc_hint logs skyline-speeder-enable
+    if [ "$INIT" = systemd ]; then
+        run timeout 130 systemctl start skyline-speeder-enable.service \
+            || warn "skyline-speeder-enable.service did not come back after the restart; check: $REPLY"
+    elif ! svc_active skyline-speeder-enable; then
+        svc_run start skyline-speeder-enable \
+            || warn "skyline-speeder-enable did not come back after the restart; check: $REPLY"
+    fi
 fi
 if [ "$BARE_ATTACHED" -eq 1 ] && [ "$ENABLE" -eq 0 ]; then
     # Leave the host as it was: attached by hand, and so, like before, not
@@ -2241,7 +2853,7 @@ if [ "$BARE_ATTACHED" -eq 1 ] && [ "$ENABLE" -eq 0 ]; then
         REATTACHED=1
         ok "skyline_cc attached again, as it was before the upgrade"
     else
-        warn "attaching skyline_cc again after the upgrade failed; run: sudo ssctl enable"
+        warn "attaching skyline_cc again after the upgrade failed; run: ${SUDO}ssctl enable"
     fi
 fi
 read_status
@@ -2313,21 +2925,25 @@ if [ "$ENABLE" -eq 0 ]; then
     NOW_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
     NOW_ENABLED=$(status_value enabled)
     UNIT_ACTIVE=0 UNIT_ENABLED=0
-    if systemctl is-active --quiet skyline-speeder-enable.service 2>/dev/null; then UNIT_ACTIVE=1; fi
-    if systemctl is-enabled --quiet skyline-speeder-enable.service 2>/dev/null; then UNIT_ENABLED=1; fi
+    if svc_active skyline-speeder-enable; then UNIT_ACTIVE=1; fi
+    if svc_enabled skyline-speeder-enable; then UNIT_ENABLED=1; fi
     UNIT_ON=$((UNIT_ACTIVE | UNIT_ENABLED))
     # Over an enable unit that is already active, `enable --now` does nothing.
     if [ "$UNIT_ACTIVE" -eq 0 ]; then
-        ATTACH_CMD="sudo systemctl enable --now skyline-speeder-enable.service"
+        svc_hint enable-now skyline-speeder-enable; ATTACH_CMD=$REPLY
     elif [ "$UNIT_ENABLED" -eq 1 ]; then
-        ATTACH_CMD="sudo systemctl restart skyline-speeder-enable.service"
+        svc_hint restart skyline-speeder-enable; ATTACH_CMD=$REPLY
     else
-        ATTACH_CMD="sudo systemctl enable skyline-speeder-enable.service && sudo systemctl restart skyline-speeder-enable.service"
+        svc_hint enable skyline-speeder-enable; ATTACH_CMD=$REPLY
+        svc_hint restart skyline-speeder-enable; ATTACH_CMD="$ATTACH_CMD && $REPLY"
     fi
+    svc_hint disable-now skyline-speeder-enable; DETACH_CMD=$REPLY
+    svc_hint enable-now skyline-speeder-enable; BOOT_CMD=$REPLY
+    svc_hint logs skyline-speederd; LOGS_CMD=$REPLY
     if [ -z "$STATUS_JSON" ]; then
         ATTACH_STATE="ssctl status did not answer, so whether skyline_cc is attached is unknown"
     elif [ "$NOW_ENABLED" = true ] && [ "$UNIT_ON" -eq 1 ]; then
-        ATTACH_STATE="skyline_cc stays attached (skyline-speeder-enable.service, from an earlier install)"
+        ATTACH_STATE="skyline_cc stays attached (skyline-speeder-enable$SVC_SUFFIX, from an earlier install)"
     elif [ "$NOW_ENABLED" = true ] && [ "$REATTACHED" -eq 1 ]; then
         ATTACH_STATE="skyline_cc is attached again, as it was before the upgrade"
     elif [ "$NOW_ENABLED" = true ]; then
@@ -2347,13 +2963,13 @@ if [ "$ENABLE" -eq 0 ]; then
     row "install log" "$LOG"
     printf '\n' >&3
     if [ -z "$STATUS_JSON" ]; then
-        printf '     Check: sudo ssctl status; journalctl -u skyline-speederd.service\n' >&3
+        printf '     Check: %sssctl status; %s\n' "$SUDO" "$LOGS_CMD" >&3
     elif [ "$NOW_ENABLED" = true ] && [ "$UNIT_ON" -eq 1 ]; then
-        printf '     To detach it: sudo systemctl disable --now skyline-speeder-enable.service\n' >&3
+        printf '     To detach it: %s\n' "$DETACH_CMD" >&3
     elif [ "$NOW_ENABLED" = true ]; then
         printf '     Like before, it is not attached again after a reboot. To attach it at\n' >&3
-        printf '     every boot:  sudo systemctl enable --now skyline-speeder-enable.service\n' >&3
-        printf '     To detach:   sudo ssctl drain --timeout 60\n' >&3
+        printf '     every boot:  %s\n' "$BOOT_CMD" >&3
+        printf '     To detach:   %sssctl drain --timeout 60\n' "$SUDO" >&3
     elif [ "$NOW_CC" = skyline_cc ]; then
         # The state BARE_ATTACHED prevents, reached some other way (say, the
         # daemon was killed out of band): the default names a skyline_cc that
@@ -2362,11 +2978,11 @@ if [ "$ENABLE" -eq 0 ]; then
         printf '     connections still get it, but nothing controls or tunes it any more.\n' >&3
         if [ "$UNIT_ON" -eq 1 ]; then
             printf '     Attach this build:  %s\n' "$ATTACH_CMD" >&3
-            printf '     or detach it:       sudo systemctl disable --now skyline-speeder-enable.service\n' >&3
+            printf '     or detach it:       %s\n' "$DETACH_CMD" >&3
         else
-            printf '     Attach this build:  sudo ssctl enable   (and at every boot:\n' >&3
+            printf '     Attach this build:  %sssctl enable   (and at every boot:\n' "$SUDO" >&3
             printf '                         %s)\n' "$ATTACH_CMD" >&3
-            printf '     or detach it:       sudo ssctl drain --timeout 60\n' >&3
+            printf '     or detach it:       %sssctl drain --timeout 60\n' "$SUDO" >&3
         fi
     else
         printf '     New connections use %s. Attach skyline_cc now and at every boot' "$NOW_CC" >&3
@@ -2387,9 +3003,10 @@ fi
 
 # --- 11. attach and persist ------------------------------------------------
 step "Attaching skyline_cc"
-run systemctl enable --now skyline-speeder-enable.service || {
-    journalctl -u skyline-speeder-enable.service -n 40 --no-pager >>"$LOG" 2>&1 || true
-    die "attaching skyline_cc failed. Check: journalctl -u skyline-speeder-enable.service"
+svc_run enable-now skyline-speeder-enable || {
+    svc_journal skyline-speeder-enable
+    svc_hint logs skyline-speeder-enable
+    die "attaching skyline_cc failed. Check: $REPLY"
 }
 
 step "Verifying"
@@ -2415,16 +3032,17 @@ attach_problem() {
 }
 attach_problem
 if [ -n "$ATTACH_PROBLEM" ]; then
-    log "not attached after the enable unit ran ($ATTACH_PROBLEM); restarting skyline-speeder-enable.service once"
-    run systemctl restart skyline-speeder-enable.service || true
+    log "not attached after the enable unit ran ($ATTACH_PROBLEM); restarting skyline-speeder-enable$SVC_SUFFIX once"
+    svc_run restart skyline-speeder-enable || true
     attach_problem
 fi
 if [ -n "$ATTACH_PROBLEM" ]; then
-    journalctl -u skyline-speeder-enable.service -n 40 --no-pager >>"$LOG" 2>&1 || true
+    svc_journal skyline-speeder-enable
     STEP_RAN=1
+    svc_hint logs skyline-speeder-enable
     die "skyline_cc is not attached: $ATTACH_PROBLEM.
-   Attach it by hand:  sudo ssctl enable
-   Why it failed:      journalctl -u skyline-speeder-enable.service"
+   Attach it by hand:  ${SUDO}ssctl enable
+   Why it failed:      $REPLY"
 fi
 ok "active congestion control: $ACTIVE"
 GUARD_QDISC=$(status_value qdisc)
@@ -2460,7 +3078,7 @@ ok "default qdisc: $AFTER_DQ; ${DEV:-no egress interface} root qdisc: ${AFTER_RO
 # was left alone -- with the default qdisc added to the first.
 QDISC_ROWS=()
 if [ "$HAS_GUARD" -eq 1 ] && [ "$GUARD_QDISC" != false ] && [ "$AFTER_DQ" != fq ]; then
-    warn "net.core.default_qdisc is $AFTER_DQ, not fq. See DRIFT GUARD in: sudo ssctl status"
+    warn "net.core.default_qdisc is $AFTER_DQ, not fq. See DRIFT GUARD in: ${SUDO}ssctl status"
 fi
 for i in "${!AFTER_DEVS[@]}"; do
     d=${AFTER_DEVS[i]} now=${AFTER_ROOTS[i]}
@@ -2478,7 +3096,7 @@ for i in "${!AFTER_DEVS[@]}"; do
                     text="$now on $label ($shaping: it shapes, so it was left alone)"
                 elif qdisc_replaceable "$now"; then
                     text="$now on $label (not replaced)"
-                    warn "$label root qdisc is still $now, not fq. See \"last error\" under DRIFT GUARD in: sudo ssctl status"
+                    warn "$label root qdisc is still $now, not fq. See \"last error\" under DRIFT GUARD in: ${SUDO}ssctl status"
                 else
                     text="$now on $label (looks built on purpose, so it was left alone)"
                 fi ;;
@@ -2562,9 +3180,9 @@ STATUS_WHAT="is it attached, is it the host default, kernel support"
 # /usr/local/src/skyline-speeder; somebody who piped this file straight into
 # bash has no tree at all and is told that is what it takes.
 if [ -r "$REPO_ROOT/install.sh" ]; then
-    UNINSTALL_CMD="sudo $REPO_ROOT/install.sh --uninstall"
+    UNINSTALL_CMD="${SUDO}$REPO_ROOT/install.sh --uninstall"
 else
-    UNINSTALL_CMD="sudo <a Skyline Speeder source tree>/install.sh --uninstall"
+    UNINSTALL_CMD="${SUDO}<a Skyline Speeder source tree>/install.sh --uninstall"
 fi
 
 # What --restore-pre-install would put back, named value by value: on a host
@@ -2600,18 +3218,35 @@ knob() {
     printf '   %-31s %s\n' "$REPLY" "$3" >&3
 }
 
-cat >&3 <<EOF
+# guide_row <command> <description> [<more description lines>...]: one entry
+# of the list below, the command in a column 32 wide -- or on a line of its own
+# when it is wider, as the service restart always was. Printed rather than a
+# heredoc because the command column is not the same width on every host:
+# sudo only where there is one, rc-service under OpenRC.
+guide_row() {
+    local entry=$1 line
+    shift
+    if [ "${#entry}" -lt 32 ]; then
+        printf '   %-32s%s\n' "$entry" "$1" >&3
+    else
+        printf '   %s\n%35s%s\n' "$entry" '' "$1" >&3
+    fi
+    shift
+    for line in "$@"; do printf '%35s%s\n' '' "$line" >&3; done
+}
+svc_hint restart skyline-speederd
+RESTART_CMD=$REPLY
 
- ${BLD}Everyday commands${RST}
-   sudo ssctl status               $STATUS_WHAT
-   sudo ssctl flows                the accelerated connections, the coefficients
-                                   in force on them, and what the algorithm did
-                                   (--json on either one for the raw reply)
-   sudo ssctl drain --timeout 60   graceful detach: new connections use ${FALLBACK:-cubic};
-                                   over SSH it ends in a harmless timeout error
-   sudo ssctl enable               attach again after a drain
-   sudo systemctl restart skyline-speederd
-                                   apply speeder.toml edits (drains, re-attaches)
+printf '\n %sEveryday commands%s\n' "$BLD" "$RST" >&3
+guide_row "${SUDO}ssctl status" "$STATUS_WHAT"
+guide_row "${SUDO}ssctl flows" "the accelerated connections, the coefficients" \
+    "in force on them, and what the algorithm did" \
+    "(--json on either one for the raw reply)"
+guide_row "${SUDO}ssctl drain --timeout 60" "graceful detach: new connections use ${FALLBACK:-cubic};" \
+    "over SSH it ends in a harmless timeout error"
+guide_row "${SUDO}ssctl enable" "attach again after a drain"
+guide_row "$RESTART_CMD" "apply speeder.toml edits (drains, re-attaches)"
+cat >&3 <<EOF
 
  ${BLD}Tuning${RST}  (full guide: $GUIDE_URL)
    The shipped values are already tuned; most hosts need no change. The guide
@@ -2623,14 +3258,14 @@ knob --loss-inflation-max-ratio loss_inflation_max_ratio "loss made up for, at m
 knob --max-queue-delay-ms max_queue_delay_ms "queueing delay treated as congestion"
 knob --max-pacing-mbps max_pacing_mbps "pacing cap per connection, not host-wide"
 cat >&3 <<EOF
-   Live:        sudo ssctl set-module-config --max-pacing-mbps 1200 ...
+   Live:        ${SUDO}ssctl set-module-config --max-pacing-mbps 1200 ...
                 Absolute: each flag left out is sent as its built-in default --
-                copy the current values from sudo ssctl flows first. Lost
+                copy the current values from ${SUDO}ssctl flows first. Lost
                 when skyline-speederd restarts.
-                sudo ssctl reset-module-config    back to the file's values
+                ${SUDO}ssctl reset-module-config    back to the file's values
    Persistent:  edit $CFG, check it with
-                sudo skyline-speederd --config $CFG --validate-only
-                then sudo systemctl restart skyline-speederd
+                ${SUDO}skyline-speederd --config $CFG --validate-only
+                then $RESTART_CMD
 EOF
 
 # Printed rather than put in the heredoc above: what it can honestly say about
@@ -2641,10 +3276,18 @@ printf '\n %sUninstall%s\n   %s\n' "$BLD" "$RST" "$UNINSTALL_CMD" >&3
 printf '%s\n' \
     "                drains live flows, removes the units, binaries and BPF" \
     "                objects, and puts this host on bbr + fq" >&3
+# The keepers as the sentence names them: "iproute2, curl, ca-certificates and tar".
+KEEP_TEXT=
+for i in "${!KEEP_PKGS[@]}"; do
+    if [ "$i" -eq 0 ]; then KEEP_TEXT=${KEEP_PKGS[i]}
+    elif [ "$i" -eq $((${#KEEP_PKGS[@]} - 1)) ]; then KEEP_TEXT="$KEEP_TEXT and ${KEEP_PKGS[i]}"
+    else KEEP_TEXT="$KEEP_TEXT, ${KEEP_PKGS[i]}"
+    fi
+done
 if [ "$ADDED_REMOVABLE" -gt 0 ]; then
     printf '%s\n' \
         "                It also removes the $ADDED_REMOVABLE package(s) this install added." \
-        "                iproute2, curl, ca-certificates and tar are never among" \
+        "                $KEEP_TEXT are never among" \
         "                them; the list is in" \
         "                $ADDED_PKGS" >&3
 else
@@ -2665,7 +3308,7 @@ cat >&3 <<EOF
 
  ${BLD}Note${RST}  dynamic RTO (the sockops policy; off by default) only sees processes in
        /sys/fs/cgroup/skyline-speeder. Opt a service in with:
-         sudo /opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <command...>
+         ${SUDO}/opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <command...>
 EOF
 
 printf '\n' >&3

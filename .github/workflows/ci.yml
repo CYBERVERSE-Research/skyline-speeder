@@ -162,10 +162,15 @@ jobs:
       - name: shellcheck
         run: |
           shellcheck -S warning install.sh scripts/*.sh infra/*.sh \
-            infra/kernel/*.sh research/experiments/*.sh
+            infra/kernel/*.sh research/experiments/*.sh packaging/openrc/*
 
+      # scripts/bootstrap.sh and the OpenRC scripts are POSIX sh: bootstrap is
+      # piped into busybox sh on Alpine, where bash is not there yet. dash
+      # parses nothing that sh cannot.
       - name: Syntax
-        run: bash -n install.sh scripts/*.sh infra/*.sh infra/kernel/*.sh research/experiments/*.sh
+        run: |
+          bash -n install.sh scripts/*.sh infra/*.sh infra/kernel/*.sh research/experiments/*.sh
+          dash -n scripts/bootstrap.sh packaging/openrc/*
 
   python:
     name: Experiment harness (unit tests)

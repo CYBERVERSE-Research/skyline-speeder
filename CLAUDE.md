@@ -30,6 +30,12 @@ skyline-speederd --config config/speeder.toml --validate-only --verify-bpf
 bpftool，也不需要 /sys/kernel/btf/vmlinux**，供容器/发布流水线使用）。
 `bpf/include/vmlinux.h` 是构建产物，**不提交**。
 
+本机生成的 vmlinux.h 编译时带 `-DBPF_NO_KFUNC_PROTOTYPES`：bpftool 7.5 起把运行内核导出的每个
+kfunc 原型都写进头里，其中一个与发行版 libbpf 的 `bpf_helpers.h` 对不上就编不过（Fedora 43：
+6.17 内核的 `bpf_stream_vprintk` 五个参数，libbpf 1.6.1 声明四个）。所以 **BPF 源码调用的 kfunc
+必须自己声明**（见 `skyline_cc.bpf.c` 顶部），不能靠 vmlinux.h。`PREBUILT_VMLINUX_H` 路径不带
+这个宏，发布产物逐字节不变。
+
 vmlinux.h 只需要**定义**代码用到的类型，不必来自最终运行的那个内核：bpftool 生成的
 头带 `preserve_access_index`，每处字段访问都生成 CO-RE 重定位记录，偏移由 libbpf 在
 加载时按运行内核的 BTF 修正。已双向实测（6.12.63 ↔ 6.19.14），复现脚本见
@@ -43,8 +49,9 @@ vmlinux.h 只需要**定义**代码用到的类型，不必来自最终运行的
 | `.name = "skyline_cc"` | `bpf/skyline_cc.bpf.c` | 算法注册名，**≤ 15 字符**（`TCP_CA_NAME_MAX` 为 16 含 NUL） |
 | `SKYLINE_ABI_VERSION` | `bpf/include/skyline_abi.h` | 布局变更必须递增，用户态据此拒绝加载不匹配的对象 |
 | `cong_control` 4 参数签名 | `bpf/skyline_cc.bpf.c` | `(sk, ack, flag, rs)`，内核 >= 6.10 才有 |
-| 安装路径 `/opt|/etc|/run/skyline-speeder` | 配置、unit、脚本 | 三处必须一致 |
+| 安装路径 `/opt|/etc|/run/skyline-speeder` | 配置、unit（含 `packaging/openrc/` 的两个 OpenRC 脚本）、脚本 | 三处必须一致 |
 | `RuntimeDirectory=skyline-speeder` | `packaging/skyline-speederd.service` | **必须与 `socket_path` 的父目录同名**，否则 socket 建不出来 |
+| `checkpath -d /run/skyline-speeder` | `packaging/openrc/skyline-speederd` | OpenRC 下的 `RuntimeDirectory=`：同样**必须是 `socket_path`（及 `events_path`、`state_path`）的父目录**，daemon 启动先打开的就是那里的事件日志 |
 
 > `RuntimeDirectory` 与 `socket_path` 的耦合是历史上真实踩过的坑：一次批量重命名
 > 把 `RuntimeDirectory` 改成了 `skyline` 而配置里是 `/run/skyline-speeder/`，
@@ -157,7 +164,8 @@ release 的预编译产物**，不是 `main`。合并进 `main` 的改动，在�
 
 | 改动落在 | 要发版吗 | 原因 |
 |---|---|---|
-| `bpf/`、`crates/`、`config/speeder-guest.toml`、`packaging/`、`release.yml` 打进产物的 `infra/*.sh` | **要** | 它们就在产物里，不发版默认安装的用户拿不到 |
+| `bpf/`、`crates/`、`config/speeder-guest.toml`、`packaging/*.service`、`release.yml` 打进产物的 `infra/*.sh` | **要** | 它们就在产物里，不发版默认安装的用户拿不到 |
+| `packaging/openrc/` | 通常不要 | 不进产物：OpenRC 主机（Alpine）是 musl，总是源码构建，两个脚本由安装器从它自己的源码树（`main`）安装 |
 | `install.sh`、`scripts/bootstrap.sh` | 通常不要 | 一键安装每次都从 `main` 取安装器，合并即生效；新安装器依赖产物里还没有的东西时除外，那就先发版 |
 | 文档、实验框架、CI、只影响源码构建的部分 | 不要 | 不进产物 |
 

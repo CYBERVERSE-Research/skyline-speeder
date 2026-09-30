@@ -16,6 +16,63 @@ for anyone holding a prebuilt `.bpf.o`.
   installs the published release** instead of rebuilding. Pass `--source` to
   keep building from source.
 
+### Added
+
+- **Fedora, the RHEL family and Alpine.** The one-line install and
+  `install.sh` run on Fedora and on RHEL and its rebuilds -- Rocky Linux,
+  AlmaLinux, CentOS Stream -- with dnf and systemd, and on Alpine with apk and
+  OpenRC, beside Debian and Ubuntu. The distribution decides only the package
+  manager and the service manager; every other step is the same. Run end to
+  end on Fedora 43, Rocky Linux 10.2, Alpine 3.23 and, again, Debian 13:
+  install, upgrade in place, uninstall, and a reboot coming back attached.
+  - Fedora and the RHEL family install the published release, as Debian 13
+    does (glibc 2.42 and 2.39), and get `iproute-tc` with it: Fedora's cloud
+    image has no `tc`, without which the guard cannot keep fq on the NIC. A
+    source build there takes `libbpf-devel` from CodeReady Builder, which RHEL
+    and its rebuilds define but switch off, for that one transaction only
+    (`--enablerepo`); no `.repo` file is changed. SELinux in enforcing mode
+    needs nothing: the daemon runs as `unconfined_service_t`.
+  - Alpine's musl C library cannot run the published binaries, so Alpine
+    always builds from source (about ten minutes on one vCPU). The two
+    services are OpenRC scripts, `packaging/openrc/skyline-speederd` and
+    `skyline-speeder-enable`, installed in `/etc/init.d`: the same binary,
+    configuration and ordering as the systemd units, under supervise-daemon,
+    with the daemon's output going to syslog. The daemon needs cgroup v2 at
+    `/sys/fs/cgroup`, which on Alpine only OpenRC's `cgroups` service mounts
+    and no runlevel starts; `skyline-speederd` now `need`s it. `bpftool` is
+    in Alpine's community repository; a host without it enabled gets it from
+    the same mirror's community repository for that one command, and
+    `/etc/apk/repositories` is not changed. `.cargo/config.toml` links the
+    musl build dynamically: statically, libbpf-sys would need zlib and zstd
+    archives Alpine keeps in `-static` packages nothing installs.
+  - **`scripts/bootstrap.sh` is POSIX sh**, so a fresh Alpine, which has
+    busybox `wget` but neither `curl` nor `bash`, runs it as root with
+    `wget -qO- .../bootstrap.sh | sh`; it installs `curl` and `bash` with
+    the host's own package manager before handing off to `install.sh`.
+  - `--uninstall` removes the recorded toolchain on dnf and apk hosts too,
+    with the same promise as under apt: only what the install added, never
+    `iproute`/`iproute-tc` (`iproute2` on Alpine), `curl`,
+    `ca-certificates`, `tar` or (Alpine) `bash`, never what one of those still
+    needs, never a package dnf protects. Under dnf the removal is planned with
+    `rpm -e --test`, and the record never holds `gpg-pubkey`, the repository
+    signing key dnf imports during the first install; under apk it is
+    `apk del` of the names the install added to the world, which never takes
+    a package something still needs.
+
+### Fixed
+
+- **A source build no longer fails to compile the BPF objects on a kernel
+  newer than the host's libbpf headers.** bpftool writes a prototype for every
+  kfunc the running kernel exports into the vmlinux.h it generates, and one of
+  them can disagree with the declaration of the same kfunc in the
+  distribution's `bpf_helpers.h`: on Fedora 43, kernel 6.17 exports
+  `bpf_stream_vprintk` with five arguments and libbpf 1.6.1 declares four, so
+  `make bpf` stopped with `conflicting types for 'bpf_stream_vprintk'`. A
+  header generated from this machine's BTF is now compiled with
+  `BPF_NO_KFUNC_PROTOTYPES`; the sources declare the kfuncs they call
+  themselves. Release builds use the pinned reference header, unchanged, and
+  their objects stay byte for byte the same.
+
 ### Changed
 
 - **The one-line install installs the latest published release by default.**
@@ -32,6 +89,9 @@ for anyone holding a prebuilt `.bpf.o`.
   the two an install would do. The installer still comes from `--ref` (main),
   while the artifact comes from the latest release, so a change merged after
   that release reaches the one-line install only with the next one.
+- The commands `install.sh` prints -- the closing guide, and the ones in its
+  warnings and errors -- carry `sudo` only on a host that has it, so they can
+  be pasted as they are into a root shell on a cloud image without sudo.
 
 ## [0.4.0] - 2026-09-29
 

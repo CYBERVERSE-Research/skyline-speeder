@@ -8,6 +8,10 @@ Skyline Speeder 只需要部署在 TCP 连接的**服务器发送端**——客�
 部署前先明确目标机器满足：
 
 - 内核版本满足第 2 节的要求；
+- 发行版是下面三类之一（安装器只按它选包管理器和服务管理器，其余步骤处处相同）：Debian/Ubuntu
+  （apt + systemd）、Fedora 与 RHEL 系——Rocky Linux、AlmaLinux、CentOS Stream（dnf + systemd）、
+  Alpine（apk + OpenRC）。一键安装已在 Debian 13、Fedora 43、Rocky Linux 10.2、Alpine 3.23 上完整
+  跑通；
 - 有 root 权限（安装系统服务、加载 BPF 程序、创建 cgroup 都需要）；
 - 目标发送路径的带宽、RTT、丢包特征跟第 11 节"已知风险与部署前评估"里描述
   的适用边界相符。
@@ -79,7 +83,8 @@ cargo build --workspace --release
 
 ## 4. 安装与部署
 
-三条路径装出来的东西相同（同样的文件、systemd unit 与配置模板），都先过内核验证器：
+三条路径装出来的东西相同（同样的文件、服务与配置模板；服务在 systemd 主机上是两个 unit，在 OpenRC
+主机上是 `/etc/init.d` 下的两个脚本，见第 4.4 节），都先过内核验证器：
 
 | 路径 | 命令 | 适用 |
 |---|---|---|
@@ -90,13 +95,17 @@ cargo build --workspace --release
 没有仓库 checkout 的机器用 `scripts/bootstrap.sh`：
 `curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash`，
 它把源码树放到 `/usr/local/src/skyline-speeder` 后交给 `install.sh`，其余参数原样转交
-（例如 `... | sudo bash -s -- --source`）。它运行的 `install.sh` 来自 `--ref`（默认
+（例如 `... | sudo bash -s -- --source`）。它是 POSIX sh 脚本：全新的 Alpine 只有 busybox 的 `wget`、
+没有 `curl` 和 `bash`，以 root 执行
+`wget -qO- https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sh`
+即可，缺的 `curl`、`bash`、`tar` 由它按本机的包管理器（apt/dnf/apk）补上。它运行的 `install.sh` 来自 `--ref`（默认
 `main`），装上的产物却来自最新 release（或 `--release` 指定的那个）：`--ref` 选的是安装器，
 不是安装的版本。
 
 ### 4.1 一键安装（`install.sh`）
 
-依次执行：检查系统（Debian/Ubuntu、内核 ≥ 6.12、BTF、cgroup v2，以及本机能否运行发布的
+依次执行：检查系统（发行版及其包管理器、服务管理器，内核 ≥ 6.12、BTF、挂在 `/sys/fs/cgroup`
+的 cgroup v2——OpenRC 主机上还没挂时由它启动 OpenRC 的 `cgroups` 服务——以及本机能否运行发布的
 二进制）→ 安装软件包 → 下载并校验发布产物（源码构建时改为：准备 Rust 工具链 → 编译 BPF
 对象 → 编译控制面）→ 安装文件（即第 4.3 节的 `install-guest.sh`）→ 把 `runtime.tc_interface` 指向默认路由所在的网卡（见下文"选择
 出口网卡"）→ 过内核验证器 → 启动（升级时是重启）`skyline-speederd` → 挂载 `skyline_cc`
@@ -133,6 +142,16 @@ bookworm 的 `libelf-dev` 依赖 `libelf1 (= 0.188-2.1)`，安装器改取 `libe
 换版本若牵连卸载，先把要卸载的包名告警出来。`apt-get update` 因为某个仓库不可达而失败
 （一键 BBR 脚本留下的源、搬走的镜像）时只告警并继续——能不能装由计划决定。`--check`
 同样跑这份计划，报告 apt 到底能不能装上这些包。
+
+dnf 和 apk 不走这套计划：两者都把整份请求一起求解，要么全装、要么一个不装，装不上时直接
+转述它们自己的报错；`--check` 用 `dnf install --assumeno` / `apk add --simulate` 回答同一个问题。
+dnf 不装弱依赖（`install_weak_deps=False`，否则 clang 会带进 compiler-rt、libomp 等）。RHEL 系的
+`libbpf-devel` 在默认关闭的 CodeReady Builder 仓库里，源码构建时只对这一次事务
+`--enablerepo=crb`（RHEL 上是 `codeready-builder-for-rhel-N-<arch>-rpms`，Oracle Linux 上是
+`olN_codeready_builder`），不改 `.repo` 文件。Fedora/RHEL 把 `tc` 单独放在 `iproute-tc`，两条路径
+都会装上——Fedora 的云镜像默认没有它，guard 就管不了网卡的根 qdisc。apk 的 `bpftool` 在
+community 仓库：主机没启用 community 时，只对这一次命令加上同一镜像、同一版本的
+`--repository .../community`，不改 `/etc/apk/repositories`。
 
 **选择出口网卡。** 只在配置里还是模板值 `data0` 时改写，运维改过的配置不动（它指向的网卡
 不存在也只告警，不替你改）。取默认路由经过的第一块**以太网**设备
@@ -204,10 +223,11 @@ BPF 对象由发布流水线在固定的 6.12 LTS 参考头上编译，加载时
 修正字段偏移，所以内核要求不变：6.12 LTS 或更新，且存在 `/sys/kernel/btf/vmlinux`。
 
 预编译的 `skyline-speederd` 在 Ubuntu 24.04 上构建，需要 **glibc 2.38 或更新**，以及
-`libelf.so.1` 和 `libz.so.1`：Debian 13、Ubuntu 24.04 及更新版本满足；产物目前只发布
-x86_64。安装器在动手之前检查这两点（`getconf GNU_LIBC_VERSION`、`uname -m`）：不满足时，
-默认路径打印 `building from source: <原因>` 并改为源码构建（例如 Debian 12 + backports
-内核），`--prebuilt`/`--release` 则直接中止。`--check` 会报告将走哪条路径。
+`libelf.so.1` 和 `libz.so.1`：Debian 13、Ubuntu 24.04、Fedora 43、Rocky Linux 10 及更新版本满足
+（dnf 下这两个库按它们提供的 soname 请求，不管 zlib 是不是已换成 zlib-ng）；产物目前只发布
+x86_64。安装器在动手之前检查这两点（`getconf GNU_LIBC_VERSION`、`uname -m`，musl 的动态加载器
+`/lib/ld-musl-*.so.1`）：不满足时，默认路径打印 `building from source: <原因>` 并改为源码构建
+（例如 Debian 12 + backports 内核，或 musl 的 Alpine），`--prebuilt`/`--release` 则直接中止。`--check` 会报告将走哪条路径。
 
 装上的是已发布的 release，不是 `main`：`main` 上在最新 release 之后合并的改动，要等下一个
 release 才会进入默认安装——所以每个 PR 都要考虑是否需要随之发布（见仓库 `CLAUDE.md`）。
@@ -257,6 +277,8 @@ sudo infra/install-guest.sh --confirm-install
   `snapshot-skyline-events.sh`/`run-in-skyline-cgroup.sh`，以及 enable unit 调用的
   `boot-enable.sh`/`boot-disable.sh`）
 - `/etc/systemd/system/skyline-speederd.service`、`/etc/systemd/system/skyline-speeder-enable.service`
+  （OpenRC 主机上是 `/etc/init.d/skyline-speederd`、`/etc/init.d/skyline-speeder-enable`，并
+  `rc-update add skyline-speederd default`）
 
 只在 `/etc/skyline-speeder/speeder.toml` 尚不存在时才会用 `config/speeder-guest.toml` 创建它——
 已有配置文件不会被覆盖。
@@ -270,6 +292,39 @@ sudo infra/install-guest.sh --confirm-install
 时会随之重启并重新挂载；按本节和第 7 节手动安装的主机上它通常不是 active，重启后 `skyline_cc`
 处于未挂载状态，原来挂着的话再执行一次 `sudo ssctl enable`。各版本的升级注意事项见
 `CHANGELOG.md` 里对应的 *Upgrading from ...* 小节（从 0.2.0 升级见 *Upgrading from 0.2.0*）。
+
+### 4.4 OpenRC 主机（Alpine）
+
+Alpine 用 OpenRC 而不是 systemd，C 库是 musl 而不是 glibc。一键安装照样适用，区别只有这些：
+
+- **只能源码构建。** 发布的二进制链接 glibc，默认路径检测到 musl 就改为源码构建（1 vCPU 上
+  约 10 分钟）。Rust 的 musl 目标默认静态链接，而 Alpine 把 zlib、zstd 的静态库放在没人装的
+  `-static` 包里，链接会失败；仓库的 `.cargo/config.toml` 让 musl 上的构建改为动态链接。
+- **两个服务**是 `packaging/openrc/` 下的脚本，装到 `/etc/init.d/`，与两个 systemd unit 一一对应：
+  - `skyline-speederd`：由 `supervise-daemon` 托管，异常退出 2 秒后重拉、60 秒内 5 次仍失败就
+    放弃（对应 `Restart=on-failure`）；停止时先发 SIGTERM，留 30 秒让它摘掉 struct_ops；输出经
+    `logger` 进 syslog（Alpine 上是 `/var/log/messages`，由系统日志轮转，不会长成没有上限的
+    文件）；启动前建好 `/run/skyline-speeder`（`RuntimeDirectory=` 的对应物，**必须是
+    `socket_path`、`events_path`、`state_path` 的父目录**）、`/sys/fs/bpf/skyline-speeder` 和
+    `/sys/fs/cgroup/skyline-speeder`。
+  - `skyline-speeder-enable`：`need skyline-speederd`，start 执行 `boot-enable.sh`，stop 执行
+    `boot-disable.sh`。与 systemd 的 `Requires=` + `After=` 效果相同：在 daemon 之后启动、之前
+    停止（所以先 drain），daemon 重启时跟着重启——不过 OpenRC 是在后台重启它，
+    `rc-service skyline-speederd restart` 返回时 `boot-enable.sh` 可能还在等 socket，安装器升级时
+    会等它结束再核对。
+- **cgroup v2。** daemon 要求 cgroup v2 挂在 `/sys/fs/cgroup`。Alpine 上只有 OpenRC 的 `cgroups`
+  服务会挂它，而它默认不在任何 runlevel 里：`skyline-speederd` 声明了 `need cgroups`，每次开机由
+  OpenRC 先把它启动起来；安装时安装器自己启动一次。`/etc/rc.conf` 的 `rc_cgroup_mode` 设成
+  `hybrid`/`legacy` 时 v2 不在这个路径上，安装器会中止并说明。
+- **命令对照。** 本文档其余各处的 systemd 命令在 OpenRC 上这样写（安装器最后打印的指南已经按本机
+  给出）：
+
+| systemd | OpenRC |
+|---|---|
+| `systemctl restart skyline-speederd` | `rc-service skyline-speederd restart` |
+| `systemctl enable --now skyline-speeder-enable.service` | `rc-update add skyline-speeder-enable default && rc-service skyline-speeder-enable start` |
+| `systemctl disable --now skyline-speeder-enable.service` | `rc-service skyline-speeder-enable stop && rc-update del skyline-speeder-enable default` |
+| `journalctl -u skyline-speederd.service` | `grep skyline-speederd /var/log/messages` |
 
 ## 5. 配置文件
 
@@ -491,6 +546,21 @@ unit、二进制与 `/opt/skyline-speeder`，保留 `/etc/skyline-speeder`，然
    它装的东西不是我们该卸的。此时 Skyline Speeder 本身已经卸完了，所以这一步的任何失败都只是
    告警加一条手工命令，不会中断卸载。
    记录里的包一个都不在了，或没有这份记录（例如 0.2.0 装的机器），这一步什么也不做。
+
+   dnf 主机上承诺相同，做法不同：记录同样是装包前后 rpm 数据库的差集，再按 rpm 给每个包盖的
+   事务号（`INSTALLTID`）只留下这次请求所在的那个事务，并始终排除 `gpg-pubkey`——那是 dnf
+   第一次从某个仓库装包时导入的仓库签名密钥，是这台机器对仓库的信任，不是我们的包，而且所有
+   密钥都叫这个名字。卸载时 `iproute`/`iproute-tc`/`curl`/`ca-certificates`/`tar` 和 dnf
+   的 protected packages 永不移除；先用 `rpm -e --test` 对整份清单出计划，清单之外还有包依赖
+   其中某一个时，按 rpm 报出的能力（capability）找到提供它的那个我们的包，单独留下并说明是谁
+   需要它，再重新出计划（最多十轮，找不出该留谁就一个都不卸）；最后由 dnf 执行删除，并关掉
+   `clean_requirements_on_remove`——清单本身已经是安装加进来的全部，dnf 的 autoremove 会顺手带走
+   不是这个安装器留下的孤儿包。
+
+   apk 主机上记录的是安装往 `/etc/apk/world` 里加的名字（请求的包，不含 apk 带进来的依赖），
+   卸载就是对它们 `apk del`：apk 把它们移出 world，再删掉 world 里已经没人需要的依赖——还被
+   `curl` 用着的库、运维此前或此后按名字装的包，它本来就不会删，也会列出留下了哪些、为什么。
+   `iproute2`/`curl`/`ca-certificates`/`tar`/`bash` 同样永不移除。
    rustup 只在 `/etc/skyline-speeder/added-rustup` 存在时移除（即确实是安装器装的），优先用
    `rustup self uninstall`，它不可用时才删目录，且只删仍然长得像 rustup 留下的目录。
 
@@ -504,8 +574,9 @@ unit、二进制与 `/opt/skyline-speeder`，保留 `/etc/skyline-speeder`，然
 这时才用 `replace root mq`。最后把 `default_qdisc` 设回、重新读取核对，不符就告警。
 
 不用安装器时：先 `sudo ssctl drain --timeout 60`，再
-`sudo systemctl disable --now skyline-speeder-enable.service skyline-speederd.service`，然后删除
-第 4.3 节列出的全部安装路径；qdisc 与 sysctl 需要自己改回。
+`sudo systemctl disable --now skyline-speeder-enable.service skyline-speederd.service`（OpenRC：
+先后对 `skyline-speeder-enable`、`skyline-speederd` 执行 `rc-service <服务> stop` 和
+`rc-update del <服务> default`），然后删除第 4.3 节列出的全部安装路径；qdisc 与 sysctl 需要自己改回。
 
 ## 10. 可观测性与排障
 

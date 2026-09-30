@@ -15,6 +15,16 @@ sudo ./install.sh              # 默认：安装最新发布的预编译产物�
 sudo ./install.sh --source     # 或：在本机从源码构建
 ```
 
+支持的发行版与各自的包管理器、服务管理器：Debian/Ubuntu（apt、systemd）、Fedora 与 RHEL 系——
+Rocky Linux、AlmaLinux、CentOS Stream（dnf、systemd）、Alpine（apk、OpenRC）。安装器按
+`/etc/os-release` 与 PID 1 自动选择，其余步骤处处相同；其他发行版在第一步就以非零退出码拒绝。
+Alpine 是 musl，总是源码构建；两个服务是 `/etc/init.d/skyline-speederd` 与
+`/etc/init.d/skyline-speeder-enable`，本文里的 `systemctl ...` 在那里换成 `rc-service ...` /
+`rc-update ...`，`journalctl -u <unit>` 换成 `grep <服务名> /var/log/messages`（对照表见
+`docs/01-deployment-guide.md` §4.4）。没有仓库 checkout 时，Alpine 上以 root 执行
+`wget -qO- https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sh`，
+其余发行版 `curl -fsSL <同一 URL> | sudo bash`。
+
 退出码非零即失败。输出约定（便于机器解析）：stdout 不是终端时，每一步开始、结束各打印
 一行 `[ n/N] <步骤名>` / `[ n/N] done in <耗时>`，最后是 `all N steps done in <耗时>`，
 随后是安装摘要与使用指南；终端上则是一行原地刷新的进度条。所有子命令（apt、rustup、
@@ -71,7 +81,7 @@ guard 看 `status` 里有没有 `"guard"` 键，不要只看版本号。
 | 内核版本 | `uname -r` | **>= 6.12**（ABI 下限 6.10） |
 | 内核 BTF | `test -r /sys/kernel/btf/vmlinux` | 存在（`CONFIG_DEBUG_INFO_BTF=y`） |
 | bpffs | `mount \| grep -q ' /sys/fs/bpf '` | 已挂载 |
-| cgroup v2 | `grep -qw cgroup2 /proc/filesystems` | 支持 |
+| cgroup v2 | `test -e /sys/fs/cgroup/cgroup.controllers` | 以 unified 方式挂在 `/sys/fs/cgroup`（OpenRC 主机上由 `cgroups` 服务挂载，安装器会启动它） |
 | `fq` qdisc | `modprobe sch_fq` | 可加载 |
 | struct_ops | 见 §4 的 `capabilities` | `true` |
 
@@ -86,7 +96,8 @@ guard 看 `status` 里有没有 `"guard"` 键，不要只看版本号。
 ## 2. 两条安装路径：预编译产物与源码构建
 
 不带参数时安装器先判断本机能否运行发布的二进制：架构是发布流水线出产物的架构（目前只有
-x86_64），且 glibc ≥ 2.38（`getconf GNU_LIBC_VERSION`）。能则装预编译产物，否则打印一行
+x86_64），C 库不是 musl（`/lib/ld-musl-*.so.1` 不存在），且 glibc ≥ 2.38
+（`getconf GNU_LIBC_VERSION`）。能则装预编译产物，否则打印一行
 `warn building from source: <原因>` 后改为源码构建。`--source` 无条件源码构建；`--prebuilt`
 与 `--release <tag>` 只装产物，本机跑不了时在第一步之前就以 `error --prebuilt/--release
 cannot install here: <原因>` 中止（退出码非零），不会改为构建。`--check` 会报告将走哪条路径
@@ -95,12 +106,12 @@ cannot install here: <原因>` 中止（退出码非零），不会改为构建�
 | | 预编译产物（默认） | 源码构建（`--source`，或默认路径在本机跑不了产物时） |
 |---|---|---|
 | 命令 | `./install.sh`；`./install.sh --prebuilt`（只装产物）；`./install.sh --release <tag>` 固定到某个版本 | `./install.sh --source` |
-| 目标机需要 | **不需要任何工具链**，只要 `curl`、`tar`、`iproute2`（安装器自动安装）；但预编译的 `skyline-speederd` 在 Ubuntu 24.04 上构建，需要 **glibc ≥ 2.38** 以及 `libelf.so.1`、`libz.so.1`（Debian 13、Ubuntu 24.04 及更新版本满足） | 编译工具链（clang/LLVM、bpftool、libbpf/libelf/zlib 开发包、Rust），安装器自动安装，`--uninstall` 再卸掉 |
+| 目标机需要 | **不需要任何工具链**，只要 `curl`、`tar`、`iproute2`（安装器自动安装）；但预编译的 `skyline-speederd` 在 Ubuntu 24.04 上构建，需要 **glibc ≥ 2.38** 以及 `libelf.so.1`、`libz.so.1`（Debian 13、Ubuntu 24.04、Fedora 43、Rocky Linux 10 及更新版本满足；Fedora/RHEL 还会装上 `iproute-tc`） | 编译工具链（clang/LLVM、bpftool、libbpf/libelf/zlib 开发包、Rust；RHEL 系的 `libbpf-devel` 只对那一次事务启用 CRB 仓库取得，Alpine 的 `bpftool` 在 community 仓库），安装器自动安装，`--uninstall` 再卸掉 |
 | 装的是什么 | 最新（或 `--release` 指定的）release：`main` 上在它之后合并的改动不在其中 | 运行的这份源码树（一键安装时即 `--ref`，默认 `main`） |
 | BPF 对象的类型来源 | 发布流水线固定的 6.12 LTS 参考头，加载时由 CO-RE 按本机内核的 BTF 修正字段偏移 | 本机 `/sys/kernel/btf/vmlinux` |
 | 完整性校验 | 产物旁的 `.sha256` 必须匹配，不匹配即中止；取不到 `.sha256` 时告警、只信任 TLS | 源码树本身（`scripts/bootstrap.sh` 可用 `SKYLINE_SHA256` 固定 tarball 摘要） |
 
-两条路径的其余步骤完全相同（同样过验证器、同样的 systemd unit 与配置模板）。
+两条路径的其余步骤完全相同（同样过验证器、同样的服务——systemd unit 或 OpenRC 脚本——与配置模板）。
 
 **预编译产物从哪来。** 默认取 GitHub 上的最新 release；`--release <tag>` 取指定版本；
 环境变量 `SKYLINE_ARTIFACT_URL` 跳过 release 查找，直接使用一个 https URL（镜像、内网
@@ -385,8 +396,15 @@ sysctl 的话，仍处于武装状态的 guard 会把它改回 `skyline_cc`。`s
    `required`/`important` 的永不移除（按架构分别判断）；先用 `apt-get -s --purge remove`
    出计划，其中 `Purg`/`Remv` 一旦出现清单之外的包，就把被它依赖的那个包单独留下并告警说明是
    谁需要它，其余照卸、重新出计划（最多三轮），三轮后仍不干净才**一个都不卸**、改为打印手工
-   命令。rustup 仅在 `/etc/skyline-speeder/added-rustup` 存在时移除。这一步的失败一律只是
-   告警——此时本体已经卸完，中断卸载更糟。
+   命令。dnf 主机：记录同样是前后 rpm 数据库的差集（只留本次请求所在事务的包，且永远不含
+   `gpg-pubkey`——那是 dnf 首次从仓库装包时导入的签名密钥），`iproute`/`iproute-tc`/`curl`/
+   `ca-certificates`/`tar` 与 dnf 的 protected packages 永不移除；先用 `rpm -e --test` 出计划，
+   清单外有包依赖其中某个时按 rpm 报出的能力留下提供它的那个、重新出计划（最多十轮），最后由
+   `dnf remove` 执行（关掉 `clean_requirements_on_remove`）。apk 主机：记录的是安装加进
+   `/etc/apk/world` 的名字，卸载即对它们 `apk del`，还被别的包需要的依赖由 apk 自己保留并列出；
+   `iproute2`/`curl`/`ca-certificates`/`tar`/`bash` 永不移除。rustup 仅在
+   `/etc/skyline-speeder/added-rustup` 存在时移除。这一步的失败一律只是告警——此时本体已经卸完，
+   中断卸载更糟。
 
 加 `--restore-pre-install` 时第 1 步换成从 `/etc/skyline-speeder/pre-install-state`
 还原安装前的拥塞控制算法与默认 qdisc；快照里记有网卡及其根 qdisc
