@@ -10,6 +10,15 @@ for anyone holding a prebuilt `.bpf.o`.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-09-30
+
+### Upgrading from 0.4.1
+
+- **Re-run the installer the way the host was installed.** Only `ssctl`
+  changed: the BPF objects, the ABI and the configuration are as in 0.4.1 --
+  both artifacts again carry the 0.4.0 objects byte for byte -- and
+  `ssctl --json` prints what it printed.
+
 ### Changed
 
 - **`ssctl` prints `sudo` in front of its remedies wherever the host has
@@ -952,7 +961,8 @@ rather than as fixes to a version nobody could have installed.
   socket file permissions. Multi-tenant hosts need additional access control.
 - The experiment harness requires **Python 3.11 or newer** (`tomllib`).
 
-[Unreleased]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.2.0...v0.3.0
