@@ -552,16 +552,23 @@ unit、二进制与 `/opt/skyline-speeder`，保留 `/etc/skyline-speeder`，然
    事务号（`INSTALLTID`）只留下这次请求所在的那个事务，并始终排除 `gpg-pubkey`——那是 dnf
    第一次从某个仓库装包时导入的仓库签名密钥，是这台机器对仓库的信任，不是我们的包，而且所有
    密钥都叫这个名字。卸载时 `iproute`/`iproute-tc`/`curl`/`ca-certificates`/`tar` 和 dnf
-   的 protected packages 永不移除；先用 `rpm -e --test` 对整份清单出计划，清单之外还有包依赖
-   其中某一个时，按 rpm 报出的能力（capability）找到提供它的那个我们的包，单独留下并说明是谁
-   需要它，再重新出计划（最多十轮，找不出该留谁就一个都不卸）；最后由 dnf 执行删除，并关掉
-   `clean_requirements_on_remove`——清单本身已经是安装加进来的全部，dnf 的 autoremove 会顺手带走
-   不是这个安装器留下的孤儿包。
+   的 protected packages 永不移除，它们递归依赖的包（例如 `iproute-tc` 底下的 `libbpf`，按 rpm
+   的依赖逐层求出）也永不移除，与 apt 的第二道护栏相同；再用 `rpm -e --test` 对剩下的清单
+   出计划，清单之外还有包依赖其中某一个时，按 rpm 报出的能力（capability）找到提供它的那个
+   我们的包，单独留下并说明是谁需要它，再重新出计划（最多十轮，找不出该留谁就一个都不卸）；
+   最后由 dnf 执行删除，并关掉 `clean_requirements_on_remove`——清单本身已经是安装加进来的
+   全部，dnf 的 autoremove 会顺手带走不是这个安装器留下的孤儿包。
 
    apk 主机上记录的是安装往 `/etc/apk/world` 里加的名字（请求的包，不含 apk 带进来的依赖），
    卸载就是对它们 `apk del`：apk 把它们移出 world，再删掉 world 里已经没人需要的依赖——还被
    `curl` 用着的库、运维此前或此后按名字装的包，它本来就不会删，也会列出留下了哪些、为什么。
    `iproute2`/`curl`/`ca-certificates`/`tar`/`bash` 同样永不移除。
+
+   安装结束时，指南里「卸载还会删掉 N 个包」的 N 按同一套护栏计算，与卸载实际删掉的一致：apt、
+   dnf 是记录里除去上面几类必留的包之后剩下的个数；apk 则先让 `apk del --simulate` 出计划，
+   不算它会留下的名字。例如 Debian 上原本没有 `curl` 时，预编译安装会记下 `curl` 和它带进来的
+   十几个库，它们全都留下，指南就说没有要删的包。
+
    rustup 只在 `/etc/skyline-speeder/added-rustup` 存在时移除（即确实是安装器装的），优先用
    `rustup self uninstall`，它不可用时才删目录，且只删仍然长得像 rustup 留下的目录。
 

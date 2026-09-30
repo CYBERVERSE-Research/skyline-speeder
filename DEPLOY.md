@@ -398,11 +398,13 @@ sysctl 的话，仍处于武装状态的 guard 会把它改回 `skyline_cc`。`s
    谁需要它，其余照卸、重新出计划（最多三轮），三轮后仍不干净才**一个都不卸**、改为打印手工
    命令。dnf 主机：记录同样是前后 rpm 数据库的差集（只留本次请求所在事务的包，且永远不含
    `gpg-pubkey`——那是 dnf 首次从仓库装包时导入的签名密钥），`iproute`/`iproute-tc`/`curl`/
-   `ca-certificates`/`tar` 与 dnf 的 protected packages 永不移除；先用 `rpm -e --test` 出计划，
-   清单外有包依赖其中某个时按 rpm 报出的能力留下提供它的那个、重新出计划（最多十轮），最后由
-   `dnf remove` 执行（关掉 `clean_requirements_on_remove`）。apk 主机：记录的是安装加进
-   `/etc/apk/world` 的名字，卸载即对它们 `apk del`，还被别的包需要的依赖由 apk 自己保留并列出；
-   `iproute2`/`curl`/`ca-certificates`/`tar`/`bash` 永不移除。rustup 仅在
+   `ca-certificates`/`tar` 与 dnf 的 protected packages 永不移除，它们递归依赖的包也永不移除
+   （按 rpm 的依赖逐层求闭包）；再用 `rpm -e --test` 出计划，清单外有包依赖其中某个时按 rpm
+   报出的能力留下提供它的那个、重新出计划（最多十轮），最后由 `dnf remove` 执行（关掉
+   `clean_requirements_on_remove`）。apk 主机：记录的是安装加进 `/etc/apk/world` 的名字，卸载
+   即对它们 `apk del`，还被别的包需要的依赖由 apk 自己保留并列出；`iproute2`/`curl`/
+   `ca-certificates`/`tar`/`bash` 永不移除。安装结束时指南里「卸载还会删掉 N 个包」的 N 按同一
+   套护栏计算（apk 用 `apk del --simulate` 出计划），与实际卸载一致。rustup 仅在
    `/etc/skyline-speeder/added-rustup` 存在时移除。这一步的失败一律只是告警——此时本体已经卸完，
    中断卸载更糟。
 
