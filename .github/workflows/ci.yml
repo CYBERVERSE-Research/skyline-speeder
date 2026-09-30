@@ -59,6 +59,18 @@ jobs:
       - name: Unit tests
         run: cargo test --workspace --locked
 
+  # The build release.yml makes for the -musl artifact (Alpine), run on every
+  # pull request as well: a change that breaks it fails here, not at tag time,
+  # where a failed release job publishes nothing at all.
+  musl:
+    name: Rust on musl (build in Alpine 3.21, run in clean Alpine)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and run
+        run: infra/build-musl.sh
+
   bpf:
     name: BPF (CO-RE compile only)
     runs-on: ubuntu-24.04

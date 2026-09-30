@@ -18,10 +18,10 @@ sudo ./install.sh --source     # 或：在本机从源码构建
 支持的发行版与各自的包管理器、服务管理器：Debian/Ubuntu（apt、systemd）、Fedora 与 RHEL 系——
 Rocky Linux、AlmaLinux、CentOS Stream（dnf、systemd）、Alpine（apk、OpenRC）。安装器按
 `/etc/os-release` 与 PID 1 自动选择，其余步骤处处相同；其他发行版在第一步就以非零退出码拒绝。
-Alpine 是 musl，总是源码构建；两个服务是 `/etc/init.d/skyline-speederd` 与
-`/etc/init.d/skyline-speeder-enable`，本文里的 `systemctl ...` 在那里换成 `rc-service ...` /
-`rc-update ...`，`journalctl -u <unit>` 换成 `grep <服务名> /var/log/messages`（对照表见
-`docs/01-deployment-guide.md` §4.4）。没有仓库 checkout 时，Alpine 上以 root 执行
+Alpine 是 musl，装的是 release 里的 musl 版产物（v0.4.1 起，Alpine 3.21 及更新）；两个服务是
+`/etc/init.d/skyline-speederd` 与 `/etc/init.d/skyline-speeder-enable`，本文里的 `systemctl ...`
+在那里换成 `rc-service ...` / `rc-update ...`，`journalctl -u <unit>` 换成
+`grep <服务名> /var/log/messages`（对照表见 `docs/01-deployment-guide.md` §4.4）。没有仓库 checkout 时，Alpine 上以 root 执行
 `wget -qO- https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sh`，
 其余发行版 `curl -fsSL <同一 URL> | sudo bash`。
 
@@ -96,8 +96,12 @@ guard 看 `status` 里有没有 `"guard"` 键，不要只看版本号。
 ## 2. 两条安装路径：预编译产物与源码构建
 
 不带参数时安装器先判断本机能否运行发布的二进制：架构是发布流水线出产物的架构（目前只有
-x86_64），C 库不是 musl（`/lib/ld-musl-*.so.1` 不存在），且 glibc ≥ 2.38
-（`getconf GNU_LIBC_VERSION`）。能则装预编译产物，否则打印一行
+x86_64），且 C 库够新——两种 C 库各有一个产物：glibc 版 `skyline-speeder-<tag>-x86_64.tar.gz`
+要求 glibc ≥ 2.38（`getconf GNU_LIBC_VERSION`）；musl 版 `skyline-speeder-<tag>-x86_64-musl.tar.gz`
+（v0.4.1 起）要求 musl ≥ 1.2.5（`/lib/ld-musl-*.so.1` 存在即是 musl，版本由它自己报出）。
+musl 主机上默认路径还会先问一次 release API：最新 release 没有 musl 版产物（v0.4.0 及更早）时
+改为源码构建。产物里的 `MANIFEST` 记着 `libc=`，与本机不符的产物（例如用
+`SKYLINE_ARTIFACT_URL` 指错了文件）在验证器之前就被拒绝。能则装预编译产物，否则打印一行
 `warn building from source: <原因>` 后改为源码构建。`--source` 无条件源码构建；`--prebuilt`
 与 `--release <tag>` 只装产物，本机跑不了时在第一步之前就以 `error --prebuilt/--release
 cannot install here: <原因>` 中止（退出码非零），不会改为构建。`--check` 会报告将走哪条路径
@@ -106,7 +110,7 @@ cannot install here: <原因>` 中止（退出码非零），不会改为构建�
 | | 预编译产物（默认） | 源码构建（`--source`，或默认路径在本机跑不了产物时） |
 |---|---|---|
 | 命令 | `./install.sh`；`./install.sh --prebuilt`（只装产物）；`./install.sh --release <tag>` 固定到某个版本 | `./install.sh --source` |
-| 目标机需要 | **不需要任何工具链**，只要 `curl`、`tar`、`iproute2`（安装器自动安装）；但预编译的 `skyline-speederd` 在 Ubuntu 24.04 上构建，需要 **glibc ≥ 2.38** 以及 `libelf.so.1`、`libz.so.1`（Debian 13、Ubuntu 24.04、Fedora 43、Rocky Linux 10 及更新版本满足；Fedora/RHEL 还会装上 `iproute-tc`） | 编译工具链（clang/LLVM、bpftool、libbpf/libelf/zlib 开发包、Rust；RHEL 系的 `libbpf-devel` 只对那一次事务启用 CRB 仓库取得，Alpine 的 `bpftool` 在 community 仓库），安装器自动安装，`--uninstall` 再卸掉 |
+| 目标机需要 | **不需要任何工具链**，只要 `curl`、`tar`、`iproute2`（安装器自动安装）；但 glibc 版 `skyline-speederd` 在 Ubuntu 24.04 上构建，需要 **glibc ≥ 2.38** 以及 `libelf.so.1`、`libz.so.1`（Debian 13、Ubuntu 24.04、Fedora 43、Rocky Linux 10 及更新版本满足；Fedora/RHEL 还会装上 `iproute-tc`）；musl 版在 Alpine 3.21 容器里构建，需要 **musl ≥ 1.2.5**（Alpine 3.21 及更新）以及 `libelf`、`zlib`、`zstd-libs`、`libgcc`（安装器自动安装） | 编译工具链（clang/LLVM、bpftool、libbpf/libelf/zlib 开发包、Rust；RHEL 系的 `libbpf-devel` 只对那一次事务启用 CRB 仓库取得，Alpine 的 `bpftool` 在 community 仓库），安装器自动安装，`--uninstall` 再卸掉 |
 | 装的是什么 | 最新（或 `--release` 指定的）release：`main` 上在它之后合并的改动不在其中 | 运行的这份源码树（一键安装时即 `--ref`，默认 `main`） |
 | BPF 对象的类型来源 | 发布流水线固定的 6.12 LTS 参考头，加载时由 CO-RE 按本机内核的 BTF 修正字段偏移 | 本机 `/sys/kernel/btf/vmlinux` |
 | 完整性校验 | 产物旁的 `.sha256` 必须匹配，不匹配即中止；取不到 `.sha256` 时告警、只信任 TLS | 源码树本身（`scripts/bootstrap.sh` 可用 `SKYLINE_SHA256` 固定 tarball 摘要） |

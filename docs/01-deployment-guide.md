@@ -218,16 +218,29 @@ guard 并把默认算法写回 `fallback_cc`，再等存量连接至多 60 秒�
 ### 4.2 预编译产物（默认路径）
 
 这是不带参数时的默认路径（v0.4.0 及更早的 `install.sh` 默认源码构建，要加 `--prebuilt`）。目标机上不需要
-clang、LLVM、bpftool 或 Rust，安装器只装 `curl`、`tar`、`iproute2`。
+clang、LLVM、bpftool 或 Rust，安装器只装 `curl`、`tar`、`iproute2`（Fedora/RHEL 还有
+`iproute-tc`，Alpine 还有 `bash` 和 musl 版运行时要的四个库）。
 BPF 对象由发布流水线在固定的 6.12 LTS 参考头上编译，加载时由 CO-RE 按本机内核的 BTF
 修正字段偏移，所以内核要求不变：6.12 LTS 或更新，且存在 `/sys/kernel/btf/vmlinux`。
 
-预编译的 `skyline-speederd` 在 Ubuntu 24.04 上构建，需要 **glibc 2.38 或更新**，以及
-`libelf.so.1` 和 `libz.so.1`：Debian 13、Ubuntu 24.04、Fedora 43、Rocky Linux 10 及更新版本满足
-（dnf 下这两个库按它们提供的 soname 请求，不管 zlib 是不是已换成 zlib-ng）；产物目前只发布
-x86_64。安装器在动手之前检查这两点（`getconf GNU_LIBC_VERSION`、`uname -m`，musl 的动态加载器
-`/lib/ld-musl-*.so.1`）：不满足时，默认路径打印 `building from source: <原因>` 并改为源码构建
-（例如 Debian 12 + backports 内核，或 musl 的 Alpine），`--prebuilt`/`--release` 则直接中止。`--check` 会报告将走哪条路径。
+每个 release 带两个产物，按 C 库区分，目前都只发布 x86_64：
+
+- glibc 版 `skyline-speeder-<tag>-x86_64.tar.gz`：`skyline-speederd` 在 Ubuntu 24.04 上构建，需要
+  **glibc 2.38 或更新**，以及 `libelf.so.1` 和 `libz.so.1`：Debian 13、Ubuntu 24.04、Fedora 43、
+  Rocky Linux 10 及更新版本满足（dnf 下这两个库按它们提供的 soname 请求，不管 zlib 是不是已换成
+  zlib-ng）；
+- musl 版 `skyline-speeder-<tag>-x86_64-musl.tar.gz`（v0.4.1 起）：在 Alpine 3.21 容器里构建
+  （`infra/build-musl.sh`），需要 **musl 1.2.5 或更新**（Alpine 3.21 及更新），以及 `libelf`、
+  `zlib`、`zstd-libs`、`libgcc`，安装器会装上。后缀放在架构名之后是刻意的：v0.4.0 及更早的
+  安装器按 `-x86_64.tar.gz` 取第一个匹配的产物，永远不会误取 musl 版。
+
+两个产物里的 BPF 对象是同一套文件，逐字节相同。安装器在动手之前检查架构和 C 库
+（`uname -m`；`/lib/ld-musl-*.so.1` 存在即是 musl，版本由它自己报出，否则 `getconf
+GNU_LIBC_VERSION`），按 C 库选产物；不满足时，默认路径打印 `building from source: <原因>` 并改为
+源码构建（例如 Debian 12 + backports 内核），`--prebuilt`/`--release` 则直接中止。musl 主机上默认
+路径还会先问一次 release API：最新 release 没有 musl 版（v0.4.0 及更早）时也改为源码构建。
+`--check` 会报告将走哪条路径。产物的 `MANIFEST` 记着 `libc=`，与本机 C 库不符的产物（例如
+`SKYLINE_ARTIFACT_URL` 指错了文件）在验证器之前就被拒绝，并说明该用哪一个。
 
 装上的是已发布的 release，不是 `main`：`main` 上在最新 release 之后合并的改动，要等下一个
 release 才会进入默认安装——所以每个 PR 都要考虑是否需要随之发布（见仓库 `CLAUDE.md`）。
@@ -297,10 +310,13 @@ sudo infra/install-guest.sh --confirm-install
 
 Alpine 用 OpenRC 而不是 systemd，C 库是 musl 而不是 glibc。一键安装照样适用，区别只有这些：
 
-- **只能源码构建。** 发布的二进制链接 glibc，默认路径检测到 musl 就改为源码构建（1 vCPU 上
-  约 10 分钟）。Rust 的 musl 目标默认静态链接，而 Alpine 把 zlib 的静态库放在没人装的
-  `zlib-static` 包里，链接会以 `cannot find -lz` 失败；仓库的 `.cargo/config.toml` 让 musl 上的
-  构建改为动态链接。
+- **装 musl 版产物。** v0.4.1 起每个 release 都带 musl 版产物（见第 4.2 节），Alpine 3.21 及
+  更新默认装它，外加它运行时要的 `libelf`、`zlib`、`zstd-libs`、`libgcc`；两个 OpenRC 脚本也在
+  产物里。更早的 release 没有 musl 版：`--release v0.4.0` 这样指定会直接中止，默认路径在最新
+  release 没有 musl 版时改为源码构建（1 vCPU 上约 10 分钟），`--source` 则总是源码构建。Rust 的
+  musl 目标默认静态链接，而 Alpine 把 zlib 的静态库放在没人装的 `zlib-static` 包里，链接会以
+  `cannot find -lz` 失败；仓库的 `.cargo/config.toml` 让 musl 上的构建改为动态链接，源码构建和
+  发布构建都是。
 - **两个服务**是 `packaging/openrc/` 下的脚本，装到 `/etc/init.d/`，与两个 systemd unit 一一对应：
   - `skyline-speederd`：由 `supervise-daemon` 托管，异常退出 2 秒后重拉、60 秒内 5 次仍失败就
     放弃（对应 `Restart=on-failure`）；停止时先发 SIGTERM，留 30 秒让它摘掉 struct_ops；输出经

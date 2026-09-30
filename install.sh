@@ -7,10 +7,11 @@
 #
 # Installs the latest published release -- the three CO-RE BPF objects and the
 # Rust control plane, no build toolchain -- together with the systemd units
-# (OpenRC scripts on Alpine), and activates skyline_cc across reboots. A host
-# that cannot run the published binaries (another architecture, a C library
-# older than they were built against, or musl, as on Alpine) is told why and
-# gets a build from this source tree instead. Installs no proxy, no network
+# (OpenRC scripts on Alpine), and activates skyline_cc across reboots. A
+# release carries a glibc build and, from v0.4.1, a musl build for Alpine; the
+# host's C library picks one. A host that cannot run either (another
+# architecture, a C library older than they were built against) is told why
+# and gets a build from this source tree instead. Installs no proxy, no network
 # service, and opens no port.
 #
 # The distribution decides only the package manager and the service manager:
@@ -110,14 +111,18 @@ SUDO=           # "sudo " where the host has sudo: the prefix of every command w
 ADDED_COUNT=0      # packages recorded in $ADDED_PKGS after this run
 ADDED_REMOVABLE=0  # of those, the ones an uninstall would actually remove
 GUIDE_URL=https://github.com/CYBERVERSE-Research/skyline-speeder/blob/main/docs/usage.md
-# What the published artifact can run on. release.yml builds it on an
-# ubuntu-24.04 runner for x86_64 only, and the skyline-speederd that comes out
-# asks for GLIBC_2.38 (`objdump -T bin/skyline-speederd`). Both are a sync
-# point with release.yml: raise the floor when the runner moves on, and add an
+# What the published artifacts can run on. release.yml builds them for x86_64
+# only. The glibc build comes off an ubuntu-24.04 runner, and the
+# skyline-speederd in it asks for GLIBC_2.38 (`objdump -T bin/skyline-speederd`).
+# The musl build (-musl, from v0.4.1) comes out of an Alpine 3.21 container
+# (infra/build-musl.sh), whose musl is 1.2.5 -- a binary runs on the musl it
+# was built against and on every later one. All three are a sync point with
+# release.yml: raise a floor when the build environment moves on, and add an
 # architecture when a release starts publishing one, or the default install
 # breaks on exactly the hosts it used to fall back for.
 PREBUILT_ARCHES="x86_64"
 PREBUILT_GLIBC_MIN=2.38
+PREBUILT_MUSL_MIN=1.2.5
 
 # `-qq` silences apt but not dpkg, which still prints an unpack line per
 # package plus a "Reading database" progress bar. Dpkg::Use-Pty=0 stops the
@@ -407,6 +412,25 @@ host_is_musl() {
         [ -e "$f" ] && return 0
     done
     return 1
+}
+
+# The musl version, as its dynamic loader states it when run with no program
+# ("musl libc (x86_64)", then "Version 1.2.5", on stderr); empty if it will
+# not say. It exits 1 doing so, which is why the status is ignored.
+musl_version() {
+    local f
+    for f in /lib/ld-musl-*.so.1; do
+        [ -x "$f" ] || continue
+        "$f" 2>&1 | awk '$1 == "Version" { print $2 }' || true
+        return 0
+    done
+}
+
+# version_older <a> <b>: whether version a sorts before version b. awk, not
+# head -1, takes the first line: it reads to the end, so sort never writes into
+# a closed pipe -- the SIGPIPE trap this file documents beside apt_unmet.
+version_older() {
+    [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | awk 'NR == 1')" = "$1" ]
 }
 
 # --- service manager ---------------------------------------------------------
@@ -1809,18 +1833,24 @@ purge_rustup() {
     fi
 }
 
-# prebuilt_blocker: why the published artifact cannot run on this host, or
-# nothing when it can. The C library is the one thing a CO-RE object does not
-# care about and a prebuilt daemon does.
+# prebuilt_blocker: why the published artifacts cannot run on this host, or
+# nothing when one can. The C library is the one thing a CO-RE object does not
+# care about and a prebuilt daemon does, so it picks the artifact: the glibc
+# build, or the musl build for Alpine.
 prebuilt_blocker() {
-    local arch glibc lowest
+    local arch glibc musl
     arch=$(uname -m)
     case " $PREBUILT_ARCHES " in
         *" $arch "*) ;;
         *) printf 'releases publish no %s artifact (only %s)' "$arch" "$PREBUILT_ARCHES"; return ;;
     esac
     if host_is_musl; then
-        printf 'the C library here is musl, and the published binaries are built against glibc'
+        musl=$(musl_version)
+        if [ -z "$musl" ]; then
+            printf 'the C library is musl, and its version cannot be read'
+        elif version_older "$musl" "$PREBUILT_MUSL_MIN"; then
+            printf 'musl %s is older than the %s the published musl binaries need' "$musl" "$PREBUILT_MUSL_MIN"
+        fi
         return
     fi
     glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}') || true
@@ -1828,10 +1858,33 @@ prebuilt_blocker() {
         printf 'the C library is not glibc, or its version cannot be read'
         return
     fi
-    lowest=$(printf '%s\n%s\n' "$PREBUILT_GLIBC_MIN" "$glibc" | sort -V | head -1)
-    if [ "$lowest" != "$PREBUILT_GLIBC_MIN" ]; then
+    if version_older "$glibc" "$PREBUILT_GLIBC_MIN"; then
         printf 'glibc %s is older than the %s the published binaries need' "$glibc" "$PREBUILT_GLIBC_MIN"
     fi
+}
+
+# release_lacks_musl: whether the latest release publishes no musl build --
+# every release before v0.4.1 -- with its tag in REPLY. The default install
+# on a musl host asks before it starts, and builds from source instead of
+# stopping at the download: this installer is fetched from main, so it can run
+# before a release that has the musl build exists. An unanswered question (no
+# curl or wget yet, no route to GitHub, the API's rate limit) is not a "no";
+# the download step then says what is wrong.
+release_lacks_musl() {
+    local json api="https://api.github.com/repos/${REPO_SLUG}/releases/latest" rc=1
+    json=$(mktemp)
+    if { command -v curl >/dev/null 2>&1 \
+             && curl -fsSL --proto '=https' --tlsv1.2 --max-time 30 -o "$json" "$api" 2>/dev/null; } \
+       || { command -v wget >/dev/null 2>&1 && wget -q -T 30 -O "$json" "$api" 2>/dev/null; }; then
+        if [ -s "$json" ] && ! grep -q "skyline-speeder-[^\"]*-$(uname -m)-musl\.tar\.gz" "$json"; then
+            REPLY=$(awk 'match($0, /"tag_name": *"[^"]*"/) {
+                             t = substr($0, RSTART, RLENGTH); sub(/^"tag_name": *"/, "", t)
+                             sub(/"$/, "", t); print t; exit }' "$json")
+            rc=0
+        fi
+    fi
+    rm -f "$json"
+    return "$rc"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -1998,6 +2051,12 @@ BLOCKER=$(prebuilt_blocker)
 SOURCE_REASON=
 case "$SOURCE" in
     auto)
+        # An artifact named by hand (SKYLINE_ARTIFACT_URL) is what the operator
+        # chose; only the release lookup can come back without a musl build.
+        if [ -z "$BLOCKER" ] && host_is_musl && [ -z "${SKYLINE_ARTIFACT_URL:-}" ] \
+           && release_lacks_musl; then
+            BLOCKER="the latest release${REPLY:+ ($REPLY)} publishes no musl build"
+        fi
         if [ -z "$BLOCKER" ]; then
             SOURCE=prebuilt
         else
@@ -2118,7 +2177,10 @@ export DEBIAN_FRONTEND=noninteractive
 # The whole point of --prebuilt: no compiler, no LLVM, no bpftool, no Rust.
 # Only what it takes to fetch and unpack an archive -- and, under dnf, the two
 # libraries the published skyline-speederd links, named by what they provide
-# so that zlib's move to zlib-ng does not matter. A source build needs the
+# so that zlib's move to zlib-ng does not matter; under apk, the ones the musl
+# build needs at run time (libelf, zlib, zstd-libs, libgcc: RUNTIME in
+# infra/build-musl.sh, which a release runs the binaries against in a clean
+# Alpine; keep the two in step). A source build needs the
 # same toolchain everywhere, under each distribution's own names; on Alpine
 # that includes linux-headers (musl has no kernel headers, and the libbpf that
 # libbpf-sys compiles includes them), bash, which this script runs in, and
@@ -2130,7 +2192,7 @@ case "$PKG:$SOURCE" in
     dnf:prebuilt) PKGS=(curl ca-certificates tar iproute iproute-tc 'libelf.so.1()(64bit)' 'libz.so.1()(64bit)') ;;
     dnf:*)        PKGS=(gcc make pkgconf-pkg-config clang llvm libbpf-devel elfutils-libelf-devel zlib-devel
                         bpftool curl ca-certificates tar iproute iproute-tc) ;;
-    apk:prebuilt) PKGS=(curl ca-certificates tar iproute2 bash) ;;
+    apk:prebuilt) PKGS=(curl ca-certificates tar iproute2 bash libelf zlib zstd-libs libgcc) ;;
     apk:*)        PKGS=(build-base pkgconf clang llvm libbpf-dev elfutils-dev zlib-dev linux-headers
                         bpftool curl ca-certificates tar iproute2 bash libgcc) ;;
 esac
@@ -2366,7 +2428,8 @@ apt_plan() {
 if [ "$MODE" = check ]; then
     info "preflight only; no changes will be made"
     if [ "$SOURCE" = prebuilt ]; then
-        ok "would install the published release${RELEASE_TAG:+ $RELEASE_TAG}"
+        if host_is_musl; then REPLY=" (its musl build)"; else REPLY=; fi
+        ok "would install the published release${RELEASE_TAG:+ $RELEASE_TAG}$REPLY"
     elif [ -n "$SOURCE_REASON" ]; then
         warn "would build from source: $SOURCE_REASON"
     else
@@ -2616,6 +2679,12 @@ fetch_prebuilt() {
     local api="https://api.github.com/repos/${REPO_SLUG}/releases"
     local arch; arch=$(uname -m)
     local staging="$WORK/staging"
+    # The C library picks the artifact: skyline-speeder-<tag>-<arch>.tar.gz is
+    # the glibc build, -<arch>-musl.tar.gz the musl one. The suffix goes after
+    # the architecture on purpose: installers up to v0.4.0 take the first name
+    # matching -<arch>.tar.gz, and must never land on the musl build.
+    local libc=glibc flavour=
+    if host_is_musl; then libc=musl flavour=-musl; fi
     mkdir -p "$staging"
 
     # An explicit artifact skips release resolution entirely. Two forms, because
@@ -2651,8 +2720,12 @@ fetch_prebuilt() {
     # point of a toolchain-free path. `|| true`: no match makes grep, and
     # under pipefail the assignment, fail, and set -e would then exit here
     # before the one message that says why.
-    url=$(grep -o "https://[^\"]*skyline-speeder-[^\"]*-${arch}\.tar\.gz" \
+    url=$(grep -o "https://[^\"]*skyline-speeder-[^\"]*-${arch}${flavour}\.tar\.gz" \
           "$staging/release.json" | head -1) || true
+    if [ -z "$url" ] && [ "$libc" = musl ]; then
+        die "no prebuilt musl artifact for $arch in that release: releases publish one
+   from v0.4.1 on. Build from source instead: ${SUDO}$0 --source"
+    fi
     [ -n "$url" ] || die "no prebuilt artifact for $arch in that release.
    Published artifacts are per-architecture; build from source instead."
     fi
@@ -2690,6 +2763,17 @@ fetch_prebuilt() {
     [ -n "$PREBUILT_ROOT" ] && [ -x "$PREBUILT_ROOT/bin/skyline-speederd" ] \
         || die "unexpected artifact layout: no bin/skyline-speederd at the top level"
 
+    # MANIFEST names the C library the binaries were built against (libc=,
+    # from v0.4.1; every artifact before that is glibc). The wrong one would
+    # fail at the verifier step with a bare "not found" -- the dynamic loader
+    # it asks for is not on this host -- so say which artifact this host takes.
+    local built_for
+    built_for=$(awk '{ sub(/^[ \t]+/, "") } sub(/^libc=/, "") { print; exit }' \
+        "$PREBUILT_ROOT/MANIFEST" 2>/dev/null || true)
+    [ "${built_for:-glibc}" = "$libc" ] \
+        || die "${PREBUILT_ROOT##*/} is built for ${built_for:-glibc}, and this host's C library is $libc.
+   Use the $libc artifact: skyline-speeder-<tag>-${arch}${flavour}.tar.gz"
+
     PROVENANCE="${PREBUILT_ROOT##*/} ($verified)"
     if [ -r "$PREBUILT_ROOT/MANIFEST" ]; then
         log "artifact provenance (MANIFEST):"
@@ -2712,13 +2796,16 @@ install_prebuilt_files() {
     if [ "$INIT" = systemd ]; then
         install -m 0644 "$root"/packaging/*.service /etc/systemd/system/
     else
-        # The published artifact carries the systemd units only, so an OpenRC
-        # host takes its two scripts from this installer's own tree -- the
-        # same two a source build installs.
-        [ -r "$REPO_ROOT/packaging/openrc/skyline-speederd" ] \
-            || die "no packaging/openrc/ beside this install.sh: run it from a Skyline Speeder source tree"
-        install -m 0755 "$REPO_ROOT/packaging/openrc/skyline-speederd" /etc/init.d/skyline-speederd
-        install -m 0755 "$REPO_ROOT/packaging/openrc/skyline-speeder-enable" /etc/init.d/skyline-speeder-enable
+        # The two OpenRC scripts come with the artifact from v0.4.1 on, from
+        # the same release as the daemon and the scripts they start. An older
+        # artifact has the systemd units only; then they come from this
+        # installer's own tree, the two a source build installs.
+        local openrc=$root/packaging/openrc
+        [ -r "$openrc/skyline-speederd" ] || openrc=$REPO_ROOT/packaging/openrc
+        [ -r "$openrc/skyline-speederd" ] \
+            || die "no packaging/openrc/ in the artifact or beside this install.sh: run it from a Skyline Speeder source tree"
+        install -m 0755 "$openrc/skyline-speederd" /etc/init.d/skyline-speederd
+        install -m 0755 "$openrc/skyline-speeder-enable" /etc/init.d/skyline-speeder-enable
     fi
     [ -e /etc/skyline-speeder/speeder.toml ] \
         || install -m 0644 "$root/config/speeder.toml" /etc/skyline-speeder/speeder.toml

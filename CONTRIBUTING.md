@@ -204,7 +204,10 @@ and **must not be used to draw performance conclusions**.
 ## Cutting a release
 
 Release artifacts are built by `.github/workflows/release.yml` when a `v*` tag
-is pushed. Before building anything it checks that the tag is exactly `v`
+is pushed: one per C library, the glibc build and a musl build for Alpine
+(`skyline-speeder-<tag>-<arch>-musl.tar.gz`, built in an Alpine 3.21
+container by `infra/build-musl.sh`, which needs docker and which CI runs on
+every pull request too), carrying the same BPF objects. Before building anything it checks that the tag is exactly `v`
 followed by the workspace version in `Cargo.toml`, and that `CHANGELOG.md` has a
 `## [<version>]` heading for it; otherwise it stops. So bump
 `[workspace.package] version` and turn `## [Unreleased]` into the release's
@@ -262,8 +265,7 @@ See `.gitignore`. In particular:
 
   | The change touches | Release needed? | Why |
   |---|---|---|
-  | `bpf/`, `crates/`, `config/speeder-guest.toml`, `packaging/*.service`, the `infra/*.sh` that `release.yml` ships | **yes** | it is in the artifact |
-  | `packaging/openrc/` | usually not | not in the artifact: an OpenRC host (Alpine) is musl and always builds from source, and the installer installs the two scripts from its own tree (`main`) |
+  | `bpf/`, `crates/`, `config/speeder-guest.toml`, `packaging/` (the systemd units and the OpenRC scripts), the `infra/*.sh` that `release.yml` ships | **yes** | it is in the artifact (the OpenRC scripts from v0.4.1 on: Alpine installs the musl artifact, and the installer prefers the two scripts in it) |
   | `install.sh`, `scripts/bootstrap.sh` | usually not | the one-line install always runs the installer from `main`; unless the new installer needs something the released artifact does not have yet -- then release first |
   | docs, the experiment harness, CI, anything only a source build uses | no | not in the artifact |
 
