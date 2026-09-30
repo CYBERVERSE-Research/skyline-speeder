@@ -3,9 +3,12 @@
 //! Colours, symbols, bars and unit formatting for `ssctl`'s human output.
 //!
 //! Everything a view draws goes through a `Theme`, so that one decision --
-//! is this a terminal, does it do colour, does it do UTF-8, how wide is it
-//! -- is made once and cannot be forgotten in a single line somewhere.
+//! is this a terminal, does it do colour, does it do UTF-8, how wide is it,
+//! does a command we suggest need `sudo` in front here -- is made once and
+//! cannot be forgotten in a single line somewhere.
+use std::ffi::OsStr;
 use std::fmt::Write as _;
+use std::os::unix::fs::PermissionsExt as _;
 
 /// `--color`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -21,6 +24,9 @@ pub struct Theme {
     unicode: bool,
     /// Usable width, already clamped to something a table can live in.
     pub width: usize,
+    /// Whether a command the report tells the operator to run is written
+    /// with `sudo ` in front -- see `wants_sudo`.
+    pub sudo: bool,
 }
 
 const RESET: &str = "\x1b[0m";
@@ -40,6 +46,20 @@ impl Theme {
             color,
             unicode: utf8_locale(),
             width: terminal_width(tty).clamp(60, 120),
+            sudo: wants_sudo(
+                std::env::var_os("PATH").is_some_and(|path| on_path(&path, "sudo")),
+                std::env::var_os("SUDO_USER").as_deref(),
+            ),
+        }
+    }
+
+    /// `command` the way the operator types it on this host: `sudo ssctl
+    /// enable` or `ssctl enable`.
+    pub fn command(&self, command: &str) -> String {
+        if self.sudo {
+            format!("sudo {command}")
+        } else {
+            command.to_owned()
         }
     }
 
@@ -194,6 +214,32 @@ fn utf8_locale() -> bool {
         }
     }
     false
+}
+
+/// Whether the commands a report suggests start with `sudo `.
+///
+/// They are there to be pasted, so they must work where they were printed,
+/// the rule install.sh keeps for its own guide. Every one of them is another
+/// `ssctl` call, which needs exactly the access to the control socket this
+/// call already had -- nothing is rendered without it. So the prefix goes on
+/// only when that access came from sudo: SUDO_USER names the user whose shell
+/// the next command is typed into, and that shell needs sudo again (unless
+/// the user is root, as with root's own `sudo ssctl ...`). A root shell, and
+/// a user the socket was opened up to, run the bare command. And never a
+/// sudo this host does not have: Alpine has none until somebody installs it,
+/// and neither do the root shells of many cloud images, where the prefix
+/// would only earn "sudo: not found".
+fn wants_sudo(sudo_on_path: bool, sudo_user: Option<&OsStr>) -> bool {
+    sudo_on_path && sudo_user.is_some_and(|user| !user.is_empty() && user != "root")
+}
+
+/// Whether `program` is an executable file in one of `path`'s directories,
+/// the lookup a shell does for a command name.
+fn on_path(path: &OsStr, program: &str) -> bool {
+    std::env::split_paths(path).any(|dir| {
+        std::fs::metadata(dir.join(program))
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    })
 }
 
 fn terminal_width(tty: bool) -> usize {
@@ -362,6 +408,7 @@ mod tests {
             color: false,
             unicode: false,
             width: 80,
+            sudo: false,
         };
         let drawn = format!(
             "{}{}{}{}",
@@ -380,6 +427,7 @@ mod tests {
             color: false,
             unicode: true,
             width: 80,
+            sudo: false,
         };
         assert_eq!(theme.bar(0.0, 4, Mark::Good), "[░░░░]");
         assert_eq!(theme.bar(0.5, 4, Mark::Good), "[██░░]");
@@ -403,6 +451,57 @@ mod tests {
         let long = wrap("see /a/very/long/path/that/exceeds/the/width/entirely", 20);
         assert_eq!(long.len(), 2);
         assert_eq!(long[1], "/a/very/long/path/that/exceeds/the/width/entirely");
+    }
+
+    /// Who reads the report decides the prefix: only somebody who got to it
+    /// through another user's sudo is told to use sudo again, and nobody on
+    /// a host without one.
+    #[test]
+    fn sudo_only_where_the_access_came_from_sudo() {
+        let alice = OsStr::new("alice");
+        // `sudo ssctl status`, typed in alice's shell.
+        assert!(wants_sudo(true, Some(alice)));
+        // A root shell, and root's own `sudo ssctl status`.
+        assert!(!wants_sudo(true, None));
+        assert!(!wants_sudo(true, Some(OsStr::new("root"))));
+        assert!(!wants_sudo(true, Some(OsStr::new(""))));
+        // No sudo on this host (Alpine, a bare cloud image): never.
+        assert!(!wants_sudo(false, Some(alice)));
+        assert!(!wants_sudo(false, None));
+    }
+
+    #[test]
+    fn sudo_is_looked_up_the_way_a_shell_does() {
+        let dir = std::env::temp_dir().join(format!("ssctl-on-path-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("doas")).expect("create a scratch directory");
+        let sudo = dir.join("sudo");
+        std::fs::write(&sudo, "#!/bin/sh\n").expect("write a stand-in sudo");
+        let search = std::env::join_paths([std::path::Path::new("/nonexistent"), &dir])
+            .expect("join the search path");
+
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert!(
+            !on_path(&search, "sudo"),
+            "not executable, so not a command"
+        );
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(on_path(&search, "sudo"));
+        assert!(!on_path(&search, "doas"), "a directory is not a command");
+        assert!(!on_path(OsStr::new("/nonexistent"), "sudo"));
+        std::fs::remove_dir_all(&dir).expect("remove the scratch directory");
+    }
+
+    #[test]
+    fn a_command_carries_sudo_only_when_the_theme_says_so() {
+        let mut theme = Theme {
+            color: false,
+            unicode: false,
+            width: 80,
+            sudo: true,
+        };
+        assert_eq!(theme.command("ssctl enable"), "sudo ssctl enable");
+        theme.sudo = false;
+        assert_eq!(theme.command("ssctl enable"), "ssctl enable");
     }
 
     #[test]
