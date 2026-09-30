@@ -4,8 +4,8 @@
 //!
 //! Everything a view draws goes through a `Theme`, so that one decision --
 //! is this a terminal, does it do colour, does it do UTF-8, how wide is it,
-//! does a command we suggest need `sudo` in front here -- is made once and
-//! cannot be forgotten in a single line somewhere.
+//! does this host have the sudo a suggested command would start with -- is
+//! made once and cannot be forgotten in a single line somewhere.
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
@@ -25,7 +25,8 @@ pub struct Theme {
     /// Usable width, already clamped to something a table can live in.
     pub width: usize,
     /// Whether a command the report tells the operator to run is written
-    /// with `sudo ` in front -- see `wants_sudo`.
+    /// with `sudo ` in front: wherever this host has sudo -- see
+    /// `sudo_installed`.
     pub sudo: bool,
 }
 
@@ -46,10 +47,7 @@ impl Theme {
             color,
             unicode: utf8_locale(),
             width: terminal_width(tty).clamp(60, 120),
-            sudo: wants_sudo(
-                std::env::var_os("PATH").is_some_and(|path| on_path(&path, "sudo")),
-                std::env::var_os("SUDO_USER").as_deref(),
-            ),
+            sudo: sudo_installed(std::env::var_os("PATH").as_deref()),
         }
     }
 
@@ -216,21 +214,16 @@ fn utf8_locale() -> bool {
     false
 }
 
-/// Whether the commands a report suggests start with `sudo `.
-///
-/// They are there to be pasted, so they must work where they were printed,
-/// the rule install.sh keeps for its own guide. Every one of them is another
-/// `ssctl` call, which needs exactly the access to the control socket this
-/// call already had -- nothing is rendered without it. So the prefix goes on
-/// only when that access came from sudo: SUDO_USER names the user whose shell
-/// the next command is typed into, and that shell needs sudo again (unless
-/// the user is root, as with root's own `sudo ssctl ...`). A root shell, and
-/// a user the socket was opened up to, run the bare command. And never a
-/// sudo this host does not have: Alpine has none until somebody installs it,
-/// and neither do the root shells of many cloud images, where the prefix
-/// would only earn "sudo: not found".
-fn wants_sudo(sudo_on_path: bool, sudo_user: Option<&OsStr>) -> bool {
-    sudo_on_path && sudo_user.is_some_and(|user| !user.is_empty() && user != "root")
+/// Whether the commands a report suggests start with `sudo `: wherever the
+/// host has sudo, whoever runs `ssctl`. That is the rule install.sh's closing
+/// guide follows, so the two never tell the operator different things on one
+/// host, and the commands are there to be pasted: with sudo in front they
+/// work from an ordinary user's shell and are harmless in a root one. Where
+/// there is no sudo -- Alpine until somebody installs it, the root shell of
+/// many cloud images -- the prefix would only earn "sudo: not found", so the
+/// bare command is printed.
+fn sudo_installed(path: Option<&OsStr>) -> bool {
+    path.is_some_and(|path| on_path(path, "sudo"))
 }
 
 /// Whether `program` is an executable file in one of `path`'s directories,
@@ -453,23 +446,9 @@ mod tests {
         assert_eq!(long[1], "/a/very/long/path/that/exceeds/the/width/entirely");
     }
 
-    /// Who reads the report decides the prefix: only somebody who got to it
-    /// through another user's sudo is told to use sudo again, and nobody on
-    /// a host without one.
-    #[test]
-    fn sudo_only_where_the_access_came_from_sudo() {
-        let alice = OsStr::new("alice");
-        // `sudo ssctl status`, typed in alice's shell.
-        assert!(wants_sudo(true, Some(alice)));
-        // A root shell, and root's own `sudo ssctl status`.
-        assert!(!wants_sudo(true, None));
-        assert!(!wants_sudo(true, Some(OsStr::new("root"))));
-        assert!(!wants_sudo(true, Some(OsStr::new(""))));
-        // No sudo on this host (Alpine, a bare cloud image): never.
-        assert!(!wants_sudo(false, Some(alice)));
-        assert!(!wants_sudo(false, None));
-    }
-
+    /// sudo is looked up the way a shell looks up a command, and whether it
+    /// is there is all the prefix depends on: a file that is not executable
+    /// is no sudo, and with no PATH at all there is none.
     #[test]
     fn sudo_is_looked_up_the_way_a_shell_does() {
         let dir = std::env::temp_dir().join(format!("ssctl-on-path-{}", std::process::id()));
@@ -484,10 +463,14 @@ mod tests {
             !on_path(&search, "sudo"),
             "not executable, so not a command"
         );
+        assert!(!sudo_installed(Some(search.as_os_str())));
         std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         assert!(on_path(&search, "sudo"));
+        assert!(sudo_installed(Some(search.as_os_str())));
         assert!(!on_path(&search, "doas"), "a directory is not a command");
         assert!(!on_path(OsStr::new("/nonexistent"), "sudo"));
+        assert!(!sudo_installed(Some(OsStr::new("/nonexistent"))));
+        assert!(!sudo_installed(None));
         std::fs::remove_dir_all(&dir).expect("remove the scratch directory");
     }
 

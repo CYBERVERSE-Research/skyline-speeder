@@ -10,6 +10,17 @@ for anyone holding a prebuilt `.bpf.o`.
 
 ## [Unreleased]
 
+### Changed
+
+- **`ssctl` prints `sudo` in front of its remedies wherever the host has
+  sudo**, the rule the closing guide of `install.sh` follows, so the two no
+  longer disagree on one host. 0.4.1 printed it only when `ssctl` itself had
+  been started through sudo by another user: in a root shell on a host with
+  sudo it said `ssctl enable` where the installer's guide said
+  `sudo ssctl enable`. On a host without sudo -- Alpine unless somebody
+  installed it, the root shell of many cloud images -- the commands are still
+  printed bare. `--json` is unchanged.
+
 ## [0.4.1] - 2026-09-30
 
 ### Upgrading from 0.4.0
