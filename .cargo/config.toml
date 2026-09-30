@@ -1,8 +1,8 @@
 # Built on a musl host (Alpine), link the binaries dynamically, the way every
 # other program on that host is linked. Rust's musl targets link statically by
-# default, and then libbpf-sys needs libelf, zlib and zstd as static archives:
-# Alpine keeps zlib's and zstd's in separate -static packages that nothing
-# installs, so the link fails. Inert on glibc hosts, the release build
-# included. RUSTFLAGS in the environment replaces this.
+# default, and then the -lz libbpf-sys asks for needs zlib's static archive,
+# which Alpine keeps in zlib-static, a package nothing installs: the link fails
+# with `cannot find -lz` (measured on Alpine 3.23). Inert on glibc hosts, the
+# release build included. RUSTFLAGS in the environment replaces this.
 [target.'cfg(target_env = "musl")']
 rustflags = ["-C", "target-feature=-crt-static"]

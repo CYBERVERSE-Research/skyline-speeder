@@ -43,8 +43,8 @@ for anyone holding a prebuilt `.bpf.o`.
     in Alpine's community repository; a host without it enabled gets it from
     the same mirror's community repository for that one command, and
     `/etc/apk/repositories` is not changed. `.cargo/config.toml` links the
-    musl build dynamically: statically, libbpf-sys would need zlib and zstd
-    archives Alpine keeps in `-static` packages nothing installs.
+    musl build dynamically: statically, the link fails on `-lz`, whose archive
+    Alpine keeps in `zlib-static`, which nothing installs.
   - **`scripts/bootstrap.sh` is POSIX sh**, so a fresh Alpine, which has
     busybox `wget` but neither `curl` nor `bash`, runs it as root with
     `wget -qO- .../bootstrap.sh | sh`; it installs `curl` and `bash` with

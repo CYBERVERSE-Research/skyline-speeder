@@ -298,8 +298,9 @@ sudo infra/install-guest.sh --confirm-install
 Alpine 用 OpenRC 而不是 systemd，C 库是 musl 而不是 glibc。一键安装照样适用，区别只有这些：
 
 - **只能源码构建。** 发布的二进制链接 glibc，默认路径检测到 musl 就改为源码构建（1 vCPU 上
-  约 10 分钟）。Rust 的 musl 目标默认静态链接，而 Alpine 把 zlib、zstd 的静态库放在没人装的
-  `-static` 包里，链接会失败；仓库的 `.cargo/config.toml` 让 musl 上的构建改为动态链接。
+  约 10 分钟）。Rust 的 musl 目标默认静态链接，而 Alpine 把 zlib 的静态库放在没人装的
+  `zlib-static` 包里，链接会以 `cannot find -lz` 失败；仓库的 `.cargo/config.toml` 让 musl 上的
+  构建改为动态链接。
 - **两个服务**是 `packaging/openrc/` 下的脚本，装到 `/etc/init.d/`，与两个 systemd unit 一一对应：
   - `skyline-speederd`：由 `supervise-daemon` 托管，异常退出 2 秒后重拉、60 秒内 5 次仍失败就
     放弃（对应 `Restart=on-failure`）；停止时先发 SIGTERM，留 30 秒让它摘掉 struct_ops；输出经
