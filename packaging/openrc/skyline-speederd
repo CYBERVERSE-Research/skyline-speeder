@@ -1,0 +1,48 @@
+#!/sbin/openrc-run
+# shellcheck shell=sh disable=SC2034  # openrc-run reads the variables set here
+# OpenRC counterpart of packaging/skyline-speederd.service, for hosts that run
+# OpenRC instead of systemd (Alpine). Keep the two in step: the same binary and
+# configuration, the same directories created before it starts, and -- like
+# the systemd unit -- no attach: skyline-speeder-enable does that.
+
+description="Skyline Speeder experimental TCP congestion-control daemon"
+
+command=/usr/local/sbin/skyline-speederd
+command_args="--config /etc/skyline-speeder/speeder.toml"
+supervisor=supervise-daemon
+# ConditionPathExists= in the systemd unit.
+required_files="/etc/skyline-speeder/speeder.toml"
+# Restart=on-failure, RestartSec=2 -- and give up the way systemd's start
+# limit does, instead of respawning a daemon that cannot start forever.
+respawn_delay=2
+respawn_max=5
+respawn_period=60
+# SIGTERM is what makes the daemon stop its guard and unregister skyline_cc
+# on the way out (impl Drop for Daemon); a KILL skips all of it.
+retry="TERM/30/KILL/5"
+# What it writes -- guard corrections, errors -- goes to syslog, which the
+# system logger rotates. Not a file under /var/log that grows without bound.
+output_logger="logger -t skyline-speederd -p daemon.info"
+error_logger="logger -t skyline-speederd -p daemon.err"
+
+depend() {
+    # The sockops policy attaches to a cgroup v2 path, and the daemon refuses
+    # to start without cgroup v2 at /sys/fs/cgroup. On Alpine nothing mounts
+    # it unless the cgroups service runs, and that service is in no runlevel
+    # by default: `need` starts it first.
+    need cgroups localmount
+    # After sysctl: the files under /etc/sysctl.d are applied first, so a
+    # "one-click BBR" one there does not undo what skyline-speeder-enable
+    # then sets (the guard would put it back, but only a pass later).
+    after net sysctl modules
+}
+
+start_pre() {
+    # RuntimeDirectory= and ExecStartPre= of the systemd unit. /run is a
+    # tmpfs, so this directory is gone after every reboot, and the daemon
+    # opens its event log and state file there before anything else. It must
+    # be the parent of runtime.socket_path, events_path and state_path in
+    # speeder.toml -- the same coupling as RuntimeDirectory= in the unit.
+    checkpath -d -m 0755 -o root:root /run/skyline-speeder || return 1
+    mkdir -p /sys/fs/bpf/skyline-speeder /sys/fs/cgroup/skyline-speeder
+}

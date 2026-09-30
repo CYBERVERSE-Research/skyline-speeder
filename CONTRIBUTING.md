@@ -27,6 +27,15 @@ so it must run on the target kernel, or be pointed at BTF explicitly with
 `make VMLINUX_BTF=<path> bpf`. `bpf/include/vmlinux.h` is a build artefact and is
 never committed.
 
+A vmlinux.h generated this way is compiled with `-DBPF_NO_KFUNC_PROTOTYPES`: from
+7.5 on, bpftool writes a prototype for every kfunc the running kernel exports, and
+one of them can disagree with the distribution's `bpf_helpers.h` (on Fedora 43,
+kernel 6.17 exports `bpf_stream_vprintk` with five arguments and libbpf 1.6.1
+declares four). So **declare every kfunc a BPF source calls in that source**, as
+`skyline_cc.bpf.c` does, rather than relying on vmlinux.h. The
+`PREBUILT_VMLINUX_H` path a release builds with does not set the macro, and the
+released objects stay byte for byte the same.
+
 `make check` and `make test` drive a Python venv for the experiment-harness unit
 tests, which need **Python 3.11 or newer** (`research/experiments/matrix_lib.py`
 imports `tomllib`; on 3.10 and earlier the tests fail at import). Either run
@@ -58,8 +67,9 @@ Breaking any of these is a defect regardless of what else the change does.
 | `.name = "skyline_cc"` | `bpf/skyline_cc.bpf.c` | Registration name, **≤ 15 characters** (`TCP_CA_NAME_MAX` is 16 including NUL) |
 | `SKYLINE_ABI_VERSION` | `bpf/include/skyline_abi.h` | Must be incremented on any layout change; userspace refuses to load a mismatched object |
 | `cong_control` 4-argument signature | `bpf/skyline_cc.bpf.c` | `(sk, ack, flag, rs)` — exists only on kernel >= 6.10 |
-| Install paths `/opt`, `/etc`, `/run/skyline-speeder` | config, units, scripts | All three must agree |
+| Install paths `/opt`, `/etc`, `/run/skyline-speeder` | config, units (the two OpenRC scripts in `packaging/openrc/` included), scripts | All three must agree |
 | `RuntimeDirectory=skyline-speeder` | `packaging/skyline-speederd.service` | **Must match the parent directory of `socket_path`** |
+| `checkpath -d /run/skyline-speeder` | `packaging/openrc/skyline-speederd` | OpenRC's `RuntimeDirectory=`: **must be the parent directory of `socket_path`** (and of `events_path`, `state_path`), where the daemon opens its event log first |
 
 > The `RuntimeDirectory` / `socket_path` coupling is a hole this project has
 > already fallen into once: a bulk rename changed `RuntimeDirectory` to
@@ -252,7 +262,8 @@ See `.gitignore`. In particular:
 
   | The change touches | Release needed? | Why |
   |---|---|---|
-  | `bpf/`, `crates/`, `config/speeder-guest.toml`, `packaging/`, the `infra/*.sh` that `release.yml` ships | **yes** | it is in the artifact |
+  | `bpf/`, `crates/`, `config/speeder-guest.toml`, `packaging/*.service`, the `infra/*.sh` that `release.yml` ships | **yes** | it is in the artifact |
+  | `packaging/openrc/` | usually not | not in the artifact: an OpenRC host (Alpine) is musl and always builds from source, and the installer installs the two scripts from its own tree (`main`) |
   | `install.sh`, `scripts/bootstrap.sh` | usually not | the one-line install always runs the installer from `main`; unless the new installer needs something the released artifact does not have yet -- then release first |
   | docs, the experiment harness, CI, anything only a source build uses | no | not in the artifact |
 

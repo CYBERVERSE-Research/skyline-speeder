@@ -8,7 +8,7 @@
 
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
 [![Kernel](https://img.shields.io/badge/kernel-6.12%20LTS%2B-orange.svg)](#kernel-requirement)
-[![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu-red.svg)](install.sh)
+[![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu%20%7C%20Fedora%20%7C%20RHEL%20%7C%20Alpine-red.svg)](install.sh)
 [![eBPF](https://img.shields.io/badge/eBPF-CO--RE%20struct__ops-green.svg)](bpf/)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-black.svg)](rust-toolchain.toml)
 
@@ -94,14 +94,22 @@ If you know your egress bandwidth, it is fixed and your kernel is old, tcp-bruta
 
 Verified: `6.12.101`, `6.18.42` and `7.1.6` pass, including IPv4/IPv6 data-path smoke tests. `6.1.180` and `6.6.148` fail to load, by design.
 
+**Distributions:** Debian and Ubuntu (apt, systemd), Fedora and the RHEL family — Rocky Linux, AlmaLinux, CentOS Stream (dnf, systemd) — and Alpine (apk, OpenRC), on a kernel that meets the line above. The one-line install has been run end to end on Debian 13, Fedora 43, Rocky Linux 10.2 and Alpine 3.23.
+
 ## Quick start
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash
 ```
 
+On Alpine, as root — a fresh Alpine has `wget` but neither `curl` nor `bash`, and the bootstrap installs both:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sh
+```
+
 > [!NOTE]
-> **The one-line install now installs the latest published release by default**: prebuilt BPF objects and daemon, with no compiler, LLVM or Rust put on the host. A host that cannot run the published binaries (not x86_64, or a glibc older than 2.38, such as Debian 12) is told why and builds from source instead. To build from source anyway, or to install a particular release:
+> **The one-line install now installs the latest published release by default**: prebuilt BPF objects and daemon, with no compiler, LLVM or Rust put on the host. A host that cannot run the published binaries (not x86_64, a glibc older than 2.38 such as Debian 12's, or musl, as on Alpine) is told why and builds from source instead. To build from source anyway, or to install a particular release:
 >
 > ```bash
 > curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash -s -- --source           # build from source on this host
@@ -110,7 +118,7 @@ curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder
 >
 > Installers up to and including v0.4.0 built from source by default and needed `--prebuilt` for the release; the one-line install always runs the installer from `main`, so it has the new default already. `--prebuilt` still works and now means "the release or nothing": on a host that cannot run it, it stops instead of building.
 
-A minimal image may lack `curl` (`apt-get install -y curl`) or `sudo` (drop it if you are root). To read the scripts before running them, which is **recommended** since this changes the congestion control of every new connection on the machine:
+A minimal Debian image may lack `curl` (`apt-get install -y curl`), and many images lack `sudo` (drop it if you are root). To read the scripts before running them, which is **recommended** since this changes the congestion control of every new connection on the machine:
 
 ```bash
 git clone https://github.com/CYBERVERSE-Research/skyline-speeder.git
@@ -127,11 +135,11 @@ sudo ./install.sh --uninstall --restore-pre-install   # ... but put back the
                                #   congestion control and qdisc from before the install
 ```
 
-The installer checks the kernel, builds or downloads the three BPF objects and the daemon, points the TC program at the default-route interface (IPv4 or IPv6; when that route leaves through a tunnel such as WireGuard, it asks you to name the NIC), runs every object through the kernel verifier, then starts the daemon, attaches `skyline_cc` and enables both at boot. It shows one progress line and keeps every command's output in `/var/log/skyline-speeder-install.log`; when it finishes it prints the congestion control and qdisc before and after, then a short guide to `ssctl`, tuning and uninstalling. **It installs no proxy and opens no port.**
+The installer uses the distribution's own package manager and service manager — apt, dnf or apk; systemd, or OpenRC on Alpine, where `rc-service skyline-speederd restart` stands in for `systemctl restart skyline-speederd` in these docs. It checks the kernel, builds or downloads the three BPF objects and the daemon, points the TC program at the default-route interface (IPv4 or IPv6; when that route leaves through a tunnel such as WireGuard, it asks you to name the NIC), runs every object through the kernel verifier, then starts the daemon, attaches `skyline_cc` and enables both at boot. It shows one progress line and keeps every command's output in `/var/log/skyline-speeder-install.log`; when it finishes it prints the congestion control and qdisc before and after, then a short guide to `ssctl`, tuning and uninstalling. **It installs no proxy and opens no port.**
 
-`--uninstall` drains live flows, removes the units, binaries and BPF objects, puts the host on **bbr + fq**, and removes the packages the install added. It records which packages those were (`/etc/skyline-speeder/added-packages`) and removes only those: never `iproute2`, `curl`, `ca-certificates` or `tar`, never anything one of those still needs (keeping `curl` while removing the library under it is not something apt can do), and never anything dpkg calls *required* or *important*. apt plans the removal first: a package something else on the host now needs is kept and named, and the rest is removed; only when no reduced plan stays inside the recorded list is nothing removed at all, and the command to do it by hand is printed instead. A rustup toolchain is removed only if the installer is the one that installed it. `bbr` and `fq` are set for that boot; no file under `/etc/sysctl.d` is written or edited, so those files decide again after a reboot. `--restore-pre-install` puts back the congestion control and qdiscs the host ran before instead — it also records those, including the egress interface's root qdisc. `/etc/skyline-speeder` is kept either way, so a reinstall keeps your settings.
+`--uninstall` drains live flows, removes the units, binaries and BPF objects, puts the host on **bbr + fq**, and removes the packages the install added. It records which packages those were (`/etc/skyline-speeder/added-packages`) and removes only those: never `iproute2` (`iproute` and `iproute-tc` on Fedora/RHEL), `curl`, `ca-certificates` or `tar` (or `bash` on Alpine), never anything one of those still needs (keeping `curl` while removing the library under it is not something apt can do), and never anything dpkg calls *required* or *important* or dnf protects. The removal is planned first (by apt, or `rpm -e --test`; apk never removes what something still needs): a package something else on the host now needs is kept and named, and the rest is removed; only when no reduced plan stays inside the recorded list is nothing removed at all, and the command to do it by hand is printed instead. A rustup toolchain is removed only if the installer is the one that installed it. `bbr` and `fq` are set for that boot; no file under `/etc/sysctl.d` is written or edited, so those files decide again after a reboot. `--restore-pre-install` puts back the congestion control and qdiscs the host ran before instead — it also records those, including the egress interface's root qdisc. `/etc/skyline-speeder` is kept either way, so a reinstall keeps your settings.
 
-The published release needs no toolchain, only `curl`, `tar` and `iproute2` (the installer installs them): the objects are CO-RE, compiled against a pinned 6.12 header and relocated against this kernel when they load. The prebuilt daemon is built on Ubuntu 24.04 and needs glibc 2.38 or newer with `libelf.so.1` and `libz.so.1` (Debian 13, Ubuntu 24.04 and later); on older userspace the default install builds from source by itself, and `--source` does so anywhere. `--release <tag>` pins a version, and `SKYLINE_ARTIFACT_URL=/path/to/tarball sudo -E ./install.sh --prebuilt` installs a copied artifact on a host with no route to GitHub. What gets installed is a published release, which can be older than this README and than `main`: a change merged after the latest release reaches the one-line install only with the next one. A release that predates a feature described here (the v0.2.0 release has no qdisc guard, for one) is named as such by the installer.
+The published release needs no toolchain, only `curl`, `tar` and `iproute2` (the installer installs them): the objects are CO-RE, compiled against a pinned 6.12 header and relocated against this kernel when they load. The prebuilt daemon is built on Ubuntu 24.04 and needs glibc 2.38 or newer with `libelf.so.1` and `libz.so.1` (Debian 13, Ubuntu 24.04, Fedora 43, Rocky Linux 10 and later); on older userspace, and on Alpine's musl, the default install builds from source by itself, and `--source` does so anywhere. `--release <tag>` pins a version, and `SKYLINE_ARTIFACT_URL=/path/to/tarball sudo -E ./install.sh --prebuilt` installs a copied artifact on a host with no route to GitHub. What gets installed is a published release, which can be older than this README and than `main`: a change merged after the latest release reaches the one-line install only with the next one. A release that predates a feature described here (the v0.2.0 release has no qdisc guard, for one) is named as such by the installer.
 
 > [!IMPORTANT]
 > **Upgrading:** run the installer again. Once the new objects pass the kernel verifier it restarts `skyline-speederd` itself, draining live flows for up to 60 seconds, and attaches `skyline_cc` again, also on a host where it was attached by hand with `ssctl enable`. Settings changed with `ssctl` do not survive the restart. A host that was built from source moves to the published release unless you pass `--source` again. Details: [CHANGELOG.md](CHANGELOG.md), *Upgrading from 0.3.0*.
@@ -195,8 +203,8 @@ sudo /opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <your service command..
 
 ```
 skyline-speeder/
-├── install.sh                    one-command install (Debian/Ubuntu)
-├── scripts/bootstrap.sh          remote installer entry point (curl | sudo bash)
+├── install.sh                    one-command install (Debian/Ubuntu, Fedora/RHEL, Alpine)
+├── scripts/bootstrap.sh          remote installer entry point (curl | sudo bash, or wget | sh)
 ├── bpf/
 │   ├── skyline_cc.bpf.c          struct_ops congestion control, runs on every ACK
 │   ├── skyline_policy.bpf.c      cgroup sockops: CC selection and dynamic RTO floor/ceiling
@@ -207,7 +215,7 @@ skyline-speeder/
 │   ├── ssctl/                    command line
 │   └── skyline-common/           shared ABI types and config parsing
 ├── config/                       speeder-guest.toml (installed template) / speeder.toml (development)
-├── packaging/                    systemd units
+├── packaging/                    systemd units; openrc/ holds the same two services for OpenRC
 ├── infra/                        install helpers, cgroup wrapper, two-VM test bed
 ├── research/experiments/         test manifests, runner, analysis, field measurements
 ├── docs/                         usage guide, deployment, interface reference, design, performance report
@@ -223,6 +231,10 @@ skyline-speeder/
 ```bash
 sudo apt-get install -y build-essential pkg-config clang llvm \
     libbpf-dev libelf-dev zlib1g-dev bpftool
+# Fedora / RHEL (libbpf-devel is in CodeReady Builder there: add --enablerepo=crb):
+#   sudo dnf install gcc make pkgconf-pkg-config clang llvm libbpf-devel elfutils-libelf-devel zlib-devel bpftool
+# Alpine (bpftool is in the community repository):
+#   apk add build-base pkgconf clang llvm libbpf-dev elfutils-dev zlib-dev linux-headers bpftool
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 make bpf                          # generate vmlinux.h, compile the three CO-RE objects

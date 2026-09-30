@@ -1,0 +1,29 @@
+#!/sbin/openrc-run
+# shellcheck shell=sh disable=SC2034  # openrc-run reads the variables set here
+# OpenRC counterpart of packaging/skyline-speeder-enable.service: attach
+# skyline_cc once skyline-speederd runs, and drain it again before that stops,
+# with the same two scripts the systemd unit runs. Why this is a service of its
+# own, and not something skyline-speederd does when it starts, is explained in
+# infra/boot-enable.sh.
+
+description="Attach Skyline Speeder skyline_cc and select it, with the fq qdisc, as the system TCP congestion control"
+
+depend() {
+    # Requires= + After= in the systemd unit: started after skyline-speederd,
+    # stopped before it (which is what drains the flows first), and
+    # restarted when it is.
+    need skyline-speederd
+}
+
+start() {
+    ebegin "Attaching skyline_cc"
+    # boot-enable.sh waits up to 60 s for the daemon's control socket.
+    /opt/skyline-speeder/infra/boot-enable.sh
+    eend $?
+}
+
+stop() {
+    ebegin "Detaching skyline_cc (draining live flows, up to 60 s)"
+    /opt/skyline-speeder/infra/boot-disable.sh
+    eend $?
+}

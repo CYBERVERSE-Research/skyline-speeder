@@ -8,7 +8,7 @@
 
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
 [![Kernel](https://img.shields.io/badge/kernel-6.12%20LTS%2B-orange.svg)](#内核版本要求)
-[![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu-red.svg)](install.sh)
+[![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu%20%7C%20Fedora%20%7C%20RHEL%20%7C%20Alpine-red.svg)](install.sh)
 [![eBPF](https://img.shields.io/badge/eBPF-CO--RE%20struct__ops-green.svg)](bpf/)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-black.svg)](rust-toolchain.toml)
 
@@ -96,14 +96,22 @@ RTT 70-73 ms、丢包 10%-30%，测于晚高峰。skyline_cc 使用 0.1.0 时随
 
 已验证：`6.12.101`、`6.18.42`、`7.1.6` 通过（含 IPv4/IPv6 数据路径冒烟测试）；`6.1.180` 和 `6.6.148` 按设计加载失败。
 
+**发行版：** Debian 与 Ubuntu（apt、systemd），Fedora 与 RHEL 系——Rocky Linux、AlmaLinux、CentOS Stream（dnf、systemd），以及 Alpine（apk、OpenRC），内核满足上面的要求即可。一键安装已在 Debian 13、Fedora 43、Rocky Linux 10.2 和 Alpine 3.23 上完整跑通。
+
 ## 快速开始
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash
 ```
 
+Alpine 上以 root 运行——全新的 Alpine 只有 `wget`，没有 `curl` 和 `bash`，引导脚本会把两者装上：
+
+```sh
+wget -qO- https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sh
+```
+
 > [!NOTE]
-> **一键安装现在默认安装最新发布的预编译版本**：直接使用预编译好的 BPF 对象和 daemon，不会在本机安装编译器、LLVM 或 Rust。本机跑不了发布版的二进制时（不是 x86_64，或者 glibc 低于 2.38，例如 Debian 12），安装器会说明原因并自动改为从源码构建。想强制从源码构建，或者安装指定版本：
+> **一键安装现在默认安装最新发布的预编译版本**：直接使用预编译好的 BPF 对象和 daemon，不会在本机安装编译器、LLVM 或 Rust。本机跑不了发布版的二进制时（不是 x86_64，glibc 低于 2.38（例如 Debian 12），或者是 musl（例如 Alpine）），安装器会说明原因并自动改为从源码构建。想强制从源码构建，或者安装指定版本：
 >
 > ```bash
 > curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash -s -- --source           # 在本机从源码构建
@@ -112,7 +120,7 @@ curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder
 >
 > v0.4.0 及更早的安装器，不带参数时从源码构建，要装发布版得加 `--prebuilt`；一键安装运行的始终是 `main` 上的安装器，所以已经是新的默认行为。`--prebuilt` 仍然可用，现在的含义是"只装发布版"：本机跑不了发布版时直接停下，不会改为源码构建。
 
-最小化镜像可能没有 `curl`（`apt-get install -y curl`）或 `sudo`（已经是 root 就去掉）。想先看过脚本再运行（**推荐**，因为它会改变这台机器上所有新建连接的拥塞控制）：
+最小化的 Debian 镜像可能没有 `curl`（`apt-get install -y curl`），很多镜像也没有 `sudo`（已经是 root 就去掉）。想先看过脚本再运行（**推荐**，因为它会改变这台机器上所有新建连接的拥塞控制）：
 
 ```bash
 git clone https://github.com/CYBERVERSE-Research/skyline-speeder.git
@@ -129,11 +137,11 @@ sudo ./install.sh --uninstall --restore-pre-install   # 同上，但还原成
                                #   安装前那台机器用的拥塞控制与 qdisc
 ```
 
-安装器会检查内核，构建或下载三个 BPF 对象和 daemon，把 TC 程序指向默认路由所在的网卡（IPv4 或 IPv6；默认路由走 WireGuard 这类隧道时，它会请你自己指定网卡），让每个对象过一遍内核验证器，然后启动 daemon、挂载 `skyline_cc`，并把两者设为开机自启。安装过程中终端只显示一行进度，所有命令的输出都保存在 `/var/log/skyline-speeder-install.log`；装完会列出拥塞控制与 qdisc 改动前后的值，再给出 `ssctl` 用法、调参与卸载方法的简短指南。**不安装任何代理，不监听任何端口。**
+安装器使用发行版自己的包管理器和服务管理器——apt、dnf 或 apk；systemd，Alpine 上是 OpenRC（本文档里的 `systemctl restart skyline-speederd` 在 Alpine 上对应 `rc-service skyline-speederd restart`）。它会检查内核，构建或下载三个 BPF 对象和 daemon，把 TC 程序指向默认路由所在的网卡（IPv4 或 IPv6；默认路由走 WireGuard 这类隧道时，它会请你自己指定网卡），让每个对象过一遍内核验证器，然后启动 daemon、挂载 `skyline_cc`，并把两者设为开机自启。安装过程中终端只显示一行进度，所有命令的输出都保存在 `/var/log/skyline-speeder-install.log`；装完会列出拥塞控制与 qdisc 改动前后的值，再给出 `ssctl` 用法、调参与卸载方法的简短指南。**不安装任何代理，不监听任何端口。**
 
-`--uninstall` 会先 drain 掉存量连接，删除两个 systemd 单元、二进制和 BPF 对象，把本机切到 **bbr + fq**，并卸掉安装时装上的包。装了哪些包是记录下来的（`/etc/skyline-speeder/added-packages`），也只卸这些：不碰 `iproute2`、`curl`、`ca-certificates`、`tar`，不碰这几个包**仍然依赖**的东西（保留 `curl` 却删掉它底下的库，apt 根本做不到），也不碰 dpkg 标为 *required*/*important* 的包。卸之前先让 apt 出计划：计划里如果要连带删掉主机上别的东西，就把造成这件事的那个包单独留下并说明，其余照卸；只有在怎么缩减都无法得到一个不越界的计划时，才一个都不卸、改为打印手工命令。rustup 工具链只在确实是安装器装的情况下才移除。`bbr` 与 `fq` 只在本次运行时生效——不写也不改 `/etc/sysctl.d` 下的任何文件，所以重启后仍由那些文件决定。加 `--restore-pre-install` 则还原成安装前那台机器用的拥塞控制与 qdisc（包括出口网卡的根 qdisc，安装时一并记录）。两种方式都保留 `/etc/skyline-speeder`，重装时你的配置还在。
+`--uninstall` 会先 drain 掉存量连接，删除两个 systemd 单元、二进制和 BPF 对象，把本机切到 **bbr + fq**，并卸掉安装时装上的包。装了哪些包是记录下来的（`/etc/skyline-speeder/added-packages`），也只卸这些：不碰 `iproute2`（Fedora/RHEL 上是 `iproute` 与 `iproute-tc`）、`curl`、`ca-certificates`、`tar`（Alpine 上还有 `bash`），不碰这几个包**仍然依赖**的东西（保留 `curl` 却删掉它底下的库，apt 根本做不到），也不碰 dpkg 标为 *required*/*important* 或 dnf 保护的包。卸之前先出计划（apt 自己出，dnf 用 `rpm -e --test`；apk 本来就不会删还被依赖的包）：计划里如果要连带删掉主机上别的东西，就把造成这件事的那个包单独留下并说明，其余照卸；只有在怎么缩减都无法得到一个不越界的计划时，才一个都不卸、改为打印手工命令。rustup 工具链只在确实是安装器装的情况下才移除。`bbr` 与 `fq` 只在本次运行时生效——不写也不改 `/etc/sysctl.d` 下的任何文件，所以重启后仍由那些文件决定。加 `--restore-pre-install` 则还原成安装前那台机器用的拥塞控制与 qdisc（包括出口网卡的根 qdisc，安装时一并记录）。两种方式都保留 `/etc/skyline-speeder`，重装时你的配置还在。
 
-已发布的版本不需要编译工具链，只需要 `curl`、`tar` 和 `iproute2`（安装器会自动安装）：对象是 CO-RE 的，用固定的 6.12 参考头编译，加载时再按这台机器的内核重定位。预编译的 daemon 在 Ubuntu 24.04 上构建，需要 glibc 2.38 以上以及 `libelf.so.1`、`libz.so.1`（Debian 13、Ubuntu 24.04 及更新版本满足）；用户态更旧的系统，默认安装会自动改为从源码构建，`--source` 则在任何机器上都从源码构建。`--release <tag>` 指定版本；连不上 GitHub 的机器，把产物拷过去后用 `SKYLINE_ARTIFACT_URL=/path/to/tarball sudo -E ./install.sh --prebuilt` 安装。装上的是已发布的 release，可能比这份 README、也比 `main` 旧：`main` 上在最新 release 之后合并的改动，要等下一个 release 才会进入一键安装。装的 release 早于这里描述的某个功能时（例如 v0.2.0 这个 release 还没有 qdisc 守护），安装器会明确提示。
+已发布的版本不需要编译工具链，只需要 `curl`、`tar` 和 `iproute2`（安装器会自动安装）：对象是 CO-RE 的，用固定的 6.12 参考头编译，加载时再按这台机器的内核重定位。预编译的 daemon 在 Ubuntu 24.04 上构建，需要 glibc 2.38 以上以及 `libelf.so.1`、`libz.so.1`（Debian 13、Ubuntu 24.04、Fedora 43、Rocky Linux 10 及更新版本满足）；用户态更旧的系统，以及 Alpine 的 musl，默认安装会自动改为从源码构建，`--source` 则在任何机器上都从源码构建。`--release <tag>` 指定版本；连不上 GitHub 的机器，把产物拷过去后用 `SKYLINE_ARTIFACT_URL=/path/to/tarball sudo -E ./install.sh --prebuilt` 安装。装上的是已发布的 release，可能比这份 README、也比 `main` 旧：`main` 上在最新 release 之后合并的改动，要等下一个 release 才会进入一键安装。装的 release 早于这里描述的某个功能时（例如 v0.2.0 这个 release 还没有 qdisc 守护），安装器会明确提示。
 
 > [!IMPORTANT]
 > **升级：** 再运行一次安装器即可。新对象通过内核验证器后，它会自己重启 `skyline-speederd`：先让现有连接排空（最多 60 秒），再重新挂载 `skyline_cc`；原先是手工 `ssctl enable` 挂载的主机也一样。用 `ssctl` 做的修改不会保留到重启之后。原先从源码构建的主机会换成已发布的版本，除非再次带上 `--source`。详见 [CHANGELOG.md](CHANGELOG.md) 的 *Upgrading from 0.3.0*。
@@ -197,8 +205,8 @@ sudo /opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <你的服务启动命�
 
 ```
 skyline-speeder/
-├── install.sh                    一键安装（Debian/Ubuntu）
-├── scripts/bootstrap.sh          远程安装入口（curl | sudo bash）
+├── install.sh                    一键安装（Debian/Ubuntu、Fedora/RHEL、Alpine）
+├── scripts/bootstrap.sh          远程安装入口（curl | sudo bash，或 wget | sh）
 ├── bpf/
 │   ├── skyline_cc.bpf.c          struct_ops 拥塞控制，每个 ACK 执行
 │   ├── skyline_policy.bpf.c      cgroup sockops：选择拥塞控制，动态 RTO 上下限
@@ -209,7 +217,7 @@ skyline-speeder/
 │   ├── ssctl/                    命令行
 │   └── skyline-common/           共享 ABI 类型与配置解析
 ├── config/                       speeder-guest.toml（安装用模板）/ speeder.toml（开发用）
-├── packaging/                    systemd 单元
+├── packaging/                    systemd 单元；openrc/ 是给 OpenRC 的同样两个服务
 ├── infra/                        安装辅助、cgroup 工具、双 VM 测试床
 ├── research/experiments/         测试 manifest、执行、分析与现场测量
 ├── docs/                         使用指南、部署、接口参考、设计、性能报告
@@ -225,6 +233,10 @@ skyline-speeder/
 ```bash
 sudo apt-get install -y build-essential pkg-config clang llvm \
     libbpf-dev libelf-dev zlib1g-dev bpftool
+# Fedora / RHEL（RHEL 系的 libbpf-devel 在 CodeReady Builder 里：加 --enablerepo=crb）：
+#   sudo dnf install gcc make pkgconf-pkg-config clang llvm libbpf-devel elfutils-libelf-devel zlib-devel bpftool
+# Alpine（bpftool 在 community 仓库）：
+#   apk add build-base pkgconf clang llvm libbpf-dev elfutils-dev zlib-dev linux-headers bpftool
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 make bpf                          # 生成 vmlinux.h 并编译三个 CO-RE 对象

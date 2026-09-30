@@ -55,6 +55,11 @@ iperf3 -c <对端IP> -u -b 400M -t 10
 几个最常用参数的当前值。装的过程中所有命令的输出都在 `/var/log/skyline-speeder-install.log`，
 出错时先看它。
 
+> Alpine 用的是 OpenRC：下文的 `sudo systemctl restart skyline-speederd` 在那里是
+> `rc-service skyline-speederd restart`，`journalctl -u skyline-speederd` 换成
+> `grep skyline-speederd /var/log/messages`（Alpine 默认没有 sudo，以 root 执行即可）。
+> 安装脚本最后打印的命令已经按本机写好。
+
 检查当前状态：
 
 ```bash
