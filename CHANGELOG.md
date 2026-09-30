@@ -10,14 +10,51 @@ for anyone holding a prebuilt `.bpf.o`.
 
 ## [Unreleased]
 
-### Upgrading
+## [0.4.1] - 2026-09-30
 
-- **Running the installer again on a host that was built from source now
-  installs the published release** instead of rebuilding. Pass `--source` to
-  keep building from source.
+### Upgrading from 0.4.0
+
+- **Re-run the installer the way the host was installed.** The BPF objects,
+  the ABI and the configuration did not change -- both 0.4.1 artifacts carry
+  the 0.4.0 objects byte for byte -- so an upgrade replaces the two binaries
+  and the service files, restarts `skyline-speederd` as before, and keeps
+  `/etc/skyline-speeder/speeder.toml`.
+- **A host that was built from source now moves to the published release**
+  instead of rebuilding -- on Alpine too, which gets the new musl build and,
+  with it, `libelf`, `zlib`, `zstd-libs` and `libgcc`. Pass `--source` to keep
+  building from source. The build toolchain an earlier source install
+  recorded stays until `--uninstall`, which removes it.
+- `ssctl --json` prints exactly what 0.4.0 printed; only the readable reports
+  changed (see *Fixed*).
 
 ### Added
 
+- **A musl build for Alpine.** A release now publishes
+  `skyline-speeder-<tag>-x86_64-musl.tar.gz` beside the glibc artifact, and
+  `install.sh` takes the one that matches the host's C library, so the
+  default install on Alpine installs the release as it does elsewhere: no
+  compiler, LLVM or Rust on the host, and no ten-minute build. The control
+  plane is built in an Alpine 3.21 container (`infra/build-musl.sh`), the
+  oldest Alpine whose kernel meets the 6.12 floor, and runs on its musl,
+  1.2.5, and later: Alpine 3.21 and newer. It links dynamically and needs
+  `libelf`, `zlib`, `zstd-libs` and `libgcc`, which the installer adds; before
+  anything is published, the binaries are run in clean Alpine 3.21 and latest
+  containers that have only those. The BPF objects are the glibc artifact's,
+  the same files. The musl suffix follows the architecture so that installers
+  up to v0.4.0, which take the first asset ending in `-x86_64.tar.gz`, never
+  pick it.
+  - Both artifacts now carry the OpenRC scripts, and the installer takes them
+    from the artifact -- from its own tree only for an older release -- and a
+    `MANIFEST` that names the C library: an artifact built for the other one
+    is refused before the verifier step, with the name of the right one.
+  - The installer checks the musl version the loader reports against 1.2.5,
+    as it checks glibc against 2.38. `--release v0.4.0` and older stop on a
+    musl host with the reason, and the default install builds from source
+    when the latest release has no musl build, which it asks the release API
+    before it starts: the installer comes from `main`, and may run before the
+    release it expects. `--source` works on Alpine as before.
+  - CI builds and runs the musl binaries on every pull request, since a
+    release job that fails publishes nothing.
 - **Fedora, the RHEL family and Alpine.** The one-line install and
   `install.sh` run on Fedora and on RHEL and its rebuilds -- Rocky Linux,
   AlmaLinux, CentOS Stream -- with dnf and systemd, and on Alpine with apk and
@@ -32,19 +69,20 @@ for anyone holding a prebuilt `.bpf.o`.
     and its rebuilds define but switch off, for that one transaction only
     (`--enablerepo`); no `.repo` file is changed. SELinux in enforcing mode
     needs nothing: the daemon runs as `unconfined_service_t`.
-  - Alpine's musl C library cannot run the published binaries, so Alpine
-    always builds from source (about ten minutes on one vCPU). The two
-    services are OpenRC scripts, `packaging/openrc/skyline-speederd` and
-    `skyline-speeder-enable`, installed in `/etc/init.d`: the same binary,
-    configuration and ordering as the systemd units, under supervise-daemon,
-    with the daemon's output going to syslog. The daemon needs cgroup v2 at
-    `/sys/fs/cgroup`, which on Alpine only OpenRC's `cgroups` service mounts
-    and no runlevel starts; `skyline-speederd` now `need`s it. `bpftool` is
-    in Alpine's community repository; a host without it enabled gets it from
-    the same mirror's community repository for that one command, and
-    `/etc/apk/repositories` is not changed. `.cargo/config.toml` links the
-    musl build dynamically: statically, the link fails on `-lz`, whose archive
-    Alpine keeps in `zlib-static`, which nothing installs.
+  - Alpine installs the musl build above; with `--source` it builds from
+    source, about ten minutes on one vCPU. The two services are OpenRC
+    scripts, `packaging/openrc/skyline-speederd` and `skyline-speeder-enable`,
+    installed in `/etc/init.d`: the same binary, configuration and ordering as
+    the systemd units, under supervise-daemon, with the daemon's output going
+    to syslog. The daemon needs cgroup v2 at `/sys/fs/cgroup`, which on Alpine
+    only OpenRC's `cgroups` service mounts and no runlevel starts;
+    `skyline-speederd` now `need`s it. For a source build, `bpftool` is in
+    Alpine's community repository; a host without it enabled gets it from the
+    same mirror's community repository for that one command, and
+    `/etc/apk/repositories` is not changed. `.cargo/config.toml` links a musl
+    build dynamically, the release's and a source build alike: statically, the
+    link fails on `-lz`, whose archive Alpine keeps in `zlib-static`, which
+    nothing installs.
   - **`scripts/bootstrap.sh` is POSIX sh**, so a fresh Alpine, which has
     busybox `wget` but neither `curl` nor `bash`, runs it as root with
     `wget -qO- .../bootstrap.sh | sh`; it installs `curl` and `bash` with
@@ -53,14 +91,32 @@ for anyone holding a prebuilt `.bpf.o`.
     with the same promise as under apt: only what the install added, never
     `iproute`/`iproute-tc` (`iproute2` on Alpine), `curl`,
     `ca-certificates`, `tar` or (Alpine) `bash`, never what one of those still
-    needs, never a package dnf protects. Under dnf the removal is planned with
-    `rpm -e --test`, and the record never holds `gpg-pubkey`, the repository
-    signing key dnf imports during the first install; under apk it is
+    needs, never a package dnf protects. Under dnf what a keeper needs is set
+    aside from the rpm database first, and the rest planned with
+    `rpm -e --test`; the record never holds `gpg-pubkey`, the repository
+    signing key dnf imports during the first install. Under apk it is
     `apk del` of the names the install added to the world, which never takes
-    a package something still needs.
+    a package something still needs, and says which it kept.
 
 ### Fixed
 
+- **`ssctl status` and `ssctl flows` told everyone to run `sudo ssctl ...`.**
+  The remedies they print -- `sudo ssctl enable`, `(sudo ssctl flows)`,
+  `(sudo ssctl status)` -- had `sudo` written into them, which fails as
+  printed on Alpine, where there is no sudo unless somebody installs it, and
+  in the root shell of many cloud images. The prefix is now there only when
+  sudo is installed and `ssctl` was started through it by another user
+  (`SUDO_USER`, and not root): every remedy is another `ssctl` call, which
+  needs the access this one already had. `--json` is unchanged.
+- **`install.sh`'s closing guide promised to remove packages an uninstall
+  keeps.** It counted every recorded package that was not a keeper, the
+  libraries a keeper stands on included: after a prebuilt install on a Debian
+  13 host without curl, it said an uninstall removes fourteen packages, and
+  `--uninstall` removed none. The guide now counts the set the uninstall
+  starts from -- no keeper, nothing a keeper needs, nothing the package
+  manager protects, nothing gone already -- and under apk asks apk for its
+  plan (`apk del --simulate`), since `apk del` keeps a package something else
+  still needs.
 - **A source build no longer fails to compile the BPF objects on a kernel
   newer than the host's libbpf headers.** bpftool writes a prototype for every
   kfunc the running kernel exports into the vmlinux.h it generates, and one of
@@ -79,16 +135,17 @@ for anyone holding a prebuilt `.bpf.o`.
   `curl .../bootstrap.sh | sudo bash`, and `install.sh` without arguments,
   first check whether this host can run the published binaries -- x86_64, the
   only architecture a release carries, and glibc 2.38 or newer, what the
-  prebuilt `skyline-speederd` links against -- and install the release if it
-  can: no compiler, LLVM or Rust on the host. A host that cannot is told why
-  (`building from source: glibc 2.36 is older than the 2.38 the published
-  binaries need`) and builds from source as before. The new `--source` builds
-  from source unconditionally. `--prebuilt` and `--release <tag>` now stop
-  before the first step on a host that cannot run the artifact, instead of
-  failing at the verifier step after the download; `--check` reports which of
-  the two an install would do. The installer still comes from `--ref` (main),
-  while the artifact comes from the latest release, so a change merged after
-  that release reaches the one-line install only with the next one.
+  prebuilt `skyline-speederd` links against, or musl 1.2.5 or newer for the
+  musl build -- and install the release if it can: no compiler, LLVM or Rust
+  on the host. A host that cannot is told why (`building from source: glibc
+  2.36 is older than the 2.38 the published binaries need`) and builds from
+  source as before. The new `--source` builds from source unconditionally.
+  `--prebuilt` and `--release <tag>` now stop before the first step on a host
+  that cannot run the artifact, instead of failing at the verifier step after
+  the download; `--check` reports which of the two an install would do. The
+  installer still comes from `--ref` (main), while the artifact comes from the
+  latest release, so a change merged after that release reaches the one-line
+  install only with the next one.
 - The commands `install.sh` prints -- the closing guide, and the ones in its
   warnings and errors -- carry `sudo` only on a host that has it, so they can
   be pasted as they are into a root shell on a cloud image without sudo.
@@ -884,7 +941,8 @@ rather than as fixes to a version nobody could have installed.
   socket file permissions. Multi-tenant hosts need additional access control.
 - The experiment harness requires **Python 3.11 or newer** (`tomllib`).
 
-[Unreleased]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.1.0...v0.2.0

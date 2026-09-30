@@ -17,6 +17,7 @@ Skyline Speeder 由三个 eBPF 程序 + 一个 Rust 用户态控制面组成，�
 ```bash
 make bpf                          # 生成 vmlinux.h 并编译三个 CO-RE 对象
 cargo build --workspace --release
+infra/build-musl.sh               # musl（Alpine）版控制面，在 Alpine 3.21 容器里构建；发布流水线与 CI 用的就是它
 make check                        # cargo fmt --check + cargo check + 单元测试
 make test                         # 含 cargo test
 
@@ -164,8 +165,7 @@ release 的预编译产物**，不是 `main`。合并进 `main` 的改动，在�
 
 | 改动落在 | 要发版吗 | 原因 |
 |---|---|---|
-| `bpf/`、`crates/`、`config/speeder-guest.toml`、`packaging/*.service`、`release.yml` 打进产物的 `infra/*.sh` | **要** | 它们就在产物里，不发版默认安装的用户拿不到 |
-| `packaging/openrc/` | 通常不要 | 不进产物：OpenRC 主机（Alpine）是 musl，总是源码构建，两个脚本由安装器从它自己的源码树（`main`）安装 |
+| `bpf/`、`crates/`、`config/speeder-guest.toml`、`packaging/`（systemd unit 与 OpenRC 脚本）、`release.yml` 打进产物的 `infra/*.sh` | **要** | 它们就在产物里，不发版默认安装的用户拿不到（OpenRC 脚本自 v0.4.1 进产物，Alpine 默认装 musl 版产物，安装器优先用产物里的那两个） |
 | `install.sh`、`scripts/bootstrap.sh` | 通常不要 | 一键安装每次都从 `main` 取安装器，合并即生效；新安装器依赖产物里还没有的东西时除外，那就先发版 |
 | 文档、实验框架、CI、只影响源码构建的部分 | 不要 | 不进产物 |
 

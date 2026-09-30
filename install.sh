@@ -7,10 +7,11 @@
 #
 # Installs the latest published release -- the three CO-RE BPF objects and the
 # Rust control plane, no build toolchain -- together with the systemd units
-# (OpenRC scripts on Alpine), and activates skyline_cc across reboots. A host
-# that cannot run the published binaries (another architecture, a C library
-# older than they were built against, or musl, as on Alpine) is told why and
-# gets a build from this source tree instead. Installs no proxy, no network
+# (OpenRC scripts on Alpine), and activates skyline_cc across reboots. A
+# release carries a glibc build and, from v0.4.1, a musl build for Alpine; the
+# host's C library picks one. A host that cannot run either (another
+# architecture, a C library older than they were built against) is told why
+# and gets a build from this source tree instead. Installs no proxy, no network
 # service, and opens no port.
 #
 # The distribution decides only the package manager and the service manager:
@@ -110,14 +111,18 @@ SUDO=           # "sudo " where the host has sudo: the prefix of every command w
 ADDED_COUNT=0      # packages recorded in $ADDED_PKGS after this run
 ADDED_REMOVABLE=0  # of those, the ones an uninstall would actually remove
 GUIDE_URL=https://github.com/CYBERVERSE-Research/skyline-speeder/blob/main/docs/usage.md
-# What the published artifact can run on. release.yml builds it on an
-# ubuntu-24.04 runner for x86_64 only, and the skyline-speederd that comes out
-# asks for GLIBC_2.38 (`objdump -T bin/skyline-speederd`). Both are a sync
-# point with release.yml: raise the floor when the runner moves on, and add an
+# What the published artifacts can run on. release.yml builds them for x86_64
+# only. The glibc build comes off an ubuntu-24.04 runner, and the
+# skyline-speederd in it asks for GLIBC_2.38 (`objdump -T bin/skyline-speederd`).
+# The musl build (-musl, from v0.4.1) comes out of an Alpine 3.21 container
+# (infra/build-musl.sh), whose musl is 1.2.5 -- a binary runs on the musl it
+# was built against and on every later one. All three are a sync point with
+# release.yml: raise a floor when the build environment moves on, and add an
 # architecture when a release starts publishing one, or the default install
 # breaks on exactly the hosts it used to fall back for.
 PREBUILT_ARCHES="x86_64"
 PREBUILT_GLIBC_MIN=2.38
+PREBUILT_MUSL_MIN=1.2.5
 
 # `-qq` silences apt but not dpkg, which still prints an unpack line per
 # package plus a "Reading database" progress bar. Dpkg::Use-Pty=0 stops the
@@ -407,6 +412,25 @@ host_is_musl() {
         [ -e "$f" ] && return 0
     done
     return 1
+}
+
+# The musl version, as its dynamic loader states it when run with no program
+# ("musl libc (x86_64)", then "Version 1.2.5", on stderr); empty if it will
+# not say. It exits 1 doing so, which is why the status is ignored.
+musl_version() {
+    local f
+    for f in /lib/ld-musl-*.so.1; do
+        [ -x "$f" ] || continue
+        "$f" 2>&1 | awk '$1 == "Version" { print $2 }' || true
+        return 0
+    done
+}
+
+# version_older <a> <b>: whether version a sorts before version b. awk, not
+# head -1, takes the first line: it reads to the end, so sort never writes into
+# a closed pipe -- the SIGPIPE trap this file documents beside apt_unmet.
+version_older() {
+    [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | awk 'NR == 1')" = "$1" ]
 }
 
 # --- service manager ---------------------------------------------------------
@@ -1151,7 +1175,11 @@ restore_pre_install() {
 }
 
 # The packages dpkg has fully installed, one per line, sorted -- the input to
-# the difference an install records in $ADDED_PKGS.
+# the difference an install records in $ADDED_PKGS, and what an uninstall
+# checks a recorded package against. A line per installed architecture:
+# `\n` in the format is what keeps them apart. Without it dpkg concatenates
+# one field per architecture into a single word, and a test over the result
+# answers about a string no instance actually has.
 dpkg_installed_set() {
     dpkg-query -W -f '${Package} ${Status}\n' 2>/dev/null \
         | awk '$NF == "installed" { print $1 }' | sort || true
@@ -1198,18 +1226,62 @@ pkg_is_keeper() {
 }
 
 # pkg_closure <package...>: every installed package those still need,
-# transitively, themselves included, one per line. apt-cache prints a package
-# name at the start of a line and its relations indented; an architecture
-# suffix (`dpkg:i386`) and a virtual package's angle brackets are stripped.
-# Recommends and Suggests are deliberately excluded -- "would be nice to have"
-# is not a reason to keep a compiler.
+# transitively, themselves included, one per line. Under apt and dnf; nothing
+# under apk, whose `del` never takes a package something still needs.
 pkg_closure() {
     [ "$#" -gt 0 ] || return 0
+    case "$PKG" in
+        apt) apt_closure "$@" ;;
+        dnf) rpm_closure "$@" ;;
+    esac
+}
+
+# apt-cache prints a package name at the start of a line and its relations
+# indented; an architecture suffix (`dpkg:i386`) and a virtual package's angle
+# brackets are stripped. Recommends and Suggests are deliberately excluded --
+# "would be nice to have" is not a reason to keep a compiler.
+apt_closure() {
     command -v apt-cache >/dev/null 2>&1 || return 0
     apt-cache depends --recurse --installed --no-recommends --no-suggests \
         --no-conflicts --no-breaks --no-replaces --no-enhances "$@" 2>/dev/null \
         | awk '/^[^[:space:]]/ { sub(/:[^:]*$/, ""); gsub(/[<>]/, ""); if ($0 != "") print }' \
         | sort -u || true
+}
+
+# The same from the rpm database, a level at a time: the requirements of the
+# packages the last level found, then the installed packages that provide
+# them. Two rpm runs a level, each over the whole level -- one run per
+# capability would open the database a few hundred times, most of a minute.
+# Requirements only: weak dependencies (Recommends and the like) are not
+# followed, as under apt. rpmlib() requirements name features of rpm itself,
+# and a rich dependency ("(a if b)") is a condition rpm -q cannot resolve;
+# neither names a package, and both are skipped.
+rpm_closure() {
+    local -A seen=()
+    local -a level=() next=() caps=()
+    local p
+    for p in "$@"; do
+        if [ -z "${seen[$p]:-}" ] && rpm -q --quiet "$p" 2>/dev/null; then
+            seen[$p]=1
+            level+=("$p")
+        fi
+    done
+    while [ "${#level[@]}" -gt 0 ]; do
+        mapfile -t caps < <(rpm -q --requires "${level[@]}" 2>/dev/null \
+            | awk '{ sub(/[ \t].*/, "") } $0 != "" && !/^\(/ && !/^rpmlib\(/ && !s[$0]++' || true)
+        next=()
+        if [ "${#caps[@]}" -gt 0 ]; then
+            # "no package provides X" is the one line with a space in it.
+            while IFS= read -r p; do
+                [ -n "$p" ] && [ -z "${seen[$p]:-}" ] || continue
+                seen[$p]=1
+                next+=("$p")
+            done < <(rpm -q --whatprovides --qf '%{NAME}\n' "${caps[@]}" 2>/dev/null \
+                | awk '!/ / && !s[$0]++' || true)
+        fi
+        level=(${next[@]+"${next[@]}"})
+    done
+    [ "${#seen[@]}" -eq 0 ] || printf '%s\n' "${!seen[@]}" | sort
 }
 
 # pkg_in_list <package> <list...>
@@ -1325,38 +1397,87 @@ apk_own_requests() {
     done <<<"$1"
 }
 
-# How many recorded packages an uninstall would actually remove, into
-# $ADDED_REMOVABLE. A --prebuilt install adds only curl, ca-certificates, tar
-# and iproute2, every one of them a keeper, so the closing guide must not tell
-# that operator their packages will be removed.
-count_removable_packages() {
-    local p
-    ADDED_REMOVABLE=0
+# removal_candidates: the recorded packages an uninstall hands to the package
+# manager, into CANDIDATES, and how many recorded packages it keeps on the way,
+# into CANDIDATES_KEPT. These are the rails that need no removal plan: never a
+# keeper, never a package the package manager protects, never one a keeper
+# still needs (pkg_closure), and nothing that is gone already -- removed by
+# somebody else or by an earlier uninstall (under apk: out of the world).
+# purge_toolchain starts from this and so does the count in the closing guide,
+# so the guide cannot promise the removal of a package the uninstall keeps.
+#
+# Files and grep -xF, not `printf | grep -q`: grep exiting at the first match
+# would SIGPIPE the printf, and under pipefail the test would read false --
+# silently dropping the protection this is here to apply.
+removal_candidates() {
+    local p have needed
+    CANDIDATES=() CANDIDATES_KEPT=0
     [ -r "$ADDED_PKGS" ] || return 0
+    have=$(mktemp) needed=$(mktemp)
+    pkg_record_set >"$have"
+    pkg_closure "${KEEP_PKGS[@]}" >"$needed"
     while IFS= read -r p; do
-        p=${p%%#*}
-        p=${p//[[:space:]]/}
-        [ -n "$p" ] || continue
-        pkg_is_keeper "$p" && continue
-        pkg_protected "$p" && continue
-        ADDED_REMOVABLE=$((ADDED_REMOVABLE + 1))
-    done <"$ADDED_PKGS"
+        if pkg_is_keeper "$p"; then
+            CANDIDATES_KEPT=$((CANDIDATES_KEPT + 1))
+            continue
+        fi
+        grep -qxF -- "$p" "$have" || continue
+        if pkg_protected "$p" || grep -qxF -- "$p" "$needed"; then
+            CANDIDATES_KEPT=$((CANDIDATES_KEPT + 1))
+            continue
+        fi
+        CANDIDATES+=("$p")
+    done < <(recorded_packages)
+    rm -f "$have" "$needed"
 }
 
-# pkg_installed <package>: whether dpkg has it installed, for any architecture.
-# `${Status}\n`, not `${Status}`: without the newline dpkg concatenates one
-# status per installed architecture into a single word, and a test over the
-# result then answers about a string no instance actually has. awk rather than
-# `grep -q` so nothing exits early on a producer this script pipes into --
-# SIGPIPE plus pipefail is the trap this file documents in four other places.
-# rpm and apk answer the same question with an exit status of their own.
-pkg_installed() {
-    case "$PKG" in
-        dnf) rpm -q --quiet "$1" 2>/dev/null ;;
-        apk) apk info -e "$1" >/dev/null 2>&1 ;;
-        *) dpkg-query -W -f '${Status}\n' "$1" 2>/dev/null \
-               | awk '/ installed$/ { found = 1 } END { exit !found }' ;;
-    esac
+# How many recorded packages an uninstall would actually remove, into
+# $ADDED_REMOVABLE, for the closing guide. On a Debian host without curl, a
+# prebuilt install records curl and the fourteen libraries apt brought with it,
+# and an uninstall keeps all fifteen -- curl is a keeper and the libraries are
+# what it stands on -- so the guide must not say fourteen packages go.
+#
+# Under apk a recorded name is in the world, and `apk del` takes it out of the
+# world but removes the package only when nothing else needs it: libelf, zlib
+# and zstd-libs, which the prebuilt musl daemon links, are what iproute2 and
+# curl stand on as well. So apk plans the removal without doing it
+# (--simulate), and every name counts that it does not say it keeps.
+count_removable_packages() {
+    local p plan kept
+    ADDED_REMOVABLE=0
+    removal_candidates
+    [ "${#CANDIDATES[@]}" -gt 0 ] || return 0
+    if [ "$PKG" != apk ]; then
+        ADDED_REMOVABLE=${#CANDIDATES[@]}
+        return 0
+    fi
+    plan=$(mktemp) kept=$(mktemp)
+    if apk del --simulate --no-progress "${CANDIDATES[@]}" >"$plan" 2>&1; then
+        apk_kept "$plan" >"$kept"
+        for p in "${CANDIDATES[@]}"; do
+            if ! grep -qxF -- "$p" "$kept"; then ADDED_REMOVABLE=$((ADDED_REMOVABLE + 1)); fi
+        done
+    else
+        log "apk cannot plan removing ${CANDIDATES[*]}: $(tail -n 1 "$plan")"
+    fi
+    rm -f "$plan" "$kept"
+}
+
+# apk_kept <output of apk del>: the names it took out of the world but whose
+# package it kept, one per line. apk says so in a block --
+#
+#   World updated, but the following packages are not removed due to:
+#     libgcc: cloud-init eudev py3-pyserial
+#             py3-netifaces sgdisk
+#
+# -- that ends at a blank line. Read from there and not from the "Purging"
+# lines, which name packages, not what was asked for: a world entry can be a
+# name some package provides (clang, which clang21 provides), and the counter
+# in front is padded ("( 1/49) Purging bpftool").
+apk_kept() {
+    awk '/not removed due to/ { f = 1; next }
+         f && !NF { exit }
+         f && /^  [^ ]+:/ { sub(/^  /, ""); sub(/:.*/, ""); print }' "$1" 2>/dev/null || true
 }
 
 # pkg_protected <package>: whether the package manager keeps it whatever the
@@ -1387,8 +1508,8 @@ dnf_protected() {
 
 # pkg_priority_protected <package>: whether dpkg calls it required or important
 # for any architecture -- in which case an uninstall never removes it, whatever
-# the record says. Same newline story as pkg_installed: measured on a host with
-# i386 enabled, `dpkg-query -W -f '${Priority}' libbz2-1.0` answers
+# the record says. Same newline story as dpkg_installed_set: measured on a host
+# with i386 enabled, `dpkg-query -W -f '${Priority}' libbz2-1.0` answers
 # "optionalimportant", which matches neither word and quietly turned this rail
 # off for every multi-arch package.
 pkg_priority_protected() {
@@ -1398,6 +1519,16 @@ pkg_priority_protected() {
         *" required "*|*" important "*) return 0 ;;
     esac
     return 1
+}
+
+# The line for an uninstall left with nothing to remove once the rails have
+# run: everything it recorded either stays (reported just above) or is gone.
+nothing_to_purge() {
+    if [ "$CANDIDATES_KEPT" -gt 0 ]; then
+        ok "no other packages to remove"
+    else
+        ok "no packages to remove: nothing this installer added is still installed"
+    fi
 }
 
 # purge_toolchain: remove the packages an install of this host added, and
@@ -1419,7 +1550,7 @@ pkg_priority_protected() {
 # purge_toolchain_apk.
 purge_toolchain() {
     local -a want=() extra=() keep=()
-    local p sim out protected round kept
+    local p sim out protected round
     if [ ! -r "$ADDED_PKGS" ]; then
         log "no $ADDED_PKGS: this host has no record of packages an install added"
         return 0
@@ -1432,57 +1563,23 @@ purge_toolchain() {
         warn "no apt-get here; the packages listed in $ADDED_PKGS were left installed"
         return 0
     fi
-    kept=0
-    while IFS= read -r p; do
-        p=${p%%#*}
-        p=${p//[[:space:]]/}
-        [ -n "$p" ] || continue
-        if pkg_is_keeper "$p"; then
-            kept=$((kept + 1))
-            continue
-        fi
-        # Not installed any more: somebody else removed it, or a previous
-        # uninstall did.
-        pkg_installed "$p" || continue
-        if pkg_priority_protected "$p"; then
-            kept=$((kept + 1))
-            continue
-        fi
-        want+=("$p")
-    done <"$ADDED_PKGS"
     # Keeping curl while removing libcurl4 is not a thing apt can do, and it
     # would resolve the contradiction by taking curl. So everything a package
-    # we keep still needs is kept too -- measured on a test host, where this is
-    # the difference between removing the whole toolchain and removing nothing
-    # at all.
-    #
-    # The closure goes to a file, and grep reads that file: `printf | grep -q`
-    # would let grep exit at the first match and SIGPIPE the printf, which
-    # under pipefail makes the whole test read as false -- silently dropping
-    # the protection this is here to apply.
-    protected=$(mktemp)
-    pkg_closure "${KEEP_PKGS[@]}" >"$protected"
-    if [ -s "$protected" ]; then
-        keep=()
-        for p in "${want[@]}"; do
-            if grep -qxF -- "$p" "$protected"; then
-                kept=$((kept + 1))
-            else
-                keep+=("$p")
-            fi
-        done
-        want=(${keep[@]+"${keep[@]}"})
-    fi
+    # we keep still needs is kept too (removal_candidates) -- measured on a
+    # test host, where this is the difference between removing the whole
+    # toolchain and removing nothing at all.
+    removal_candidates
+    want=(${CANDIDATES[@]+"${CANDIDATES[@]}"})
     # One line rather than one per package: in uninstall mode $LOG is not
     # started, so a `log` here would reach nobody at all, and ninety of them
     # would bury the summary.
-    [ "$kept" -eq 0 ] || info "keeping $kept recorded package(s): a keeper, something a keeper needs, or required/important"
+    [ "$CANDIDATES_KEPT" -eq 0 ] || info "keeping $CANDIDATES_KEPT recorded package(s): a keeper, something a keeper needs, or required/important"
     if [ "${#want[@]}" -eq 0 ]; then
-        ok "no packages to remove: nothing this installer added is still installed"
-        rm -f "$ADDED_PKGS" "$protected"
+        nothing_to_purge
+        rm -f "$ADDED_PKGS"
         return 0
     fi
-    sim=$(mktemp) out=$(mktemp)
+    sim=$(mktemp) out=$(mktemp) protected=$(mktemp)
     # Ask apt to plan it, and keep asking: a package of ours that something the
     # operator installed later depends on drags that something into the plan,
     # and the answer is to leave that one package alone rather than to abandon
@@ -1556,30 +1653,24 @@ purge_toolchain() {
 
 # purge_toolchain_dnf: the same removal where dnf installed the packages. The
 # record is the difference of two rpm databases, so it names what dnf pulled
-# in with the toolchain too, and rpm plans the removal: `rpm -e --test` over
-# exactly that set fails, naming the capability and who needs it, when a
-# package outside the set still needs one of ours -- curl a library of its own,
-# something installed since that links LLVM. The one of ours that provides it
-# is kept and the plan made again, until rpm finds nothing (or the rounds run
-# out, and nothing is removed). dnf then does the removal, with
-# clean_requirements_on_remove off: the set already is everything the install
-# added, and dnf's autoremove would take orphans this installer never created.
+# in with the toolchain too. What a keeper stands on -- the libraries of curl,
+# of iproute-tc -- is set aside before any plan (removal_candidates), as under
+# apt. Then rpm plans the removal: `rpm -e --test` over exactly that set fails,
+# naming the capability and who needs it, when a package outside the set still
+# needs one of ours -- something installed since that links LLVM. The one of
+# ours that provides it is kept and the plan made again, until rpm finds
+# nothing (or the rounds run out, and nothing is removed). dnf then does the
+# removal, with clean_requirements_on_remove off: the set already is
+# everything the install added, and dnf's autoremove would take orphans this
+# installer never created.
 purge_toolchain_dnf() {
     local -a want=() keep=()
-    local p cap who prov out round=0 kept=0
-    while IFS= read -r p; do
-        if pkg_is_keeper "$p" || pkg_protected "$p"; then
-            kept=$((kept + 1))
-            continue
-        fi
-        # Not installed any more: somebody else removed it, or a previous
-        # uninstall did.
-        pkg_installed "$p" || continue
-        want+=("$p")
-    done < <(recorded_packages)
-    [ "$kept" -eq 0 ] || info "keeping $kept recorded package(s): a keeper, or one dnf protects"
+    local p cap who prov out round=0
+    removal_candidates
+    want=(${CANDIDATES[@]+"${CANDIDATES[@]}"})
+    [ "$CANDIDATES_KEPT" -eq 0 ] || info "keeping $CANDIDATES_KEPT recorded package(s): a keeper, something a keeper needs, or one dnf protects"
     if [ "${#want[@]}" -eq 0 ]; then
-        ok "no packages to remove: nothing this installer added is still installed"
+        nothing_to_purge
         rm -f "$ADDED_PKGS"
         return 0
     fi
@@ -1639,38 +1730,39 @@ purge_toolchain_dnf() {
 # the rail the apt path has to build for itself is how apk works. apk names
 # what it kept, and why.
 purge_toolchain_apk() {
-    local -a want=()
-    local p out world kept=0 n
-    # A file, not `apk_world | grep -q`: grep exiting at the first match would
-    # SIGPIPE the producer, and under pipefail the test would read false.
-    world=$(mktemp)
-    apk_world >"$world"
-    while IFS= read -r p; do
-        if pkg_is_keeper "$p"; then
-            kept=$((kept + 1))
-            continue
-        fi
-        # Out of the world already: somebody else removed it, or a previous
-        # uninstall did.
-        grep -qxF -- "$p" "$world" || continue
-        want+=("$p")
-    done < <(recorded_packages)
-    [ "$kept" -eq 0 ] || info "keeping $kept recorded package(s): ${KEEP_PKGS[*]} stay"
+    local -a want=() gone=()
+    local p out kept n
+    removal_candidates
+    want=(${CANDIDATES[@]+"${CANDIDATES[@]}"})
+    [ "$CANDIDATES_KEPT" -eq 0 ] || info "keeping $CANDIDATES_KEPT recorded package(s): ${KEEP_PKGS[*]} stay"
     if [ "${#want[@]}" -eq 0 ]; then
-        ok "no packages to remove: nothing this installer added is still installed"
-        rm -f "$ADDED_PKGS" "$world"
+        nothing_to_purge
+        rm -f "$ADDED_PKGS"
         return 0
     fi
     info "removing ${#want[@]} package(s) this installer added, and what only they needed"
-    out=$(mktemp)
+    out=$(mktemp) kept=$(mktemp)
     if apk del --no-progress "${want[@]}" >"$out" 2>&1; then
         n=$(grep -c ' Purging ' "$out" || true)
-        ok "removed: ${want[*]} ($n package(s) in all)"
+        apk_kept "$out" >"$kept"
+        for p in "${want[@]}"; do
+            if ! grep -qxF -- "$p" "$kept"; then gone+=("$p"); fi
+        done
+        if [ "${#gone[@]}" -gt 0 ]; then
+            ok "removed: ${gone[*]} ($n package(s) in all)"
+        else
+            ok "no package removed: something else on this host needs every one of them"
+        fi
         # "World updated, but the following packages are not removed due to:",
         # then "  pkg: what needs it" lines, a blank line, and the removal.
+        # That is apk keeping what something else still needs, as it is meant
+        # to, so it is reported rather than warned about: after a prebuilt
+        # install, the libraries the musl daemon links -- libelf, zlib,
+        # zstd-libs -- are what iproute2 and curl stand on too. Out of the
+        # world, they are back to where they were before the install.
         if grep -q 'not removed due to' "$out"; then
-            warn "apk kept some of them, because something else on this host needs them:"
-            while IFS= read -r p; do warn "  $p"; done \
+            info "out of /etc/apk/world, but still installed: something else on this host needs them"
+            while IFS= read -r p; do info "  $p"; done \
                 < <(awk '/not removed due to/ { f = 1; next } f && !NF { exit } f { print }' "$out")
         fi
         rm -f "$ADDED_PKGS"
@@ -1678,7 +1770,7 @@ purge_toolchain_apk() {
         warn "apk failed to remove these, and left them installed: ${want[*]}"
         while IFS= read -r p; do warn "  $p"; done < <(tail -n 5 "$out")
     fi
-    rm -f "$out" "$world"
+    rm -f "$out" "$kept"
 }
 
 # purge_rustup: undo the rustup installation an install of this host made.
@@ -1741,18 +1833,24 @@ purge_rustup() {
     fi
 }
 
-# prebuilt_blocker: why the published artifact cannot run on this host, or
-# nothing when it can. The C library is the one thing a CO-RE object does not
-# care about and a prebuilt daemon does.
+# prebuilt_blocker: why the published artifacts cannot run on this host, or
+# nothing when one can. The C library is the one thing a CO-RE object does not
+# care about and a prebuilt daemon does, so it picks the artifact: the glibc
+# build, or the musl build for Alpine.
 prebuilt_blocker() {
-    local arch glibc lowest
+    local arch glibc musl
     arch=$(uname -m)
     case " $PREBUILT_ARCHES " in
         *" $arch "*) ;;
         *) printf 'releases publish no %s artifact (only %s)' "$arch" "$PREBUILT_ARCHES"; return ;;
     esac
     if host_is_musl; then
-        printf 'the C library here is musl, and the published binaries are built against glibc'
+        musl=$(musl_version)
+        if [ -z "$musl" ]; then
+            printf 'the C library is musl, and its version cannot be read'
+        elif version_older "$musl" "$PREBUILT_MUSL_MIN"; then
+            printf 'musl %s is older than the %s the published musl binaries need' "$musl" "$PREBUILT_MUSL_MIN"
+        fi
         return
     fi
     glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}') || true
@@ -1760,10 +1858,33 @@ prebuilt_blocker() {
         printf 'the C library is not glibc, or its version cannot be read'
         return
     fi
-    lowest=$(printf '%s\n%s\n' "$PREBUILT_GLIBC_MIN" "$glibc" | sort -V | head -1)
-    if [ "$lowest" != "$PREBUILT_GLIBC_MIN" ]; then
+    if version_older "$glibc" "$PREBUILT_GLIBC_MIN"; then
         printf 'glibc %s is older than the %s the published binaries need' "$glibc" "$PREBUILT_GLIBC_MIN"
     fi
+}
+
+# release_lacks_musl: whether the latest release publishes no musl build --
+# every release before v0.4.1 -- with its tag in REPLY. The default install
+# on a musl host asks before it starts, and builds from source instead of
+# stopping at the download: this installer is fetched from main, so it can run
+# before a release that has the musl build exists. An unanswered question (no
+# curl or wget yet, no route to GitHub, the API's rate limit) is not a "no";
+# the download step then says what is wrong.
+release_lacks_musl() {
+    local json api="https://api.github.com/repos/${REPO_SLUG}/releases/latest" rc=1
+    json=$(mktemp)
+    if { command -v curl >/dev/null 2>&1 \
+             && curl -fsSL --proto '=https' --tlsv1.2 --max-time 30 -o "$json" "$api" 2>/dev/null; } \
+       || { command -v wget >/dev/null 2>&1 && wget -q -T 30 -O "$json" "$api" 2>/dev/null; }; then
+        if [ -s "$json" ] && ! grep -q "skyline-speeder-[^\"]*-$(uname -m)-musl\.tar\.gz" "$json"; then
+            REPLY=$(awk 'match($0, /"tag_name": *"[^"]*"/) {
+                             t = substr($0, RSTART, RLENGTH); sub(/^"tag_name": *"/, "", t)
+                             sub(/"$/, "", t); print t; exit }' "$json")
+            rc=0
+        fi
+    fi
+    rm -f "$json"
+    return "$rc"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -1930,6 +2051,12 @@ BLOCKER=$(prebuilt_blocker)
 SOURCE_REASON=
 case "$SOURCE" in
     auto)
+        # An artifact named by hand (SKYLINE_ARTIFACT_URL) is what the operator
+        # chose; only the release lookup can come back without a musl build.
+        if [ -z "$BLOCKER" ] && host_is_musl && [ -z "${SKYLINE_ARTIFACT_URL:-}" ] \
+           && release_lacks_musl; then
+            BLOCKER="the latest release${REPLY:+ ($REPLY)} publishes no musl build"
+        fi
         if [ -z "$BLOCKER" ]; then
             SOURCE=prebuilt
         else
@@ -2050,7 +2177,10 @@ export DEBIAN_FRONTEND=noninteractive
 # The whole point of --prebuilt: no compiler, no LLVM, no bpftool, no Rust.
 # Only what it takes to fetch and unpack an archive -- and, under dnf, the two
 # libraries the published skyline-speederd links, named by what they provide
-# so that zlib's move to zlib-ng does not matter. A source build needs the
+# so that zlib's move to zlib-ng does not matter; under apk, the ones the musl
+# build needs at run time (libelf, zlib, zstd-libs, libgcc: RUNTIME in
+# infra/build-musl.sh, which a release runs the binaries against in a clean
+# Alpine; keep the two in step). A source build needs the
 # same toolchain everywhere, under each distribution's own names; on Alpine
 # that includes linux-headers (musl has no kernel headers, and the libbpf that
 # libbpf-sys compiles includes them), bash, which this script runs in, and
@@ -2062,7 +2192,7 @@ case "$PKG:$SOURCE" in
     dnf:prebuilt) PKGS=(curl ca-certificates tar iproute iproute-tc 'libelf.so.1()(64bit)' 'libz.so.1()(64bit)') ;;
     dnf:*)        PKGS=(gcc make pkgconf-pkg-config clang llvm libbpf-devel elfutils-libelf-devel zlib-devel
                         bpftool curl ca-certificates tar iproute iproute-tc) ;;
-    apk:prebuilt) PKGS=(curl ca-certificates tar iproute2 bash) ;;
+    apk:prebuilt) PKGS=(curl ca-certificates tar iproute2 bash libelf zlib zstd-libs libgcc) ;;
     apk:*)        PKGS=(build-base pkgconf clang llvm libbpf-dev elfutils-dev zlib-dev linux-headers
                         bpftool curl ca-certificates tar iproute2 bash libgcc) ;;
 esac
@@ -2298,7 +2428,8 @@ apt_plan() {
 if [ "$MODE" = check ]; then
     info "preflight only; no changes will be made"
     if [ "$SOURCE" = prebuilt ]; then
-        ok "would install the published release${RELEASE_TAG:+ $RELEASE_TAG}"
+        if host_is_musl; then REPLY=" (its musl build)"; else REPLY=; fi
+        ok "would install the published release${RELEASE_TAG:+ $RELEASE_TAG}$REPLY"
     elif [ -n "$SOURCE_REASON" ]; then
         warn "would build from source: $SOURCE_REASON"
     else
@@ -2432,7 +2563,7 @@ if [ "$PKG" = dnf ] || [ "$PKG" = apk ]; then
     fi
     record_added_packages "$WORK/pkgs-before"
     if [ "$ADDED_COUNT" -gt 0 ]; then
-        ok "prerequisites installed ($ADDED_COUNT package(s) recorded; --uninstall removes them again)"
+        ok "prerequisites installed ($ADDED_COUNT package(s) recorded, $ADDED_REMOVABLE of which --uninstall removes again)"
     else
         ok "prerequisites installed (this host already had all of them)"
     fi
@@ -2489,7 +2620,7 @@ dpkg_installed_set >"$WORK/pkgs-before"
 run apt-get "${APT_OPTS[@]}" install "${APT_SPEC[@]}" || die "failed to install build prerequisites"
 record_added_packages "$WORK/pkgs-before"
 if [ "$ADDED_COUNT" -gt 0 ]; then
-    ok "prerequisites installed ($ADDED_COUNT package(s) recorded; --uninstall removes them again)"
+    ok "prerequisites installed ($ADDED_COUNT package(s) recorded, $ADDED_REMOVABLE of which --uninstall removes again)"
 else
     ok "prerequisites installed (this host already had all of them)"
 fi
@@ -2548,6 +2679,12 @@ fetch_prebuilt() {
     local api="https://api.github.com/repos/${REPO_SLUG}/releases"
     local arch; arch=$(uname -m)
     local staging="$WORK/staging"
+    # The C library picks the artifact: skyline-speeder-<tag>-<arch>.tar.gz is
+    # the glibc build, -<arch>-musl.tar.gz the musl one. The suffix goes after
+    # the architecture on purpose: installers up to v0.4.0 take the first name
+    # matching -<arch>.tar.gz, and must never land on the musl build.
+    local libc=glibc flavour=
+    if host_is_musl; then libc=musl flavour=-musl; fi
     mkdir -p "$staging"
 
     # An explicit artifact skips release resolution entirely. Two forms, because
@@ -2583,8 +2720,12 @@ fetch_prebuilt() {
     # point of a toolchain-free path. `|| true`: no match makes grep, and
     # under pipefail the assignment, fail, and set -e would then exit here
     # before the one message that says why.
-    url=$(grep -o "https://[^\"]*skyline-speeder-[^\"]*-${arch}\.tar\.gz" \
+    url=$(grep -o "https://[^\"]*skyline-speeder-[^\"]*-${arch}${flavour}\.tar\.gz" \
           "$staging/release.json" | head -1) || true
+    if [ -z "$url" ] && [ "$libc" = musl ]; then
+        die "no prebuilt musl artifact for $arch in that release: releases publish one
+   from v0.4.1 on. Build from source instead: ${SUDO}$0 --source"
+    fi
     [ -n "$url" ] || die "no prebuilt artifact for $arch in that release.
    Published artifacts are per-architecture; build from source instead."
     fi
@@ -2622,6 +2763,17 @@ fetch_prebuilt() {
     [ -n "$PREBUILT_ROOT" ] && [ -x "$PREBUILT_ROOT/bin/skyline-speederd" ] \
         || die "unexpected artifact layout: no bin/skyline-speederd at the top level"
 
+    # MANIFEST names the C library the binaries were built against (libc=,
+    # from v0.4.1; every artifact before that is glibc). The wrong one would
+    # fail at the verifier step with a bare "not found" -- the dynamic loader
+    # it asks for is not on this host -- so say which artifact this host takes.
+    local built_for
+    built_for=$(awk '{ sub(/^[ \t]+/, "") } sub(/^libc=/, "") { print; exit }' \
+        "$PREBUILT_ROOT/MANIFEST" 2>/dev/null || true)
+    [ "${built_for:-glibc}" = "$libc" ] \
+        || die "${PREBUILT_ROOT##*/} is built for ${built_for:-glibc}, and this host's C library is $libc.
+   Use the $libc artifact: skyline-speeder-<tag>-${arch}${flavour}.tar.gz"
+
     PROVENANCE="${PREBUILT_ROOT##*/} ($verified)"
     if [ -r "$PREBUILT_ROOT/MANIFEST" ]; then
         log "artifact provenance (MANIFEST):"
@@ -2644,13 +2796,16 @@ install_prebuilt_files() {
     if [ "$INIT" = systemd ]; then
         install -m 0644 "$root"/packaging/*.service /etc/systemd/system/
     else
-        # The published artifact carries the systemd units only, so an OpenRC
-        # host takes its two scripts from this installer's own tree -- the
-        # same two a source build installs.
-        [ -r "$REPO_ROOT/packaging/openrc/skyline-speederd" ] \
-            || die "no packaging/openrc/ beside this install.sh: run it from a Skyline Speeder source tree"
-        install -m 0755 "$REPO_ROOT/packaging/openrc/skyline-speederd" /etc/init.d/skyline-speederd
-        install -m 0755 "$REPO_ROOT/packaging/openrc/skyline-speeder-enable" /etc/init.d/skyline-speeder-enable
+        # The two OpenRC scripts come with the artifact from v0.4.1 on, from
+        # the same release as the daemon and the scripts they start. An older
+        # artifact has the systemd units only; then they come from this
+        # installer's own tree, the two a source build installs.
+        local openrc=$root/packaging/openrc
+        [ -r "$openrc/skyline-speederd" ] || openrc=$REPO_ROOT/packaging/openrc
+        [ -r "$openrc/skyline-speederd" ] \
+            || die "no packaging/openrc/ in the artifact or beside this install.sh: run it from a Skyline Speeder source tree"
+        install -m 0755 "$openrc/skyline-speederd" /etc/init.d/skyline-speederd
+        install -m 0755 "$openrc/skyline-speeder-enable" /etc/init.d/skyline-speeder-enable
     fi
     [ -e /etc/skyline-speeder/speeder.toml ] \
         || install -m 0644 "$root/config/speeder.toml" /etc/skyline-speeder/speeder.toml

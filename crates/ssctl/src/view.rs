@@ -191,7 +191,10 @@ pub fn status(theme: &Theme, response: &Response) -> String {
             "skyline_cc struct_ops",
             &theme.red("not attached"),
         );
-        page.note("nothing is accelerated until: sudo ssctl enable");
+        page.note(&format!(
+            "nothing is accelerated until: {}",
+            theme.command("ssctl enable")
+        ));
     }
 
     let default_cc = if live.tcp_congestion_control.is_empty() {
@@ -212,7 +215,10 @@ pub fn status(theme: &Theme, response: &Response) -> String {
     } else if status.enabled {
         page.row(Mark::Bad, "host default cc", &theme.red(default_cc));
         page.note("skyline_cc is loaded but new connections do not use it");
-        page.note("something rewrote net.ipv4.tcp_congestion_control; re-run: sudo ssctl enable");
+        page.note(&format!(
+            "something rewrote net.ipv4.tcp_congestion_control; re-run: {}",
+            theme.command("ssctl enable")
+        ));
     } else {
         page.row(Mark::Off, "host default cc", &theme.dim(default_cc));
     }
@@ -253,7 +259,10 @@ pub fn status(theme: &Theme, response: &Response) -> String {
         &format!(
             "{} {}",
             theme.bold(&count(status.active_flows)),
-            theme.dim("on skyline_cc  (sudo ssctl flows)")
+            theme.dim(&format!(
+                "on skyline_cc  ({})",
+                theme.command("ssctl flows")
+            ))
         ),
     );
 
@@ -387,10 +396,10 @@ pub fn status(theme: &Theme, response: &Response) -> String {
     // --- anything wrong ----------------------------------------------------
     let mut warnings: Vec<String> = Vec::new();
     if !status.enabled {
-        warnings.push(
-            "skyline_cc is not attached: this host is not accelerated (sudo ssctl enable)"
-                .to_owned(),
-        );
+        warnings.push(format!(
+            "skyline_cc is not attached: this host is not accelerated ({})",
+            theme.command("ssctl enable")
+        ));
     } else if !carrying {
         warnings.push(format!(
             "new connections use {default_cc}, not skyline_cc -- the acceleration is bypassed"
@@ -617,7 +626,10 @@ pub fn flows(theme: &Theme, response: &Response) -> String {
             "skyline_cc",
             &theme.red("not attached -- nothing on this host is accelerated"),
         );
-        page.note("attach it with: sudo ssctl enable");
+        page.note(&format!(
+            "attach it with: {}",
+            theme.command("ssctl enable")
+        ));
         page.blank();
     } else if !carrying {
         page.row(
@@ -625,7 +637,10 @@ pub fn flows(theme: &Theme, response: &Response) -> String {
             "host default cc",
             &theme.red(&status.guard.live.tcp_congestion_control),
         );
-        page.note("skyline_cc is attached but new connections bypass it (sudo ssctl status)");
+        page.note(&format!(
+            "skyline_cc is attached but new connections bypass it ({})",
+            theme.command("ssctl status")
+        ));
         page.blank();
     }
 
@@ -1241,8 +1256,12 @@ mod tests {
 
     fn theme() -> Theme {
         // Colour off: the assertions below look for text, and a test must
-        // not depend on the terminal running it.
-        Theme::detect(ColorChoice::Never)
+        // not depend on the terminal running it. sudo pinned on for the same
+        // reason: whether this machine has one, and whether the tests run
+        // under it, must not decide what the assertions see.
+        let mut theme = Theme::detect(ColorChoice::Never);
+        theme.sudo = true;
+        theme
     }
 
     fn healthy() -> RuntimeStatus {
@@ -1486,6 +1505,48 @@ mod tests {
         let text = flows(&theme, &reply(standby, Some(FlowReport::default())));
         assert!(text.contains("NOT ACCELERATING"));
         assert!(text.contains("nothing on this host is accelerated"));
+    }
+
+    /// Every remedy the reports print is a command to paste. Where sudo does
+    /// not belong -- a root shell, Alpine without sudo -- the same commands
+    /// come out bare, and nothing else in either report moves.
+    #[test]
+    fn remedies_carry_sudo_only_where_it_belongs() {
+        let with = theme();
+        let mut without = theme();
+        without.sudo = false;
+
+        let mut standby = healthy();
+        standby.enabled = false;
+        standby.attached_s = None;
+        standby.metrics = None;
+        standby.guard.armed = false;
+        standby.guard.live.tcp_congestion_control = "bbr".to_owned();
+        let mut bypassed = healthy();
+        bypassed.guard.live.tcp_congestion_control = "bbr".to_owned();
+
+        // Word by word: a note wraps, and once the prefix is gone its lines
+        // may break somewhere else.
+        let words = |text: String| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut seen = String::new();
+        for state in [healthy(), standby, bypassed] {
+            for render in [status, flows] {
+                let response = reply(state.clone(), Some(sample_flows()));
+                let sudo = words(render(&with, &response));
+                let bare = words(render(&without, &response));
+                assert!(!bare.contains("sudo"), "{bare}");
+                assert_eq!(sudo.replace("sudo ", ""), bare);
+                seen.push_str(&sudo);
+                seen.push(' ');
+            }
+        }
+        for remedy in [
+            "sudo ssctl enable",
+            "(sudo ssctl flows)",
+            "(sudo ssctl status)",
+        ] {
+            assert!(seen.contains(remedy), "no report says {remedy}");
+        }
     }
 
     /// An `ss` that could not run must not take the rest of the report with
