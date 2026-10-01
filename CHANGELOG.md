@@ -10,6 +10,27 @@ for anyone holding a prebuilt `.bpf.o`.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-10-01
+
+### Upgrading from 0.4.2
+
+- **Re-run the installer the way the host was installed.** The BPF objects
+  and the ABI are as in 0.4.2 -- both artifacts again carry the 0.4.0 objects
+  byte for byte -- and so are the values in the configuration template. The
+  daemon and `infra/boot-disable.sh` change; the installer restarts
+  `skyline-speederd` as before.
+- **An existing `/etc/skyline-speeder/speeder.toml` keeps its `fallback_cc`.**
+  Only a configuration the installer creates gets the algorithm the host
+  boots into. On a host that runs bbr and still has the template's `cubic`,
+  set `fallback_cc = "bbr"` there and restart `skyline-speederd`, and
+  `ssctl drain` and the enable unit's ExecStop will leave it on bbr.
+- **A host whose install stopped at the verifier step with "configured
+  fallback congestion control is unavailable"** (xanmod, and any kernel that
+  builds CUBIC as a module): re-run the installer. The configuration that
+  install left behind is kept, and its `cubic` passes now that the kernel's
+  own module loading counts; set `fallback_cc = "bbr"` in it first to keep
+  the host on bbr whenever skyline_cc is detached.
+
 ### Fixed
 
 - **The install stopped at the verifier step on kernels that build CUBIC as a
@@ -998,7 +1019,8 @@ rather than as fixes to a version nobody could have installed.
   socket file permissions. Multi-tenant hosts need additional access control.
 - The experiment harness requires **Python 3.11 or newer** (`tomllib`).
 
-[Unreleased]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.3.0...v0.4.0
