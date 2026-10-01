@@ -163,6 +163,19 @@ IPv6（纯 IPv6 主机没有 IPv4 默认路由），各按 `ip route` 列出的�
 网卡在本机不存在、或不是以太网设备时同样告警，并给出改法：改
 `/etc/skyline-speeder/speeder.toml`，然后 `sudo systemctl restart skyline-speederd`。
 
+**选择 `fallback_cc`。** 同样只在这次运行新建配置文件时改写：重跑、升级，以及上一次
+安装失败时留下的配置都不动。`fallback_cc` 是 `skyline_cc` 不在时新连接用的算法——
+`ssctl drain` 和 enable unit 的 ExecStop 写它，每次 enable 在挂载前也先写它一次——模板里
+是 `cubic`，开机就是 bbr 的主机于是每摘除一次就被换成 cubic。安装器改用开机时 sysctl
+配置选定的那个算法（按 systemd-sysctl 的规则找出生效的文件，规则见下面的「结束摘要」，
+例如「一键 BBR」脚本留下的 `/etc/sysctl.d/99-bbr.conf` 里的 `bbr`）：它就是这台机器不装
+Skyline Speeder 时运行的算法，也是每次开机 `skyline-speederd` 启动前一定已经注册的
+算法——systemd-sysctl（OpenRC 上是 sysctl 服务）在那之前写入它，写入时内核顺带加载它的
+模块，所以 0.4.3 之前那些只认已注册算法的 daemon 用它也一样安全。开机配置里没有设定、
+设的是 `skyline_cc`、或设的算法本机此刻并没有注册时，保留模板的 `cubic`。安装输出里
+`fallback_cc set to …`/`fallback_cc left at …` 一行说明这次的选择，`--check` 也报告新建的
+配置会得到哪个值。
+
 **安装前记录。** 动手之前记下当前的拥塞控制、`net.core.default_qdisc`，以及 guard 将要
 维护的每块网卡的根 qdisc（`fq`、`cake`、`mq/fq_codel` 这样的摘要；这些网卡通常就是
 `runtime.tc_interface`，它是 VLAN、bond、网桥时则是它下面的物理网卡），用于结束时的前后
@@ -356,6 +369,9 @@ Alpine 用 OpenRC 而不是 systemd，C 库是 musl 而不是 glibc。一键安�
 - `[guard]` 默认 `interval_s = 5`、`qdisc = true`：挂载后 `skyline-speederd` 每 5 秒确认一次
   拥塞控制仍是 `skyline_cc`、`default_qdisc` 与 `runtime.tc_interface`（或它下面的物理
   网卡）的根 qdisc 仍是 `fq`，被改就改回（第 7 节）。只想让它管拥塞控制设 `qdisc = false`。
+- `fallback_cc` 模板值 `cubic`，`install.sh` 新建配置时换成开机 sysctl 配置选定的算法
+  （第 4 节）。手工改时可以填内核已注册的算法（`/proc/sys/net/ipv4/tcp_available_congestion_control`），
+  也可以填内核能自动加载的模块 `tcp_<名字>`（例如 xanmod 内核上的 `cubic`；0.4.3 起）。
 
 安装后先检查一遍 `/etc/skyline-speeder/speeder.toml`，确认 `runtime.tc_interface` 指向正确
 的发送网卡名，再继续下一步——TC 程序挂在这块网卡上，guard 维护的也是这块网卡的根 qdisc
@@ -632,6 +648,16 @@ journalctl -u skyline-speederd.service | grep 'guard:'
 抢这些设置（常见是 `sysctl --system` 重新应用了 `/etc/sysctl.d` 里的 `bbr`）——guard 会
 一直改回，要根除就找出那个文件。`ssctl status` 的 `version` 是正在运行的 daemon 的版本，
 和 `skyline-speederd --version`（磁盘上的二进制）不一致说明还没重启到新版本。
+
+**`configured fallback congestion control is unavailable`。** 校验（安装器的
+「Running the kernel verifier」一步、`--validate-only`、`ssctl enable`）在加载任何 BPF
+对象之前就停下了：`fallback_cc` 填的算法这个内核既没有注册，也没有可加载的模块
+`tcp_<名字>`，能力报告的 `notes` 列出本机已注册的算法。改
+`/etc/skyline-speeder/speeder.toml` 里的 `fallback_cc` 为其中之一（通常是主机原本在用的
+`bbr`），再重跑安装命令或 `sudo systemctl restart skyline-speederd`。0.4.3 之前的版本只认
+**已注册**的算法：xanmod 这类默认 bbr、把 cubic 编成模块的内核上，模板的 `cubic` 开机后
+并未注册，安装因此失败，按同样的办法改成 `bbr` 即可。不要用 `modprobe tcp_cubic` 绕过：
+daemon 只在启动时探测一次，重启后 cubic 没有加载，开机自动挂载就会失败。
 
 **M1 tier-2 排障决策树**（`rack_rto.stats` 一直是 0 时）：
 

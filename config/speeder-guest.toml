@@ -7,6 +7,9 @@ prr_pacing_enabled = true
 # See config/speeder.toml's comment: kernel-equivalent pacing-rate ceiling used
 # when M4 is off, same independent-switch shape as prr_pacing_enabled.
 auto_pacing_enabled = true
+# See config/speeder.toml's comment: what new connections get while
+# skyline_cc is detached. install.sh sets it, in a config it creates, to the
+# algorithm the host boots into.
 fallback_cc = "cubic"
 max_pacing_mbps = 1200
 max_cwnd_packets = 50000

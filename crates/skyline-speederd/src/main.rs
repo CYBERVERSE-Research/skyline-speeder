@@ -1413,6 +1413,95 @@ fn is_function_pointer(btf: &Btf<'_>, type_id: TypeId) -> bool {
         .is_some_and(|pointee| pointee.skip_mods_and_typedefs().kind() == BtfKind::FuncProto)
 }
 
+const AVAILABLE_CONGESTION_CONTROL_SYSCTL: &str =
+    "/proc/sys/net/ipv4/tcp_available_congestion_control";
+
+/// How this kernel can provide the algorithm `fallback_cc` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FallbackAvailability {
+    /// Listed in tcp_available_congestion_control: built in, or its module
+    /// is already loaded.
+    Registered,
+    /// Not registered yet, but the module the kernel would load for it exists.
+    Loadable,
+    /// Neither: writing the name to the sysctl fails with ENOENT.
+    Missing,
+}
+
+/// `registered` is tcp_available_congestion_control, which lists only the
+/// algorithms registered so far -- built in, or from a module already loaded.
+/// That is not the kernel's own rule: a root write of a name it does not know
+/// to net.ipv4.tcp_congestion_control makes it `request_module("tcp_<name>")`
+/// and look again (tcp_ca_find_autoload, net/ipv4/tcp_cong.c), so a module is
+/// as good a fallback as a built-in algorithm. Taking the list as the whole
+/// answer failed every install on xanmod, whose kernels build CUBIC (the
+/// shipped fallback_cc) as a module and register only reno and bbr at boot.
+/// `module_exists` is `ModuleIndex::can_load` outside the tests.
+fn fallback_availability(
+    name: &str,
+    registered: &str,
+    module_exists: impl Fn(&str) -> bool,
+) -> FallbackAvailability {
+    if registered.split_whitespace().any(|known| known == name) {
+        return FallbackAvailability::Registered;
+    }
+    // modinfo also takes a file name, so only what can be an algorithm name
+    // -- the kernel's are made of [A-Za-z0-9_-] -- is handed to it.
+    let plain = !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+    if plain && module_exists(&format!("tcp_{name}")) {
+        FallbackAvailability::Loadable
+    } else {
+        FallbackAvailability::Missing
+    }
+}
+
+/// The running kernel's module index -- what modprobe, and so the kernel's own
+/// request_module, can load -- read from the files depmod writes for it. Not
+/// modinfo: busybox's, which is Alpine's unless kmod is installed, exits 0 for
+/// a module that does not exist, and a fallback_cc that only looked loadable
+/// would pass validation and then fail where it is written -- in drain, just
+/// before skyline_cc is unregistered while still the default.
+struct ModuleIndex {
+    dep: String,
+    alias: String,
+    loading_disabled: bool,
+}
+
+impl ModuleIndex {
+    fn read(kernel_release: &str) -> Self {
+        let dir = Path::new("/lib/modules").join(kernel_release);
+        Self {
+            dep: fs::read_to_string(dir.join("modules.dep")).unwrap_or_default(),
+            alias: fs::read_to_string(dir.join("modules.alias")).unwrap_or_default(),
+            loading_disabled: fs::read_to_string("/proc/sys/kernel/modules_disabled")
+                .is_ok_and(|value| value.trim() == "1"),
+        }
+    }
+
+    /// Each modules.dep line starts with one module's path, `.ko` plus any
+    /// compression suffix, then a colon and what it depends on
+    /// (`kernel/net/ipv4/tcp_yeah.ko.xz: kernel/net/ipv4/tcp_vegas.ko.xz`);
+    /// modules.alias lines are `alias <alias> <module>`. To modprobe `-` and
+    /// `_` in a module name are the same.
+    fn can_load(&self, module: &str) -> bool {
+        let wanted = module.replace('-', "_");
+        let is_wanted = |name: &str| name.replace('-', "_") == wanted;
+        let listed = self.dep.lines().any(|line| {
+            let path = line.split(':').next().unwrap_or_default();
+            let file = path.rsplit('/').next().unwrap_or_default();
+            is_wanted(file.split(".ko").next().unwrap_or_default())
+        });
+        let aliased = self.alias.lines().any(|line| {
+            let mut words = line.split_whitespace();
+            words.next() == Some("alias") && words.next().is_some_and(is_wanted)
+        });
+        !self.loading_disabled && (listed || aliased)
+    }
+}
+
 fn probe_capabilities(config: &SkylineConfig) -> CapabilityReport {
     let kernel_release = fs::read_to_string("/proc/sys/kernel/osrelease")
         .unwrap_or_else(|_| "unknown".to_owned())
@@ -1448,14 +1537,43 @@ fn probe_capabilities(config: &SkylineConfig) -> CapabilityReport {
     } else {
         BtfCapabilities::default()
     };
-    let fallback_cc_available =
-        fs::read_to_string("/proc/sys/net/ipv4/tcp_available_congestion_control")
-            .map(|available| {
-                available
-                    .split_whitespace()
-                    .any(|name| name == config.fallback_cc.as_str())
-            })
-            .unwrap_or(false);
+    let registered = fs::read_to_string(AVAILABLE_CONGESTION_CONTROL_SYSCTL).unwrap_or_default();
+    let modules = ModuleIndex::read(&kernel_release);
+    let fallback = fallback_availability(&config.fallback_cc, &registered, |module| {
+        modules.can_load(module)
+    });
+    let fallback_cc_available = fallback != FallbackAvailability::Missing;
+    match fallback {
+        FallbackAvailability::Registered => {}
+        // Worth a line because it shows: every enable writes fallback_cc before
+        // it attaches, so the first one loads the module and lsmod lists it.
+        // Said as of the probe, which runs once at start: the report is
+        // served unchanged long after that first enable.
+        FallbackAvailability::Loadable => notes.push(format!(
+            "fallback_cc {name} was not registered when skyline-speederd started; the \
+             kernel loads its module, tcp_{name}, the first time {name} is selected",
+            name = config.fallback_cc
+        )),
+        FallbackAvailability::Missing => {
+            // The names to choose from. skyline_cc is registered while an
+            // instance is attached, but it is no fallback for itself: drain
+            // writes fallback_cc just before it unregisters skyline_cc.
+            let choices: Vec<&str> = registered
+                .split_whitespace()
+                .filter(|known| *known != SKYLINE_CC_NAME)
+                .collect();
+            notes.push(format!(
+                "fallback_cc {name} is not available: when skyline-speederd started this kernel \
+                 had not registered it and had no module tcp_{name}; registered then: {list}",
+                name = config.fallback_cc,
+                list = if choices.is_empty() {
+                    "none".to_owned()
+                } else {
+                    choices.join(" ")
+                }
+            ));
+        }
+    }
 
     if !config.runtime.cgroup_path.is_dir() {
         notes.push(format!(
@@ -1516,7 +1634,13 @@ fn validate_capabilities(report: &CapabilityReport) -> Result<()> {
         bail!("BPF struct_ops support was not detected");
     }
     if !report.fallback_cc_available {
-        bail!("configured fallback congestion control is unavailable");
+        // The capability notes name the algorithms this kernel has; this line
+        // is the one install.sh points at, so it says what to change.
+        bail!(
+            "configured fallback congestion control is unavailable: set fallback_cc to one \
+             this kernel has (see the capability notes, or \
+             {AVAILABLE_CONGESTION_CONTROL_SYSCTL})"
+        );
     }
     Ok(())
 }
@@ -1850,6 +1974,111 @@ mod tests {
         btf.structure("tcp_sock", &[(RACK_REO_HOOK_MEMBER, int)]);
 
         assert!(!probe_btf_capabilities(&btf.parse("rack-scalar")).rack_reo_hook);
+    }
+
+    #[test]
+    fn a_registered_fallback_needs_no_module_lookup() {
+        let no_lookup = |module: &str| -> bool { panic!("looked up {module}") };
+
+        assert_eq!(
+            fallback_availability("cubic", "reno cubic bbr\n", no_lookup),
+            FallbackAvailability::Registered
+        );
+    }
+
+    #[test]
+    fn a_modular_fallback_is_available_once_its_module_exists() {
+        // xanmod 7.1.9: CUBIC is a module, and only reno and bbr are
+        // registered after boot.
+        let xanmod = |module: &str| module == "tcp_cubic";
+
+        assert_eq!(
+            fallback_availability("cubic", "reno bbr\n", xanmod),
+            FallbackAvailability::Loadable
+        );
+        assert_eq!(
+            fallback_availability("vegas", "reno bbr\n", xanmod),
+            FallbackAvailability::Missing
+        );
+    }
+
+    #[test]
+    fn registered_names_match_whole_words_only() {
+        assert_eq!(
+            fallback_availability("bbr", "reno bbr2 cubic", |_| false),
+            FallbackAvailability::Missing
+        );
+    }
+
+    #[test]
+    fn only_an_algorithm_name_reaches_the_module_lookup() {
+        let anything = |_: &str| true;
+
+        for name in ["", "../cubic", "cubic.ko", "a b"] {
+            assert_eq!(
+                fallback_availability(name, "reno bbr", anything),
+                FallbackAvailability::Missing,
+                "{name:?}"
+            );
+        }
+        assert_eq!(
+            fallback_availability("dctcp-reno", "reno bbr", anything),
+            FallbackAvailability::Loadable
+        );
+    }
+
+    fn module_index(dep: &str, alias: &str) -> ModuleIndex {
+        ModuleIndex {
+            dep: dep.to_owned(),
+            alias: alias.to_owned(),
+            loading_disabled: false,
+        }
+    }
+
+    #[test]
+    fn module_index_reads_the_paths_depmod_writes() {
+        // As on the test hosts: xanmod 7.1.9 (uncompressed), Debian 13's
+        // 6.12 (xz), whose CUBIC is built in and so not in modules.dep.
+        let xanmod = module_index(
+            "kernel/net/ipv4/tcp_cubic.ko:\n\
+             kernel/net/ipv4/tcp_yeah.ko: kernel/net/ipv4/tcp_vegas.ko\n",
+            "alias tcp-ulp-tls tls\n",
+        );
+        let debian = module_index(
+            "kernel/net/ipv4/tcp_bbr.ko.xz:\nkernel/net/ipv4/tcp_cubic_test.ko.xz:\n",
+            "",
+        );
+
+        assert!(xanmod.can_load("tcp_cubic"));
+        assert!(debian.can_load("tcp_bbr"));
+        assert!(
+            !debian.can_load("tcp_cubic"),
+            "a longer name is another module"
+        );
+        assert!(
+            !xanmod.can_load("tcp_vegas"),
+            "what follows the colon is a dependency, not a module of this kernel"
+        );
+    }
+
+    #[test]
+    fn module_index_takes_aliases_and_treats_dash_as_underscore() {
+        let index = module_index(
+            "updates/dkms/brutal.ko:\nkernel/net/foo/tcp-x.ko.zst:\n",
+            "alias tcp_brutal brutal\n",
+        );
+
+        assert!(index.can_load("tcp_brutal"));
+        assert!(index.can_load("tcp_x"));
+        assert!(!index.can_load("tcp_tls"));
+    }
+
+    #[test]
+    fn no_module_loads_once_loading_is_disabled() {
+        let mut index = module_index("kernel/net/ipv4/tcp_cubic.ko:\n", "");
+        index.loading_disabled = true;
+
+        assert!(!index.can_load("tcp_cubic"));
     }
 
     #[test]

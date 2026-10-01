@@ -10,6 +10,64 @@ for anyone holding a prebuilt `.bpf.o`.
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-10-01
+
+### Upgrading from 0.4.2
+
+- **Re-run the installer the way the host was installed.** The BPF objects
+  and the ABI are as in 0.4.2 -- both artifacts again carry the 0.4.0 objects
+  byte for byte -- and so are the values in the configuration template. The
+  daemon and `infra/boot-disable.sh` change; the installer restarts
+  `skyline-speederd` as before.
+- **An existing `/etc/skyline-speeder/speeder.toml` keeps its `fallback_cc`.**
+  Only a configuration the installer creates gets the algorithm the host
+  boots into. On a host that runs bbr and still has the template's `cubic`,
+  set `fallback_cc = "bbr"` there and restart `skyline-speederd`, and
+  `ssctl drain` and the enable unit's ExecStop will leave it on bbr.
+- **A host whose install stopped at the verifier step with "configured
+  fallback congestion control is unavailable"** (xanmod, and any kernel that
+  builds CUBIC as a module): re-run the installer. The configuration that
+  install left behind is kept, and its `cubic` passes now that the kernel's
+  own module loading counts; set `fallback_cc = "bbr"` in it first to keep
+  the host on bbr whenever skyline_cc is detached.
+
+### Fixed
+
+- **The install stopped at the verifier step on kernels that build CUBIC as a
+  module, xanmod among them.** `skyline-speederd` accepted `fallback_cc` only
+  when `tcp_available_congestion_control` listed it, and that file names only
+  the algorithms registered so far: built in, or from a module already loaded.
+  xanmod builds `tcp_cubic` as a module and registers just reno and bbr at
+  boot, so the template's `cubic` failed the capability check with
+  `configured fallback congestion control is unavailable` before a single BPF
+  object was loaded. The list is not the kernel's own rule: when root writes a
+  name it does not know to `net.ipv4.tcp_congestion_control`, the kernel loads
+  the module `tcp_<name>` and looks again. The daemon now takes a fallback that
+  is registered or comes from such a module, looked up in the kernel's module
+  index (`modules.dep`, `modules.alias`) rather than with `modinfo`, which in
+  its busybox build -- Alpine's unless kmod is installed -- reports success
+  for a module that does not exist. The capability notes say when that module
+  was not loaded yet as the daemon started, and when neither holds, which
+  algorithms the kernel had registered; the error says what to change.
+- **Detaching took a host that runs bbr to cubic.** `fallback_cc` -- what new
+  connections get whenever skyline_cc is not attached: `ssctl drain`, the
+  enable unit's ExecStop, and briefly every enable, which writes it before the
+  attach -- was the template's `cubic` on every install, though nearly every
+  host arrives already running bbr. `install.sh` now sets it, in a
+  configuration it creates, to the algorithm the host's sysctl configuration
+  selects at boot (`fallback_cc set to bbr, which /etc/sysctl.d/99-bbr.conf
+  selects at boot`), and keeps `cubic` when nothing selects one, when that is
+  `skyline_cc`, or when the kernel does not have it registered. That algorithm
+  is registered before `skyline-speederd` starts on every boot -- the boot's
+  own sysctl write loads its module -- so an older daemon, which `--release`
+  still installs, accepts it too; on xanmod this alone gets a fresh install
+  through. A configuration that exists already, one a failed install left
+  behind included, is never rewritten. `--check` says what a new configuration
+  would get.
+  - `infra/boot-disable.sh`, the enable unit's ExecStop, writes the configured
+    `fallback_cc` when the daemon is already gone, where it wrote a hard-coded
+    cubic. `SKYLINE_FALLBACK_CC` still overrides it.
+
 ## [0.4.2] - 2026-09-30
 
 ### Upgrading from 0.4.1
@@ -961,7 +1019,8 @@ rather than as fixes to a version nobody could have installed.
   socket file permissions. Multi-tenant hosts need additional access control.
 - The experiment harness requires **Python 3.11 or newer** (`tomllib`).
 
-[Unreleased]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.3.0...v0.4.0
