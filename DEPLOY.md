@@ -200,6 +200,16 @@ grep '^tc_interface' /etc/skyline-speeder/speeder.toml
 模板值并告警）。`tc_interface` 是 VLAN、bond 或网桥时照填即可，guard 维护的是它下面的
 物理网卡（§10）。
 
+```bash
+# 3.5 fallback_cc —— skyline_cc 不在时新连接用的算法（drain、enable unit 的 ExecStop、
+# 每次 enable 挂载前都写它）。模板是 cubic；开机就是 bbr 的主机填 bbr，摘除时才回到它。
+# install.sh 新建配置时自动这样做（取开机 sysctl 配置选定的算法，docs/01 第 4 节）。
+# 必须是已注册的算法，或内核能自动加载的模块 tcp_<名字>（0.4.3 起；更早的版本只认已注册的）。
+CC=$(sysctl -n net.ipv4.tcp_congestion_control)    # 挂载 skyline_cc 之前，就是主机自己的算法
+[ "$CC" = skyline_cc ] || sed -i "s|^fallback_cc = \".*\"|fallback_cc = \"$CC\"|" /etc/skyline-speeder/speeder.toml
+grep '^fallback_cc' /etc/skyline-speeder/speeder.toml
+```
+
 > **升级已有安装**：`install-guest.sh` 只替换文件，不会重启已在运行的 `skyline-speederd`
 > （`install.sh` 会，见 §0——走一键路径的主机不需要下面这段）。第 4 节验证通过后执行：
 >
@@ -239,6 +249,12 @@ skyline-speederd --config /etc/skyline-speeder/speeder.toml --validate-only --ve
 
 `rack_reo_hook: false` 是**正常的**——它只表示 early-loss 停留在观测模式，
 不阻断部署。
+
+`fallback_cc_available: false`（`Error: configured fallback congestion control is unavailable`）
+说明 `fallback_cc` 填的算法这个内核既没有注册、也没有可加载的模块 `tcp_<名字>`：`notes`
+列出本机已注册的算法，把 `fallback_cc` 改成其中之一（见 3.5）。0.4.3 之前的版本连"有模块
+但还没加载"也算不可用——xanmod 这类默认 bbr、把 cubic 编成模块的内核上，模板的 `cubic`
+就是这样失败的，改成 `bbr` 即可。
 
 ---
 

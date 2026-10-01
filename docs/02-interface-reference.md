@@ -169,7 +169,7 @@ daemon 应答，旧 `ssctl` 也能解码新 daemon 的应答。`RuntimeStatus` �
 |---|---|
 | `kernel_release` | `uname -r` |
 | `btf` / `bpffs` / `cgroup_v2` / `fq_available` / `struct_ops` | 硬性前提，任一为 `false` 则 `--validate-only`、`ssctl validate`、`ssctl enable` 直接拒绝（`skyline-speederd` 进程本身照常启动） |
-| `fallback_cc_available` | `fallback_cc` 配置的算法名是否确实是内核已注册的拥塞控制；也是硬性前提，为 `false` 时上述三处一样拒绝 |
+| `fallback_cc_available` | 内核能否提供 `fallback_cc` 配置的算法：已注册（编进内核，或模块已加载），或者有模块 `tcp_<名字>`——root 写这个 sysctl 时内核会自己加载它（xanmod 就把 cubic 编成模块，开机只注册 reno 和 bbr）。也是硬性前提，为 `false` 时上述三处一样拒绝。daemon 启动时模块尚未加载的，`notes` 里注明；不可用时 `notes` 列出启动时已注册的算法（`skyline_cc` 除外：drain 正是在注销它之前写 fallback）。0.4.3 之前只认已注册的算法 |
 | `rack_reo_hook` | 探测一个内核补丁专用的钩子是否存在，标准上游内核上恒为 `false`；仅作记录，不参与上述门槛 |
 | `notes` | 自由文本，记录软性降级信息（例如某功能因内核能力不足而退化为纯观测；`[guard] qdisc = true`、设置了 `tc_interface` 而主机上没有 `tc`（iproute2）时，也在这里提示 guard 无法维护该网卡（或它下面的物理网卡）的根 qdisc；`tc_interface` 不是以太网设备时提示 `TC interface <网卡> is not an Ethernet device (type N, e.g. a tunnel); skyline_tc is not attached`，见第 6.7 节）。`TC runtime unavailable: <原因>` 是 TC 程序没有加载的原因 |
 
@@ -286,7 +286,7 @@ BPF 侧的四段配置各自独立维护自己的 ABI 版本号，互不联动�
 | `enabled_modules` | string[] | 启动时启用的 M1-M4 模块子集，取值 `early-loss`/`adaptive-cwnd`/`loss-classifier`/`pacing` | 是（`ssctl enable`） |
 | `prr_pacing_enabled` | bool | 框架级 PRR 重实现开关，独立于上面四个模块——即使 `enabled_modules` 为空也默认生效（修正的是"绕开内核 PRR 后基线不对等"这个问题，不是可选特性）。M2 开启时该路径不会被执行 | 是（`set-module-config`） |
 | `auto_pacing_enabled` | bool | M4 关闭时使用的、等价于内核默认行为的 pacing 速率上限，独立开关，语义同上 | 是（`set-module-config`） |
-| `fallback_cc` | string | 未启用/摘除 `skyline_cc` 时新连接使用的拥塞控制算法名，必须是内核已注册的算法 | 否 |
+| `fallback_cc` | string | 未启用/摘除 `skyline_cc` 时新连接使用的拥塞控制算法名（每次 enable 挂载前、`ssctl drain`、enable unit 的 ExecStop 都写它），必须是内核已注册的算法，或可由内核自动加载的模块 `tcp_<名字>`。模板值 `cubic`；`install.sh` 新建配置时换成开机 sysctl 配置选定的算法（见 `docs/01-deployment-guide.md` 第 4 节） | 否 |
 | `max_pacing_mbps` | u64 | pacing 速率硬上限（Mbps），`pacing` 模块启用时不可为 0 | 是 |
 | `max_cwnd_packets` | u32 | cwnd 硬上限（包），最小值 4 | 是 |
 | `max_queue_delay_ms` | u32 | 队列时延护栏的固定基准值（毫秒） | 是 |

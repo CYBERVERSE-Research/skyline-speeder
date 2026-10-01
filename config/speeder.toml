@@ -14,6 +14,14 @@ prr_pacing_enabled = true
 # prr_pacing_enabled's comment -- same rationale, same independent-switch
 # shape). Set to false only for rollback/A-B comparison.
 auto_pacing_enabled = true
+# Congestion control for new connections whenever skyline_cc is not attached:
+# every enable writes it before the attach, and `ssctl drain` and the enable
+# unit's ExecStop write it on the way out. It must be registered
+# (/proc/sys/net/ipv4/tcp_available_congestion_control) or a module tcp_<name>
+# the kernel loads when the sysctl is written -- xanmod builds cubic that way.
+# install.sh replaces cubic in a config it creates with the algorithm the
+# host's sysctl configuration selects at boot (bbr on most VPS images), so
+# detaching leaves the host on what it ran; an existing file is never rewritten.
 fallback_cc = "cubic"
 max_pacing_mbps = 1200
 max_cwnd_packets = 50000

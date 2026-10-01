@@ -872,6 +872,32 @@ conf_sysctl_settings() {
     sysctl_key_settings /etc/sysctl.conf
 }
 
+# boot_fallback_cc: "name|file" for the fallback_cc a new speeder.toml gets, or
+# nothing to keep the template's. fallback_cc is what new connections get
+# whenever skyline_cc is not attached -- `ssctl drain`, the enable unit's
+# ExecStop, and briefly every enable, which writes it before the attach -- so
+# the template's cubic took a host that boots into bbr off bbr each time. The
+# algorithm the boot configuration selects is what the host runs without
+# Skyline Speeder, and the one name certain to be registered whenever
+# skyline-speederd starts: systemd-sysctl (OpenRC: the sysctl service) writes it
+# earlier in every boot, and that write loads its module. A daemon older than
+# 0.4.3 accepts nothing else -- it takes only a registered fallback_cc, which is
+# how the template's cubic stopped every install on xanmod, whose kernels build
+# CUBIC as a module -- and this installer still installs those releases
+# (`--release`). Kept: no boot setting, skyline_cc (which no boot can
+# register), or a name this kernel does not have registered right now.
+boot_fallback_cc() {
+    local key value file
+    while IFS='|' read -r key value file; do
+        [ "$key" = net.ipv4.tcp_congestion_control ] || continue
+        case "$value" in ''|skyline_cc) return 0 ;; esac
+        case " $(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null) " in
+            *" $value "*) printf '%s|%s\n' "$value" "$file" ;;
+        esac
+        return 0
+    done <<<"$BOOT_SETTINGS"
+}
+
 # `ssctl status --json` pretty-prints one "key": value per line. awk rather than a
 # JSON parser for the same reason as the release lookup below: python3/jq are
 # not guaranteed on a minimal server image. First match only; no early `exit`,
@@ -2166,6 +2192,11 @@ describe_egress
 log "before: tcp_congestion_control=$BEFORE_CC default_qdisc=$BEFORE_DQ egress: $REPLY"
 [ -z "$BOOT_SETTINGS" ] || log "set at boot (key|value|file):" "$BOOT_SETTINGS"
 [ -z "$CONF_SETTINGS" ] || log "set in /etc/sysctl.conf, not read at boot (key|value|file):" "$CONF_SETTINGS"
+# Whether this run writes speeder.toml from the template, which section 8 then
+# adapts to the host. An existing one belongs to its operator -- also when an
+# earlier run left it behind by failing -- and is never rewritten.
+CFG_FRESH=1
+[ ! -e "$CFG" ] || CFG_FRESH=0
 
 # --- 5. packages -----------------------------------------------------------
 export DEBIAN_FRONTEND=noninteractive
@@ -2493,6 +2524,13 @@ if [ "$MODE" = check ]; then
         [ -n "$key" ] || continue
         info "set in $file (by sysctl -p / sysctl --system, not at boot): ${key##*.} = $value"
     done <<<"$CONF_SETTINGS"
+    if [ "$CFG_FRESH" -eq 0 ]; then
+        info "$CFG exists and is kept as it is"
+    elif REPLY=$(boot_fallback_cc) && [ -n "$REPLY" ]; then
+        info "a new $CFG would get fallback_cc = ${REPLY%%|*}, which ${REPLY#*|} selects at boot"
+    else
+        info "a new $CFG would keep the template's fallback_cc: no boot setting selects a congestion control this kernel has"
+    fi
     info "preflight complete"
     printf '\n' >&3
     sponsor '--'
@@ -2826,13 +2864,13 @@ else
     run "$REPO_ROOT/infra/install-guest.sh" --confirm-install || die "installing the files failed"
 fi
 
-# --- 8. point the TC program at the real egress interface ------------------
+# --- 8. adapt the template: egress interface, fallback_cc -------------------
 # The shipped template targets the reference test bed's interface name, which
 # almost never matches a real host. Fix it up on first install only -- an
 # existing operator-edited config is never rewritten. The replacement is the
 # first Ethernet device a default route (IPv4, then IPv6) leaves through; see
 # ethernet_route_interface for why a tunnel is not taken.
-step "Configuring the egress interface"
+step "Configuring speeder.toml"
 ROUTE_DEV=$(default_route_interface)
 ETH_DEV=$(ethernet_route_interface)
 PLACEHOLDER=0
@@ -2874,6 +2912,20 @@ elif [ ! -e "/sys/class/net/$DEV" ]; then
     warn "runtime.tc_interface $DEV does not exist on this host (default route: ${ROUTE_DEV:-none}); until it names the NIC, skyline_tc is not attached and no NIC qdisc is managed: $TC_FIX"
 elif [ -n "$TC_TYPE" ] && [ "$TC_TYPE" != 1 ]; then
     warn "runtime.tc_interface $DEV is not an Ethernet device (type $TC_TYPE, e.g. a tunnel): skyline-speederd does not attach skyline_tc to it, and the qdisc guard does not reach the NIC that carries its traffic. Point it at the NIC: $TC_FIX"
+fi
+# fallback_cc: the algorithm this host boots into (boot_fallback_cc says why),
+# on first install only, as above.
+if [ "$CFG_FRESH" -eq 1 ]; then
+    FALLBACK_BOOT=$(boot_fallback_cc)
+    FALLBACK_NOW=$(sed -n 's/^fallback_cc = "\([^"]*\)"$/\1/p' "$CFG" 2>/dev/null || true)
+    if [ -z "$FALLBACK_BOOT" ]; then
+        ok "fallback_cc left at ${FALLBACK_NOW:-the template value}: no boot setting selects a congestion control this kernel has"
+    elif [ "${FALLBACK_BOOT%%|*}" = "$FALLBACK_NOW" ]; then
+        ok "fallback_cc is $FALLBACK_NOW, which ${FALLBACK_BOOT#*|} selects at boot"
+    elif [ -n "$FALLBACK_NOW" ]; then
+        sed -i "s|^fallback_cc = \"$FALLBACK_NOW\"\$|fallback_cc = \"${FALLBACK_BOOT%%|*}\"|" "$CFG"
+        ok "fallback_cc set to ${FALLBACK_BOOT%%|*}, which ${FALLBACK_BOOT#*|} selects at boot"
+    fi
 fi
 
 # --- 9. validate before starting anything ----------------------------------
