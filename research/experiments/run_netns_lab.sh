@@ -100,6 +100,17 @@ nsenter -t "$SERVER_PID" -n ip link set lo up
 nsenter -t "$SERVER_PID" -n ip link set ss up
 nsenter -t "$SERVER_PID" -n ip route add default via 10.20.2.1
 
+# One packet per skb at both ends, or --loss-pct is not a packet-loss rate.
+# TCP builds GSO batches of up to 64 KiB whatever a device's offloads say
+# (sk_setup_caps() gives every TCP socket NETIF_F_GSO), a veth hands them on
+# whole, and so the netem on the router's far side drops a batch at a time:
+# measured on 6.12 at 0.5% loss, 8.4 segments per drop instead of 1, and
+# far fewer loss events for the same loss rate. With gso_max_segs 1 TCP
+# builds one-segment skbs from the start -- what the two-VM test bed gets
+# from offload = "off" (docs/04-performance-report.md section 2.3).
+nsenter -t "$CLIENT_PID" -n ip link set dev cc gso_max_segs 1
+nsenter -t "$SERVER_PID" -n ip link set dev ss gso_max_segs 1
+
 sysctl -qw net.ipv4.ip_forward=1
 
 if [ "$IPV6" -eq 1 ]; then

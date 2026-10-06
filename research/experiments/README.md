@@ -38,6 +38,12 @@
 性能）标记自己的性质，`matrix_lib.py` 的 `validate_manifest()` 会强制校验
 这条约束与 `performance_valid` 字段一致。
 
+场景的 `offload` 决定路由器上的 NetEm 拿到什么：`"off"` 时 Server 数据网卡
+关掉 TSO/GSO/GRO，到达路由器的是一个个的包，`loss_pct`/`reorder_pct` 逐包
+生效；`"on"`（默认）时 Server 的 TSO 大帧原样到达路由器，NetEm 每次丢掉或
+重排一整个大帧。要逐包随机丢包就写 `"off"`，代价是吞吐上限约
+100-150 Mbit/s（见 `docs/04-performance-report.md` 第 2.3 节）。
+
 | Manifest | 用途 |
 |---|---|
 | `smoke.toml` | 最小正确性冒烟 |
