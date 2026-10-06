@@ -68,9 +68,9 @@ RTT 70-73 ms, 10-30% loss, measured at evening peak. skyline_cc ran the coeffici
 | **Bulk, 4 streams** | skyline_cc and tcp-brutal, both ahead of bbr | median 117 / 115 vs 77 Mbps |
 | **Bulk, 1 stream** | bbr and skyline_cc tie; tcp-brutal last | 4/8, 4/8, 0/8 rotations; median 59 / 53 / 46 Mbps |
 | **Web page load** | no stable winner | rotation-to-rotation spread exceeds the difference |
-| **Server retransmissions**, all scenarios | bbr lowest | bbr 10.0%, skyline_cc 11.6%, tcp-brutal 12.3% |
+| **Server retransmissions**, share of all segments sent, all scenarios | bbr lowest | bbr 9.1%, skyline_cc 10.4%, tcp-brutal 10.9% |
 
-The single-stream result says the most about the three designs. **tcp-brutal sent the most and delivered the least: 13.9% of its segments were retransmissions, against 9.9% for bbr and 11.1% for skyline_cc, for a median of 46 Mbps.** Its fixed 200 Mbps is far above what this path delivers at 10-30% loss, and an open loop that sends harder when packets are lost turns that gap into pure retransmission. skyline_cc estimates the rate itself, so there is no target rate to set too high.
+The single-stream result says the most about the three designs. **tcp-brutal sent the most and delivered the least: 12.2% of its segments were retransmissions, against 9.0% for bbr and 10.0% for skyline_cc, for a median of 46 Mbps.** Its fixed 200 Mbps is far above what this path delivers at 10-30% loss, and an open loop that sends harder when packets are lost turns that gap into pure retransmission. skyline_cc estimates the rate itself, so there is no target rate to set too high.
 
 > [!NOTE]
 > This is a field measurement on one path, not the controlled two-VM test bed that formal results in this repository come from, and it is not a claim about your link. Its 70 ms RTT is also below this project's target of 100-300 ms, where bbr recovers from loss far more easily. Read it as evidence about how the three algorithms behave, not as a throughput benchmark. Per-rotation numbers and raw records: [research/experiments/single-ended/](research/experiments/single-ended/). Controlled test-bed results: [docs/04-performance-report.md](docs/04-performance-report.md) (Chinese).

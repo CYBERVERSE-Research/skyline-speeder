@@ -13,6 +13,16 @@ from collections import defaultdict
 ALGOS = ["bbr", "brutal", "skyline_cc"]
 LABEL = {"bbr": "bbr", "brutal": "tcp-brutal@200M", "skyline_cc": "skyline_cc"}
 
+
+def retrans_share(d):
+    """Retransmitted share of every segment sent. Linux counts a segment in
+    TcpOutSegs only when it carries new data or none at all (__tcp_transmit_skb,
+    net/ipv4/tcp_output.c): a retransmission is in TcpRetransSegs and never in
+    TcpOutSegs, so the denominator is their sum. RetransSegs / OutSegs alone reads
+    high, and past 100% on a path that loses most of what is sent."""
+    out, rt = d.get("TcpOutSegs", 0), d.get("TcpRetransSegs", 0)
+    return 100.0 * rt / (out + rt) if out + rt else None
+
 # scenario key -> (title, metric, unit, lower_is_better, decimals)
 METRICS = [
     ("game",  "RTT p50",        "rtt_ms_p50",       "ms",   True,  1),
@@ -138,9 +148,8 @@ def main(path, probe_path=None):
             for rec in by[scen].get(a, {}).values():
                 for k, v in (rec.get("server") or {}).items():
                     agg[a][k] += v
-    rows = [("重传率 %", lambda d: 100.0 * d["TcpRetransSegs"] / d["TcpOutSegs"]
-             if d.get("TcpOutSegs") else None, 2),
-            ("发出报文段", lambda d: d.get("TcpOutSegs"), 0),
+    rows = [("重传占比 %（重传 ÷ 全部发出）", retrans_share, 2),
+            ("新数据报文段（TcpOutSegs，不含重传）", lambda d: d.get("TcpOutSegs"), 0),
             ("重传报文段", lambda d: d.get("TcpRetransSegs"), 0),
             ("RTO 超时", lambda d: d.get("TcpExtTCPTimeouts"), 0),
             ("快速重传", lambda d: d.get("TcpExtTCPFastRetrans"), 0),

@@ -62,7 +62,12 @@ def load(path):
     """scenario -> algo -> [per-run values], plus a synthetic 'cost' scenario."""
     runs = defaultdict(lambda: defaultdict(list))
     # retransmit rate is a per-rotation ratio of sums, not a mean of per-run
-    # ratios: short runs would otherwise weigh as much as long ones.
+    # ratios: short runs would otherwise weigh as much as long ones. Its
+    # denominator is every segment sent, TcpOutSegs + TcpRetransSegs: Linux adds a
+    # segment to OutSegs only when it carries new data or none at all
+    # (__tcp_transmit_skb, net/ipv4/tcp_output.c), so a retransmission is in
+    # RetransSegs and never in OutSegs. RetransSegs / OutSegs alone reads high,
+    # and past 100% on a path that loses most of what is sent.
     seg = defaultdict(lambda: defaultdict(lambda: [0, 0]))
     for line in Path(path).read_text().splitlines():
         line = line.strip()
@@ -82,7 +87,7 @@ def load(path):
     for algo, rots in seg.items():
         for rot, (out, rt) in rots.items():
             if out:
-                runs["cost"][algo].append({"retrans_pct": 100.0 * rt / out, "rep": rot})
+                runs["cost"][algo].append({"retrans_pct": 100.0 * rt / (out + rt), "rep": rot})
     return runs
 
 
