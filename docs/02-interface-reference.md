@@ -168,7 +168,7 @@ daemon 应答，旧 `ssctl` 也能解码新 daemon 的应答。`RuntimeStatus` �
 | 字段 | 含义 |
 |---|---|
 | `kernel_release` | `uname -r` |
-| `btf` / `bpffs` / `cgroup_v2` / `fq_available` / `struct_ops` | 硬性前提，任一为 `false` 则 `--validate-only`、`ssctl validate`、`ssctl enable` 直接拒绝（`skyline-speederd` 进程本身照常启动） |
+| `btf` / `bpffs` / `cgroup_v2` / `fq_available` / `struct_ops` | 硬性前提，任一为 `false` 则 `--validate-only`、`ssctl validate`、`ssctl enable` 直接拒绝（`skyline-speederd` 进程本身照常启动）。`fq_available` 指内核有 `sch_fq`：编进内核、能加载、已加载，或已是默认 qdisc；0.4.4 起读内核的模块索引判断，不再问 `modinfo`（busybox 的 `modinfo` 对不存在的模块也返回成功） |
 | `fallback_cc_available` | 内核能否提供 `fallback_cc` 配置的算法：已注册（编进内核，或模块已加载），或者有模块 `tcp_<名字>`——root 写这个 sysctl 时内核会自己加载它（xanmod 就把 cubic 编成模块，开机只注册 reno 和 bbr）。也是硬性前提，为 `false` 时上述三处一样拒绝。daemon 启动时模块尚未加载的，`notes` 里注明；不可用时 `notes` 列出启动时已注册的算法（`skyline_cc` 除外：drain 正是在注销它之前写 fallback）。0.4.3 之前只认已注册的算法 |
 | `rack_reo_hook` | 探测一个内核补丁专用的钩子是否存在，标准上游内核上恒为 `false`；仅作记录，不参与上述门槛 |
 | `notes` | 自由文本，记录软性降级信息（例如某功能因内核能力不足而退化为纯观测；`[guard] qdisc = true`、设置了 `tc_interface` 而主机上没有 `tc`（iproute2）时，也在这里提示 guard 无法维护该网卡（或它下面的物理网卡）的根 qdisc；`tc_interface` 不是以太网设备时提示 `TC interface <网卡> is not an Ethernet device (type N, e.g. a tunnel); skyline_tc is not attached`，见第 6.7 节）。`TC runtime unavailable: <原因>` 是 TC 程序没有加载的原因 |
