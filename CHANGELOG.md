@@ -10,7 +10,82 @@ for anyone holding a prebuilt `.bpf.o`.
 
 ## [Unreleased]
 
-## [0.4.3] - 2026-10-01
+## [0.4.4] - 2026-10-06
+
+### Upgrading from 0.4.3
+
+- **Re-run the installer the way the host was installed.** `skyline_cc.bpf.o`
+  changes -- it carries a second struct_ops map for Linux 7.1 and later, see
+  below -- and so do the daemon and `ssctl`. `skyline_policy.bpf.o`,
+  `skyline_tc.bpf.o`, the ABI and the configuration template are as in 0.4.3,
+  and nothing in `/etc/skyline-speeder/speeder.toml` needs changing. The
+  installer restarts `skyline-speederd` as before.
+- **On a 7.1 or later kernel `bpftool struct_ops show` names the map
+  `skyline_cc_txs`.** The algorithm is still registered as `skyline_cc`, the
+  name `sysctl`, `ss` and `ssctl` show; a check that greps the bpftool listing
+  for `skyline_cc` matches both.
+
+### Fixed
+
+- **On Linux 7.1 and later, skyline_cc never saw a connection start sending
+  again after it went idle.** Linux 7.1 gave that event, CA_EVENT_TX_START, an
+  op of its own in `tcp_congestion_ops`, `cwnd_event_tx_start`, and stopped
+  passing it to `cwnd_event`, which is the only op skyline_cc implemented for
+  it. Only the M2-off CUBIC core uses the event (it restarts the growth
+  epoch), so the shipped configuration, M2 on, behaved the same; the neutral
+  baseline did not. `skyline_cc.bpf.o` now carries the algorithm twice, as
+  `skyline_cc` for kernels without the op and `skyline_cc_txs` for kernels
+  with it -- libbpf refuses a struct_ops map that sets a member the kernel
+  lacks, so one map cannot serve both -- and `skyline-speederd` creates the
+  one the running kernel's BTF calls for. `--validate-only --verify-bpf`
+  loads the same one and says which. Measured on Debian 13's 6.12.63 and on
+  xanmod 7.1.9: a connection that sends, idles and sends again reaches the
+  handler on both.
+- **`fq` could pass the capability check on a kernel without it.** The daemon
+  asked `modinfo sch_fq`, and busybox's `modinfo` -- Alpine's unless kmod is
+  installed -- exits 0 for any module name. It now reads the kernel's module
+  index, as 0.4.3 does for `fallback_cc`, and takes `fq` as available when it
+  is built in (`modules.builtin`), can be loaded, is loaded, or is already
+  the default qdisc.
+- **`ssctl` panicked when whatever read its output stopped early.**
+  `ssctl --json flows | head -1` or `ssctl status | grep -q ACCELERATING`
+  ended in `failed printing to stdout: Broken pipe` and exit status 101,
+  which under `set -o pipefail` turns a check that succeeded into a failure.
+  It now stops writing quietly, and its exit status depends only on the
+  daemon's reply.
+
+### Changed
+
+- **The README's retransmission figures for the 2026-09-20 field comparison
+  were not shares of the segments sent.** They were `TcpRetransSegs /
+  TcpOutSegs`, and Linux counts a retransmission in `TcpRetransSegs` but never
+  in `TcpOutSegs`, so they read high: tcp-brutal's single-stream "13.9% of its
+  segments were retransmissions" is 12.2% of everything it sent (bbr 9.9% ->
+  9.0%, skyline_cc 11.1% -> 10.0%; all scenarios 10.0 / 11.6 / 12.3% -> 9.1 /
+  10.4 / 10.9%). `analyze.py` and `plot_comparison.py` divide by new plus
+  retransmitted segments, and `RESULTS.md` and the two figures are
+  regenerated from the unchanged data. The ranking does not change.
+- **`docs/04-performance-report.md` says that its out-of-target scenarios
+  lost GSO batches, not packets.** Those scenarios (section 3.2; the data of
+  sections 5 and 6.1) ran with `offload = "on"`, so the server's TSO frames
+  reached the router's netem whole, and every drop or reordering took a whole
+  batch: in a netns copy of the topology on 6.12, 0.5% netem loss took 8.4
+  segments per drop with the sender's offloads on and exactly one with them
+  off. The target grid runs with `offload = "off"` and is per packet. The open
+  question the report listed -- `gso_segs > 1` at the TC hook with offloads
+  off -- is answered there: TCP builds GSO batches whatever the device says
+  (`sk_setup_caps()`), and they are split in software only between the qdisc
+  and the NIC, so the wire and the router see single packets.
+- **`research/experiments/run_netns_lab.sh` lost GSO batches as well**, its
+  netem sitting behind veths that hand TCP's batches on whole. It sets
+  `gso_max_segs 1` at both ends now, so `--loss-pct` is a packet-loss rate.
+- CI and the release workflow use the Node 24 majors of their actions
+  (`actions/checkout@v5`, `actions/upload-artifact@v6`,
+  `actions/setup-python@v6`, `softprops/action-gh-release@v3`); GitHub
+  deprecated the Node 20 ones.
+- The date of 0.4.3 is the day it was released, 2026-10-02.
+
+## [0.4.3] - 2026-10-02
 
 ### Upgrading from 0.4.2
 
@@ -1019,7 +1094,8 @@ rather than as fixes to a version nobody could have installed.
   socket file permissions. Multi-tenant hosts need additional access control.
 - The experiment harness requires **Python 3.11 or newer** (`tomllib`).
 
-[Unreleased]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.4...HEAD
+[0.4.4]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.0...v0.4.1
