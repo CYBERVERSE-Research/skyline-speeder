@@ -9,7 +9,7 @@ use skyline_common::{
     Module, ModuleTuningConfig, RackRtoConfig, RedundancyConfig, Request, Response,
     RetransmitDscpConfig,
 };
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use style::{ColorChoice, Theme};
@@ -353,12 +353,12 @@ fn main() -> Result<()> {
         // health checks in DEPLOY.md and any monitoring built on them read.
         // The sponsor line goes to stderr so stdout stays pure JSON, and
         // only to a terminal -- see `stderr_is_terminal`.
-        println!("{}", serde_json::to_string_pretty(&response)?);
+        emit(&format!("{}\n", serde_json::to_string_pretty(&response)?))?;
         if theme.stderr_is_terminal() {
             eprintln!("{}", view::sponsor(&theme));
         }
     } else {
-        print!("{}", wants.render(&theme, &response));
+        emit(&wants.render(&theme, &response))?;
     }
     if response.ok {
         Ok(())
@@ -366,6 +366,23 @@ fn main() -> Result<()> {
         // The message is already on screen in both modes; repeating it as
         // the process error would print it twice.
         std::process::exit(1);
+    }
+}
+
+/// Writes a report to stdout. A reader that has what it wanted may close the
+/// pipe before the end (`ssctl --json flows | head -1`, `| grep -q
+/// ACCELERATING`); `print!` turns the EPIPE that follows into a panic and exit
+/// status 101, which reads as a crash and, under `set -o pipefail`, fails a
+/// check that in fact succeeded. Nothing is lost that anyone was reading, so
+/// a closed pipe ends the output quietly; any other write error is reported.
+fn emit(text: &str) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    match stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        result => result.context("write to stdout"),
     }
 }
 

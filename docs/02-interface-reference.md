@@ -47,6 +47,10 @@ Skyline Speeder 的运行期由一个守护进程 `skyline-speederd` 和一个�
 
 `--json` 模式下赞助方提示行走 stderr，stdout 只有 JSON。
 
+输出被管道提前关掉时（`ssctl --json flows | head -1`、`ssctl status | grep -q ACCELERATING`），
+`ssctl` 安静地停止输出，退出码只取决于 daemon 的应答（0.4.4 起；之前会 panic 并以 101 退出，
+在 `set -o pipefail` 下把一次成功的检查变成失败）。
+
 > **升级注意**：`ssctl status | grep -q '"enabled": true'` 这类检查要改成
 > `ssctl status --json | grep -q '"enabled": true'`。`install.sh` 已经改好，并且在
 > 遇到旧版 `ssctl`（不认识 `--json`）时自动回退。
