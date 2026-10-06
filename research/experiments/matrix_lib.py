@@ -686,6 +686,12 @@ def validate_manifest(manifest: Manifest) -> None:
             raise ValueError("loss percentage must be in [0, 100)")
         if scenario.queue_bdp <= 0 or scenario.parallel <= 0:
             raise ValueError("queue BDP and parallelism must be positive")
+        # offload decides what the router's netem gets: "off" hands it single
+        # packets, so loss_pct/reorder_pct act per packet; "on" lets the
+        # server's TSO frames reach it whole, and it drops or reorders a GSO
+        # batch at a time. Not refused with loss: the out-of-target scenarios
+        # run at 500-1000 Mbit, which the test bed reaches only with offloads
+        # on (docs/04-performance-report.md section 2.3).
         if scenario.offload not in {"on", "off"}:
             raise ValueError("offload must be on or off")
         if scenario.loss_model == "gemodel" and scenario.burst_length < 1:

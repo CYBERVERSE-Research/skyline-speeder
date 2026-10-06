@@ -700,7 +700,8 @@ sudo ./install.sh --uninstall --restore-pre-install
 > `sudo ./install.sh --check` 核对一下到底是哪个文件在开机时设这两个键。
 
 > [!NOTE]
-> 卸载后 `bpftool struct_ops show` 可能还能看到 `skyline_cc`。**这不是失败**——
+> 卸载后 `bpftool struct_ops show` 可能还能看到 `skyline_cc`（7.1 及以上内核上叫
+> `skyline_cc_txs`）。**这不是失败**——
 > 只要还有连接在用它，内核就不释放。这些连接断开后或重启后会自动消失。
 
 **DSCP 标记和 RTO 调节不受 `drain` 影响**，要单独关：

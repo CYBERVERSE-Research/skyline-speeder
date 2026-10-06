@@ -96,12 +96,19 @@ BDP ≈ 1.78 MB ≈ 1225 包。测试时段为晚高峰：首轮 19:59–21:29�
 | 网页 | 三者混杂，无稳定赢家；页面加载 brutal 4/7，TTFB bbr 4/7 |
 | 大文件单流 | **bbr 与 skyline_cc 各 4/8**，tcp-brutal **0/8**（中位 46 Mbps，最低） |
 | 大文件 4 并发 | **skyline_cc 117 / brutal 115 / bbr 77 Mbps**，两个加速器都明显胜过 bbr |
-| 服务端重传率（全部场景累计） | bbr 10.0% < skyline_cc 11.6% < tcp-brutal 12.3% |
+| 服务端重传占比（全部场景累计） | bbr 9.1% < skyline_cc 10.4% < tcp-brutal 10.9% |
 
-最值得注意的一条：**单流大文件上 tcp-brutal 发得最多（37.0 万报文段，其中 5.1 万重传，重传率 13.9%；bbr 为 9.9%，skyline_cc 为 11.1%）却传得最少（中位 46 Mbps）**。
+最值得注意的一条：**单流大文件上 tcp-brutal 发得最多（42.1 万报文段，其中 5.1 万是重传，占 12.2%；bbr 为 9.0%，skyline_cc 为 10.0%）却传得最少（中位 46 Mbps）**。
 在 10–30% 丢包下，为它配置的 200 Mbps 已远高于链路实际能交付的速率，而 brutal 的设计就是
 "丢了就多发以维持目标速率"——这在高丢包下变成纯粹的损耗放大。tcp-brutal 自己的文档写得很清楚：
 *"set it too high and you only produce loss."* 这不是 bug，是它把带宽判断交给运维的必然代价。
+
+> **口径更正。** 这里的重传占比最初按 `TcpRetransSegs ÷ TcpOutSegs` 计算，写的是 10.0% / 11.6% / 12.3%
+> （全部场景）与 9.9% / 11.1% / 13.9%（单流），并把 tcp-brutal 单流写成「37.0 万报文段，其中 5.1 万重传」。
+> 但 Linux 只把携带新数据（或不带数据）的报文段计入 `TcpOutSegs`（`net/ipv4/tcp_output.c` 的
+> `__tcp_transmit_skb`），重传只进 `TcpRetransSegs`，所以「发出的全部报文段」是两者之和：37.0 万是新数据，
+> 加上 5.1 万重传共发出 42.1 万。上面的数字已按 `TcpRetransSegs ÷ (TcpOutSegs + TcpRetransSegs)` 重算，
+> `RESULTS.md` 与图随之重新生成；原始数据未变，排名未变。
 
 ## 文件
 

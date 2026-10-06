@@ -60,11 +60,11 @@
 <path d="M603.0,463.0 L857.6,463.0 Q861.1,463.0 861.1,466.5 L861.1,474.5 Q861.1,478.0 857.6,478.0 L603.0,478.0 Z" fill="#1baf7a"/>
 <text x="868.1" y="475" font-size="11.5" font-weight="600" text-anchor="start" fill="#0b0b0b">+51%  <tspan font-weight="400" fill="#6b6a66">117 Mbps</tspan></text>
 <text x="228" y="506" font-size="12.5" text-anchor="end" fill="#0b0b0b">Cost · retransmit rate</text>
-<text x="228" y="520" font-size="10.5" text-anchor="end" fill="#6b6a66">bbr 9.9%</text>
-<path d="M603.0,490.0 L473.1,490.0 Q469.6,490.0 469.6,493.5 L469.6,501.5 Q469.6,505.0 473.1,505.0 L603.0,505.0 Z" fill="#eb6834"/>
-<text x="462.6" y="502" font-size="11.5" font-weight="600" text-anchor="end" fill="#0b0b0b">-27%  <tspan font-weight="400" fill="#6b6a66">12.5%</tspan></text>
-<path d="M603.0,509.0 L521.9,509.0 Q518.4,509.0 518.4,512.5 L518.4,520.5 Q518.4,524.0 521.9,524.0 L603.0,524.0 Z" fill="#1baf7a"/>
-<text x="511.4" y="521" font-size="11.5" font-weight="600" text-anchor="end" fill="#0b0b0b">-17%  <tspan font-weight="400" fill="#6b6a66">11.6%</tspan></text>
+<text x="228" y="520" font-size="10.5" text-anchor="end" fill="#6b6a66">bbr 9.0%</text>
+<path d="M603.0,490.0 L487.9,490.0 Q484.4,490.0 484.4,493.5 L484.4,501.5 Q484.4,505.0 487.9,505.0 L603.0,505.0 Z" fill="#eb6834"/>
+<text x="477.4" y="502" font-size="11.5" font-weight="600" text-anchor="end" fill="#0b0b0b">-24%  <tspan font-weight="400" fill="#6b6a66">11.1%</tspan></text>
+<path d="M603.0,509.0 L530.7,509.0 Q527.2,509.0 527.2,512.5 L527.2,520.5 Q527.2,524.0 530.7,524.0 L603.0,524.0 Z" fill="#1baf7a"/>
+<text x="520.2" y="521" font-size="11.5" font-weight="600" text-anchor="end" fill="#0b0b0b">-15%  <tspan font-weight="400" fill="#6b6a66">10.4%</tspan></text>
 <line x1="603.0" y1="108" x2="603.0" y2="524" stroke="#2a78d6" stroke-width="2"/>
 <text x="603.0" y="102" font-size="10.5" text-anchor="middle" font-weight="600" fill="#2a78d6">bbr</text>
 <rect x="34" y="560" width="11" height="11" rx="2.5" fill="#eb6834"/>

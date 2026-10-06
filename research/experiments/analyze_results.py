@@ -313,11 +313,12 @@ def rack_rto_stats_delta(run_dir):
 #: abi_mismatch). NOT the right oracle for absolute counts against the
 #: capture-derived columns below: retransmits_marked counts skbs, one per TC
 #: pass, while the capture counts wire packets -- these diverge at high
-#: throughput because skb->gso_segs>1 shows up even with offload=off fully
-#: confirmed (tso/gso/gro all off, MTU-sized wire packets, reproduced on an
-#: isolated connection -- see retransmit-dscp-mechanism.toml's header
-#: comment). retransmit_capture_marked/false_positives, not this field, is
-#: the authority on marking correctness.
+#: throughput because the TC hook sees TCP's GSO batches even with offload=off
+#: (sk_setup_caps() gives every TCP socket NETIF_F_GSO; the batch is split in
+#: software only on its way from the qdisc to the NIC -- see
+#: retransmit-dscp-mechanism.toml's header comment).
+#: retransmit_capture_marked/false_positives, not this field, is the authority
+#: on marking correctness.
 RETRANSMIT_DSCP_STATS_DELTA_FIELDS = (
     "packets_seen",
     "retransmits_detected",

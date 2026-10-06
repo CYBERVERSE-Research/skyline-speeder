@@ -35,15 +35,15 @@
 # （BPF 侧，按 skb 计数一次）和 retransmit_capture_marked（发送端抓包，按
 # wire 上的实际包计数）在高吞吐 case（尤其 skyline-best）下不相等，前者明显偏
 # 小。即使 offload=off 且确认 tso/gso/gro 全部关闭，tc_stats.gso_packets
-# 仍有非零 delta；抓包里的包长度全部是 MTU（1500B，没有真实超帧），说明
-# skb->gso_segs>1 反映的更可能是 TCP 自己的 MSS 计数簿记，不是"这个 skb
-# 真的会在 wire 上再拆分"——但这意味着 BPF 按 skb 计一次的地方，wire 上
-# 可能对应不止一个包，retransmit_marked 因此系统性小于
-# retransmit_capture_marked。**retransmit_capture_marked 才是标记正确性
-# 的权威依据**（发送端抓包直接看 wire，不受这个口径问题影响）；这五组
-# case 里 false_positives 全部是 0，标记机制本身没有问题。gso_packets 这
-# 个计数器在这个环境下是否测的是别的东西是一个更大范围、跟这次 DSCP 功能
-# 无关的独立问题，见 docs/04-performance-report.md 第 8 节。
+# 仍有非零 delta，而抓包里的包长度全部是 MTU（1500B）。原因已查明：TCP 不管
+# 网卡 offload 怎么设都先组 GSO 大帧（sk_setup_caps() 给每个 TCP socket 加
+# NETIF_F_GSO），离开 qdisc 交给网卡时才由软件分段（validate_xmit_skb()），
+# 而 TC 钩子在分段之前——BPF 按 skb 计一次的地方，wire 上确实是不止一个包，
+# retransmit_marked 因此系统性小于 retransmit_capture_marked（分出来的每个
+# 包都带着已改写的 DSCP）。**retransmit_capture_marked 才是标记正确性的
+# 权威依据**（发送端抓包直接看 wire）；这五组 case 里 false_positives 全部
+# 是 0，标记机制本身没有问题。路由器上的 NetEm 拿到的是分段后的包，所以
+# offload=off 时丢包确实逐包独立，见 docs/04-performance-report.md 第 2.3 节。
 name = "retransmit-dscp-mechanism"
 execution_class = "formal-kvm"
 performance_valid = true

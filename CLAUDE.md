@@ -50,6 +50,7 @@ vmlinux.h 只需要**定义**代码用到的类型，不必来自最终运行的
 | `.name = "skyline_cc"` | `bpf/skyline_cc.bpf.c` | 算法注册名，**≤ 15 字符**（`TCP_CA_NAME_MAX` 为 16 含 NUL） |
 | `SKYLINE_ABI_VERSION` | `bpf/include/skyline_abi.h` | 布局变更必须递增，用户态据此拒绝加载不匹配的对象 |
 | `cong_control` 4 参数签名 | `bpf/skyline_cc.bpf.c` | `(sk, ack, flag, rs)`，内核 >= 6.10 才有 |
+| struct_ops 双变体 `skyline_cc` / `skyline_cc_txs` | `bpf/skyline_cc.bpf.c` | 两张 map 挂**同一组回调**，只有 TX_START 的入口不同（`cwnd_event` / 7.1 起的 `cwnd_event_tx_start`）；daemon 按内核 BTF 只创建其中一张。**给一张加回调，另一张也要加**，否则行为随内核版本悄悄不同 |
 | 安装路径 `/opt|/etc|/run/skyline-speeder` | 配置、unit（含 `packaging/openrc/` 的两个 OpenRC 脚本）、脚本 | 三处必须一致 |
 | `RuntimeDirectory=skyline-speeder` | `packaging/skyline-speederd.service` | **必须与 `socket_path` 的父目录同名**，否则 socket 建不出来 |
 | `checkpath -d /run/skyline-speeder` | `packaging/openrc/skyline-speederd` | OpenRC 下的 `RuntimeDirectory=`：同样**必须是 `socket_path`（及 `events_path`、`state_path`）的父目录**，daemon 启动先打开的就是那里的事件日志 |

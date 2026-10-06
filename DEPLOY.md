@@ -287,7 +287,8 @@ systemctl enable --now skyline-speeder-enable.service
 # G1 daemon 与挂载单元均已启动
 systemctl is-active skyline-speederd.service skyline-speeder-enable.service
 
-# G2 struct_ops 已注册（需要 bpftool；--prebuilt 主机上没有它，以 G3 为准）
+# G2 struct_ops 已注册（需要 bpftool；--prebuilt 主机上没有它，以 G3 为准）。
+# 内核 >= 7.1 上这张 map 叫 skyline_cc_txs，下面的 grep 同样匹配
 bpftool struct_ops show | grep -q skyline_cc
 
 # G3 算法已进入内核可用列表
@@ -450,7 +451,8 @@ ssctl reset-retransmit-dscp
 
 ### 8.1 已知行为：struct_ops 在连接结束前不会消失
 
-停止服务或卸载后，`bpftool struct_ops show` 可能仍列出 `skyline_cc` 条目。
+停止服务或卸载后，`bpftool struct_ops show` 可能仍列出 `skyline_cc` 条目（内核 >= 7.1 上是
+`skyline_cc_txs`）。
 **这不是失败。** struct_ops map 只要还有 socket 引用就不会被内核释放——与内核模块
 "in use" 时 `rmmod` 失败是同一类引用计数行为。
 

@@ -9,8 +9,8 @@ use clap::Parser;
 use guard::Guard;
 use libbpf_rs::btf::{types::Struct, Btf, BtfKind, BtfType, TypeId};
 use libbpf_rs::{
-    Link, MapCore, MapFlags, Object, ObjectBuilder, RingBufferBuilder, TcHook, TcHookBuilder,
-    TC_EGRESS,
+    Link, MapCore, MapFlags, Object, ObjectBuilder, OpenObject, RingBufferBuilder, TcHook,
+    TcHookBuilder, TC_EGRESS,
 };
 use skyline_common::{
     CapabilityReport, FeatureMask, Module, ModuleTuningConfig, RackRtoConfig, RackRtoStats,
@@ -50,6 +50,9 @@ struct BpfRuntime {
     active_slot: u32,
     event_stop: Arc<AtomicBool>,
     event_threads: Vec<JoinHandle<()>>,
+    /// The struct_ops map `load_cc_object()` created for this kernel. The
+    /// other one is not created, and `Object::maps()` does not list it.
+    struct_ops_map: &'static str,
 }
 
 impl BpfRuntime {
@@ -72,22 +75,24 @@ impl BpfRuntime {
         // happened to be. `Request::Enable` raises it to skyline_cc only after
         // the attach succeeds.
         set_default_congestion_control(&config.fallback_cc)?;
-        let mut cc_object = load_object(&cc_path)?;
+        let (mut cc_object, struct_ops_map) = load_cc_object(&cc_path)?;
         let mut runtime = Self {
             objects: Vec::new(),
             links: Vec::new(),
             active_slot: 0,
             event_stop: Arc::new(AtomicBool::new(false)),
             event_threads: Vec::new(),
+            struct_ops_map,
         };
         runtime.event_stop.store(true, Ordering::Release);
         update_config_maps(&mut cc_object, config, 0)?;
         let struct_ops_link = {
-            let mut map = find_map_mut(&mut cc_object, "skyline_cc")?;
+            let mut map = find_map_mut(&mut cc_object, struct_ops_map)?;
             map.attach_struct_ops()
                 .context("attach skyline_cc struct_ops")?
         };
         runtime.links.push(struct_ops_link);
+        eprintln!("skyline_cc attached through struct_ops map {struct_ops_map}");
         // With the log off nothing drains the ring buffer: once it is full,
         // bpf_ringbuf_reserve() fails and skyline_emit() drops the event,
         // which costs less than reading and discarding every one.
@@ -122,8 +127,8 @@ impl BpfRuntime {
             .ok_or_else(|| anyhow!("skyline_cc object is not loaded"))?;
         let map = object
             .maps()
-            .find(|map| map.name() == OsStr::new("skyline_cc"))
-            .ok_or_else(|| anyhow!("skyline_cc struct_ops map is missing"))?;
+            .find(|map| map.name() == OsStr::new(self.struct_ops_map))
+            .ok_or_else(|| anyhow!("{} struct_ops map is missing", self.struct_ops_map))?;
         map.delete(&0_u32.to_ne_bytes())
             .context("unregister skyline_cc struct_ops")
     }
@@ -805,21 +810,77 @@ fn read_rack_tuning() -> RackTuningConfig {
     }
 }
 
-fn load_object(path: &Path) -> Result<Object> {
+fn open_object(path: &Path) -> Result<OpenObject> {
     if !path.is_file() {
         bail!("BPF object {} does not exist; run make bpf", path.display());
     }
-    let mut builder = ObjectBuilder::default();
-    builder
+    ObjectBuilder::default()
         .open_file(path)
-        .with_context(|| format!("open BPF object {}", path.display()))?
+        .with_context(|| format!("open BPF object {}", path.display()))
+}
+
+fn load_object(path: &Path) -> Result<Object> {
+    open_object(path)?
         .load()
         .with_context(|| format!("load BPF object {}", path.display()))
+}
+
+/// skyline_cc.bpf.o carries the algorithm twice, once per layout of the
+/// kernel's tcp_congestion_ops: `skyline_cc` without the
+/// `cwnd_event_tx_start` op Linux 7.1 added, `skyline_cc_txs` with it. Why
+/// two maps rather than one is above `skyline_cc_txs` in the BPF source.
+const STRUCT_OPS_MAP: &str = "skyline_cc";
+const STRUCT_OPS_TX_START_MAP: &str = "skyline_cc_txs";
+
+/// The struct_ops map for the running kernel. When its BTF cannot be read,
+/// the old layout: it loads on every kernel, and on 7.1+ the only thing it
+/// misses is CA_EVENT_TX_START, which the M2-off CUBIC core alone uses.
+fn struct_ops_map_for_kernel() -> &'static str {
+    match Btf::from_path(KERNEL_BTF_PATH) {
+        Ok(btf) if probe_btf_capabilities(&btf).tx_start_op => STRUCT_OPS_TX_START_MAP,
+        _ => STRUCT_OPS_MAP,
+    }
+}
+
+/// Loads skyline_cc.bpf.o with only the struct_ops map this kernel takes, and
+/// returns that map's name. libbpf then loads only the programs that map uses
+/// (bpf_object_adjust_struct_ops_autoload), so the op the other layout lacks
+/// never reaches a kernel that would reject it. An object from before
+/// `skyline_cc_txs` existed has `skyline_cc` alone, which is then the one on
+/// any kernel.
+fn load_cc_object(path: &Path) -> Result<(Object, &'static str)> {
+    let mut object = open_object(path)?;
+    let mut wanted = struct_ops_map_for_kernel();
+    if !object
+        .maps()
+        .any(|map| map.name() == OsStr::new(STRUCT_OPS_TX_START_MAP))
+    {
+        wanted = STRUCT_OPS_MAP;
+    }
+    for mut map in object.maps_mut() {
+        let name = map.name().to_owned();
+        if name == STRUCT_OPS_MAP || name == STRUCT_OPS_TX_START_MAP {
+            map.set_autocreate(name == wanted)
+                .with_context(|| format!("select struct_ops map {}", name.to_string_lossy()))?;
+        }
+    }
+    let object = object
+        .load()
+        .with_context(|| format!("load BPF object {}", path.display()))?;
+    Ok((object, wanted))
 }
 
 fn verify_bpf_objects(config: &SkylineConfig) -> Result<()> {
     for name in ["skyline_cc", "skyline_policy", "skyline_tc"] {
         let path = config.runtime.bpf_dir.join(format!("{name}.bpf.o"));
+        if name == "skyline_cc" {
+            // The same map a start would create, so the verifier sees the
+            // programs this kernel will actually run.
+            let (object, map) = load_cc_object(&path).with_context(|| format!("verify {name}"))?;
+            eprintln!("{name}: loaded with struct_ops map {map}");
+            drop(object);
+            continue;
+        }
         let object = load_object(&path).with_context(|| format!("verify {name}"))?;
         drop(object);
     }
@@ -1377,11 +1438,19 @@ const STRUCT_OPS_VALUE_TYPE: &str = "bpf_struct_ops_tcp_congestion_ops";
 /// upstream kernel has it, so `false` is the normal answer.
 const RACK_REO_HOOK_MEMBER: &str = "rack_reo_wnd";
 
+/// The op Linux 7.1 added to `struct tcp_congestion_ops` for
+/// CA_EVENT_TX_START, which from then on no longer reaches `cwnd_event`.
+const TX_START_OP_MEMBER: &str = "cwnd_event_tx_start";
+
 /// Capabilities that are facts about the kernel's type information.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct BtfCapabilities {
     struct_ops: bool,
     rack_reo_hook: bool,
+    /// `tcp_congestion_ops` has `cwnd_event_tx_start`: what decides which
+    /// struct_ops map `load_cc_object()` creates. Not part of the capability
+    /// report -- either answer is a working kernel.
+    tx_start_op: bool,
 }
 
 fn probe_btf_capabilities(btf: &Btf<'_>) -> BtfCapabilities {
@@ -1400,6 +1469,14 @@ fn probe_btf_capabilities(btf: &Btf<'_>) -> BtfCapabilities {
                 && is_function_pointer(btf, member.ty)
         }) {
             capabilities.rack_reo_hook = true;
+        }
+        if ty.name() == Some(OsStr::new("tcp_congestion_ops"))
+            && ty.iter().any(|member| {
+                member.name == Some(OsStr::new(TX_START_OP_MEMBER))
+                    && is_function_pointer(btf, member.ty)
+            })
+        {
+            capabilities.tx_start_op = true;
         }
     }
     capabilities
@@ -1445,8 +1522,9 @@ fn fallback_availability(
     if registered.split_whitespace().any(|known| known == name) {
         return FallbackAvailability::Registered;
     }
-    // modinfo also takes a file name, so only what can be an algorithm name
-    // -- the kernel's are made of [A-Za-z0-9_-] -- is handed to it.
+    // Only what can be an algorithm name -- the kernel's are made of
+    // [A-Za-z0-9_-] -- is looked up as a module: a path or a file name is
+    // nothing the sysctl would take, whatever the index holds.
     let plain = !name.is_empty()
         && name
             .bytes()
@@ -1467,7 +1545,21 @@ fn fallback_availability(
 struct ModuleIndex {
     dep: String,
     alias: String,
+    builtin: String,
     loading_disabled: bool,
+}
+
+/// `name` and `wanted` name the same module: to modprobe `-` and `_` in a
+/// module name are the same.
+fn same_module(name: &str, wanted: &str) -> bool {
+    name.replace('-', "_") == wanted.replace('-', "_")
+}
+
+/// The module a path in modules.dep or modules.builtin is for:
+/// `kernel/net/sched/sch_fq.ko.xz` -> `sch_fq`.
+fn module_of_path(path: &str) -> &str {
+    let file = path.rsplit('/').next().unwrap_or_default();
+    file.split(".ko").next().unwrap_or_default()
 }
 
 impl ModuleIndex {
@@ -1476,6 +1568,7 @@ impl ModuleIndex {
         Self {
             dep: fs::read_to_string(dir.join("modules.dep")).unwrap_or_default(),
             alias: fs::read_to_string(dir.join("modules.alias")).unwrap_or_default(),
+            builtin: fs::read_to_string(dir.join("modules.builtin")).unwrap_or_default(),
             loading_disabled: fs::read_to_string("/proc/sys/kernel/modules_disabled")
                 .is_ok_and(|value| value.trim() == "1"),
         }
@@ -1484,22 +1577,43 @@ impl ModuleIndex {
     /// Each modules.dep line starts with one module's path, `.ko` plus any
     /// compression suffix, then a colon and what it depends on
     /// (`kernel/net/ipv4/tcp_yeah.ko.xz: kernel/net/ipv4/tcp_vegas.ko.xz`);
-    /// modules.alias lines are `alias <alias> <module>`. To modprobe `-` and
-    /// `_` in a module name are the same.
+    /// modules.alias lines are `alias <alias> <module>`.
     fn can_load(&self, module: &str) -> bool {
-        let wanted = module.replace('-', "_");
-        let is_wanted = |name: &str| name.replace('-', "_") == wanted;
         let listed = self.dep.lines().any(|line| {
-            let path = line.split(':').next().unwrap_or_default();
-            let file = path.rsplit('/').next().unwrap_or_default();
-            is_wanted(file.split(".ko").next().unwrap_or_default())
+            same_module(
+                module_of_path(line.split(':').next().unwrap_or_default()),
+                module,
+            )
         });
         let aliased = self.alias.lines().any(|line| {
             let mut words = line.split_whitespace();
-            words.next() == Some("alias") && words.next().is_some_and(is_wanted)
+            words.next() == Some("alias")
+                && words.next().is_some_and(|alias| same_module(alias, module))
         });
         !self.loading_disabled && (listed || aliased)
     }
+
+    /// modules.builtin lists what the kernel was built with, one path per
+    /// line and no compression suffix (`kernel/net/sched/sch_fq.ko`). Such a
+    /// module needs no loading, so modules_disabled does not matter.
+    fn built_in(&self, module: &str) -> bool {
+        self.builtin
+            .lines()
+            .any(|line| same_module(module_of_path(line.trim()), module))
+    }
+}
+
+/// sch_fq is there if the kernel has it built in or can load it, if it is
+/// loaded, or if it is the default qdisc already: net.core.default_qdisc
+/// takes only a name the kernel has registered. Read from `ModuleIndex`, not
+/// modinfo, for the reason given there -- busybox's modinfo said yes to
+/// sch_fq whether the kernel had it or not. `proc_modules` is /proc/modules,
+/// `default_qdisc` net.core.default_qdisc.
+fn fq_is_available(modules: &ModuleIndex, proc_modules: &str, default_qdisc: &str) -> bool {
+    modules.built_in("sch_fq")
+        || modules.can_load("sch_fq")
+        || proc_modules.lines().any(|line| line.starts_with("sch_fq "))
+        || default_qdisc.trim() == "fq"
 }
 
 fn probe_capabilities(config: &SkylineConfig) -> CapabilityReport {
@@ -1510,10 +1624,12 @@ fn probe_capabilities(config: &SkylineConfig) -> CapabilityReport {
     let btf = Path::new(KERNEL_BTF_PATH).is_file();
     let bpffs = Path::new("/sys/fs/bpf").is_dir();
     let cgroup_v2 = Path::new("/sys/fs/cgroup/cgroup.controllers").is_file();
-    let fq_available = command_success("modinfo", &["sch_fq"])
-        || fs::read_to_string("/proc/modules")
-            .map(|modules| modules.lines().any(|line| line.starts_with("sch_fq ")))
-            .unwrap_or(false);
+    let modules = ModuleIndex::read(&kernel_release);
+    let fq_available = fq_is_available(
+        &modules,
+        &fs::read_to_string("/proc/modules").unwrap_or_default(),
+        &fs::read_to_string("/proc/sys/net/core/default_qdisc").unwrap_or_default(),
+    );
     let mut notes = Vec::new();
     // Read from the kernel BTF in-process, never by shelling out to bpftool.
     // A `--prebuilt` host deliberately has no bpftool, and a missing binary
@@ -1524,6 +1640,7 @@ fn probe_capabilities(config: &SkylineConfig) -> CapabilityReport {
     let BtfCapabilities {
         struct_ops,
         rack_reo_hook,
+        tx_start_op: _,
     } = if btf {
         match Btf::from_path(KERNEL_BTF_PATH) {
             Ok(kernel_btf) => probe_btf_capabilities(&kernel_btf),
@@ -1538,7 +1655,6 @@ fn probe_capabilities(config: &SkylineConfig) -> CapabilityReport {
         BtfCapabilities::default()
     };
     let registered = fs::read_to_string(AVAILABLE_CONGESTION_CONTROL_SYSCTL).unwrap_or_default();
-    let modules = ModuleIndex::read(&kernel_release);
     let fallback = fallback_availability(&config.fallback_cc, &registered, |module| {
         modules.can_load(module)
     });
@@ -1928,6 +2044,7 @@ mod tests {
             BtfCapabilities {
                 struct_ops: true,
                 rack_reo_hook: false,
+                tx_start_op: false,
             }
         );
     }
@@ -1947,6 +2064,7 @@ mod tests {
             BtfCapabilities {
                 struct_ops: true,
                 rack_reo_hook: true,
+                tx_start_op: false,
             }
         );
     }
@@ -1974,6 +2092,45 @@ mod tests {
         btf.structure("tcp_sock", &[(RACK_REO_HOOK_MEMBER, int)]);
 
         assert!(!probe_btf_capabilities(&btf.parse("rack-scalar")).rack_reo_hook);
+    }
+
+    /// Linux 7.1's tcp_congestion_ops: the layout skyline_cc_txs is for.
+    #[test]
+    fn a_7_1_kernel_reports_the_tx_start_op() {
+        let mut btf = RawBtf::new();
+        let callback = btf.function_pointer();
+        let ops = btf.structure(
+            "tcp_congestion_ops",
+            &[
+                ("cong_control", callback),
+                ("cwnd_event", callback),
+                (TX_START_OP_MEMBER, callback),
+            ],
+        );
+        btf.structure(STRUCT_OPS_VALUE_TYPE, &[("data", ops)]);
+
+        assert_eq!(
+            probe_btf_capabilities(&btf.parse("tx-start")),
+            BtfCapabilities {
+                struct_ops: true,
+                rack_reo_hook: false,
+                tx_start_op: true,
+            }
+        );
+    }
+
+    /// Only tcp_congestion_ops decides the map: the same member name in
+    /// another struct says nothing about the layout libbpf will match against.
+    #[test]
+    fn the_tx_start_op_counts_only_in_tcp_congestion_ops() {
+        let mut btf = RawBtf::new();
+        let callback = btf.function_pointer();
+        let int = btf.int();
+        btf.structure("tcp_congestion_ops", &[("cong_control", callback)]);
+        btf.structure("some_other_ops", &[(TX_START_OP_MEMBER, callback)]);
+        btf.structure("tcp_congestion_ops_v2", &[(TX_START_OP_MEMBER, int)]);
+
+        assert!(!probe_btf_capabilities(&btf.parse("tx-start-elsewhere")).tx_start_op);
     }
 
     #[test]
@@ -2031,6 +2188,7 @@ mod tests {
         ModuleIndex {
             dep: dep.to_owned(),
             alias: alias.to_owned(),
+            builtin: String::new(),
             loading_disabled: false,
         }
     }
@@ -2079,6 +2237,44 @@ mod tests {
         index.loading_disabled = true;
 
         assert!(!index.can_load("tcp_cubic"));
+    }
+
+    #[test]
+    fn fq_is_found_wherever_the_kernel_has_it() {
+        let nothing = module_index("", "");
+        // Debian 13's 6.12 and xanmod 7.1.9: a module, not loaded yet.
+        let modular = module_index("kernel/net/sched/sch_fq.ko.xz:\n", "");
+        let mut built_in = module_index("", "");
+        built_in.builtin =
+            "kernel/net/sched/sch_fq_codel.ko\nkernel/net/sched/sch_fq.ko\n".to_owned();
+        let mut disabled = module_index("kernel/net/sched/sch_fq.ko:\n", "");
+        disabled.loading_disabled = true;
+
+        assert!(fq_is_available(&modular, "", "pfifo_fast\n"));
+        assert!(fq_is_available(&built_in, "", "pfifo_fast\n"));
+        assert!(fq_is_available(
+            &nothing,
+            "sch_fq 24576 7 - Live 0x0\n",
+            "pfifo_fast\n"
+        ));
+        assert!(fq_is_available(&nothing, "", "fq\n"));
+        // What busybox modinfo used to vouch for: no trace of it anywhere.
+        assert!(!fq_is_available(
+            &nothing,
+            "sch_fq_codel 24576 1 - Live 0x0\n",
+            "fq_codel\n"
+        ));
+        assert!(!fq_is_available(&disabled, "", "fq_codel\n"));
+    }
+
+    #[test]
+    fn built_in_modules_match_whole_names() {
+        let mut index = module_index("", "");
+        index.builtin = "kernel/net/sched/sch_fq_codel.ko\nkernel/net/ipv4/tcp-x.ko\n".to_owned();
+
+        assert!(!index.built_in("sch_fq"));
+        assert!(index.built_in("sch_fq_codel"));
+        assert!(index.built_in("tcp_x"));
     }
 
     #[test]
