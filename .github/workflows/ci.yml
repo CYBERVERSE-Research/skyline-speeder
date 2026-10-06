@@ -34,7 +34,7 @@ jobs:
     name: Rust (fmt, check, test)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # libbpf-rs builds libbpf-sys, which needs libelf and zlib headers and a
       # C toolchain. pkg-config is how it finds them.
@@ -66,7 +66,7 @@ jobs:
     name: Rust on musl (build in Alpine 3.21, run in clean Alpine)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build and run
         run: infra/build-musl.sh
@@ -75,7 +75,7 @@ jobs:
     name: BPF (CO-RE compile only)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install clang and libbpf
         run: |
@@ -140,7 +140,7 @@ jobs:
             fi
           done
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: bpf-objects-${{ github.sha }}
           path: build/bpf/*.bpf.o
@@ -164,7 +164,7 @@ jobs:
     name: Shell (shellcheck, syntax)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
@@ -194,9 +194,9 @@ jobs:
         # which entered the standard library in 3.11.
         python: ['3.11', '3.13']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
 

@@ -35,7 +35,7 @@ jobs:
     name: Build and publish artifacts
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
@@ -181,7 +181,7 @@ jobs:
           echo "glibc=${GLIBC}" >> "$GITHUB_OUTPUT"
           echo "musl=${MUSL}" >> "$GITHUB_OUTPUT"
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
