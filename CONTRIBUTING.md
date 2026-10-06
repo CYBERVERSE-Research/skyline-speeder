@@ -67,6 +67,7 @@ Breaking any of these is a defect regardless of what else the change does.
 | `.name = "skyline_cc"` | `bpf/skyline_cc.bpf.c` | Registration name, **≤ 15 characters** (`TCP_CA_NAME_MAX` is 16 including NUL) |
 | `SKYLINE_ABI_VERSION` | `bpf/include/skyline_abi.h` | Must be incremented on any layout change; userspace refuses to load a mismatched object |
 | `cong_control` 4-argument signature | `bpf/skyline_cc.bpf.c` | `(sk, ack, flag, rs)` — exists only on kernel >= 6.10 |
+| Two struct_ops maps, `skyline_cc` / `skyline_cc_txs` | `bpf/skyline_cc.bpf.c` | Both set **the same callbacks** and differ only in where CA_EVENT_TX_START arrives (`cwnd_event`, or `cwnd_event_tx_start` from Linux 7.1); the daemon creates one of them, by the kernel's BTF. **A callback added to one goes into the other too**, or the behaviour silently depends on the kernel version |
 | Install paths `/opt`, `/etc`, `/run/skyline-speeder` | config, units (the two OpenRC scripts in `packaging/openrc/` included), scripts | All three must agree |
 | `RuntimeDirectory=skyline-speeder` | `packaging/skyline-speederd.service` | **Must match the parent directory of `socket_path`** |
 | `checkpath -d /run/skyline-speeder` | `packaging/openrc/skyline-speederd` | OpenRC's `RuntimeDirectory=`: **must be the parent directory of `socket_path`** (and of `events_path`, `state_path`), where the daemon opens its event log first |

@@ -126,6 +126,16 @@ friendliness 地板，防止极短拥塞周期下增长长期趋近于 0）。
 这三块合起来保证：无论 M1-M4 开关如何组合，只要 M2/M4 关闭，cwnd 增长和
 pacing 行为都精确对齐内核原生实现。
 
+**空闲后重新发送（`CA_EVENT_TX_START`）**：连接空闲（没有在途包）之后第一次
+发送时，CUBIC 增长核心把增长周期的起点 `epoch_start_ns` 设为当前时刻。这个
+事件原先经 `cwnd_event` 送达；Linux 7.1 起内核把它交给 `tcp_congestion_ops`
+新加的 `cwnd_event_tx_start`，`cwnd_event` 不再看到它。`skyline_cc.bpf.o`
+因此带两张 struct_ops map：`skyline_cc`（没有这个成员的布局）和
+`skyline_cc_txs`（有），挂的是同一组回调，只是 TX_START 的入口不同。一张
+map 设了内核不认识的成员，libbpf 会拒绝整张 map，所以两者不能合成一张；
+daemon 按运行内核的 BTF 只创建其中一张（`load_cc_object()`），注册的算法名
+都是 `skyline_cc`。
+
 **验证**（双 VM 测试床，`research/experiments/manifests/neutrality.toml`，
 `n=2`，中位数，单位 Mbit/s；与 `docs/04-performance-report.md` 的主数据是同
 一次构建——内核 6.18.40，`skyline_cc.bpf.o` SHA-256 前 12 位
@@ -561,3 +571,9 @@ cwnd 增益刻意比 pacing 增益更宽松这一点两代相同——cwnd 只�
   提前量信号本身的可靠性。
 - `ssctl` 的线协议没有加密或身份验证，完全依赖 Unix socket 文件的文件
   系统权限——多租户环境下需要额外的访问控制。
+- M2 关闭路径对 `CA_EVENT_TX_START` 的处理与内核 CUBIC 不完全一致：这里把
+  增长周期的起点重置为当前时刻（起点还没设定时也照设，于是下一次增长不会重算
+  `K`），内核 CUBIC 则把起点后移空闲的时长
+  （`now - lsndtime`，以 jiffies 计），让增长接着空闲前的曲线走。照搬需要在
+  BPF 里把 jiffies 换算成纳秒（要知道 `HZ`），目前没有做。只影响 M2 关闭、
+  且中途空闲过的连接；第 4 节的中性性门槛（零丢包大流量）不受影响。

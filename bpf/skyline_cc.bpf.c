@@ -1121,15 +1121,31 @@ void BPF_PROG(skyline_set_state, struct sock *sk, __u8 new_state)
     }
 }
 
-SEC("struct_ops")
-void BPF_PROG(skyline_cwnd_event, struct sock *sk, enum tcp_ca_event event)
+/* CA_EVENT_TX_START: the first send after the connection went idle (nothing
+ * in flight). Only the M2-off CUBIC core reads epoch_start_ns. */
+static __always_inline void skyline_tx_start(struct sock *sk)
 {
     struct skyline_flow_state *flow = skyline_flow_get(sk);
 
-    if (!flow)
-        return;
-    if (event == CA_EVENT_TX_START)
+    if (flow)
         flow->epoch_start_ns = bpf_ktime_get_ns();
+}
+
+SEC("struct_ops")
+void BPF_PROG(skyline_cwnd_event, struct sock *sk, enum tcp_ca_event event)
+{
+    if (event == CA_EVENT_TX_START)
+        skyline_tx_start(sk);
+}
+
+/* Linux 7.1 gave CA_EVENT_TX_START an op of its own: tcp_ca_event()
+ * (include/net/tcp.h) hands it to cwnd_event_tx_start and returns, so
+ * cwnd_event never sees it there and skyline_cwnd_event() above has nothing
+ * left to do. Upstream CUBIC moved its TX_START handling the same way. */
+SEC("struct_ops")
+void BPF_PROG(skyline_cwnd_event_tx_start, struct sock *sk)
+{
+    skyline_tx_start(sk);
 }
 
 SEC("struct_ops")
@@ -1154,6 +1170,48 @@ struct tcp_congestion_ops skyline_cc = {
     .undo_cwnd = (void *)skyline_undo_cwnd,
     .set_state = (void *)skyline_set_state,
     .cwnd_event = (void *)skyline_cwnd_event,
+    .cong_control = (void *)skyline_cong_control,
+    .name = "skyline_cc",
+};
+
+/* The same algorithm for kernels whose tcp_congestion_ops has
+ * cwnd_event_tx_start (Linux 7.1+). It cannot be a member of skyline_cc
+ * above: libbpf refuses a struct_ops map that sets a member the running
+ * kernel lacks, so on 6.12 that map would not load at all. A second map
+ * with its own type takes it instead, and skyline-speederd creates exactly
+ * one of the two (BpfRuntime::load, by the kernel's BTF).
+ *
+ * The type is local and lists only the members set here: libbpf strips the
+ * ___tx_start suffix to find the kernel's struct and matches members by
+ * name, not by offset, so it needs no vmlinux.h that knows the new member
+ * (the 6.12 reference header the release objects are built from does not).
+ * name[] has the kernel's TCP_CA_NAME_MAX (16) entries; libbpf checks the
+ * size of every data member it copies.
+ *
+ * "?" leaves the map uncreated unless the loader asks for it, so a loader
+ * that predates it -- or plain libbpf on any kernel -- still loads the
+ * object with skyline_cc alone. The map name is short enough for the 15
+ * characters the kernel keeps of one (BPF_OBJ_NAME_LEN), so bpftool shows it
+ * whole; the algorithm both register is "skyline_cc". */
+struct tcp_congestion_ops___tx_start {
+    void (*init)(struct sock *sk);
+    void (*release)(struct sock *sk);
+    __u32 (*ssthresh)(struct sock *sk);
+    __u32 (*undo_cwnd)(struct sock *sk);
+    void (*set_state)(struct sock *sk, __u8 new_state);
+    void (*cwnd_event_tx_start)(struct sock *sk);
+    void (*cong_control)(struct sock *sk, __u32 ack, int flag, const struct rate_sample *rs);
+    char name[16];
+};
+
+SEC("?.struct_ops")
+struct tcp_congestion_ops___tx_start skyline_cc_txs = {
+    .init = (void *)skyline_init,
+    .release = (void *)skyline_release,
+    .ssthresh = (void *)skyline_ssthresh,
+    .undo_cwnd = (void *)skyline_undo_cwnd,
+    .set_state = (void *)skyline_set_state,
+    .cwnd_event_tx_start = (void *)skyline_cwnd_event_tx_start,
     .cong_control = (void *)skyline_cong_control,
     .name = "skyline_cc",
 };
