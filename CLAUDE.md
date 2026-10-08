@@ -50,7 +50,7 @@ vmlinux.h 只需要**定义**代码用到的类型，不必来自最终运行的
 | 标识符 | 位置 | 约束 |
 |---|---|---|
 | `.name = "skyline_cc"` | `bpf/skyline_cc.bpf.c` | 算法注册名，**≤ 15 字符**（`TCP_CA_NAME_MAX` 为 16 含 NUL） |
-| `SKYLINE_ABI_VERSION` | `bpf/include/skyline_abi.h` | 布局变更必须递增。加载时**没有**谁拒绝不匹配的一对：BPF 侧拿它和用户态写进配置槽的版本比对，不一致就当作没有配置，`skyline_cc` 对所有连接都不再调整 cwnd 与 pacing，且不报错。递增它，是让半新半旧的组合停摆，而不是误读结构体 |
+| `SKYLINE_ABI_VERSION` | `bpf/include/skyline_abi.h` | 布局变更必须递增。加载时**没有**谁拒绝不匹配的一对：BPF 侧每条连接复制配置时拿它和用户态写进配置槽的版本比对，不一致就不复制、当作没有配置，`skyline_cc` 对所有连接都不再调整 cwnd 与 pacing，且不报错。它也管 `struct skyline_metrics`：Rust 侧按布局读计数器，大小不符时计数器全是 0。递增它，是让半新半旧的组合停摆，而不是误读结构体 |
 | `cong_control` 4 参数签名 | `bpf/skyline_cc.bpf.c` | `(sk, ack, flag, rs)`，内核 >= 6.10 才有 |
 | struct_ops 双变体 `skyline_cc` / `skyline_cc_txs` | `bpf/skyline_cc.bpf.c` | 两张 map 挂**同一组回调**，只有 TX_START 的入口不同（`cwnd_event` / 7.1 起的 `cwnd_event_tx_start`）；daemon 按内核 BTF 只创建其中一张。**给一张加回调，另一张也要加**，否则行为随内核版本悄悄不同 |
 | 安装路径 `/opt|/etc|/run/skyline-speeder` | 配置、unit（含 `packaging/openrc/` 的两个 OpenRC 脚本）、脚本 | 三处必须一致 |
@@ -120,9 +120,12 @@ vmlinux.h 只需要**定义**代码用到的类型，不必来自最终运行的
 
 - `set-module-config` / `set-rack-rto` 是**绝对覆盖**语义：每次调用发送完整字段
   集合，不是增量更新。对应的 `reset-*` 恢复配置文件默认值。
-- 配置切换走**双槽 + 代际计数器**：新系数写入非活跃槽并递增代际，每条连接只在
-  RTT 边界切换，避免同一轮 ACK 处理内读到新旧混杂的值。**修改配置下发路径时必须
-  维持这个不变量**，否则会出现撕裂读。
+- 配置切换走**双槽 + 配置序号 + 每连接副本**：daemon 把第 N 份配置写进
+  `config_slots[N & 1]`，**写完才**把 `config_seq` 改成 N；每条连接只在连接开始和 RTT
+  边界上把序号指向的槽复制进自己的状态，复制前后序号变了就丢掉副本、下一轮再试，此后
+  每个 ACK 只读自己的副本。所以一轮之内读到的不会新旧混杂，连续两次下发也一样。
+  **修改配置下发路径时必须维持这两条**：先写槽、后写序号；BPF 只读自己的副本。
+  否则会出现撕裂读（0.4.x 没有副本和序号，一个 RTT 内连续下发两次就会改写仍有连接在读的槽）。
 
 ## guest 配置的强约束
 

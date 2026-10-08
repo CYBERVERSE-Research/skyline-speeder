@@ -262,7 +262,8 @@ sudo nano /etc/skyline-speeder/speeder.toml
 `--bw-window-rtts`、`--startup-plateau-rtts`、`--startup-growth-ratio`）在 `[adaptive_cwnd]` 段。
 
 > [!CAUTION]
-> 写错段落的键会被**静默忽略**，下面的 `--validate-only` 也照样通过。重启之后用 `sudo ssctl flows` 的
+> 0.5.0 起，写错段落或拼错的键会让下面的 `--validate-only` 直接报错，并指出它该放在哪一段；0.4.x 及更早的
+> 版本会**静默忽略**它们，`--validate-only` 照样通过。无论哪个版本，重启之后都用 `sudo ssctl flows` 的
 > PARAMETERS IN FORCE 段落核对一遍。
 
 改完：

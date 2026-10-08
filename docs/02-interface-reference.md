@@ -138,8 +138,9 @@ struct Response {
 
 `flows` 字段在线协议上是可选的（serde `default`），所以新 `ssctl` 能解码不带它的旧
 daemon 应答，旧 `ssctl` 也能解码新 daemon 的应答。`RuntimeStatus` 的 `version`、
-`guard`、`uptime_s`、`attached_s`、`redundancy` 同理（旧 daemon 的 `redundancy` 解码为
-未生效）。
+`guard`、`uptime_s`、`attached_s`、`redundancy`、`metrics_recent` 以及 `metrics` 里的
+`guardrail_rounds`、`cwnd_cap_hits` 同理（旧 daemon 的 `redundancy` 解码为未生效，缺的计数器
+解码为 0）。
 
 ## 4. 状态与计数器字段（`ssctl status --json` 的输出结构）
 
@@ -155,7 +156,8 @@ daemon 应答，旧 `ssctl` 也能解码新 daemon 的应答。`RuntimeStatus` �
 | `fallback_cc` | 未启用/摘除后新连接使用的拥塞控制算法名 |
 | `active_flows` | 当前正在使用 `skyline_cc` 的连接数 |
 | `tc_stats` | TC 程序看到的包数、字节数与 GSO 包数（`packets`/`bytes`/`gso_packets`；`gso_packets` 数的是 `gso_segs > 1` 的 skb，不是段数）；`drops` 字段恒为 0——TC 程序始终 fail open，不主动丢包 |
-| `metrics` | M2/M3/M4 的决策计数器（见下表）。没有已加载的 struct_ops 时为 `null`：从未启用、一次 drain 完成之后、daemon 重启之后都是；每次重新挂载从零计起 |
+| `metrics` | M2/M3/M4 的决策计数器（见下表），**自这次挂载起累计**。没有已加载的 struct_ops 时为 `null`：从未启用、一次 drain 完成之后、daemon 重启之后都是；每次重新挂载从零计起 |
+| `metrics_recent` | 最近约一分钟里 `metrics` 的增量：`seconds`（实际覆盖的秒数）与 `metrics`（同一组计数器在这段时间里的增量）。挂载期间 daemon 每 5 秒读一次计数器，取当前值与最接近 60 秒前的那次读数之差；挂载不满一分钟时覆盖到最早的那次读数。用它区分"现在仍在发生"和"挂载以来某个时候发生过"。未挂载、刚挂载还没有读数、或来自 0.5.0 之前的 daemon 时为 `null` |
 | `rack_tuning` | M1 tier-1 全局 sysctl 的"配置声明值"与"当前实际值"对照 |
 | `rack_rto` | M1 tier-2 配置 + 运行计数器（`stats`，见下方 `rack_rto.stats` 表） |
 | `retransmit_dscp` | DSCP 标记配置 + 运行计数器（`stats`，见下方 `retransmit_dscp.stats` 表） |
@@ -175,9 +177,11 @@ daemon 应答，旧 `ssctl` 也能解码新 daemon 的应答。`RuntimeStatus` �
 | `loss_events` | 检测到的丢包事件数。同一轮内的多次 RACK 标记只算一次（按 `tp->delivered` 是否前进去重），所以每个 ACK 最多 +1，可以直接除以 `ack_events` |
 | `state_transitions` | STARTUP→CRUISE 状态切换次数 |
 | `pacing_updates` | pacing 速率被重新计算的次数 |
-| `guardrail_hits` | **两处安全限制合计**：队列时延/ECN 护栏触发（`flow->queue_clamped`），以及 cwnd 撞到 `max_cwnd_packets` 上限。两者都在每个 ACK 的路径上，同一个 ACK 可能同时命中 |
+| `guardrail_hits` | 队列时延/ECN 护栏触发（`flow->queue_clamped` 置位）的**轮数**：每条流每轮最多一次，所以要除以 `guardrail_rounds`，不是 `ack_events`。每次触发同时写一条 type 9 事件（第 8 节）。**0.4.x 及更早**的这个计数器还包括了现在的 `cwnd_cap_hits`：0.4.x 的 `guardrail_hits` = 0.5.0 的 `guardrail_hits + cwnd_cap_hits`；`guardrail_hits` 非零而 `guardrail_rounds` 为 0 的，就是这样的旧 daemon |
 | `hypothetical_early_loss` | `early-loss` 模块开启时，每次 `loss_events` 计数同步递增的观测计数器——只统计，不驱动任何决策（见 `docs/03-design.md` 第 5 节） |
 | `prr_adjustments` | 框架级 PRR 重实现介入的次数——M2 开启时该值应恒为 0（M2 会绕开这条路径），非零说明绕开逻辑未生效 |
+| `guardrail_rounds` | 检查过护栏的轮数：M2 开启的流每进入新的一轮记一次，是 `guardrail_hits` 的分母。M2 关闭时不检查护栏，两者都不动 |
+| `cwnd_cap_hits` | ACK 处理结束时 cwnd 处在 `max_cwnd_packets`（或更高）的 ACK 数：按 ACK 计，分母是 `ack_events`。这是上限在起作用，不是拥塞信号——BDP × 增益超过上限的流，在此期间每个 ACK 都记一次 |
 
 `rack_rto.stats`（M1 tier-2，`skyline_policy` 的计数器）：
 
@@ -280,16 +284,17 @@ BPF 侧的四段配置各自独立维护自己的 ABI 版本号，互不联动�
 
 | 常量 | 覆盖范围 |
 |---|---|
-| `SKYLINE_ABI_VERSION` | M2/M3/M4 系数结构（`KernelConfig`） |
+| `SKYLINE_ABI_VERSION` | M2/M3/M4 系数结构（`KernelConfig`）与决策计数器（`SkylineMetrics`） |
 | `SKYLINE_RTO_TUNING_ABI_VERSION` | M1 tier-2 动态 RTO 结构（`KernelRtoTuning`） |
 | `SKYLINE_RETRANSMIT_DSCP_ABI_VERSION` | DSCP 标记结构（`KernelRetransmitDscpConfig`/`KernelRetransmitDscpStats`） |
 | `SKYLINE_REDUNDANCY_ABI_VERSION` | 首轮冗余结构（`KernelRedundancyConfig`/`RedundancyStats`） |
 
 各段配置的版本校验行为并不完全一致：
 
-- M2/M3/M4（`SKYLINE_ABI_VERSION`）：BPF 侧读取配置槽位时校验版本号，不匹配就当作
-  没有配置：`skyline_cong_control` 直接返回，不再为任何连接调整 cwnd 与 pacing，也没有
-  对应的计数器记录这件事。加载时没有谁拒绝不匹配的一对。
+- M2/M3/M4（`SKYLINE_ABI_VERSION`）：每条连接复制配置时（`skyline_adopt_config()`）校验
+  版本号，不匹配就不复制，这条连接就没有配置：`skyline_cong_control` 直接返回，不再为任何
+  连接调整 cwnd 与 pacing，也没有对应的计数器记录这件事。`metrics` 按布局读取，大小对不上的
+  每 CPU 值被跳过，计数器全是 0。加载时没有谁拒绝不匹配的一对。
 - DSCP 标记（`SKYLINE_RETRANSMIT_DSCP_ABI_VERSION`）：版本不匹配时跳过标记逻辑
   （相当于功能关闭），并递增 `retransmit_dscp.stats` 里的 `abi_mismatch`
   计数器。
@@ -319,11 +324,16 @@ BPF 侧的四段配置各自独立维护自己的 ABI 版本号，互不联动�
 
 除上面注明的这一处例外，运行期实际生效值以 `ssctl status` / `ssctl flows` 为准。
 
+**不认识的键会被拒绝（0.5.0 起）。** 文件里有 daemon 不认识的键时，`--validate-only` 与 daemon 启动都失败，
+报错逐个列出这些键（`guardrail_gain at the top level (it is a key of [adaptive_cwnd])`、
+`table [gaurd]`），键名属于别的段落时指明是哪一段。写错段落、拼错名字的键因此不会再被静默忽略。0.4.x 及更早的
+daemon 静默忽略它们；降级到这些版本时文件里多出的键没有影响，降级到 0.5.0 或更新的版本时要先删掉报错列出的键。
+
 ### 6.1 顶层字段
 
 | 字段 | 类型 | 说明 | 可在线覆盖 |
 |---|---|---|---|
-| `generation` | u32 | 配置代际计数器，必须非零；每次系数更新自动递增，`skyline_cc.bpf.c` 用它保证一次 ACK 处理内读到的是同一代配置，避免双缓冲区被半读 | 否（内部维护） |
+| `generation` | u32 | 配置代际计数器，必须非零；每次 `enable` / `set-*` / `reset-*` 自动递增。BPF 侧用它标出每条连接在用哪一代配置（type 11 事件的新旧代际）；防止读到半新半旧配置靠的是另一个序号，见 `docs/03-design.md` 第 11 节 | 否（内部维护） |
 | `enabled_modules` | string[] | 启动时启用的 M1-M4 模块子集，取值 `early-loss`/`adaptive-cwnd`/`loss-classifier`/`pacing` | 是（`ssctl enable`） |
 | `prr_pacing_enabled` | bool | 框架级 PRR 重实现开关，独立于上面四个模块——即使 `enabled_modules` 为空也默认生效（修正的是"绕开内核 PRR 后基线不对等"这个问题，不是可选特性）。M2 开启时该路径不会被执行 | 是（`set-module-config`） |
 | `auto_pacing_enabled` | bool | M4 关闭时使用的、等价于内核默认行为的 pacing 速率上限，独立开关，语义同上 | 是（`set-module-config`） |
@@ -461,12 +471,16 @@ JSON Lines 文件，每行一个事件：
 |---|---|---|---|
 | 1 | STATE | 切换前的模式 | 切换后的模式（与 `state` 字段一致） |
 | 2 | LOSS | 本次采样的丢包数 | 保留，恒为 0 |
-| 9 | GUARDRAIL | 触发时的队列时延（微秒） | 护栏阈值（微秒） |
+| 9 | GUARDRAIL | 触发时的队列时延（微秒）。`value_a` ≤ `value_b`（或 `value_b` 为 0，即队列检查关闭）说明这次是新的 ECN CE 标记触发的 | 护栏阈值（微秒） |
 | 10 | UNDO_CWND | 恢复目标 cwnd | 实际返回给内核的 cwnd |
-| 11 | GENERATION_SWITCH | 切换前的配置代际号 | 切换后的配置代际号 |
+| 11 | GENERATION_SWITCH | 切换前的配置代际号 | 切换后的配置代际号（一轮之内下发了几次，就直接切到最新的那一代） |
 
 （编号不连续：3-8 是保留的编号空位，当前实现从未产出，也不需要消费者
 处理，消费者可以依赖 1/2/9/10/11 这几个编号保持固定不变。）
+
+同一段时间里 type 9 事件的条数等于 `metrics.guardrail_hits` 的增量，type 2、type 1 分别对应
+`loss_events`、`state_transitions`——前提是事件没有丢：ring buffer 写满时新事件直接丢弃，
+文件轮转两次以上也会丢掉中间的事件（见下文）。
 
 **大小上限与轮转。** `events_path` 默认在 `/run` 下，而 `/run` 是按内存计的 tmpfs，
 与 systemd、Docker（runc 状态）等共用。连接多、丢包或排队频繁的主机上事件量很大：

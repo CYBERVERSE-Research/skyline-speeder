@@ -68,6 +68,8 @@ RUN_FIELDS = [
     "metrics_guardrail_hits",
     "metrics_hypothetical_early_loss",
     "metrics_prr_adjustments",
+    "metrics_guardrail_rounds",
+    "metrics_cwnd_cap_hits",
     "n_segments",
     "segment_goodput_json",
     "retransmit_dscp_enabled",
@@ -106,6 +108,11 @@ METRICS_DELTA_FIELDS = (
     "guardrail_hits",
     "hypothetical_early_loss",
     "prr_adjustments",
+    # Since 0.5.0: guardrail_hits counts guardrail trips per round only, out
+    # of guardrail_rounds; the per-ACK cwnd-cap count it used to include is
+    # cwnd_cap_hits. Runs recorded before that have neither field and read 0.
+    "guardrail_rounds",
+    "cwnd_cap_hits",
 )
 
 
@@ -585,6 +592,8 @@ def load_run(run_dir):
         "metrics_guardrail_hits": "",
         "metrics_hypothetical_early_loss": "",
         "metrics_prr_adjustments": "",
+        "metrics_guardrail_rounds": "",
+        "metrics_cwnd_cap_hits": "",
         "n_segments": len(scenario.get("segments") or []),
         "segment_goodput_json": "",
         "retransmit_dscp_enabled": bool(
@@ -653,6 +662,8 @@ def load_run(run_dir):
     row["metrics_guardrail_hits"] = metrics_delta["guardrail_hits"]
     row["metrics_hypothetical_early_loss"] = metrics_delta["hypothetical_early_loss"]
     row["metrics_prr_adjustments"] = metrics_delta["prr_adjustments"]
+    row["metrics_guardrail_rounds"] = metrics_delta["guardrail_rounds"]
+    row["metrics_cwnd_cap_hits"] = metrics_delta["cwnd_cap_hits"]
     if row["rack_rto_enabled"] and rack_rto_applied == 0:
         # M1 tier-2 was declared on for this case but never actually fired --
         # cgroup membership, RTT_CB subscription, or the setsockopt path are

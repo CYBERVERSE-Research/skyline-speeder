@@ -606,8 +606,10 @@ ExecStartPost=+/bin/sh -c 'echo $MAINPID > /sys/fs/cgroup/skyline-speeder/cgroup
   `--json` 里是 `capabilities.notes`；`set-retransmit-dscp` 随之失败）。guard 维护的也是这块网卡的根 qdisc。
 
 > [!CAUTION]
-> 解析器**静默忽略**它不认识的键，写错段落的键（例如把 `loss_inflation_max_ratio` 写进 `[adaptive_cwnd]`）
-> 不会报错，`--validate-only` 也照样通过。改完之后用 `ssctl flows` 的 PARAMETERS IN FORCE 段落核对生效的值。
+> 0.5.0 起 daemon 拒绝它不认识的键：写错段落的键（例如把 `loss_inflation_max_ratio` 写进 `[adaptive_cwnd]`）
+> 或拼错的键，会让 `--validate-only` 和 daemon 启动都失败，报错逐个列出这些键，键名属于别的段落时指明是哪一段。
+> **0.4.x 及更早的 daemon 静默忽略它们**，`--validate-only` 也照样通过。无论哪个版本，改完之后都用
+> `ssctl flows` 的 PARAMETERS IN FORCE 段落核对生效的值。
 
 ### 8.2 在线调参
 
@@ -619,8 +621,9 @@ ssctl reset-module-config                            # 回到配置文件里的�
 - `set-module-config` 是**绝对覆盖**：每次发送全部 17 个系数，命令行没写的取 `ssctl` 内置默认值，不是配置文件里
   的值（全新安装时两者相同；从 0.3.x 及更早升级、保留了旧配置的主机上不同）。`--disable-prr-pacing`、
   `--disable-auto-pacing` 同理：不写就是打开。任何一个参数越界，整条命令被拒绝，已生效的配置不变。
-- 新系数写入非活跃配置槽并递增代际，每条连接只在 RTT 边界切换过去，避免同一轮 ACK 处理里读到新旧混杂的值。
-  `skyline_cc` 未挂载时改的系数在下一次 `enable` 时生效。
+- 新系数写进当前没被指向的那个配置槽，再把配置序号指过去；每条连接在 RTT 边界把它复制进自己的状态，之后只读
+  自己的副本，所以同一轮里读到的不会新旧混杂，脚本里连着下发两次也一样（0.4.x 在一个 RTT 内连续下发两次时会
+  改写仍有连接在读的槽）。`skyline_cc` 未挂载时改的系数在下一次 `enable` 时生效。
 - `set-rack-rto` 同样是绝对覆盖，但直接改写那一份 RTO 参数，不经过配置槽（§7）。
 - 四档现成配方（保守、默认、激进、高随机丢包）与每个参数调大调小的后果见 `docs/usage.md` 第四节。
 
@@ -709,7 +712,9 @@ journalctl -u skyline-speederd.service | grep 'guard:'
 
 升级之后：
 
-- 已有的 `/etc/skyline-speeder/speeder.toml` 不会被覆盖，缺少的新配置段按默认值生效；
+- 已有的 `/etc/skyline-speeder/speeder.toml` 不会被覆盖，缺少的新配置段按默认值生效。升级到 0.5.0 及以后时，
+  文件里有新 daemon 不认识的键（写错段落、拼错）的，安装器在验证器这一步停下，报错列出这些键，旧 daemon 继续
+  运行（§10.3）：按报错改好文件再重跑；
 - 用 `ssctl` 做的在线修改只在旧 daemon 的内存里，重启后不保留；安装器把旧的 `ssctl status --json` 写进了安装
   日志，需要时照着重新下发；
 - 摘要里显示 `upgraded <旧> -> <新>`（v0.2.0 及更早的二进制没有 `--version`，显示
@@ -736,7 +741,7 @@ enable unit 此前不是 active、而这台主机应当挂载 `skyline_cc` 的�
 
 安装器在验证器**之前**就替换了文件：验证器失败时它停下，旧 daemon 继续运行，但磁盘上已是新文件，下一次重启或
 开机运行的就是新文件。先看 §4 的输出排除原因再重跑；要回到旧版本，用 `--release <旧 tag>` 安装那个版本——配置
-文件原样保留，旧版本的 daemon 会忽略它不认识的新键。
+文件原样保留。0.4.x 及更早的 daemon 会忽略它不认识的新键；0.5.0 及以后的会拒绝它们，要先删掉报错列出的键。
 
 ---
 
@@ -930,6 +935,12 @@ ss -tin | grep -c skyline_cc       # 仍在引用它的连接数
   连接、生效中的参数与首轮冗余、算法决策计数器（WHAT THE ALGORITHM DID 段落，`--json` 里是 `status.metrics`）。`metrics` 在没有已加载的
   struct_ops 时为 `null`——从未挂载、一次 drain 完成之后、daemon 重启之后都是——每次重新挂载从零计起。完整字段见
   `docs/02-interface-reference.md` 第 4、4.1 节。
+- 那些计数器**自挂载起累计**。WHAT THE ALGORITHM DID 段落最后的 `last …` 两行是最近约一分钟的同一组比率
+  （`--json` 里是 `status.metrics_recent`），用来区分"现在仍在发生"和"挂载以来某个时候发生过"。
+  `guardrail trips` 是队列时延/ECN 护栏触发的轮数占检查轮数的比例，`cwnd at the cap` 是 cwnd 顶在
+  `max_cwnd_packets` 上的 ACK 占全部 ACK 的比例——后者是上限在起作用，不是拥塞。0.4.x 把两者合在一个
+  `guardrail hits` 里、都除以 ACK 数，读不出是哪一个；要在 0.4.x 上拆开，数事件日志里 `"type":9` 的行（护栏
+  触发，§13.3），其余就是顶到上限的 ACK。
 - `/run/skyline-speeder/state.json` 只在 daemon 启动时和每次成功处理请求后改写，**不是**实时状态；监控请调用
   `ssctl status --json`。
 - `ssctl snapshot <路径>` 由 daemon 写文件，相对路径按 daemon 的工作目录解析。systemd 主机上 daemon 跑在

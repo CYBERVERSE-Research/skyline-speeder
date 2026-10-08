@@ -278,12 +278,17 @@ pub fn status(theme: &Theme, response: &Response) -> String {
         "release",
         &theme.bold(&capabilities.kernel_release),
     );
+    // fallback_cc is required, not optional: `validate` and `enable` refuse
+    // to run without it, since drain writes it just before skyline_cc is
+    // unregistered.
+    let fallback = format!("fallback {}", status.fallback_cc);
     let flags = [
         ("BTF", capabilities.btf),
         ("bpffs", capabilities.bpffs),
         ("cgroup v2", capabilities.cgroup_v2),
         ("fq", capabilities.fq_available),
         ("struct_ops", capabilities.struct_ops),
+        (fallback.as_str(), capabilities.fallback_cc_available),
     ];
     let mut rendered = String::new();
     for (name, present) in flags {
@@ -292,18 +297,12 @@ pub fn status(theme: &Theme, response: &Response) -> String {
     }
     page.row(Mark::Info, "required", rendered.trim_end());
     let optional = format!(
-        "{} RACK reorder hook   {} fallback {} available",
+        "{} RACK reorder hook",
         theme.mark(if capabilities.rack_reo_hook {
             Mark::Good
         } else {
             Mark::Off
         }),
-        theme.mark(if capabilities.fallback_cc_available {
-            Mark::Good
-        } else {
-            Mark::Warn
-        }),
-        status.fallback_cc
     );
     page.row(Mark::Info, "optional", &optional);
 
@@ -986,26 +985,61 @@ fn decisions(page: &mut Page<'_>, theme: &Theme, status: &RuntimeStatus) {
             "of ack decisions",
         ),
     );
-    page.row(
-        rate_mark(metrics.guardrail_hits, metrics.ack_events, 0.05),
-        "guardrail hits",
-        &rate_line(
-            theme,
-            metrics.guardrail_hits,
-            metrics.ack_events,
-            "of ack decisions",
-        ),
-    );
-    if metrics.guardrail_hits > 0 {
-        // Two increment sites in skyline_cc.bpf.c, not one: the
-        // queue-delay/ECN clamp and the max_cwnd_packets ceiling. Naming
-        // only the first would send an operator looking for queueing that
-        // is not there.
-        page.note(
-            "a safety limit held the gains back: the queue-delay/ECN clamp, or the cwnd \
-             ceiling, counted together",
+    if metrics.guardrail_hits > 0 && metrics.guardrail_rounds == 0 {
+        // A daemon from before 0.5.0: one counter for two things, so it can
+        // only be shown the old way, and said to be both.
+        page.row(
+            rate_mark(metrics.guardrail_hits, metrics.ack_events, 0.05),
+            "guardrail hits",
+            &rate_line(
+                theme,
+                metrics.guardrail_hits,
+                metrics.ack_events,
+                "of ack decisions",
+            ),
         );
+        page.note(
+            "this daemon counts the queue-delay/ECN guardrail and the cwnd cap together; \
+             0.5.0 and later count them apart",
+        );
+    } else {
+        // Two counters with two denominators: the guardrail is checked once
+        // a round, the cap after every ACK. Dividing a per-round count by
+        // the ACKs, as one counter for both used to, made neither readable.
+        page.row(
+            rate_mark(metrics.guardrail_hits, metrics.guardrail_rounds, 0.05),
+            "guardrail trips",
+            &rate_line(
+                theme,
+                metrics.guardrail_hits,
+                metrics.guardrail_rounds,
+                &format!("of {} rounds", count(metrics.guardrail_rounds)),
+            ),
+        );
+        if metrics.guardrail_hits > 0 {
+            page.note(
+                "queue delay or an ECN mark held a round's gain back to guardrail_gain \
+                 (events.jsonl: type 9)",
+            );
+        }
+        page.row(
+            rate_mark(metrics.cwnd_cap_hits, metrics.ack_events, 0.05),
+            "cwnd at the cap",
+            &rate_line(
+                theme,
+                metrics.cwnd_cap_hits,
+                metrics.ack_events,
+                "of ack decisions",
+            ),
+        );
+        if metrics.cwnd_cap_hits > 0 {
+            page.note(
+                "max_cwnd_packets held a window at the ceiling: a limit, not a congestion \
+                 signal",
+            );
+        }
     }
+    recent(page, status);
     page.row(
         Mark::Info,
         "mode switches",
@@ -1142,6 +1176,52 @@ fn decisions(page: &mut Page<'_>, theme: &Theme, status: &RuntimeStatus) {
     }
 }
 
+/// The same counters over about the last minute, on one line: whether what
+/// the cumulative rows show is still going on.
+fn recent(page: &mut Page<'_>, status: &RuntimeStatus) {
+    let Some(window) = &status.metrics_recent else {
+        return;
+    };
+    let metrics = &window.metrics;
+    let share = |part: u64, whole: u64| {
+        if whole == 0 {
+            "-".to_owned()
+        } else {
+            format!("{:.2}%", part as f64 / whole as f64 * 100.0)
+        }
+    };
+    // The worst of the three, so a mark that says "fine" means all of them.
+    let mark = [
+        rate_mark(metrics.loss_events, metrics.ack_events, 0.02),
+        rate_mark(metrics.guardrail_hits, metrics.guardrail_rounds, 0.05),
+        rate_mark(metrics.cwnd_cap_hits, metrics.ack_events, 0.05),
+    ]
+    .into_iter()
+    .max_by_key(|mark| match mark {
+        Mark::Warn => 3,
+        Mark::Info => 2,
+        Mark::Good => 1,
+        _ => 0,
+    })
+    .unwrap_or(Mark::Off);
+    page.row(
+        mark,
+        &format!("last {}", duration(window.seconds)),
+        &format!(
+            "{} ack decisions \u{00b7} loss {}",
+            count(metrics.ack_events),
+            share(metrics.loss_events, metrics.ack_events),
+        ),
+    );
+    page.line(&format!(
+        "{}guardrail {} of {} rounds \u{00b7} at the cap {}",
+        " ".repeat(LABEL + 7),
+        share(metrics.guardrail_hits, metrics.guardrail_rounds),
+        count(metrics.guardrail_rounds),
+        share(metrics.cwnd_cap_hits, metrics.ack_events),
+    ));
+}
+
 /// 0-10% full scale, with the rate spelled out. A bar with no stated scale
 /// is decoration; this one says what full means.
 fn rate_line(theme: &Theme, part: u64, whole: u64, what: &str) -> String {
@@ -1249,8 +1329,8 @@ mod tests {
     use super::*;
     use crate::style::ColorChoice;
     use skyline_common::{
-        CapabilityReport, GuardDevice, GuardLive, RackRtoConfig, RackRtoStats, RackRtoStatus,
-        RackTuningConfig, RackTuningStatus, RedundancyStats, RedundancyStatus,
+        CapabilityReport, GuardDevice, GuardLive, MetricsWindow, RackRtoConfig, RackRtoStats,
+        RackRtoStatus, RackTuningConfig, RackTuningStatus, RedundancyStats, RedundancyStatus,
         RetransmitDscpConfig, RetransmitDscpStatus, SkylineConfig, SkylineMetrics, TcStats,
     };
 
@@ -1288,6 +1368,17 @@ mod tests {
                 guardrail_hits: 73,
                 hypothetical_early_loss: 0,
                 prr_adjustments: 0,
+                guardrail_rounds: 9_120,
+                cwnd_cap_hits: 1_204,
+            }),
+            metrics_recent: Some(MetricsWindow {
+                seconds: 62,
+                metrics: SkylineMetrics {
+                    ack_events: 5_731,
+                    loss_events: 40,
+                    guardrail_rounds: 31,
+                    ..SkylineMetrics::default()
+                },
             }),
             rack_tuning: RackTuningStatus {
                 managed: RackTuningConfig::default(),
@@ -1604,6 +1695,71 @@ mod tests {
         assert!(text.contains("put net.core.default_qdisc back to fq\n"));
         assert!(text.contains("replaced eth0 root qdisc fq_codel with fq\n"));
         assert!(text.contains("accelerating"));
+    }
+
+    /// The queue-delay/ECN guardrail is checked once a round and the cwnd cap
+    /// after every ACK, so each is a share of its own denominator -- and the
+    /// last minute is shown beside the totals since the attach.
+    #[test]
+    fn the_guardrail_and_the_cap_are_reported_apart() {
+        let text = flows(&theme(), &reply(healthy(), Some(sample_flows())));
+        assert!(text.contains("guardrail trips"), "{text}");
+        assert!(
+            text.contains("0.80%  73 of 9,120 rounds (bar: 0-10%)"),
+            "{text}"
+        );
+        assert!(text.contains("cwnd at the cap"), "{text}");
+        assert!(
+            text.contains("0.10%  1,204 of ack decisions (bar: 0-10%)"),
+            "{text}"
+        );
+        assert!(text.contains("a limit, not a"), "{text}");
+        assert!(
+            text.contains("last 1m 2s             5,731 ack decisions \u{00b7} loss 0.70%\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("guardrail 0.00% of 31 rounds \u{00b7} at the cap 0.00%\n"),
+            "{text}"
+        );
+        assert!(!text.contains("guardrail hits"));
+    }
+
+    /// A 0.4.x daemon reports one counter for both; it is shown as such, not
+    /// passed off as guardrail trips.
+    #[test]
+    fn an_older_daemons_combined_counter_is_shown_as_it_is() {
+        let mut older = healthy();
+        older.version = "0.4.4".to_owned();
+        older.metrics_recent = None;
+        older.metrics = Some(SkylineMetrics {
+            ack_events: 326_763,
+            guardrail_hits: 193_027,
+            ..SkylineMetrics::default()
+        });
+        let text = flows(&theme(), &reply(older, Some(sample_flows())));
+        assert!(text.contains("guardrail hits"), "{text}");
+        assert!(text.contains("59.07%  193,027 of ack decisions"), "{text}");
+        assert!(text.contains("count them apart"), "{text}");
+        assert!(!text.contains("guardrail trips"));
+        assert!(!text.contains("last "), "no window from an older daemon");
+    }
+
+    /// `validate` and `enable` refuse to run without fallback_cc, so the
+    /// kernel section lists it with what is required.
+    #[test]
+    fn the_fallback_is_listed_as_required() {
+        let text = status(&theme(), &reply(healthy(), None));
+        let required = text
+            .lines()
+            .find(|line| line.contains("required"))
+            .expect("a required row");
+        assert!(required.contains("fallback bbr"), "{required}");
+        let optional = text
+            .lines()
+            .find(|line| line.contains("optional"))
+            .expect("an optional row");
+        assert!(!optional.contains("fallback"), "{optional}");
     }
 
     /// Eyeball the two reports: `cargo test -p ssctl -- --nocapture

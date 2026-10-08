@@ -23,8 +23,8 @@
 3. **队列时延/ECN 护栏的自保护降速（`guardrail_gain=0.8`）代价有限**：对比
    `guardrail_gain=0.0`（钳位到中性 1.0，不主动降速）的对照配置，七个场景的吞吐差异
    在 0 到 -3.7% 之间，这是自保护降速预期的代价（第 6.1 节；其中
-   `intercontinental-clean` 的 `guardrail_hits` 主要是 cwnd 顶到上限的计数，并不说明
-   护栏在那里频繁触发）。
+   `intercontinental-clean` 的 `guardrail_hits` 用的是 0.5.0 之前的合计口径，主要是 cwnd
+   顶到上限的计数，并不说明护栏在那里频繁触发）。
 4. **M1 tier-2（RTO 下限与上限）有直接实测证据**：打开 tier-2 的配置在强制 RTO
    场景下 3/3 全部存活，`max_rto_ms` 在 902-1129ms；关掉 tier-2 的对照只有 1/3 存活，
    纯内核默认的 BBR 曾实测到 RTO 被顶到约 101 秒，逼近内核 120 秒默认上限（第 6.2
@@ -250,7 +250,7 @@ Mbit 三点上都是双峰分布，单次运行可以差 3-4 倍）。10/20 Mbit
 **验证**（`{skyline-best, skyline-guardrail-neutral}` × 7 个历史高频触发场景 ×
 `n=3`，单位 Mbit/s，中位数）：
 
-| 场景 | skyline-best | skyline-guardrail-neutral | 差异 | guardrail_hits（3 轮合计，best/neutral） |
+| 场景 | skyline-best | skyline-guardrail-neutral | 差异 | guardrail_hits（3 轮合计，best/neutral，0.5.0 之前的合计口径） |
 |---|---:|---:|---:|---:|
 | `intercontinental-clean` | 884.34 | 884.35 | <0.01% | 207811 / 207907 |
 | `line-rate` | 956.41 | 956.41 | 0% | 4 / 11 |
@@ -260,8 +260,9 @@ Mbit 三点上都是双峰分布，单次运行可以差 3-4 倍）。10/20 Mbit
 | `burst-loss` | 467.49 | 478.22 | -2.2% | 35 / 27 |
 | `reorder-dsack` | 397.76 | 413.24 | -3.7% | 84 / 95 |
 
-`intercontinental-clean` 的 20.8 万次 `guardrail_hits` 几乎都不是护栏触发：这个
-计数器还在 cwnd 顶到 `max_cwnd_packets` 时**每个 ACK** 记一次（`docs/02-interface-reference.md`
+`intercontinental-clean` 的 20.8 万次 `guardrail_hits` 几乎都不是护栏触发：这组数据采集时，
+这个计数器还在 cwnd 顶到 `max_cwnd_packets` 时**每个 ACK** 记一次（0.5.0 起这部分单独记在
+`cwnd_cap_hits` 里，护栏触发按轮记在 `guardrail_hits` 里，见 `docs/02-interface-reference.md`
 第 4 节）。400 ms × 1000 Mbit/s 的 BDP 约 3.5 万包，乘 2.0 的 inflight 增益超过 5 万包的
 上限，cwnd 一直贴着上限；而队列时延/ECN 护栏每轮至多记一次，45 秒的 case 每次运行
 不到 115 轮，3 次合计至多约 340 次。两者差异 <0.01%：这条流被 cwnd 上限和链路带宽
@@ -429,7 +430,7 @@ LTS**。
 | 第 6.4 节（IPv4） | 重传 DSCP 机制验证（v4） | 6.18.40 | 独立构建，见运行目录 `environment.json` |
 | 第 6.4 节（IPv6） | 重传 DSCP 机制验证（v6） | 6.18.40 | 独立构建，见运行目录 `environment.json` |
 | 第 7 节 | 5 版本内核适配性冒烟 | 见表格 | 各版本独立构建，见各自运行目录 |
-| 发布前复核（2.2 节） | 当前最新构建，`rtt200-loss15` + `line-rate`，`n=2` | 6.18.40 | 当前 HEAD 构建 |
+| 发布前复核（2.2 节） | 当前最新构建，`rtt200-loss15`（2.2 节报告的场景），`n=2` | 6.18.40 | 当前 HEAD 构建 |
 
 完整原始运行数据（`runs.csv`/`summary.csv`/逐 case 详情）不随本报告交付，
 复现方法见 `research/experiments/README.md`。

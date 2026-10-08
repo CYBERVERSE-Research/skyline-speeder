@@ -74,7 +74,7 @@ Breaking any of these is a defect regardless of what else the change does.
 | Identifier | Location | Constraint |
 |---|---|---|
 | `.name = "skyline_cc"` | `bpf/skyline_cc.bpf.c` | Registration name, **≤ 15 characters** (`TCP_CA_NAME_MAX` is 16 including NUL) |
-| `SKYLINE_ABI_VERSION` | `bpf/include/skyline_abi.h` | Must be incremented on any layout change. Nothing refuses a mismatched pair at load time: the BPF side compares it with the version userspace writes into each config slot and ignores a slot that does not match, so `skyline_cc` stops adjusting cwnd and pacing on every connection -- without an error. The bump is what makes a half-updated pair stop instead of misreading the struct |
+| `SKYLINE_ABI_VERSION` | `bpf/include/skyline_abi.h` | Must be incremented on any layout change. Nothing refuses a mismatched pair at load time: each flow compares it with the version userspace writes into the config slot it copies and adopts nothing that does not match, so `skyline_cc` stops adjusting cwnd and pacing on every connection -- without an error. It covers `struct skyline_metrics` too: userspace reads the counters by layout, and a size mismatch leaves them all at 0. The bump is what makes a half-updated pair stop instead of misreading the struct |
 | `cong_control` 4-argument signature | `bpf/skyline_cc.bpf.c` | `(sk, ack, flag, rs)` — exists only on kernel >= 6.10 |
 | Two struct_ops maps, `skyline_cc` / `skyline_cc_txs` | `bpf/skyline_cc.bpf.c` | Both set **the same callbacks** and differ only in where CA_EVENT_TX_START arrives (`cwnd_event`, or `cwnd_event_tx_start` from Linux 7.1); the daemon creates one of them, by the kernel's BTF. **A callback added to one goes into the other too**, or the behaviour silently depends on the kernel version |
 | Install paths `/opt`, `/etc`, `/run/skyline-speeder` | config, units (the two OpenRC scripts in `packaging/openrc/` included), scripts | All three must agree |
@@ -92,11 +92,16 @@ Breaking any of these is a defect regardless of what else the change does.
 - `set-module-config` and `set-rack-rto` are **absolute overwrite**: every call
   carries the complete field set, never a delta. The matching `reset-*` commands
   restore config-file defaults.
-- Configuration switching uses **double slots plus a generation counter**. New
-  coefficients are written to the inactive slot and the generation is bumped;
-  each flow switches only at an RTT boundary, so no flow ever reads a mix of old
-  and new values within a single ACK. **Any change to the config delivery path
-  must preserve this** or you get torn reads.
+- Configuration switching uses **double slots, a sequence number and a per-flow
+  copy**. The daemon writes configuration N into `config_slots[N & 1]` and only
+  then sets `config_seq` to N; each flow copies the slot `config_seq` names into
+  its own state when it starts and at RTT boundaries, discards the copy if
+  `config_seq` moved while it copied, and reads only its own copy on every ACK.
+  So no flow reads a mix of old and new values within a round, however quickly
+  updates follow each other. **Any change to the config delivery path must keep
+  both halves** -- slot first, sequence number second; BPF reads only the copy --
+  or you get torn reads (0.4.x had neither, and two updates within one RTT
+  rewrote a slot live flows were reading).
 
 ## Three silent failure modes
 

@@ -9,13 +9,15 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use thiserror::Error;
 
-/// ABI version for `KernelConfig`, matched against `bpf/include/skyline_abi.h`'s
-/// `SKYLINE_ABI_VERSION`. `skyline_config_get_slot()` on the BPF side rejects a
-/// version mismatch rather than misinterpreting the struct layout. See
+/// ABI version for `KernelConfig` and `SkylineMetrics`, matched against
+/// `bpf/include/skyline_abi.h`'s `SKYLINE_ABI_VERSION`. `skyline_adopt_config()`
+/// on the BPF side adopts nothing on a version mismatch rather than
+/// misinterpreting the struct layout, and skyline_cc then leaves every
+/// connection alone without reporting anything. See
 /// `bpf/include/skyline_abi.h`'s top-of-file comment for what the current
 /// layout encodes (target deployment envelope, M2/M3 semantics, the
 /// queue-delay/ECN guardrail's `guardrail_gain_permille`).
-pub const ABI_VERSION: u32 = 7;
+pub const ABI_VERSION: u32 = 8;
 
 /// The congestion control algorithm name skyline_cc registers under. Must stay
 /// byte-identical to `.name` in bpf/skyline_cc.bpf.c -- the kernel matches the
@@ -592,9 +594,41 @@ impl SkylineConfig {
         let path = path.as_ref();
         let content = fs::read_to_string(path)
             .map_err(|source| ConfigError::Read(path.to_path_buf(), source))?;
-        let config: Self = toml::from_str(&content).map_err(ConfigError::Parse)?;
+        let config = Self::from_toml(&content)?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// A configuration file's text, parsed, refusing any key the
+    /// configuration does not have.
+    ///
+    /// serde passes over an unknown key without a word, and a key in the
+    /// wrong table is unknown there: `guardrail_gain` written above
+    /// `[adaptive_cwnd]` instead of under it passed `--validate-only`, and the
+    /// daemon ran on the value the operator meant to replace. So the file is
+    /// read as a plain table first, and every key in it has to come back when
+    /// the parsed configuration is written out again. `deny_unknown_fields`
+    /// would refuse such keys too, but not only in the file: most of these
+    /// types also travel in requests and status replies, where a field from
+    /// a newer peer must go on decoding. Nothing is validated here; `load`
+    /// does that next.
+    pub fn from_toml(content: &str) -> Result<Self, ConfigError> {
+        let file: toml::Table = toml::from_str(content).map_err(ConfigError::Parse)?;
+        let config: Self = toml::Value::Table(file.clone())
+            .try_into()
+            .map_err(ConfigError::Parse)?;
+        let Ok(toml::Value::Table(known)) = toml::Value::try_from(&config) else {
+            return Err(ConfigError::Invalid(
+                "the configuration could not be written back out to check it for unknown keys",
+            ));
+        };
+        let mut unknown = Vec::new();
+        unknown_keys(&file, &known, &known, "", &mut unknown);
+        if unknown.is_empty() {
+            Ok(config)
+        } else {
+            Err(ConfigError::UnknownKeys(unknown.join("; ")))
+        }
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -634,6 +668,7 @@ impl SkylineConfig {
         if !(0.0..=1.0).contains(&self.adaptive_cwnd.startup_growth_ratio) {
             return Err(ConfigError::Ratio(
                 "startup_growth_ratio",
+                1.0,
                 self.adaptive_cwnd.startup_growth_ratio,
             ));
         }
@@ -643,6 +678,7 @@ impl SkylineConfig {
         if !(0.0..=0.5).contains(&self.loss_classifier.loss_inflation_max_ratio) {
             return Err(ConfigError::Ratio(
                 "loss_inflation_max_ratio",
+                0.5,
                 self.loss_classifier.loss_inflation_max_ratio,
             ));
         }
@@ -662,6 +698,7 @@ impl SkylineConfig {
         if !(0.0..=1.0).contains(&self.adaptive_cwnd.guardrail_gain) {
             return Err(ConfigError::Ratio(
                 "guardrail_gain",
+                1.0,
                 self.adaptive_cwnd.guardrail_gain,
             ));
         }
@@ -804,6 +841,65 @@ impl SkylineConfig {
 
 fn permille(value: f64) -> u32 {
     (value * 1000.0).round().clamp(0.0, u32::MAX as f64) as u32
+}
+
+/// Appends to `out` each key of `file` that `known` -- the same table of the
+/// parsed configuration written back out -- lacks, saying where it was and,
+/// when the name is a key of some other table, which one. `prefix` is the
+/// dotted name of the table being walked, "" at the top level; `root` is the
+/// whole configuration written back out.
+fn unknown_keys(
+    file: &toml::Table,
+    known: &toml::Table,
+    root: &toml::Table,
+    prefix: &str,
+    out: &mut Vec<String>,
+) {
+    for (key, value) in file {
+        match known.get(key) {
+            Some(toml::Value::Table(known_table)) => {
+                if let toml::Value::Table(file_table) = value {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    unknown_keys(file_table, known_table, root, &path, out);
+                }
+            }
+            Some(_) => {}
+            None if value.is_table() => out.push(if prefix.is_empty() {
+                format!("table [{key}]")
+            } else {
+                format!("table [{prefix}.{key}]")
+            }),
+            None => {
+                let place = if prefix.is_empty() {
+                    format!("{key} at the top level")
+                } else {
+                    format!("{key} in [{prefix}]")
+                };
+                out.push(match home_of(root, key, prefix) {
+                    Some(home) => format!("{place} (it is {home})"),
+                    None => place,
+                });
+            }
+        }
+    }
+}
+
+/// Where `key` is a key of the configuration, other than in the table named
+/// `not_in` ("" for the top level).
+fn home_of(root: &toml::Table, key: &str, not_in: &str) -> Option<String> {
+    if !not_in.is_empty() && root.get(key).is_some_and(|value| !value.is_table()) {
+        return Some("a top-level key, written above the first [table]".to_owned());
+    }
+    root.iter().find_map(|(name, value)| match value {
+        toml::Value::Table(table) if name != not_in && table.contains_key(key) => {
+            Some(format!("a key of [{name}]"))
+        }
+        _ => None,
+    })
 }
 
 fn default_true() -> bool {
@@ -997,21 +1093,77 @@ pub struct RackRtoStats {
 }
 
 /// Mirrors `struct skyline_metrics` (`bpf/include/skyline_abi.h`) -- percpu counters
-/// updated by `skyline_cc.bpf.c` on every ack/loss/pacing/transition decision.
+/// updated by `skyline_cc.bpf.c` on every ack/loss/pacing/transition decision,
+/// summed over CPUs. Every field is a `u64` counter, which `accumulate` and
+/// `since` rely on. Defaulted field by field on the wire, so a newer `ssctl`
+/// decodes a reply from a daemon older than a counter (it reads 0).
 #[repr(C)]
-#[derive(Debug, Default, Clone, Copy, Pod, Zeroable, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Pod, Zeroable, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SkylineMetrics {
     pub ack_events: u64,
     pub delivered_packets: u64,
     pub loss_events: u64,
     pub state_transitions: u64,
     pub pacing_updates: u64,
+    /// Rounds in which the queue-delay/ECN guardrail tripped: a share of
+    /// `guardrail_rounds`, not of `ack_events`. Up to 0.4.x this also took
+    /// what is `cwnd_cap_hits` now; a daemon that old reports a non-zero
+    /// `guardrail_hits` with `guardrail_rounds` 0.
     pub guardrail_hits: u64,
     pub hypothetical_early_loss: u64,
     /// See `bpf/include/skyline_abi.h`'s doc comment on the field of the same
     /// name -- nonzero here for an M2-on profile means the PRR-bypass
     /// did not take effect.
     pub prr_adjustments: u64,
+    /// Rounds in which the guardrail was checked: every new round of a flow
+    /// with M2 (`adaptive-cwnd`) on.
+    pub guardrail_rounds: u64,
+    /// ACKs after which cwnd sat at `max_cwnd_packets`: a share of
+    /// `ack_events`. The ceiling holding, not a congestion signal.
+    pub cwnd_cap_hits: u64,
+}
+
+const METRIC_COUNTERS: usize = std::mem::size_of::<SkylineMetrics>() / std::mem::size_of::<u64>();
+
+impl SkylineMetrics {
+    fn counters(&self) -> &[u64; METRIC_COUNTERS] {
+        bytemuck::cast_ref(self)
+    }
+
+    fn counters_mut(&mut self) -> &mut [u64; METRIC_COUNTERS] {
+        bytemuck::cast_mut(self)
+    }
+
+    /// Adds `other` counter by counter, saturating: how the daemon sums the
+    /// per-CPU copies of the map.
+    pub fn accumulate(&mut self, other: &Self) {
+        for (total, value) in self.counters_mut().iter_mut().zip(other.counters()) {
+            *total = total.saturating_add(*value);
+        }
+    }
+
+    /// What was counted after `earlier` was read, counter by counter; 0
+    /// where a counter is lower now (a new attach starts them over).
+    pub fn since(&self, earlier: &Self) -> Self {
+        let mut delta = *self;
+        for (now, then) in delta.counters_mut().iter_mut().zip(earlier.counters()) {
+            *now = now.saturating_sub(*then);
+        }
+        delta
+    }
+}
+
+/// What `SkylineMetrics` gained over the last `seconds`, about a minute: the
+/// daemon samples the counters every few seconds while skyline_cc is
+/// attached, and this is the latest reading against the sample closest to a
+/// minute old. It tells "happening now" from "happened at some point since
+/// the attach", which the cumulative counters cannot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetricsWindow {
+    pub seconds: u64,
+    pub metrics: SkylineMetrics,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1148,7 +1300,13 @@ pub struct RuntimeStatus {
     pub tc_stats: Option<TcStats>,
     /// `None` when Skyline Speeder CC has never been enabled (mirrors `tc_stats`'s
     /// `Option` -- there is no `skyline_cc.bpf.o` loaded to read the map from).
+    /// Cumulative since the attach (`attached_s`).
     pub metrics: Option<SkylineMetrics>,
+    /// The last minute or so of `metrics`. `None` while nothing is attached,
+    /// in the first few seconds after an attach, and from a daemon older
+    /// than the field.
+    #[serde(default)]
+    pub metrics_recent: Option<MetricsWindow>,
     pub rack_tuning: RackTuningStatus,
     pub rack_rto: RackRtoStatus,
     pub retransmit_dscp: RetransmitDscpStatus,
@@ -1336,8 +1494,13 @@ pub enum ConfigError {
     Parse(toml::de::Error),
     #[error("unknown module {0}")]
     UnknownModule(String),
-    #[error("{0} must be between zero and one, got {1}")]
-    Ratio(&'static str, f64),
+    /// The name, the largest value it takes, and the value given.
+    #[error("{0} must be between 0.0 and {1:?}, got {2:?}")]
+    Ratio(&'static str, f64, f64),
+    /// Keys the file has and the configuration does not: see
+    /// `SkylineConfig::from_toml`.
+    #[error("the configuration has keys skyline-speederd does not know and would ignore: {0}")]
+    UnknownKeys(String),
     #[error("{0} must be {1}, got {2}")]
     Range(&'static str, &'static str, u32),
     #[error("{0}")]
@@ -1873,6 +2036,51 @@ mod tests {
         assert_eq!(std::mem::align_of::<KernelConfig>(), 8);
     }
 
+    /// Ten u64 counters, in the order of `struct skyline_metrics`: the map
+    /// value is read by layout, and a size that differs makes every per-CPU
+    /// read fail and the counters stay at 0.
+    #[test]
+    fn metrics_mirror_the_c_struct() {
+        assert_eq!(std::mem::size_of::<SkylineMetrics>(), 10 * 8);
+        let mut raw = [0_u64; 10];
+        for (index, value) in raw.iter_mut().enumerate() {
+            *value = index as u64 + 1;
+        }
+        let metrics: SkylineMetrics = bytemuck::cast(raw);
+        assert_eq!(metrics.guardrail_hits, 6);
+        assert_eq!(metrics.prr_adjustments, 8);
+        assert_eq!(metrics.guardrail_rounds, 9);
+        assert_eq!(metrics.cwnd_cap_hits, 10);
+    }
+
+    #[test]
+    fn metrics_add_up_and_difference_counter_by_counter() {
+        let one = SkylineMetrics {
+            ack_events: 10,
+            guardrail_rounds: 4,
+            cwnd_cap_hits: u64::MAX,
+            ..SkylineMetrics::default()
+        };
+        let mut total = one;
+        total.accumulate(&SkylineMetrics {
+            ack_events: 5,
+            guardrail_hits: 1,
+            cwnd_cap_hits: 1,
+            ..SkylineMetrics::default()
+        });
+        assert_eq!(total.ack_events, 15);
+        assert_eq!(total.guardrail_hits, 1);
+        assert_eq!(total.guardrail_rounds, 4);
+        assert_eq!(total.cwnd_cap_hits, u64::MAX, "saturates");
+
+        let delta = total.since(&one);
+        assert_eq!(delta.ack_events, 5);
+        assert_eq!(delta.guardrail_hits, 1);
+        assert_eq!(delta.guardrail_rounds, 0);
+        // A counter lower than before (a new attach) gives 0, not a wrap.
+        assert_eq!(one.since(&total).ack_events, 0);
+    }
+
     #[test]
     fn module_tuning_rejects_out_of_range_values() {
         let base = SkylineConfig::load("../../config/speeder.toml").expect("load config");
@@ -1887,15 +2095,109 @@ mod tests {
         let mut tuning = ModuleTuningConfig::from_config(&config);
         tuning.loss_inflation_max_ratio = 0.9;
         tuning.apply_to(&mut config);
+        let error = config.validate().expect_err("0.9 is above the 0.5 ceiling");
         assert!(matches!(
-            config.validate(),
-            Err(ConfigError::Ratio("loss_inflation_max_ratio", _))
+            error,
+            ConfigError::Ratio("loss_inflation_max_ratio", _, _)
         ));
+        // The range the BPF side clamps to, not "zero and one".
+        assert_eq!(
+            error.to_string(),
+            "loss_inflation_max_ratio must be between 0.0 and 0.5, got 0.9"
+        );
+
+        let mut config = base.clone();
+        config.adaptive_cwnd.guardrail_gain = 1.5;
+        assert_eq!(
+            config.validate().expect_err("above 1.0").to_string(),
+            "guardrail_gain must be between 0.0 and 1.0, got 1.5"
+        );
 
         let mut config = base;
         let mut tuning = ModuleTuningConfig::from_config(&config);
         tuning.max_cwnd_packets = 1;
         tuning.apply_to(&mut config);
         assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+    }
+
+    fn shipped_text() -> String {
+        fs::read_to_string("../../config/speeder.toml").expect("read config")
+    }
+
+    #[test]
+    fn shipped_configs_have_no_unknown_keys() {
+        for path in [
+            "../../config/speeder.toml",
+            "../../config/speeder-guest.toml",
+        ] {
+            let text = fs::read_to_string(path).expect("read config");
+            SkylineConfig::from_toml(&text).unwrap_or_else(|error| panic!("{path}: {error}"));
+        }
+    }
+
+    /// The case that went unnoticed: a key above `[adaptive_cwnd]` instead of
+    /// under it parsed, validated, and was never applied.
+    #[test]
+    fn a_key_in_the_wrong_table_is_refused_with_its_table() {
+        let text = shipped_text().replacen(
+            "max_cwnd_packets = 50000",
+            "max_cwnd_packets = 50000\nguardrail_gain = 0.5",
+            1,
+        );
+        let error = SkylineConfig::from_toml(&text).expect_err("misplaced key");
+        assert!(matches!(error, ConfigError::UnknownKeys(_)));
+        assert_eq!(
+            error.to_string(),
+            "the configuration has keys skyline-speederd does not know and would ignore: \
+             guardrail_gain at the top level (it is a key of [adaptive_cwnd])"
+        );
+
+        // And the other way round: a top-level key written inside a table.
+        let text = shipped_text().replacen(
+            "\n[adaptive_cwnd]\n",
+            "\n[adaptive_cwnd]\nmax_cwnd_packets = 9000\n",
+            1,
+        );
+        let error = SkylineConfig::from_toml(&text).expect_err("misplaced key");
+        assert!(error.to_string().ends_with(
+            "max_cwnd_packets in [adaptive_cwnd] (it is a top-level key, written above the \
+             first [table])"
+        ));
+    }
+
+    /// A misspelt table is refused as a whole -- [guard] is optional, so
+    /// without this check the misspelling would only drop it -- and every
+    /// unknown key is listed, not just the first.
+    #[test]
+    fn misspelt_keys_and_tables_are_all_refused() {
+        let text = shipped_text()
+            .replacen("bw_window_rtts = 6", "bw_window_rtts = 6\nbw_window = 6", 1)
+            .replacen("\n[guard]\n", "\n[gaurd]\n", 1);
+        assert_eq!(
+            SkylineConfig::from_toml(&text)
+                .expect_err("misspelt")
+                .to_string(),
+            "the configuration has keys skyline-speederd does not know and would ignore: \
+             bw_window in [adaptive_cwnd]; table [gaurd]"
+        );
+    }
+
+    /// Dotted keys define the same tables as a [table] header does, and an
+    /// optional key that is set must not look unknown.
+    #[test]
+    fn every_way_of_writing_a_known_key_is_accepted() {
+        let block = "[redundancy]\nenabled = true\nfirst_kib = 64   # 1..=1024\n\
+                     delay_ms = 10    # 0..=100\n";
+        let shipped = shipped_text();
+        assert!(shipped.contains(block));
+        let text = shipped.replacen(block, "", 1).replacen(
+            "generation = 1\n",
+            "generation = 1\nredundancy.first_kib = 32\nredundancy.delay_ms = 5\n",
+            1,
+        ) + "\n[rack_tuning]\ntcp_recovery = 1\n";
+        let config = SkylineConfig::from_toml(&text).expect("known keys only");
+        assert_eq!(config.redundancy.first_kib, 32);
+        assert_eq!(config.redundancy.delay_ms, 5);
+        assert_eq!(config.rack_tuning.tcp_recovery, Some(1));
     }
 }
