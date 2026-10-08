@@ -8,10 +8,67 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 the layout of `bpf/include/skyline_abi.h` and any bump to it is a breaking change
 for anyone holding a prebuilt `.bpf.o`.
 
-## [Unreleased]
+## [0.5.0] - 2026-10-08
+
+### Upgrading from 0.4.4
+
+- **Re-run the installer the way the host was installed.** All three BPF
+  objects, `skyline-speederd` and `ssctl` change, and `SKYLINE_ABI_VERSION`
+  goes from 7 to 8: the objects and the daemon of one release belong
+  together, and a 0.5.0 daemon with 0.4.x objects -- or the other way round
+  -- leaves every connection on skyline_cc unadjusted without an error. The
+  installer replaces them together and restarts `skyline-speederd` as before.
+- **`skyline-speederd` refuses a configuration with a key it does not know**
+  (see Changed). Every key a release has shipped is known, so a file nobody
+  edited passes. One with a misplaced or misspelt key stops the upgrade at
+  the verifier step, with the old daemon still running and each such key
+  named in the error: fix the file and run the installer again. Going back to
+  0.4.x needs nothing; 0.4.x ignores what it does not know, as before.
+- **`metrics.guardrail_hits` counts guardrail trips only now**, at most once
+  per flow and round, out of the new `metrics.guardrail_rounds`. What it used
+  to add on top -- every ACK that ended with cwnd at `max_cwnd_packets` -- is
+  `metrics.cwnd_cap_hits`, out of `ack_events`. Monitoring that reads
+  `guardrail_hits` sees far smaller numbers: 0.4.x's value is 0.5.0's
+  `guardrail_hits + cwnd_cap_hits`. A 0.5.0 `ssctl` asking a 0.4.x daemon
+  shows that daemon's combined counter as combined.
+
+### Added
+
+- **The queue-delay/ECN guardrail and the cwnd cap are counted apart** (#25).
+  One counter took both, each with its own granularity: the guardrail is
+  checked once a round and counted when it trips, the cap was counted after
+  every ACK that left cwnd at `max_cwnd_packets`. `ssctl flows` divided the
+  sum by the ACKs and called it "guardrail hits", so a few seconds of one fast
+  flow held at the cap read as the guardrail clamping most of the traffic.
+  `guardrail_hits` now counts trips, `guardrail_rounds` the rounds it was
+  checked in, `cwnd_cap_hits` the ACKs at the cap; `ssctl flows` shows
+  `guardrail trips` as a share of rounds and `cwnd at the cap` as a share of
+  ACK decisions, and says the second is a limit, not a congestion signal.
+  Measured with the cap lowered to 300 packets on a 100 ms path: 15 seconds
+  of one flow at the cap added 14,049 to 0.4.4's `guardrail_hits` -- out of
+  14,068 ACKs -- and logged no guardrail event; 0.5.0 counted the same test as
+  13,898 `cwnd_cap_hits` and 0 `guardrail_hits` in 81 rounds, and a run that
+  built a queue as 19 `guardrail_hits`, the 19 type 9 events logged.
+- **The last minute of the counters.** They count since the attach, so a
+  burst an hour ago and one going on now look the same in them. While
+  skyline_cc is attached the daemon reads them every 5 seconds, and
+  `status.metrics_recent` is the latest reading against the one closest to a
+  minute old; `ssctl flows` shows it as `last ...` below the totals.
 
 ### Changed
 
+- **`skyline-speederd` refuses configuration keys it does not know.** serde
+  passed over them without a word, and a key in the wrong table is one it
+  does not know there: `guardrail_gain` written above `[adaptive_cwnd]`
+  passed `--validate-only` and was never applied. The file is now checked key
+  by key against what was parsed, and `--validate-only` and a start fail with
+  every unknown key listed, along with the table it belongs in when it is a
+  key of another one (`guardrail_gain at the top level (it is a key of
+  [adaptive_cwnd])`, `table [gaurd]`). Requests and status replies are not
+  affected: a field from a newer peer still decodes.
+- **`ssctl status` lists `fallback_cc` as required, not optional.** `validate`
+  and `enable` refuse to run without it, since drain writes it just before
+  skyline_cc is unregistered.
 - **`DEPLOY.md` is the one deployment manual; `docs/01-deployment-guide.md` is
   gone.** The two covered the same ground -- prerequisites, install paths,
   upgrade, the cgroup, verification, the guard, removal -- and had drifted
@@ -23,11 +80,61 @@ for anyone holding a prebuilt `.bpf.o`.
   with what neither had: every installer flag and environment variable, the
   exit-status rules, a symptom-to-section table, how to detach for good and how
   to go back to an older release. Every reference, the issue template's link
-  and both units' `Documentation=` point at DEPLOY.md; units installed by
-  0.4.4 and earlier keep the old link until the next release replaces them.
+  and both units' `Documentation=` point at DEPLOY.md; 0.5.0's units replace
+  the ones that still pointed at the deleted guide.
 
 ### Fixed
 
+- **A second configuration update within one round could change values under
+  live flows.** The daemon wrote each update into the slot it had not written
+  last and pointed the flows at it, and a flow switched slots only at a round
+  boundary. Two updates closer together than a round trip -- `ssctl enable`
+  and `ssctl set-module-config` in one script -- rewrote the slot that flows
+  still on the first one were reading, then made it the active slot again, so
+  those flows read it while it was being written and never started their model
+  over on it. Each flow now copies the configuration into its own state, at
+  the start and then only at round boundaries, and reads nothing else; the
+  daemon writes a configuration's slot before the sequence number that names
+  it, and a flow keeps a copy only if that number did not move while it
+  copied. However closely updates follow each other, no flow sees two of them
+  within one round, and a flow that missed some adopts the latest. Measured
+  with 16 flows on a 200 ms path and two updates about 50 ms apart: under
+  0.4.4, 10 of 17 connections never switched -- no event, no restart -- and
+  went on reading the rewritten slot; under 0.5.0 every data connection
+  switched, most of them straight to the latest generation, on 6.12.63 and
+  on 7.2.6 alike.
+- **Every new connection could log a configuration switch from generation
+  0.** The ACK that completes the handshake reaches `cong_control` before
+  `init` runs. 0.4.4 took the empty state it created then for a flow on slot
+  0, and whenever the last update had gone to slot 1 it logged a
+  GENERATION_SWITCH from 0 at the start of every connection; `init` then
+  started the flow over, so only the event log was wrong. A flow with no
+  configuration now takes one without an event.
+- **The cwnd cap did not hold for a flow without a bandwidth estimate.** That
+  branch slow-starts, and `tcp_slow_start()` adds every ACKed packet to cwnd
+  whether or not the window was what limited the flow; app-limited flows are
+  exactly the ones that never get an estimate, so theirs grew past
+  `max_cwnd_packets` and every ACK of theirs counted as a guardrail hit. The
+  cap now holds there as on every other path: with the cap at 300, a flow
+  writing 1000 bytes at a time reached a cwnd of 4,784 in 38 seconds under
+  0.4.4 and stays at 300 under 0.5.0. Growing the window only while
+  it is the limit, as the kernel's own slow start does, is left open:
+  `docs/03-design.md` section 13.
+- **`scripts/bootstrap.sh --repo` installed the default repository's
+  release.** It fetched the installer from the repository it was given, but
+  install.sh looks releases up in `SKYLINE_REPO`, which it never set. It does
+  now, and the upgrade command it prints at the end carries it.
+- **The range error for `loss_inflation_max_ratio` said "between zero and
+  one"**; the ceiling is 0.5, which the error now names, as the ones for
+  `startup_growth_ratio` and `guardrail_gain` name theirs.
+- **Comments that described the code wrongly:** in `bpf/`, that the guardrail
+  overrides the loss compensation for the cwnd target as it does for pacing,
+  that it works with M2 off, and that redundancy costs at most `first_kib` per
+  connection; in the daemon, that `skyline_tc` counts nothing on an L3 device.
+- **`docs/04-performance-report.md` Appendix A** listed `line-rate` among the
+  pre-release recheck scenarios, but section 2.2 describes a recheck on
+  `rtt200-loss15` only and the report has no `line-rate` recheck result; the
+  appendix lists what section 2.2 reports.
 - **The deployment checks passed with nothing attached.** DEPLOY.md's success
   check and gate G5 were `ssctl status --json | grep -q '"enabled": true'`,
   which also matches `redundancy.config.enabled` -- `true` by default since
@@ -76,10 +183,7 @@ for anyone holding a prebuilt `.bpf.o`.
   with M2 off there is no guardrail at all; auto-pacing follows M4, not M2;
   redundancy also copies retransmissions inside its range, so nothing bounds
   it per connection; TC statistics count on any device; the RTO ceiling needs
-  Linux 6.15 and defaults to off; `ssctl flows` lists connections. The
-  double-slot configuration switch is described with the precondition nothing
-  enforces: two updates within one RTT hand some live flows a slot that is
-  being rewritten.
+  Linux 6.15 and defaults to off; `ssctl flows` lists connections.
 - **`docs/04-performance-report.md`:** the 208k `guardrail_hits` of
   `intercontinental-clean` are cwnd-cap hits, not guardrail trips; the
   `volatile-bandwidth-cliff` link loses 0.5% outside its 8% burst, the
