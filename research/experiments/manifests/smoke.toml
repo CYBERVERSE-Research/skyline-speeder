@@ -6,7 +6,7 @@
 # - ssctl status 显示当前 abi_version 与系数字段（cruise_inflight_gain等）
 # - skyline-events.jsonl 里 SKYLINE_EVENT_STATE 的 state 只出现 0/1（STARTUP/CRUISE）
 # - metrics.prr_adjustments == 0（证明 M2 路径确实绕开了 PRR）
-# - metrics.guardrail_hits 不是每轮都触发
+# - metrics.guardrail_hits 远小于 metrics.guardrail_rounds（护栏不是每轮都触发）
 #
 # rtt200-loss15（目标box中心点）× {b1, skyline-best} × runs=1，2 case，~10分钟。
 name = "smoke"

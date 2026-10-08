@@ -9,16 +9,17 @@ use clap::Parser;
 use guard::Guard;
 use libbpf_rs::btf::{types::Struct, Btf, BtfKind, BtfType, TypeId};
 use libbpf_rs::{
-    Link, MapCore, MapFlags, Object, ObjectBuilder, OpenObject, RingBufferBuilder, TcHook,
-    TcHookBuilder, TC_EGRESS,
+    Link, MapCore, MapFlags, MapHandle, Object, ObjectBuilder, OpenObject, RingBufferBuilder,
+    TcHook, TcHookBuilder, TC_EGRESS,
 };
 use skyline_common::{
-    CapabilityReport, FeatureMask, Module, ModuleTuningConfig, RackRtoConfig, RackRtoStats,
-    RackRtoStatus, RackTuningConfig, RackTuningStatus, RedundancyConfig, RedundancyStats,
-    RedundancyStatus, Request, Response, RetransmitDscpConfig, RetransmitDscpStats,
-    RetransmitDscpStatus, RuntimeStatus, SkylineConfig, SkylineEvent, SkylineMetrics, TcStats,
-    SKYLINE_CC_NAME,
+    CapabilityReport, FeatureMask, MetricsWindow, Module, ModuleTuningConfig, RackRtoConfig,
+    RackRtoStats, RackRtoStatus, RackTuningConfig, RackTuningStatus, RedundancyConfig,
+    RedundancyStats, RedundancyStatus, Request, Response, RetransmitDscpConfig,
+    RetransmitDscpStats, RetransmitDscpStatus, RuntimeStatus, SkylineConfig, SkylineEvent,
+    SkylineMetrics, TcStats, SKYLINE_CC_NAME,
 };
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
@@ -47,9 +48,15 @@ struct Arguments {
 struct BpfRuntime {
     objects: Vec<Object>,
     links: Vec<Link>,
-    active_slot: u32,
-    event_stop: Arc<AtomicBool>,
-    event_threads: Vec<JoinHandle<()>>,
+    /// The number of the configuration published last; see
+    /// `update_config_maps()`.
+    config_seq: u32,
+    /// True until `Drop` asks the threads below to finish.
+    running: Arc<AtomicBool>,
+    /// The event reader, when the event log is on, and the metrics sampler.
+    threads: Vec<JoinHandle<()>>,
+    /// What the metrics sampler has read, oldest first; see `MetricsSamples`.
+    samples: Arc<Mutex<MetricsSamples>>,
     /// The struct_ops map `load_cc_object()` created for this kernel. The
     /// other one is not created, and `Object::maps()` does not list it.
     struct_ops_map: &'static str,
@@ -79,13 +86,13 @@ impl BpfRuntime {
         let mut runtime = Self {
             objects: Vec::new(),
             links: Vec::new(),
-            active_slot: 0,
-            event_stop: Arc::new(AtomicBool::new(false)),
-            event_threads: Vec::new(),
+            config_seq: 1,
+            running: Arc::new(AtomicBool::new(true)),
+            threads: Vec::new(),
+            samples: Arc::new(Mutex::new(MetricsSamples::default())),
             struct_ops_map,
         };
-        runtime.event_stop.store(true, Ordering::Release);
-        update_config_maps(&mut cc_object, config, 0)?;
+        update_config_maps(&mut cc_object, config, runtime.config_seq)?;
         let struct_ops_link = {
             let mut map = find_map_mut(&mut cc_object, struct_ops_map)?;
             map.attach_struct_ops()
@@ -97,26 +104,31 @@ impl BpfRuntime {
         // bpf_ringbuf_reserve() fails and skyline_emit() drops the event,
         // which costs less than reading and discarding every one.
         if let Some(event_log) = event_log {
-            runtime.event_threads.push(start_event_reader(
+            runtime.threads.push(start_event_reader(
                 &cc_object,
                 "events",
                 event_log,
-                runtime.event_stop.clone(),
+                runtime.running.clone(),
             )?);
         }
+        runtime.threads.push(start_metrics_sampler(
+            &cc_object,
+            runtime.samples.clone(),
+            runtime.running.clone(),
+        )?);
         runtime.objects.push(cc_object);
 
         Ok(runtime)
     }
 
     fn update_config(&mut self, config: &SkylineConfig) -> Result<()> {
-        let next_slot = (self.active_slot + 1) & 1;
+        let next_seq = self.config_seq.wrapping_add(1);
         let cc_object = self
             .objects
             .first_mut()
             .ok_or_else(|| anyhow!("skyline_cc object is not loaded"))?;
-        update_config_maps(cc_object, config, next_slot)?;
-        self.active_slot = next_slot;
+        update_config_maps(cc_object, config, next_seq)?;
+        self.config_seq = next_seq;
         Ok(())
     }
 
@@ -154,33 +166,105 @@ impl BpfRuntime {
         let object = self.objects.first()?;
         let map = object
             .maps()
-            .find(|map| map.name() == OsStr::new("metrics"))?;
-        let values = map
-            .lookup_percpu(&0_u32.to_ne_bytes(), MapFlags::ANY)
-            .ok()
-            .flatten()?;
-        let mut total = SkylineMetrics::default();
-        for value in values {
-            let Ok(stats) = try_pod_read_unaligned::<SkylineMetrics>(&value) else {
-                continue;
-            };
-            total.ack_events = total.ack_events.saturating_add(stats.ack_events);
-            total.delivered_packets = total
-                .delivered_packets
-                .saturating_add(stats.delivered_packets);
-            total.loss_events = total.loss_events.saturating_add(stats.loss_events);
-            total.state_transitions = total
-                .state_transitions
-                .saturating_add(stats.state_transitions);
-            total.pacing_updates = total.pacing_updates.saturating_add(stats.pacing_updates);
-            total.guardrail_hits = total.guardrail_hits.saturating_add(stats.guardrail_hits);
-            total.hypothetical_early_loss = total
-                .hypothetical_early_loss
-                .saturating_add(stats.hypothetical_early_loss);
-            total.prr_adjustments = total.prr_adjustments.saturating_add(stats.prr_adjustments);
-        }
-        Some(total)
+            .find(|map| map.name() == OsStr::new(METRICS_MAP))?;
+        read_metrics(&map)
     }
+
+    /// The counters of about the last minute, from the latest reading and
+    /// the sampler's history.
+    fn metrics_recent(&self) -> Option<MetricsWindow> {
+        let current = self.metrics()?;
+        let samples = self.samples.lock().ok()?;
+        samples.window(Instant::now(), &current)
+    }
+}
+
+const METRICS_MAP: &str = "metrics";
+
+/// The per-CPU copies of skyline_cc's `metrics` map, summed.
+fn read_metrics(map: &impl MapCore) -> Option<SkylineMetrics> {
+    let values = map
+        .lookup_percpu(&0_u32.to_ne_bytes(), MapFlags::ANY)
+        .ok()
+        .flatten()?;
+    let mut total = SkylineMetrics::default();
+    for value in values {
+        if let Ok(stats) = try_pod_read_unaligned::<SkylineMetrics>(&value) {
+            total.accumulate(&stats);
+        }
+    }
+    Some(total)
+}
+
+/// How often the sampler reads the counters, and how far back
+/// `RuntimeStatus::metrics_recent` reaches.
+const METRICS_SAMPLE_EVERY: Duration = Duration::from_secs(5);
+const METRICS_RECENT_WINDOW: Duration = Duration::from_secs(60);
+
+/// The metrics sampler's readings, oldest first, kept for one window and a
+/// sample more. The counters only ever say "since the attach": a burst of
+/// guardrail trips an hour ago and one going on now look the same in them,
+/// and which of the two it is, is the first thing an operator reading them
+/// needs to know.
+#[derive(Default)]
+struct MetricsSamples {
+    readings: VecDeque<(Instant, SkylineMetrics)>,
+}
+
+impl MetricsSamples {
+    fn push(&mut self, at: Instant, metrics: SkylineMetrics) {
+        self.readings.push_back((at, metrics));
+        let keep = (METRICS_RECENT_WINDOW.as_secs() / METRICS_SAMPLE_EVERY.as_secs()) as usize + 2;
+        while self.readings.len() > keep {
+            self.readings.pop_front();
+        }
+    }
+
+    /// `current` against the newest reading at least a window old, or the
+    /// oldest there is while the attach is younger than that. `None` before
+    /// the first reading.
+    fn window(&self, now: Instant, current: &SkylineMetrics) -> Option<MetricsWindow> {
+        let (at, then) = self
+            .readings
+            .iter()
+            .rev()
+            .find(|(at, _)| now.saturating_duration_since(*at) >= METRICS_RECENT_WINDOW)
+            .or_else(|| self.readings.front())?;
+        Some(MetricsWindow {
+            seconds: now.saturating_duration_since(*at).as_secs(),
+            metrics: current.since(then),
+        })
+    }
+}
+
+/// Reads the counters every `METRICS_SAMPLE_EVERY` into `samples`, from the
+/// attach until `running` turns false. Through a handle of its own: the
+/// libbpf object stays with the request loop.
+fn start_metrics_sampler(
+    object: &Object,
+    samples: Arc<Mutex<MetricsSamples>>,
+    running: Arc<AtomicBool>,
+) -> Result<JoinHandle<()>> {
+    let map = object
+        .maps()
+        .find(|map| map.name() == OsStr::new(METRICS_MAP))
+        .ok_or_else(|| anyhow!("BPF map {METRICS_MAP} is missing"))?;
+    let handle = MapHandle::try_from(&map).context("open the metrics map for the sampler")?;
+    Ok(thread::spawn(move || {
+        let mut next = Instant::now();
+        while running.load(Ordering::Acquire) {
+            let now = Instant::now();
+            if now >= next {
+                if let Some(metrics) = read_metrics(&handle) {
+                    if let Ok(mut samples) = samples.lock() {
+                        samples.push(now, metrics);
+                    }
+                }
+                next = now + METRICS_SAMPLE_EVERY;
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+    }))
 }
 
 impl Drop for BpfRuntime {
@@ -200,8 +284,8 @@ impl Drop for BpfRuntime {
         for link in &self.links {
             let _ = link.detach();
         }
-        self.event_stop.store(false, Ordering::Release);
-        for thread in self.event_threads.drain(..) {
+        self.running.store(false, Ordering::Release);
+        for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
     }
@@ -574,7 +658,7 @@ fn start_event_reader(
     object: &Object,
     map_name: &str,
     event_log: Arc<Mutex<EventLog>>,
-    stop: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
 ) -> Result<JoinHandle<()>> {
     let map = object
         .maps()
@@ -609,7 +693,7 @@ fn start_event_reader(
     })?;
     let ring_buffer = builder.build()?;
     Ok(thread::spawn(move || {
-        while stop.load(Ordering::Acquire) {
+        while running.load(Ordering::Acquire) {
             if ring_buffer.poll(Duration::from_millis(200)).is_err() {
                 break;
             }
@@ -717,13 +801,15 @@ fn interface_type(interface: &str) -> Option<u32> {
         .ok()
 }
 
-/// skyline_tc.bpf.c parses an Ethernet header at offset 0 of every egress
-/// packet (`struct ethhdr *eth = data`, then ETH_HLEN offsets). On an L3
-/// device -- a WireGuard/WARP tunnel, tun, GRE, PPP -- there is no such
-/// header: its stats would silently count nothing, and an enabled DSCP
-/// writer would write at ETH_HLEN offsets inside the IP header. So it is
-/// only attached to an Ethernet device. An unreadable type is let through:
-/// the attach reports a missing interface better than this could.
+/// skyline_tc.bpf.c's DSCP marking and first-flight redundancy parse an
+/// Ethernet header at offset 0 of an egress packet (`struct ethhdr *eth =
+/// data`, then ETH_HLEN offsets). On an L3 device -- a WireGuard/WARP tunnel,
+/// tun, GRE, PPP -- there is no such header: the packet and byte counts would
+/// still add up, being taken before any parsing, but both features would read
+/// the IP header as if it were one, and an enabled DSCP writer would write at
+/// ETH_HLEN offsets inside it. So it is only attached to an Ethernet device.
+/// An unreadable type is let through: the attach reports a missing interface
+/// better than this could.
 fn require_ethernet(interface: &str, device_type: Option<u32>) -> Result<()> {
     match device_type {
         Some(device_type) if device_type != ARPHRD_ETHER => bail!(
@@ -903,14 +989,24 @@ fn update_u32_map(object: &mut Object, name: &str, key: u32, value: u32) -> Resu
         .with_context(|| format!("update map {name}"))
 }
 
-fn update_config_maps(object: &mut Object, config: &SkylineConfig, slot: u32) -> Result<()> {
+/// Publishes `config` as configuration number `seq`, which must be one more
+/// than the last: into slot `seq & 1` of `config_slots` -- the slot the
+/// current number does not name, and so the one no flow copies from -- and
+/// only then into `config_seq`. skyline_adopt_config() in skyline_cc.bpf.c is
+/// the other half: a flow copies the slot `config_seq` names and keeps the
+/// copy only if `config_seq` did not move meanwhile, and adopts it only at a
+/// round boundary. Two updates in a row, closer together than a round trip,
+/// are therefore safe: the second never rewrites a slot a flow is reading.
+/// The order of the two writes is what makes that true.
+fn update_config_maps(object: &mut Object, config: &SkylineConfig, seq: u32) -> Result<()> {
     let kernel_config = config.kernel_config();
     {
         let map = find_map_mut(object, "config_slots")?;
+        let slot = seq & 1;
         map.update(&slot.to_ne_bytes(), bytes_of(&kernel_config), MapFlags::ANY)
             .context("update inactive config slot")?;
     }
-    update_u32_map(object, "active_config_slot", 0, slot)
+    update_u32_map(object, "config_seq", 0, seq)
 }
 
 fn redundancy_message(config: &RedundancyConfig, accelerating: bool) -> String {
@@ -1067,6 +1163,7 @@ impl Daemon {
         let retransmit_dscp_stats = self.tc.as_ref().and_then(TcRuntime::retransmit_dscp_stats);
         let redundancy_stats = self.tc.as_ref().and_then(TcRuntime::redundancy_stats);
         let metrics = self.runtime.as_ref().and_then(BpfRuntime::metrics);
+        let metrics_recent = self.runtime.as_ref().and_then(BpfRuntime::metrics_recent);
         RuntimeStatus {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             enabled: self.runtime.is_some(),
@@ -1076,6 +1173,7 @@ impl Daemon {
             active_flows,
             tc_stats,
             metrics,
+            metrics_recent,
             rack_tuning: RackTuningStatus {
                 managed: self.config.rack_tuning,
                 live: read_rack_tuning(),
@@ -2275,6 +2373,47 @@ mod tests {
         assert!(!index.built_in("sch_fq"));
         assert!(index.built_in("sch_fq_codel"));
         assert!(index.built_in("tcp_x"));
+    }
+
+    fn acks(ack_events: u64) -> SkylineMetrics {
+        SkylineMetrics {
+            ack_events,
+            ..SkylineMetrics::default()
+        }
+    }
+
+    #[test]
+    fn recent_metrics_reach_back_about_a_minute() {
+        let start = Instant::now();
+        let mut samples = MetricsSamples::default();
+        assert_eq!(samples.window(start, &acks(5)), None, "nothing read yet");
+
+        // A reading every 5 s for 145 s; only the last window's worth stays.
+        for step in 0..30_u32 {
+            samples.push(
+                start + METRICS_SAMPLE_EVERY * step,
+                acks(u64::from(step) * 100),
+            );
+        }
+        assert_eq!(samples.readings.len(), 14);
+
+        // At 147 s the newest reading at least 60 s old is the one from 85 s.
+        let now = start + Duration::from_secs(147);
+        let window = samples.window(now, &acks(2_950)).expect("a window");
+        assert_eq!(window.seconds, 62);
+        assert_eq!(window.metrics.ack_events, 2_950 - 1_700);
+    }
+
+    #[test]
+    fn recent_metrics_after_a_young_attach_cover_what_there_is() {
+        let start = Instant::now();
+        let mut samples = MetricsSamples::default();
+        samples.push(start, acks(0));
+        samples.push(start + METRICS_SAMPLE_EVERY, acks(40));
+        let window = samples
+            .window(start + Duration::from_secs(7), &acks(90))
+            .expect("a window");
+        assert_eq!((window.seconds, window.metrics.ack_events), (7, 90));
     }
 
     #[test]

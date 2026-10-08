@@ -416,7 +416,7 @@ mod tests {
     use super::*;
     use skyline_common::{
         CapabilityReport, GuardStatus, RackRtoStatus, RackTuningConfig, RackTuningStatus,
-        RedundancyStatus, RetransmitDscpStatus, RuntimeStatus, SkylineConfig,
+        RedundancyStatus, RetransmitDscpStatus, RuntimeStatus, SkylineConfig, SkylineMetrics,
     };
 
     #[test]
@@ -440,7 +440,12 @@ mod tests {
             fallback_cc: shipped.fallback_cc.clone(),
             active_flows: 0,
             tc_stats: None,
-            metrics: None,
+            metrics: Some(SkylineMetrics {
+                ack_events: 326_763,
+                guardrail_hits: 193_027,
+                ..SkylineMetrics::default()
+            }),
+            metrics_recent: None,
             rack_tuning: RackTuningStatus {
                 managed: RackTuningConfig::default(),
                 live: RackTuningConfig::default(),
@@ -495,6 +500,11 @@ mod tests {
         assert!(fields.remove("uptime_s").is_some());
         assert!(fields.remove("attached_s").is_some());
         assert!(fields.remove("redundancy").is_some());
+        assert!(fields.remove("metrics_recent").is_some());
+        // The two counters 0.5.0 added to the metrics.
+        let metrics = fields["metrics"].as_object_mut().expect("metrics object");
+        assert!(metrics.remove("guardrail_rounds").is_some());
+        assert!(metrics.remove("cwnd_cap_hits").is_some());
 
         let decoded: Response = serde_json::from_value(wire).expect("decode an older reply");
         assert!(decoded.flows.is_none());
@@ -506,6 +516,10 @@ mod tests {
         // A daemon from before first-flight redundancy is not copying anything.
         assert!(!decoded.redundancy.active);
         assert!(decoded.enabled);
+        assert_eq!(decoded.metrics_recent, None);
+        let metrics = decoded.metrics.expect("metrics");
+        assert_eq!(metrics.guardrail_hits, 193_027);
+        assert_eq!((metrics.guardrail_rounds, metrics.cwnd_cap_hits), (0, 0));
     }
 
     /// Same absolute-replace trap as `set-module-config`: a bare
@@ -525,6 +539,37 @@ mod tests {
             panic!("set-redundancy --disable did not build a SetRedundancy request");
         };
         assert!(!config.enabled);
+    }
+
+    /// The same trap for `set-rack-rto`: a bare one must send the installed
+    /// template's `[rack_rto]` values, switched on. The template is
+    /// config/speeder-guest.toml -- both install paths put it at
+    /// /etc/skyline-speeder/speeder.toml -- and it leaves the table out, so
+    /// those are the built-in defaults. config/speeder.toml, the file a source
+    /// checkout runs with, carries field-tuned [rack_rto] values instead,
+    /// which `reset-rack-rto` restores there.
+    #[test]
+    fn set_rack_rto_defaults_match_the_installed_config() {
+        let installed =
+            SkylineConfig::load("../../config/speeder-guest.toml").expect("load config");
+
+        let arguments = Arguments::parse_from(["ssctl", "set-rack-rto"]);
+        let Request::SetRackRto { config: from_cli } = request(arguments.command) else {
+            panic!("set-rack-rto did not build a SetRackRto request");
+        };
+        assert_eq!(
+            from_cli,
+            RackRtoConfig {
+                enabled: true,
+                ..installed.rack_rto
+            }
+        );
+
+        let arguments = Arguments::parse_from(["ssctl", "set-rack-rto", "--disable"]);
+        let Request::SetRackRto { config } = request(arguments.command) else {
+            panic!("set-rack-rto --disable did not build a SetRackRto request");
+        };
+        assert_eq!(config, installed.rack_rto);
     }
 
     /// `set-module-config` is absolute-replace: a flag left off the command

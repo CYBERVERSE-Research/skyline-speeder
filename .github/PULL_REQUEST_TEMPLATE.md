@@ -26,7 +26,7 @@ Kernel it ran on: `uname -r` =
 - [ ] Install paths `/opt`, `/etc`, `/run/skyline-speeder` still agree across config, units and scripts
 - [ ] `RuntimeDirectory=` still matches the parent directory of `socket_path`
 - [ ] `checkpath -d /run/skyline-speeder` in `packaging/openrc/skyline-speederd` still matches it too
-- [ ] Config delivery still goes through the double-slot + generation counter (no torn reads)
+- [ ] Config delivery still writes the slot before `config_seq`, and BPF still reads only each flow's own copy (no torn reads)
 - [ ] `[rack_tuning]` in `config/speeder-guest.toml` is still commented out in full, and `guest_config_never_owns_global_sysctls` is untouched
 - [ ] `PRR-SSRB` was not renamed
 

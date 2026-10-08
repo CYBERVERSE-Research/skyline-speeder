@@ -31,7 +31,8 @@
 # call and nothing runs. Do not "simplify" this into top-level statements.
 #
 #   --ref <git-ref>     tag, branch or commit to install (default: main)
-#   --repo <owner/name> source repository (default: CYBERVERSE-Research/skyline-speeder)
+#   --repo <owner/name> repository to fetch the tree and take releases from
+#                       (default: CYBERVERSE-Research/skyline-speeder)
 #   --src-dir <path>    where the tree lands (default: /usr/local/src/skyline-speeder)
 #
 # Any other argument is forwarded to install.sh verbatim (on Alpine the pipe
@@ -92,6 +93,10 @@ main() {
             *)         set -- "$@" "$1"; shift; n=$((n - 1)) ;;
         esac
     done
+    # install.sh looks releases up in SKYLINE_REPO; it has no --repo. Without
+    # this, --repo fetched that repository's installer, which then installed
+    # the default repository's release.
+    export SKYLINE_REPO="$REPO"
 
     [ "$(id -u)" -eq 0 ] || die "must run as root (pipe into 'sudo bash', not 'bash'; on Alpine, run it as root)"
     # The commands printed at the end carry sudo only where there is one.
@@ -206,9 +211,13 @@ main() {
     echo
     "$SRC_DIR/install.sh" "$@"
 
+    # A later run of the kept installer has none of this environment, so a
+    # --repo install says which repository to keep upgrading from.
+    REPO_ENV=''
+    [ "$REPO" = CYBERVERSE-Research/skyline-speeder ] || REPO_ENV="SKYLINE_REPO=$REPO "
     echo
     ok "installer kept at $SRC_DIR -- upgrade or remove from there:"
-    echo "     ${SUDO}$SRC_DIR/install.sh               # upgrade to the latest release"
+    echo "     ${SUDO}${REPO_ENV}$SRC_DIR/install.sh               # upgrade to the latest release"
     echo "     ${SUDO}$SRC_DIR/install.sh --uninstall   # also puts this host on bbr + fq"
 }
 
