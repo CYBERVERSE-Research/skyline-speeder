@@ -73,8 +73,8 @@ socket/系统 sysctl 路径，双栈不需要任何改动；`skyline_cc`（M2/M3
 `tcp_sock`/`sock` 的地址族无关字段，同样不需要改动。改动集中在两处：
 `skyline_tc.bpf.c` 的重传检测新增 IPv6 扩展头遍历分支（有界展开，遇到分片/
 认证头/未知扩展头一律放行不处理），`skyline_policy.bpf.c` 的 family 判断同时
-接受 `AF_INET`/`AF_INET6`（含 IPv4-mapped 地址，见 `docs/01-deployment-
-guide.md` 第 10 节的双栈监听陷阱）。
+接受 `AF_INET`/`AF_INET6`（含 IPv4-mapped 地址，见 `DEPLOY.md` 第 13.5 节的
+双栈监听陷阱）。
 
 ## 3. 共享状态：`skyline_flow_state`
 
@@ -210,8 +210,8 @@ M1 当前只做第一档 + 第二档里 RTO 相关的部分，不涉及需要内
 `enabled=true`，RTO 调节依然独立生效，这正是"受控 cubic"对照条件需要的
 语义。
 
-**排障要点**见 `docs/01-deployment-guide.md` 第 10 节的决策树；两个使用前
-提（cgroup 迁移、双栈监听地址族判断）见该指南第 6 节和第 10 节。
+**排障要点**见 `DEPLOY.md` 第 7 节的诊断表；两个使用前提（cgroup 迁移、
+双栈监听地址族判断）见 `DEPLOY.md` 第 7 节和第 13.5 节。
 
 ## 6. M2：自适应 cwnd
 

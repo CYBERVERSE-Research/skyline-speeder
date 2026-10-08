@@ -290,7 +290,7 @@ BPF 侧的四段配置各自独立维护自己的 ABI 版本号，互不联动�
 | `enabled_modules` | string[] | 启动时启用的 M1-M4 模块子集，取值 `early-loss`/`adaptive-cwnd`/`loss-classifier`/`pacing` | 是（`ssctl enable`） |
 | `prr_pacing_enabled` | bool | 框架级 PRR 重实现开关，独立于上面四个模块——即使 `enabled_modules` 为空也默认生效（修正的是"绕开内核 PRR 后基线不对等"这个问题，不是可选特性）。M2 开启时该路径不会被执行 | 是（`set-module-config`） |
 | `auto_pacing_enabled` | bool | M4 关闭时使用的、等价于内核默认行为的 pacing 速率上限，独立开关，语义同上 | 是（`set-module-config`） |
-| `fallback_cc` | string | 未启用/摘除 `skyline_cc` 时新连接使用的拥塞控制算法名（每次 enable 挂载前、`ssctl drain`、enable unit 的 ExecStop 都写它），必须是内核已注册的算法，或可由内核自动加载的模块 `tcp_<名字>`。模板值 `cubic`；`install.sh` 新建配置时换成开机 sysctl 配置选定的算法（见 `docs/01-deployment-guide.md` 第 4 节） | 否 |
+| `fallback_cc` | string | 未启用/摘除 `skyline_cc` 时新连接使用的拥塞控制算法名（每次 enable 挂载前、`ssctl drain`、enable unit 的 ExecStop 都写它），必须是内核已注册的算法，或可由内核自动加载的模块 `tcp_<名字>`。模板值 `cubic`；`install.sh` 新建配置时换成开机 sysctl 配置选定的算法（见 `DEPLOY.md` 第 2.4 节） | 否 |
 | `max_pacing_mbps` | u64 | pacing 速率硬上限（Mbps），`pacing` 模块启用时不可为 0 | 是 |
 | `max_cwnd_packets` | u32 | cwnd 硬上限（包），最小值 4 | 是 |
 | `max_queue_delay_ms` | u32 | 队列时延护栏的固定基准值（毫秒） | 是 |
@@ -581,6 +581,6 @@ journalctl -u skyline-speederd.service | grep 'guard:'
 `interval_s = 0` 也是挂载期间让手工改回的默认拥塞控制保持下去的唯一办法（例如只想让
 `/sys/fs/cgroup/skyline-speeder` 里的进程走 `skyline_cc`）；但这只维持到下一次 `enable`，
 包括开机时 `skyline-speeder-enable.service` 执行的那一次，见
-`docs/01-deployment-guide.md` 第 7 节。
+`DEPLOY.md` 第 5.2 节。
 guard 不修改 `/etc/sysctl.conf`、`/etc/sysctl.d` 里的任何文件——那些文件每次开机仍会先
 生效一次，随后被 `enable` 覆盖。`install.sh` 会在安装结束时列出这类文件。

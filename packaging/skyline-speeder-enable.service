@@ -1,6 +1,6 @@
 [Unit]
 Description=Attach Skyline Speeder skyline_cc and select it, with the fq qdisc, as the system TCP congestion control
-Documentation=https://github.com/CYBERVERSE-Research/skyline-speeder/blob/main/docs/01-deployment-guide.md
+Documentation=https://github.com/CYBERVERSE-Research/skyline-speeder/blob/main/DEPLOY.md
 After=skyline-speederd.service
 Requires=skyline-speederd.service
 

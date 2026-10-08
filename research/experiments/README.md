@@ -77,7 +77,7 @@ infra/wait-for-guests.sh
 infra/kernel/fetch-source.sh
 infra/kernel/build.sh
 infra/kernel/deploy.sh build/kernel --confirm-install-kernel
-# 两台 guest 重启并确认 uname -r 满足 docs/01-deployment-guide.md 第 2 节
+# 两台 guest 重启并确认 uname -r 满足 DEPLOY.md 第 1.3 节
 # 的内核版本要求后，在宿主仓库根目录（不是 guest 上——cloud-init 镜像本身
 # 不包含仓库 checkout，infra/install-guest.sh 要求在运行它的机器本地就是
 # 仓库根目录，这个前提在这套测试床上不成立）：

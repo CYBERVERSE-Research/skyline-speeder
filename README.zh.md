@@ -220,9 +220,9 @@ skyline-speeder/
 ├── packaging/                    systemd 单元；openrc/ 是给 OpenRC 的同样两个服务
 ├── infra/                        安装辅助、cgroup 工具、双 VM 测试床
 ├── research/experiments/         测试 manifest、执行、分析与现场测量
-├── docs/                         使用指南、部署、接口参考、设计、性能报告
+├── docs/                         使用指南、接口参考、设计、性能报告
 ├── CHANGELOG.md                  版本说明与升级步骤
-├── DEPLOY.md                     面向自动化 agent 的确定性部署手册
+├── DEPLOY.md                     部署与运维手册，面向自动化 agent
 └── CONTRIBUTING.md               改动不能破坏的不变量
 ```
 
@@ -256,12 +256,11 @@ Debian 12 上跑 `bookworm-backports` 的 6.12 内核时，`libelf-dev` 也要�
 | 文档 | 内容 |
 |---|---|
 | **[docs/usage.md](docs/usage.md)** | **新手向：每个开关和参数、现成配方、排障** |
-| [docs/01-deployment-guide.md](docs/01-deployment-guide.md) | 构建、安装、配置、验证、调参、回滚 |
+| [DEPLOY.md](DEPLOY.md) | 部署与运维手册，面向自动化 agent、运维同样照它操作：前置条件、安装、验证门禁、升级、排障、卸载 |
 | [docs/02-interface-reference.md](docs/02-interface-reference.md) | `ssctl` 命令、控制面线协议、配置字段、事件码 |
 | [docs/03-design.md](docs/03-design.md) | 架构与各模块的实现原理 |
 | [docs/04-performance-report.md](docs/04-performance-report.md) | 受控测试床：环境、与 bbr 对比的结果、局限性 |
 | [research/experiments/README.md](research/experiments/README.md) | 复现性能测试 |
-| [DEPLOY.md](DEPLOY.md) | 面向自动化 agent 的确定性部署手册 |
 
 ## 参与贡献
 

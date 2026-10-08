@@ -10,6 +10,46 @@ for anyone holding a prebuilt `.bpf.o`.
 
 ## [Unreleased]
 
+### Changed
+
+- **`DEPLOY.md` is the one deployment manual; `docs/01-deployment-guide.md` is
+  gone.** The two covered the same ground -- prerequisites, install paths,
+  upgrade, the cgroup, verification, the guard, removal -- and had drifted
+  apart: they disagreed on the build packages, on which hosts get the prebuilt
+  artifact, on how a manually installed host attaches at boot and on what a
+  drain that times out leaves behind. What only the guide had is in DEPLOY.md
+  now (what each installer step does, the packages and records it keeps, the
+  files it installs, OpenRC, configuration and tuning, observability), along
+  with what neither had: every installer flag and environment variable, the
+  exit-status rules, a symptom-to-section table, how to detach for good and how
+  to go back to an older release. Every reference, the issue template's link
+  and both units' `Documentation=` point at DEPLOY.md; units installed by
+  0.4.4 and earlier keep the old link until the next release replaces them.
+
+### Fixed
+
+- **The deployment checks passed with nothing attached.** DEPLOY.md's success
+  check and gate G5 were `ssctl status --json | grep -q '"enabled": true'`,
+  which also matches `redundancy.config.enabled` -- `true` by default since
+  0.4.0. They read `status.enabled` itself now, the way install.sh does, and
+  no check in the manual needs python3 any more.
+- **The dynamic-RTO decision tree started from the wrong counter.** It read
+  `rtt_callbacks = 0` as "the process is not in the cgroup", but RTO tuning is
+  off after every daemon start whatever the configuration says, and then that
+  counter never moves for anyone. `established_cb` ("connections seen") is the
+  cgroup test; the tree now says so and says how to turn the tuning on.
+- **`ssctl reset-rack-rto` was given as the way to turn RTO tuning off.** It
+  restores the configuration file's `[rack_rto]`, which turns it on where the
+  file enables it; `ssctl set-rack-rto --disable` is the off switch.
+- The manual also said that without `ssctl enable` new connections use
+  `fallback_cc` (they keep the host's default: the daemon writes no sysctl
+  until then), that a drain which times out leaves skyline_cc attached until
+  the last flow ends (until a later drain completes or the daemon stops), that
+  a bare-`ssctl enable` host is also recognised by the old daemon's `enabled`
+  (the installer goes by the live default alone), that `--verbose` prints the
+  same step lines, and that a substituted apt version which would remove
+  packages only warns (the installer stops).
+
 ## [0.4.4] - 2026-10-06
 
 ### Upgrading from 0.4.3

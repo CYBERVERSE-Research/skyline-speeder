@@ -149,7 +149,7 @@ daemon 重启会把 per-case 精确值悄悄覆盖回默认值。
 | ABI 结构体 | `skyline_abi.h` + `crates/skyline-common` + `SKYLINE_ABI_VERSION` |
 | `ssctl` 命令/字段 | `docs/02-interface-reference.md` |
 | 配置字段 | `config/*.toml` + `docs/02-interface-reference.md` §6 |
-| 安装流程 | `docs/01-deployment-guide.md` + `DEPLOY.md` + `install.sh` + `scripts/bootstrap.sh` |
+| 安装流程 | `DEPLOY.md` + `install.sh` + `scripts/bootstrap.sh`（面向用户的部分还有两份 README 与 `docs/usage.md`） |
 | README 里任何面向用户的内容 | **`README.md`（英文）和 `README.zh.md`（中文）必须同时改** |
 | 硬性不变量 / 贡献流程 | `CONTRIBUTING.md`（本文件的不变量表在那里有一份面向外部贡献者的英文版）|
 | 算法行为 | `docs/03-design.md`，性能声明须有 `docs/04-performance-report.md` 数据支撑 |

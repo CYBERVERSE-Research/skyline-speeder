@@ -33,7 +33,7 @@ Kernel it ran on: `uname -r` =
 - [ ] ABI change → `skyline_abi.h` + `crates/skyline-common` + `SKYLINE_ABI_VERSION`
 - [ ] `ssctl` command or field → `docs/02-interface-reference.md`
 - [ ] Config field → `config/*.toml` + `docs/02-interface-reference.md` §6
-- [ ] Install flow → `docs/01-deployment-guide.md` + `DEPLOY.md` + `install.sh`
+- [ ] Install flow → `DEPLOY.md` + `install.sh` + `scripts/bootstrap.sh`
 - [ ] Algorithm behaviour → `docs/03-design.md`
 - [ ] User-facing README change → **both** `README.md` and `README.zh.md`
 

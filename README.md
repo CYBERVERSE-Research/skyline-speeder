@@ -218,9 +218,9 @@ skyline-speeder/
 ├── packaging/                    systemd units; openrc/ holds the same two services for OpenRC
 ├── infra/                        install helpers, cgroup wrapper, two-VM test bed
 ├── research/experiments/         test manifests, runner, analysis, field measurements
-├── docs/                         usage guide, deployment, interface reference, design, performance report
+├── docs/                         usage guide, interface reference, design, performance report
 ├── CHANGELOG.md                  release notes and upgrade instructions
-├── DEPLOY.md                     deterministic deployment manual for automation agents
+├── DEPLOY.md                     deployment and operations manual, written for automation agents
 └── CONTRIBUTING.md               invariants a change must not break
 ```
 
@@ -251,17 +251,16 @@ On a Debian 12 host running a 6.12 kernel from `bookworm-backports`, `libelf-dev
 
 ## Documentation
 
-The documents under `docs/` are in Chinese.
+The documents under `docs/` and DEPLOY.md are in Chinese.
 
 | Document | Contents |
 |---|---|
 | [docs/usage.md](docs/usage.md) | Beginner-facing: every switch and parameter, presets, troubleshooting |
-| [docs/01-deployment-guide.md](docs/01-deployment-guide.md) | Build, install, configure, verify, tune, roll back |
+| [DEPLOY.md](DEPLOY.md) | The deployment and operations manual, written for automation agents and followed by operators too: prerequisites, install, verification gates, upgrade, troubleshooting, removal |
 | [docs/02-interface-reference.md](docs/02-interface-reference.md) | `ssctl` commands, wire protocol, config fields, event codes |
 | [docs/03-design.md](docs/03-design.md) | Architecture and how each module works |
 | [docs/04-performance-report.md](docs/04-performance-report.md) | Controlled test bed: environment, results against bbr, limitations |
 | [research/experiments/README.md](research/experiments/README.md) | Reproducing the performance tests |
-| [DEPLOY.md](DEPLOY.md) | Deterministic deployment manual for automation agents |
 
 ## Contributing
 
