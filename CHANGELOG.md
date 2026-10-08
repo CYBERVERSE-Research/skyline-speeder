@@ -49,6 +49,53 @@ for anyone holding a prebuilt `.bpf.o`.
   (the installer goes by the live default alone), that `--verbose` prints the
   same step lines, and that a substituted apt version which would remove
   packages only warns (the installer stops).
+- **`docs/usage.md` turned dynamic RTO "off" with a command that can turn it
+  on, and its "all modules on" step left them off.** `reset-rack-rto` restores
+  the file's `[rack_rto]`; the off switch is `set-rack-rto --disable`, and the
+  file's values reach BPF only through `reset-rack-rto` (the guide said
+  `set-rack-rto`, which sends its own defaults). A bare `ssctl enable` keeps the
+  current module set, so after `--all-off` the A/B recipe compared the baseline
+  with itself; the recipes name the four modules now. Also corrected there:
+  `--guardrail-gain 0` acts as 1.0 instead of switching the guardrail off; hosts
+  that kept a 0.2.0 or 0.3.x configuration (`min_cwnd_packets = 4`) are upgrade
+  exceptions as much as 0.1.0 ones; which table each coefficient lives in (a
+  key in the wrong table is silently ignored); the stall script's
+  retransmission share and its table, now of all segments sent; `fallback_cc`
+  defaults to the algorithm the host boots with.
+- **`docs/02-interface-reference.md`:** `ssctl validate` checks the daemon's
+  in-memory configuration, not the file; every subcommand prints a readable
+  report unless given `--json`; the event log's key is `type`; `metrics` is
+  `null` whenever nothing is attached; `pin_dir` is not used; `gso_packets`
+  counts packets. It now defines the `rack_rto.stats` and
+  `retransmit_dscp.stats` counters, `--disable-prr-pacing` and
+  `--disable-auto-pacing`, `set-rack-rto`'s built-in defaults, the `shutdown`
+  request any client of the socket can send, the one-request-at-a-time loop a
+  drain holds up, where `snapshot` can write and that `state.json` is not live.
+- **`docs/03-design.md`:** the guardrail overrides the loss compensation for
+  pacing only -- the clamped cwnd target is BDP x `guardrail_gain` x 1/(1-p);
+  with M2 off there is no guardrail at all; auto-pacing follows M4, not M2;
+  redundancy also copies retransmissions inside its range, so nothing bounds
+  it per connection; TC statistics count on any device; the RTO ceiling needs
+  Linux 6.15 and defaults to off; `ssctl flows` lists connections. The
+  double-slot configuration switch is described with the precondition nothing
+  enforces: two updates within one RTT hand some live flows a slot that is
+  being rewritten.
+- **`docs/04-performance-report.md`:** the 208k `guardrail_hits` of
+  `intercontinental-clean` are cwnd-cap hits, not guardrail trips; the
+  `volatile-bandwidth-cliff` link loses 0.5% outside its 8% burst, the
+  queue-build segment included; `reorder-dsack`'s correlation is 25%;
+  `skyline-rto-baseline` turns off all of tier-2, not only the ceiling, so the
+  survival it shows is no longer credited to the ceiling alone, and the
+  902-1129 ms maxima are no longer read as the ceiling at work (the clamp
+  starts at 1000 ms).
+- **`CLAUDE.md`, `CONTRIBUTING.md`, both READMEs and the templates:** nothing
+  refuses a mismatched `SKYLINE_ABI_VERSION` at load time -- the BPF side
+  ignores the configuration, so skyline_cc silently stops adjusting anything;
+  the cgroup symptom is `established_cb`, not `applied`; `make bpf` need not run
+  on the target kernel; `make check` needs Python 3.11 (`PYTHON=`); SPDX
+  headers are on the BPF and Rust sources; the issue templates ask for
+  `ssctl flows` beside `ssctl status` and cover Alpine; the PR template lists
+  the two invariants it was missing.
 
 ## [0.4.4] - 2026-10-06
 

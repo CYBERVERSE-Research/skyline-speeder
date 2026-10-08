@@ -5,10 +5,11 @@
 #
 #   CAN   compile the three CO-RE BPF objects, build and test the Rust control
 #         plane, lint the shell scripts, run the experiment-harness unit tests.
-#   CANNOT load any BPF object. GitHub runners do not run a 6.12+ kernel and the
+#   CANNOT load any BPF object: no job runs the kernel verifier, so a green
+#         check says nothing about whether the objects load. That is checked by
+#         hand on a test host running a supported kernel (6.12 or later; the
 #         four-argument `cong_control` signature skyline_cc depends on does not
-#         exist below 6.10, so the verifier would reject it for reasons that say
-#         nothing about the change under review.
+#         exist below 6.10).
 #   CANNOT produce performance numbers. Those come only from the two-VM test bed
 #         described in research/experiments/README.md.
 #
