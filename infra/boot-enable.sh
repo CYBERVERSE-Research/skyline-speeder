@@ -3,9 +3,10 @@
 #
 # skyline-speederd.service only keeps the daemon resident: it deliberately does NOT
 # attach the skyline_cc struct_ops, because attaching is an explicit operator
-# action (see docs/01-deployment-guide.md section 7). Without this step a reboot
-# comes back with the daemon running and every new flow on `fallback_cc` -- a
-# silent regression, since nothing reports an error.
+# action (see DEPLOY.md section 5). Without this step a reboot comes back with
+# the daemon running and every new flow on whatever the host's default
+# congestion control is -- the daemon writes no sysctl until `ssctl enable` --
+# a silent regression, since nothing reports an error.
 #
 # `ssctl enable` owns all of activation: it attaches the struct_ops, then
 # switches net.ipv4.tcp_congestion_control to skyline_cc, and -- with [guard]

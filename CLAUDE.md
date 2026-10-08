@@ -20,8 +20,10 @@ cargo build --workspace --release
 infra/build-musl.sh               # musl（Alpine）版控制面，在 Alpine 3.21 容器里构建；发布流水线与 CI 用的就是它
 make check                        # cargo fmt --check + cargo check + 单元测试
 make test                         # 含 cargo test
+# 实验框架的测试要 Python ≥ 3.11（tomllib）；make venv 依赖 pyenv，没有 pyenv 就
+# make check PYTHON="$(command -v python3)"
 
-# 不留运行状态地过一遍内核验证器 —— 提交前必做
+# 不挂载、不写 sysctl 地过一遍内核验证器 —— 提交前必做
 skyline-speederd --config config/speeder.toml --validate-only --verify-bpf
 ```
 
@@ -48,7 +50,7 @@ vmlinux.h 只需要**定义**代码用到的类型，不必来自最终运行的
 | 标识符 | 位置 | 约束 |
 |---|---|---|
 | `.name = "skyline_cc"` | `bpf/skyline_cc.bpf.c` | 算法注册名，**≤ 15 字符**（`TCP_CA_NAME_MAX` 为 16 含 NUL） |
-| `SKYLINE_ABI_VERSION` | `bpf/include/skyline_abi.h` | 布局变更必须递增，用户态据此拒绝加载不匹配的对象 |
+| `SKYLINE_ABI_VERSION` | `bpf/include/skyline_abi.h` | 布局变更必须递增。加载时**没有**谁拒绝不匹配的一对：BPF 侧拿它和用户态写进配置槽的版本比对，不一致就当作没有配置，`skyline_cc` 对所有连接都不再调整 cwnd 与 pacing，且不报错。递增它，是让半新半旧的组合停摆，而不是误读结构体 |
 | `cong_control` 4 参数签名 | `bpf/skyline_cc.bpf.c` | `(sk, ack, flag, rs)`，内核 >= 6.10 才有 |
 | struct_ops 双变体 `skyline_cc` / `skyline_cc_txs` | `bpf/skyline_cc.bpf.c` | 两张 map 挂**同一组回调**，只有 TX_START 的入口不同（`cwnd_event` / 7.1 起的 `cwnd_event_tx_start`）；daemon 按内核 BTF 只创建其中一张。**给一张加回调，另一张也要加**，否则行为随内核版本悄悄不同 |
 | 安装路径 `/opt|/etc|/run/skyline-speeder` | 配置、unit（含 `packaging/openrc/` 的两个 OpenRC 脚本）、脚本 | 三处必须一致 |
@@ -70,8 +72,8 @@ vmlinux.h 只需要**定义**代码用到的类型，不必来自最终运行的
 以下三处出问题时**不报任何错误**，只是不生效。改动相关代码时格外小心：
 
 1. **cgroup 未迁移**：`skyline_policy` 挂在 `/sys/fs/cgroup/skyline-speeder`，
-   进程不在其中就不会经过该 BPF 程序。表现为 `rack_rto.stats.applied` 恒为 0。
-   诊断决策树见 `DEPLOY.md` §7。
+   进程不在其中就不会经过该 BPF 程序。表现为 `rack_rto.stats.established_cb`（`ssctl flows`
+   的 connections seen）恒为 0。诊断表见 `DEPLOY.md` §7。
 
 2. **未执行 `enable`**：`skyline-speederd` 启动后**不会自动挂载** `skyline_cc`，
    必须显式 `ssctl enable`。`skyline-speeder-enable.service` 正是为消除这个
@@ -142,6 +144,20 @@ daemon 重启会把 per-case 精确值悄悄覆盖回默认值。
 - `known_hosts`、密钥、填好的实验室清单
 - 任何 `/home/<用户名>` 形式的绝对路径
 
+## 文档地图
+
+| 文档 | 读者与内容 |
+|---|---|
+| `README.md` / `README.zh.md` | 用户：项目简介、实测性能、快速开始（中英内容必须一致） |
+| `DEPLOY.md` | **唯一的部署与运维手册**，面向自动化 agent，人也照它操作：前置条件、安装器的每一步、验证门禁、cgroup、guard、升级、卸载、排障 |
+| `docs/usage.md` | 新手：每个开关与参数、四档配方、动态 RTO、DSCP、连接卡顿排查 |
+| `docs/02-interface-reference.md` | `ssctl` 命令、线协议、状态字段与计数器、配置字段、事件码、guard 规则 |
+| `docs/03-design.md` | 各模块的机制、取舍与开放问题 |
+| `docs/04-performance-report.md` | 双 VM 测试床的数据、有效性边界与局限 |
+| `research/experiments/README.md` | 实验框架与复现方法 |
+| `CHANGELOG.md` | 每个版本的变化与 *Upgrading from ...* 升级注意事项 |
+| `CONTRIBUTING.md` | 本文件约定的英文版，面向外部贡献者 |
+
 ## 文档同步要求
 
 | 改动 | 需同步 |
@@ -149,7 +165,7 @@ daemon 重启会把 per-case 精确值悄悄覆盖回默认值。
 | ABI 结构体 | `skyline_abi.h` + `crates/skyline-common` + `SKYLINE_ABI_VERSION` |
 | `ssctl` 命令/字段 | `docs/02-interface-reference.md` |
 | 配置字段 | `config/*.toml` + `docs/02-interface-reference.md` §6 |
-| 安装流程 | `docs/01-deployment-guide.md` + `DEPLOY.md` + `install.sh` + `scripts/bootstrap.sh` |
+| 安装流程 | `DEPLOY.md` + `install.sh` + `scripts/bootstrap.sh`（面向用户的部分还有两份 README 与 `docs/usage.md`） |
 | README 里任何面向用户的内容 | **`README.md`（英文）和 `README.zh.md`（中文）必须同时改** |
 | 硬性不变量 / 贡献流程 | `CONTRIBUTING.md`（本文件的不变量表在那里有一份面向外部贡献者的英文版）|
 | 算法行为 | `docs/03-design.md`，性能声明须有 `docs/04-performance-report.md` 数据支撑 |

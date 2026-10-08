@@ -4,8 +4,8 @@
 
 ## Verifier
 
-CI compiles the BPF objects but **cannot load them** — GitHub runners are below
-the 6.12 kernel floor. Paste your local run:
+CI compiles the BPF objects but **does not load them**. Paste your run on a
+6.12 or later kernel:
 
 ```
 $ skyline-speederd --config config/speeder.toml --validate-only --verify-bpf
@@ -22,8 +22,10 @@ Kernel it ran on: `uname -r` =
 - [ ] `.name = "skyline_cc"` is still ≤ 15 characters
 - [ ] ABI layout unchanged, **or** `SKYLINE_ABI_VERSION` bumped and `crates/skyline-common` updated to match
 - [ ] `cong_control` still declared with 4 arguments `(sk, ack, flag, rs)`
+- [ ] The `skyline_cc` and `skyline_cc_txs` struct_ops maps still set the same callbacks
 - [ ] Install paths `/opt`, `/etc`, `/run/skyline-speeder` still agree across config, units and scripts
 - [ ] `RuntimeDirectory=` still matches the parent directory of `socket_path`
+- [ ] `checkpath -d /run/skyline-speeder` in `packaging/openrc/skyline-speederd` still matches it too
 - [ ] Config delivery still goes through the double-slot + generation counter (no torn reads)
 - [ ] `[rack_tuning]` in `config/speeder-guest.toml` is still commented out in full, and `guest_config_never_owns_global_sysctls` is untouched
 - [ ] `PRR-SSRB` was not renamed
@@ -33,7 +35,7 @@ Kernel it ran on: `uname -r` =
 - [ ] ABI change → `skyline_abi.h` + `crates/skyline-common` + `SKYLINE_ABI_VERSION`
 - [ ] `ssctl` command or field → `docs/02-interface-reference.md`
 - [ ] Config field → `config/*.toml` + `docs/02-interface-reference.md` §6
-- [ ] Install flow → `docs/01-deployment-guide.md` + `DEPLOY.md` + `install.sh`
+- [ ] Install flow → `DEPLOY.md` + `install.sh` + `scripts/bootstrap.sh`
 - [ ] Algorithm behaviour → `docs/03-design.md`
 - [ ] User-facing README change → **both** `README.md` and `README.zh.md`
 

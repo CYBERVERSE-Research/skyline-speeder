@@ -50,7 +50,7 @@
 | `target-box.toml` | 目标部署环境网格（核心性能结果来源） |
 | `target-box-rtt300-samples.toml` | 高 RTT 点加样本，提升该点的统计置信度 |
 | `bandwidth-sweep.toml` | 带宽敏感性 |
-| `neutrality.toml` | 中性性检查（模块全关 vs 内核原生 CUBIC，零丢包） |
+| `neutrality.toml` | 中性性检查：模块全关（`b2-skyline-base`）对内核 CUBIC（`b1-controlled-cubic`），另有模块全开的 `skyline-best` 作参照；门槛只看 `line-rate`（`analyze_results.py` 的 `parity_scenario`）；`dc-lowrtt` 一并报告但不作门槛，另有 `light-loss`（0.1%）与 `primary`（0.5%）两个轻丢包场景 |
 | `guardrail-gain-ab.toml` | 隔离验证 `guardrail_gain` 系数的作用 |
 | `rto-max-validation.toml` | 隔离验证 M1 tier-2 RTO 上限机制的作用 |
 | `rto-max-smoke.toml` | RTO 上限机制端到端冒烟 |
@@ -77,7 +77,7 @@ infra/wait-for-guests.sh
 infra/kernel/fetch-source.sh
 infra/kernel/build.sh
 infra/kernel/deploy.sh build/kernel --confirm-install-kernel
-# 两台 guest 重启并确认 uname -r 满足 docs/01-deployment-guide.md 第 2 节
+# 两台 guest 重启并确认 uname -r 满足 DEPLOY.md 第 1.3 节
 # 的内核版本要求后，在宿主仓库根目录（不是 guest 上——cloud-init 镜像本身
 # 不包含仓库 checkout，infra/install-guest.sh 要求在运行它的机器本地就是
 # 仓库根目录，这个前提在这套测试床上不成立）：

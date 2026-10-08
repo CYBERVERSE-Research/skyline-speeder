@@ -22,10 +22,18 @@ make check                        # cargo fmt --check + cargo check + unit tests
 make test                         # includes cargo test
 ```
 
-`make bpf` reads type information from **this machine's** `/sys/kernel/btf/vmlinux`,
-so it must run on the target kernel, or be pointed at BTF explicitly with
-`make VMLINUX_BTF=<path> bpf`. `bpf/include/vmlinux.h` is a build artefact and is
-never committed.
+`make bpf` reads type information from **this machine's** `/sys/kernel/btf/vmlinux`
+by default. Point it at another kernel's BTF with `make VMLINUX_BTF=<path> bpf`, or
+hand it a ready-made header with `make PREBUILT_VMLINUX_H=<path> bpf` -- that path
+needs neither bpftool nor this machine's BTF, and it is how releases are built.
+The header only has to define the types the code uses, not come from the kernel
+the objects will run on: it is generated with `preserve_access_index`, so every
+field access carries a CO-RE relocation that libbpf fixes against the running
+kernel's BTF at load time (built on 6.12.63 and loaded on 6.19.14, and the other
+way round; `infra/kernel/core-portability.sh` reproduces it). CO-RE cannot fix a
+field that was renamed or removed, so after a data-plane change, rerun that script
+before relying on it. `bpf/include/vmlinux.h` is a build artefact and is never
+committed.
 
 A vmlinux.h generated this way is compiled with `-DBPF_NO_KFUNC_PROTOTYPES`: from
 7.5 on, bpftool writes a prototype for every kfunc the running kernel exports, and
@@ -39,7 +47,8 @@ released objects stay byte for byte the same.
 `make check` and `make test` drive a Python venv for the experiment-harness unit
 tests, which need **Python 3.11 or newer** (`research/experiments/matrix_lib.py`
 imports `tomllib`; on 3.10 and earlier the tests fail at import). Either run
-`make venv` once, or point them at any suitable interpreter:
+`make venv` once (it creates the venv through pyenv), or point them at any
+suitable interpreter:
 
 ```bash
 make check PYTHON=$(command -v python3)
@@ -47,16 +56,16 @@ make check PYTHON=$(command -v python3)
 
 ### Required before every commit
 
-Push all three objects through the kernel verifier without leaving runtime state
-behind:
+Push all three objects through the kernel verifier, attaching nothing and writing
+no sysctl:
 
 ```bash
 skyline-speederd --config config/speeder.toml --validate-only --verify-bpf
 ```
 
 Paste the result into your pull request. A change that has not been through the
-verifier is not reviewable, and CI cannot do this for you — GitHub runners do not
-run a 6.12+ kernel, so CI compiles the objects but cannot load them.
+verifier is not reviewable, and CI cannot do this for you: it compiles the
+objects but no job loads them.
 
 ## Hard invariants
 
@@ -65,7 +74,7 @@ Breaking any of these is a defect regardless of what else the change does.
 | Identifier | Location | Constraint |
 |---|---|---|
 | `.name = "skyline_cc"` | `bpf/skyline_cc.bpf.c` | Registration name, **≤ 15 characters** (`TCP_CA_NAME_MAX` is 16 including NUL) |
-| `SKYLINE_ABI_VERSION` | `bpf/include/skyline_abi.h` | Must be incremented on any layout change; userspace refuses to load a mismatched object |
+| `SKYLINE_ABI_VERSION` | `bpf/include/skyline_abi.h` | Must be incremented on any layout change. Nothing refuses a mismatched pair at load time: the BPF side compares it with the version userspace writes into each config slot and ignores a slot that does not match, so `skyline_cc` stops adjusting cwnd and pacing on every connection -- without an error. The bump is what makes a half-updated pair stop instead of misreading the struct |
 | `cong_control` 4-argument signature | `bpf/skyline_cc.bpf.c` | `(sk, ack, flag, rs)` — exists only on kernel >= 6.10 |
 | Two struct_ops maps, `skyline_cc` / `skyline_cc_txs` | `bpf/skyline_cc.bpf.c` | Both set **the same callbacks** and differ only in where CA_EVENT_TX_START arrives (`cwnd_event`, or `cwnd_event_tx_start` from Linux 7.1); the daemon creates one of them, by the kernel's BTF. **A callback added to one goes into the other too**, or the behaviour silently depends on the kernel version |
 | Install paths `/opt`, `/etc`, `/run/skyline-speeder` | config, units (the two OpenRC scripts in `packaging/openrc/` included), scripts | All three must agree |
@@ -96,8 +105,8 @@ careful around the code that touches them.
 
 1. **cgroup not migrated.** `skyline_policy` attaches to
    `/sys/fs/cgroup/skyline-speeder`; a process outside it never traverses that
-   BPF program. Symptom: `rack_rto.stats.applied` stays at 0. Decision tree in
-   `DEPLOY.md` section 7.
+   BPF program. Symptom: `rack_rto.stats.established_cb` ("connections seen" in
+   `ssctl flows`) stays at 0. Decision table in `DEPLOY.md` section 7.
 2. **`enable` never run.** `skyline-speederd` does **not** attach `skyline_cc`
    on startup — `ssctl enable` is required. `skyline-speeder-enable.service`
    exists precisely to remove this silent failure. **Do not delete it on the
@@ -188,7 +197,7 @@ and **must not be used to draw performance conclusions**.
 | ABI struct | `skyline_abi.h` + `crates/skyline-common` + `SKYLINE_ABI_VERSION` |
 | `ssctl` command or field | `docs/02-interface-reference.md` |
 | Config field | `config/*.toml` + `docs/02-interface-reference.md` section 6 |
-| Install flow | `docs/01-deployment-guide.md` + `DEPLOY.md` + `install.sh` + `scripts/bootstrap.sh` |
+| Install flow | `DEPLOY.md` + `install.sh` + `scripts/bootstrap.sh` (and both READMEs and `docs/usage.md` where they describe it) |
 | Algorithm behaviour | `docs/03-design.md`; performance claims need data in `docs/04-performance-report.md` |
 | Anything user-facing in the README | Both `README.md` and `README.zh.md` |
 
@@ -236,8 +245,9 @@ deliberate: falling back to the runner's own BTF would silently ship objects
 built against a newer kernel, and the failure would land on a 6.12 user's
 machine rather than in CI.
 
-After a release, verify the shipped objects load on a kernel other than the one
-they were built against:
+A release that changes the data plane is checked before it is tagged: build the
+objects the way `release.yml` does, freeze them on one kernel and verify that they
+load on another. The same script checks an unpacked artifact after the release:
 
 ```bash
 SKYLINE_BPF_DIR=<unpacked artifact>/bpf infra/kernel/core-portability.sh freeze
@@ -284,8 +294,9 @@ See `.gitignore`. In particular:
 
 This repository is **GPL-2.0-only** throughout. See `LICENSE` and `NOTICE`.
 
-Every file carries an `SPDX-License-Identifier`. Keep it when you edit a file,
-and add one to any file you create.
+Every BPF and Rust source carries an `SPDX-License-Identifier` (the scripts,
+configuration and documents do not yet). Keep it when you edit a file, and add
+one to any file you create.
 
 By contributing you agree that your contribution is licensed under GPL-2.0-only,
 and that you have the right to grant this — in particular, that you are not

@@ -55,8 +55,8 @@ body:
   - type: textarea
     id: status
     attributes:
-      label: ssctl status
-      description: Full output, taken while the slow transfer is running.
+      label: ssctl status and ssctl flows
+      description: Full output of both, taken while the slow transfer is running -- `flows` shows the connections and what the algorithm decided. It lists peer addresses; mask them before posting.
       render: shell
     validations:
       required: true

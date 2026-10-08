@@ -9,10 +9,11 @@ body:
         far the most common reports. Please rule them out before filing:
 
         1. `ssctl enable` was never run — the daemon does not attach `skyline_cc` on startup.
-        2. The process is not inside `/sys/fs/cgroup/skyline-speeder` — the dynamic RTO half never runs. Symptom: `rack_rto.stats.applied` stays at 0.
+        2. The process is not inside `/sys/fs/cgroup/skyline-speeder` — the dynamic RTO half never runs. Symptom: `rack_rto.stats.established_cb` ("connections seen" in `ssctl flows`) stays at 0.
         3. `runtime.tc_interface` points at the wrong NIC.
 
-        The decision tree is in `DEPLOY.md` section 7.
+        The diagnosis table is in `DEPLOY.md` section 7; section 13 starts with a
+        symptom-to-section table for everything else.
 
   - type: checkboxes
     id: ruled-out
@@ -50,6 +51,7 @@ body:
       label: How was it installed
       options:
         - scripts/bootstrap.sh (curl | sudo bash)
+        - scripts/bootstrap.sh on Alpine (wget | sh)
         - git clone + sudo ./install.sh
         - built by hand (make bpf + cargo build)
         - other
@@ -67,8 +69,8 @@ body:
   - type: textarea
     id: status
     attributes:
-      label: ssctl status
-      description: Full output. This carries the capability probe results and the decision counters, and is the single most useful thing in the report.
+      label: ssctl status and ssctl flows
+      description: Full output of `ssctl status --json` and `ssctl flows --json`. `status` carries the capability probe results and the guard, `flows` the accelerated connections, the parameters in force and the decision counters; together they are the single most useful thing in the report. `flows` lists peer addresses -- mask them before posting.
       render: shell
     validations:
       required: true
@@ -87,5 +89,5 @@ body:
     id: journal
     attributes:
       label: Daemon log
-      description: "`journalctl -u skyline-speederd.service -n 100 --no-pager`"
+      description: "`journalctl -u skyline-speederd.service -n 100 --no-pager` (Alpine/OpenRC: `grep skyline-speederd /var/log/messages | tail -n 100`)"
       render: shell

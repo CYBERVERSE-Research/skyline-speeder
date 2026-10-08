@@ -38,7 +38,7 @@ BBR 靠估计带宽而不是对每次丢包作出反应，但它仍会向丢包�
 - **两个阶段。** STARTUP 用较高的增益尽快摸到路径带宽；带宽连续几轮不再增长后，进入 CRUISE。
 - **拥塞护栏。** 只有两个信号算真实拥塞：排队时延超过阈值（固定值与基准 RTT 的一定比例取较大者），以及 ECN 标记。任一出现，这一轮的增益就降到 `guardrail_gain`，低于测得的带宽；下一轮信号消失即恢复。
 - **有上限的 RTO**（可选）。一个 cgroup sockops 程序按连接限制内核的重传超时，避免线路抖一下就让连接最长等上两分钟。
-- **首轮冗余**（默认开启）。在这样的链路上，拖慢短响应的不是窗口，而是等丢包恢复：尾丢探测约两个往返、重传超时约三个往返、丢了 SYN-ACK 固定等一秒。一个 TC 出方向程序把每条 skyline_cc 连接的握手包和前 64 KiB 各发两份，第二份比原包晚 10 ms，丢一个包只多等这几毫秒，而不是等一个计时器。代价是每条连接最多多发 64 KiB。
+- **首轮冗余**（默认开启）。在这样的链路上，拖慢短响应的不是窗口，而是等丢包恢复：尾丢探测约两个往返、重传超时约三个往返、丢了 SYN-ACK 固定等一秒。一个 TC 出方向程序把每条 skyline_cc 连接的握手包和前 64 KiB 各发两份，第二份比原包晚 10 ms，丢一个包只多等这几毫秒，而不是等一个计时器。代价是每条连接约多发 64 KiB，这段范围内有重传时更多（重传的段也各复制一份）。
 
 Rust 编写的 `skyline-speederd` 负责加载 BPF 对象（每个对象加载时都要过内核验证器），并通过双缓冲槽在线下发新系数，每条流在 RTT 边界切换过去；`ssctl` 是它的命令行。
 
@@ -139,7 +139,7 @@ sudo ./install.sh --uninstall --restore-pre-install   # 同上，但还原成
 
 安装器使用发行版自己的包管理器和服务管理器——apt、dnf 或 apk；systemd，Alpine 上是 OpenRC（本文档里的 `systemctl restart skyline-speederd` 在 Alpine 上对应 `rc-service skyline-speederd restart`）。它会检查内核，构建或下载三个 BPF 对象和 daemon，把 TC 程序指向默认路由所在的网卡（IPv4 或 IPv6；默认路由走 WireGuard 这类隧道时，它会请你自己指定网卡），让每个对象过一遍内核验证器，然后启动 daemon、挂载 `skyline_cc`，并把两者设为开机自启。安装过程中终端只显示一行进度，所有命令的输出都保存在 `/var/log/skyline-speeder-install.log`；装完会列出拥塞控制与 qdisc 改动前后的值，再给出 `ssctl` 用法、调参与卸载方法的简短指南。**不安装任何代理，不监听任何端口。**
 
-`--uninstall` 会先 drain 掉存量连接，删除两个 systemd 单元、二进制和 BPF 对象，把本机切到 **bbr + fq**，并卸掉安装时装上的包。装了哪些包是记录下来的（`/etc/skyline-speeder/added-packages`），也只卸这些：不碰 `iproute2`（Fedora/RHEL 上是 `iproute` 与 `iproute-tc`）、`curl`、`ca-certificates`、`tar`（Alpine 上还有 `bash`），不碰这几个包**仍然依赖**的东西（保留 `curl` 却删掉它底下的库，apt 根本做不到），也不碰 dpkg 标为 *required*/*important* 或 dnf 保护的包。卸之前先出计划（apt 自己出，dnf 用 `rpm -e --test`；apk 本来就不会删还被依赖的包）：计划里如果要连带删掉主机上别的东西，就把造成这件事的那个包单独留下并说明，其余照卸；只有在怎么缩减都无法得到一个不越界的计划时，才一个都不卸、改为打印手工命令。rustup 工具链只在确实是安装器装的情况下才移除。`bbr` 与 `fq` 只在本次运行时生效——不写也不改 `/etc/sysctl.d` 下的任何文件，所以重启后仍由那些文件决定。加 `--restore-pre-install` 则还原成安装前那台机器用的拥塞控制与 qdisc（包括出口网卡的根 qdisc，安装时一并记录）。两种方式都保留 `/etc/skyline-speeder`，重装时你的配置还在。
+`--uninstall` 会先 drain 掉存量连接，删除两个服务（systemd 单元，Alpine 上是 OpenRC 脚本）、二进制和 BPF 对象，把本机切到 **bbr + fq**，并卸掉安装时装上的包。装了哪些包是记录下来的（`/etc/skyline-speeder/added-packages`），也只卸这些：不碰 `iproute2`（Fedora/RHEL 上是 `iproute` 与 `iproute-tc`）、`curl`、`ca-certificates`、`tar`（Alpine 上还有 `bash`），不碰这几个包**仍然依赖**的东西（保留 `curl` 却删掉它底下的库，apt 根本做不到），也不碰 dpkg 标为 *required*/*important* 或 dnf 保护的包。卸之前先出计划（apt 自己出，dnf 用 `rpm -e --test`；apk 本来就不会删还被依赖的包）：计划里如果要连带删掉主机上别的东西，就把造成这件事的那个包单独留下并说明，其余照卸；只有在怎么缩减都无法得到一个不越界的计划时，才一个都不卸、改为打印手工命令。rustup 工具链只在确实是安装器装的情况下才移除。`bbr` 与 `fq` 只在本次运行时生效——不写也不改 `/etc/sysctl.d` 下的任何文件，所以重启后仍由那些文件决定。加 `--restore-pre-install` 则还原成安装前那台机器用的拥塞控制与 qdisc（包括出口网卡的根 qdisc，安装时一并记录）。两种方式都保留 `/etc/skyline-speeder`，重装时你的配置还在。
 
 已发布的版本不需要编译工具链，只需要 `curl`、`tar` 和 `iproute2`（安装器会自动安装）：对象是 CO-RE 的，用固定的 6.12 参考头编译，加载时再按这台机器的内核重定位。预编译的 daemon 有两个构建：一个在 Ubuntu 24.04 上构建，需要 glibc 2.38 以上以及 `libelf.so.1`、`libz.so.1`（Debian 13、Ubuntu 24.04、Fedora 43、Rocky Linux 10 及更新版本满足）；另一个自 v0.4.1 起在 Alpine 3.21 里针对 musl 构建，Alpine 3.21 及更新会装它，外加 `libelf`、`zlib`、`zstd-libs`、`libgcc`。用户态更旧的系统，默认安装会自动改为从源码构建，`--source` 则在任何机器上都从源码构建。`--release <tag>` 指定版本；连不上 GitHub 的机器，把产物拷过去后用 `SKYLINE_ARTIFACT_URL=/path/to/tarball sudo -E ./install.sh --prebuilt` 安装。装上的是已发布的 release，可能比这份 README、也比 `main` 旧：`main` 上在最新 release 之后合并的改动，要等下一个 release 才会进入一键安装。装的 release 早于这里描述的某个功能时（例如 v0.2.0 这个 release 还没有 qdisc 守护），安装器会明确提示。
 
@@ -156,7 +156,7 @@ ssctl drain     # 优雅摘除：新连接改走 fallback_cc，再等存量连�
 
 两份报告都是给人看的：在终端上带颜色和符号，被管道接走时两样都没有。要给脚本解析就加 `--json`，打印 daemon 的原始应答。
 
-`ssctl flows` 逐条列出内核当前跑在 `skyline_cc` 上的每条 TCP 连接——对端、RTT、拥塞窗口、pacing 速率、交付速率、已发字节以及其中的重传占比——下面接着是这些连接上生效中的系数，以及算法决策计数器。逐条数据是**内核自己的**，通过 `ss` 读回：skyline_cc 的逐流状态存在 socket storage 里，用户态无法遍历，但 cwnd、pacing 速率和 RTT 恰好就是它写进套接字的那几项。
+`ssctl flows` 逐条列出内核当前跑在 `skyline_cc` 上的 TCP 连接（已发字节最多的 50 条，其余只给出条数）——对端、RTT、拥塞窗口、pacing 速率、交付速率、已发字节以及其中的重传占比——下面接着是这些连接上生效中的系数，以及算法决策计数器。逐条数据是**内核自己的**，通过 `ss` 读回：skyline_cc 的逐流状态存在 socket storage 里，用户态无法遍历，但 cwnd、pacing 速率和 RTT 恰好就是它写进套接字的那几项。
 
 通过 SSH 执行 `ssctl drain` 总会走到超时，因为你自己的会话就是一条 skyline_cc 连接。这无害：它在开始等待之前就已经让新连接改走 `fallback_cc`。
 
@@ -207,6 +207,7 @@ sudo /opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <你的服务启动命�
 skyline-speeder/
 ├── install.sh                    一键安装（Debian/Ubuntu、Fedora/RHEL、Alpine）
 ├── scripts/bootstrap.sh          远程安装入口（curl | sudo bash，或 wget | sh）
+├── Makefile                      make bpf、make check、make test
 ├── bpf/
 │   ├── skyline_cc.bpf.c          struct_ops 拥塞控制，每个 ACK 执行
 │   ├── skyline_policy.bpf.c      cgroup sockops：选择拥塞控制，动态 RTO 上下限
@@ -220,9 +221,9 @@ skyline-speeder/
 ├── packaging/                    systemd 单元；openrc/ 是给 OpenRC 的同样两个服务
 ├── infra/                        安装辅助、cgroup 工具、双 VM 测试床
 ├── research/experiments/         测试 manifest、执行、分析与现场测量
-├── docs/                         使用指南、部署、接口参考、设计、性能报告
+├── docs/                         使用指南、接口参考、设计、性能报告
 ├── CHANGELOG.md                  版本说明与升级步骤
-├── DEPLOY.md                     面向自动化 agent 的确定性部署手册
+├── DEPLOY.md                     部署与运维手册，面向自动化 agent
 └── CONTRIBUTING.md               改动不能破坏的不变量
 ```
 
@@ -241,9 +242,9 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 make bpf                          # 生成 vmlinux.h 并编译三个 CO-RE 对象
 cargo build --workspace --release
-make check                        # 格式、静态检查与单元测试
+make check PYTHON="$(command -v python3)"   # 格式、静态检查与单元测试（实验框架的测试要 Python 3.11+）
 
-# 让每个对象过一遍内核验证器，不留下任何运行状态
+# 让每个对象过一遍内核验证器，不挂载任何东西
 skyline-speederd --config config/speeder.toml --validate-only --verify-bpf
 ```
 
@@ -256,12 +257,11 @@ Debian 12 上跑 `bookworm-backports` 的 6.12 内核时，`libelf-dev` 也要�
 | 文档 | 内容 |
 |---|---|
 | **[docs/usage.md](docs/usage.md)** | **新手向：每个开关和参数、现成配方、排障** |
-| [docs/01-deployment-guide.md](docs/01-deployment-guide.md) | 构建、安装、配置、验证、调参、回滚 |
+| [DEPLOY.md](DEPLOY.md) | 部署与运维手册，面向自动化 agent、运维同样照它操作：前置条件、安装、验证门禁、升级、排障、卸载 |
 | [docs/02-interface-reference.md](docs/02-interface-reference.md) | `ssctl` 命令、控制面线协议、配置字段、事件码 |
 | [docs/03-design.md](docs/03-design.md) | 架构与各模块的实现原理 |
 | [docs/04-performance-report.md](docs/04-performance-report.md) | 受控测试床：环境、与 bbr 对比的结果、局限性 |
 | [research/experiments/README.md](research/experiments/README.md) | 复现性能测试 |
-| [DEPLOY.md](DEPLOY.md) | 面向自动化 agent 的确定性部署手册 |
 
 ## 参与贡献
 

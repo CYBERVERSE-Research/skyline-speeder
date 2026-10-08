@@ -20,14 +20,15 @@
    且都远超"至少领先 5%"这一验收判据。
 2. **`reorder-dsack`（不在目标环境范围内）是唯一 Skyline Speeder 不如 BBR 的场景**
    （第 5 节，比 BBR 低约 13%），差距明确不是调优目标。
-3. **队列时延/ECN 护栏的自保护降速（`guardrail_gain=0.8`）在最容易触发护
-   栏的场景上没有引入回归**：对比 `guardrail_gain=0.0`（钳位到中性 1.0，
-   不主动降速）的对照配置，最担心的 0% 丢包高频触发场景差异 <0.01%
-   （第 6.1 节）。
-4. **M1 tier-2 的 `TCP_RTO_MAX_MS` 上限调节有直接实测证据**：有上限的配置
-   在强制 RTO 场景下 3/3 全部存活、RTO 稳定钳在目标值附近；没有上限的对照
-   组（含纯内核默认的 BBR）曾实测到 RTO 被顶到约 101 秒，逼近内核 120 秒
-   默认上限（第 6.2 节）。
+3. **队列时延/ECN 护栏的自保护降速（`guardrail_gain=0.8`）代价有限**：对比
+   `guardrail_gain=0.0`（钳位到中性 1.0，不主动降速）的对照配置，七个场景的吞吐差异
+   在 0 到 -3.7% 之间，这是自保护降速预期的代价（第 6.1 节；其中
+   `intercontinental-clean` 的 `guardrail_hits` 主要是 cwnd 顶到上限的计数，并不说明
+   护栏在那里频繁触发）。
+4. **M1 tier-2（RTO 下限与上限）有直接实测证据**：打开 tier-2 的配置在强制 RTO
+   场景下 3/3 全部存活，`max_rto_ms` 在 902-1129ms；关掉 tier-2 的对照只有 1/3 存活，
+   纯内核默认的 BBR 曾实测到 RTO 被顶到约 101 秒，逼近内核 120 秒默认上限（第 6.2
+   节）。样本 `n=3`，且对照切换的是整个 tier-2，不能单独归给上限。
 5. **链路波动场景下两个 Skyline Speeder 变体依然反超默认 BBR**（第 6.3
    节），但吞吐的运行间变异系数明显高于静态场景，与"拥塞证据触发次数"的
    波动相关。
@@ -125,7 +126,7 @@ BBR 在部分场景呈双峰分布，小样本下用它的中位数做门槛不�
 | `primary` | 150 | 500 | 0.5% random | — | 中等距离中等丢包 |
 | `heavy-loss` | 250 | 100 | 2.0% random | — | 重丢包 |
 | `burst-loss` | 150 | 500 | 0.5% gemodel，突发长度 5 | — | 突发（成簇）丢包 |
-| `reorder-dsack` | 100 | 500 | 0% | 25%，相关性 10% | 纯重排序 |
+| `reorder-dsack` | 100 | 500 | 0% | 25%，相关性 25% | 纯重排序 |
 | `intercontinental-clean` | 400 | 1000 | 0% | — | 跨国无损对照 |
 
 这些场景都是 `offload=on`，表中的丢包与重排序按 GSO 大帧发生，不是逐包的，见
@@ -134,10 +135,12 @@ BBR 在部分场景呈双峰分布，小样本下用它的中位数做门槛不�
 ### 3.3 链路波动场景
 
 单个 case 内实时热更新路由器 NetEm/HTB 参数（`tc ... change`，不中断连接、
-不清零 qdisc 计数器）：`volatile-bandwidth-cliff`（`rtt_ms=300`）分四段——
-`[0,20)s` 平稳 `rate=100Mbit`；`[20,35)s` 骤降到 `rate=15Mbit`（队列包数锁
-定，让排队时延真实放大）、仍不丢包；`[35,43)s` 同样低带宽下叠加一次真实
-丢包突发（gemodel 8%）；`[43,59)s` 恢复到 `rate=100Mbit`。
+不清零 qdisc 计数器）：`volatile-bandwidth-cliff`（`rtt_ms=300`，全程带 gemodel
+突发丢包、突发长度 220）分四段——`[0,20)s` 平稳 `rate=100Mbit`、丢包 0.5%；
+`[20,35)s` 骤降到 `rate=15Mbit`（队列包数锁定，让排队时延真实放大），丢包仍是
+0.5%；`[35,43)s` 同样低带宽下丢包升到 8%，一次真实的丢包突发；`[43,59)s` 恢复到
+`rate=100Mbit`、丢包 0.5%。（manifest 的注释写着 `[20,35)s` 不引入丢包，但它的
+配置、也就是实际运行的条件，是 0.5%。）
 
 ### 3.4 Profile 定义
 
@@ -150,13 +153,13 @@ BBR 在部分场景呈双峰分布，小样本下用它的中位数做门槛不�
 实验 manifest（`research/experiments/manifests/`）里还定义了其他内核原生算法的
 基线 profile；本报告只与 `bbr-fq` 对比，不列出它们。
 
-以下是围绕 `skyline-best` 的对照用配置变体，各自只改一个系数，用来隔离该系数
-的影响：
+以下是围绕 `skyline-best` 的对照用配置变体，用来隔离某一项设置的影响（`skyline-guardrail-neutral` 与
+`skyline-relaxed-congestion-ratio` 只改一个系数，`skyline-rto-baseline` 去掉的是整段 `[rack_rto]`）：
 
 | Profile ID | 与 `skyline-best` 的差异 |
 |---|---|
 | `skyline-guardrail-neutral` | `guardrail_gain=0.0`（护栏只取消加速，不主动降速） |
-| `skyline-rto-baseline` | 完全省略 `[rack_rto]`（RTO 上限调节关闭） |
+| `skyline-rto-baseline` | 完全省略 `[rack_rto]`：实验框架因此下发 `ssctl reset-rack-rto`，回到 guest 配置的"关闭"，M1 tier-2 的下限与上限两半都不生效（`skyline-best` 两半都开：下限 `srtt_permille` 1100、`floor_us` 20000，上限 3x/6x） |
 | `skyline-relaxed-congestion-ratio` | `rto_max_congestion_ratio_permille=1500`（拥塞证据判定阈值从默认 2x 放宽到 1.5x） |
 
 `cruise_inflight_gain`（2.0）/`cruise_pacing_gain`（1.1）的选定依据：cwnd
@@ -240,9 +243,9 @@ Mbit 三点上都是双峰分布，单次运行可以差 3-4 倍）。10/20 Mbit
 ### 6.1 队列时延/ECN 护栏的自保护降速
 
 **机制**：护栏触发（队列时延超过阈值，或出现新鲜 ECN CE 标记）时，把该
-轮的 cwnd 目标增益和 pacing 增益都钳位到 `guardrail_gain`（默认 0.8，即降
-到测得带宽的 80%）；`0.0` 表示只取消加速、不主动降速。每轮从零重新判定，
-不是粘性状态。
+轮的 cwnd 目标增益和 pacing 增益都钳位到 `guardrail_gain`（默认 0.8：pacing 降到
+测得带宽的 80%；cwnd 目标之后仍乘 M3 的丢包补偿系数，见 `docs/03-design.md`
+第 6 节）；`0.0` 表示只取消加速、不主动降速。每轮从零重新判定，不是粘性状态。
 
 **验证**（`{skyline-best, skyline-guardrail-neutral}` × 7 个历史高频触发场景 ×
 `n=3`，单位 Mbit/s，中位数）：
@@ -257,18 +260,22 @@ Mbit 三点上都是双峰分布，单次运行可以差 3-4 倍）。10/20 Mbit
 | `burst-loss` | 467.49 | 478.22 | -2.2% | 35 / 27 |
 | `reorder-dsack` | 397.76 | 413.24 | -3.7% | 84 / 95 |
 
-`intercontinental-clean`（护栏触发极频繁，3 次运行合计 20.8 万次）下两者
-差异 <0.01%——这条流早已被链路带宽本身（而非护栏）限速在满速附近，0.8x
-系数应用在一个已经被其他约束钳住的增益上，不改变收敛后的稳态吞吐。其余
+`intercontinental-clean` 的 20.8 万次 `guardrail_hits` 几乎都不是护栏触发：这个
+计数器还在 cwnd 顶到 `max_cwnd_packets` 时**每个 ACK** 记一次（`docs/02-interface-reference.md`
+第 4 节）。400 ms × 1000 Mbit/s 的 BDP 约 3.5 万包，乘 2.0 的 inflight 增益超过 5 万包的
+上限，cwnd 一直贴着上限；而队列时延/ECN 护栏每轮至多记一次，45 秒的 case 每次运行
+不到 115 轮，3 次合计至多约 340 次。两者差异 <0.01%：这条流被 cwnd 上限和链路带宽
+钳在满速附近，护栏增益几乎没有作用的机会，这一行不能说明护栏触发得频繁。其余
 场景的小幅下降（2-4%）是护栏真正生效时"自保护降速"这一设计本身预期的代
 价（用一点吞吐换队列时延/ECN 安全边际），不是缺陷。
 
 ### 6.2 M1 tier-2：`TCP_RTO_MAX_MS` 上限调节
 
 **机制**：`ceiling = clamp(k × base_rtt, 1000ms, 120000ms)`，无拥塞证据
-时 `k=rto_max_normal_permille`（默认 3x），检测到真实拥塞证据（新鲜 CE 标
+时 `k=rto_max_normal_permille`（本实验配置 3x），检测到真实拥塞证据（新鲜 CE 标
 记，或 srtt 相对 min_rtt 明显增长）后切换到 `rto_max_congested_permille`
-（默认 6x），不回退内核 120 秒默认值。
+（本实验配置 6x），不回退内核 120 秒默认值。代码与随附模板里两者默认为 0，即上限
+关闭；这个选项需要内核 ≥ 6.15（本报告用的是 6.18.40）。
 
 **强制超时场景实测**（`forced-rto-burst-rtt300`：`rtt_ms=300`、
 `rate_mbit=15`、Gilbert-Elliott 突发丢包 8%）：
@@ -276,17 +283,19 @@ Mbit 三点上都是双峰分布，单次运行可以差 3-4 倍）。10/20 Mbit
 | profile | 有效/总 | `rack_rto_max_applied`（每轮） | `rack_rto_max_rejected` | `max_rto_ms`（各轮） |
 |---|---:|---:|---:|---:|
 | `skyline-best`（上限开） | 3/3 | 12-15 | 0 | 902 / 1086 / 1129 |
-| `skyline-rto-baseline`（上限关） | 1/3 | — | — | 902（唯一有效样本） |
+| `skyline-rto-baseline`（tier-2 关） | 1/3 | — | — | 902（唯一有效样本） |
 | `bbr-fq`（无 Skyline Speeder，内核原生） | 3/3 | — | — | 902 / 4016 / **100992** |
 
-`skyline-best` 的 3 个有效样本 `max_rto_ms` 全部稳定钳在 902-1129ms，贴着
-`3x base_rtt≈900ms` 的目标值，`rack_rto_max_rejected` 全部为 0（机制被调
-用且内核接受）。对照的 `bbr-fq`（完全没有 Skyline Speeder、纯内核默认行为）三次运行
+`skyline-best` 的 3 个有效样本 `max_rto_ms` 为 902-1129ms，`rack_rto_max_rejected`
+全部为 0（机制被调用且内核接受）。按公式，上限是 `clamp(3 × base_rtt, 1000ms, 120000ms)`：
+RTT 300ms 时至少是 1000ms，srtt 被排队抬高或出现拥塞证据时更大，所以 902ms 这类最大值
+本身并没有碰到上限（没有上限的两组也各有一次 902ms）。对照的 `bbr-fq`（完全没有 Skyline Speeder、纯内核默认行为）三次运行
 的 `max_rto_ms` 波动极大，其中一次采样到 **100992ms**（约 101 秒，逼近内
-核 `TCP_RTO_MAX` 120 秒默认上限）；`skyline-rto-baseline`（同样没有上限）
-在这个场景下有效率只有 33%——大多数运行直接被拖入内核默认的级联
-超时、被超时保护提前判为无效样本，这个"存活率"本身就是上限调节要防止的
-问题最直接的证据。
+核 `TCP_RTO_MAX` 120 秒默认上限）；`skyline-rto-baseline`（tier-2 整体关闭，
+没有上限也没有下限）在这个场景下有效率只有 33%——大多数运行直接被拖入内核默认
+的级联超时、被超时保护提前判为无效样本。`n=3` 能支持的是"打开 tier-2 的 3 次运行都
+没有出现数秒级的 RTO"；这组对照切换的是整个 tier-2（下限与上限），存活率的差异不能
+单独归给上限。
 
 **链路波动场景下的拥塞证据分支**（`volatile-bandwidth-cliff`，`n=3`）：
 

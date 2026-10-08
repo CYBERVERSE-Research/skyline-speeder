@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
-  - name: Read the deployment guide first
-    url: https://github.com/CYBERVERSE-Research/skyline-speeder/blob/main/docs/01-deployment-guide.md
-    about: Build, install, verify, tune, roll back and troubleshoot (Chinese). Section 10 has the troubleshooting decision tree.
+  - name: Read the deployment manual first
+    url: https://github.com/CYBERVERSE-Research/skyline-speeder/blob/main/DEPLOY.md
+    about: Install, verify, upgrade, troubleshoot and remove (Chinese). Section 13 starts with a symptom-to-section troubleshooting table.
   - name: Tuning and parameter guide
     url: https://github.com/CYBERVERSE-Research/skyline-speeder/blob/main/docs/usage.md
     about: What every switch and parameter does, and what happens when you raise or lower it (Chinese).

@@ -32,11 +32,12 @@
 #             (≈2500 包)，loss=gemodel 0.5%——平稳基线，建立 min_rtt。
 #   [20, 35)  segment 1：rate 骤降到 15Mbit，queue_packets 锁定 2500（不
 #             随新带宽重算）——2500 包在 15Mbit 下排队时延≈2s，
-#             srtt/min_rtt 比值可达 ~7-8x，远超 tier-2 默认 2x 门槛；这一
-#             段刻意不引入丢包，让排队证据先干净地立住，也给 Skyline Speeder 自己的
+#             srtt/min_rtt 比值可达 ~7-8x，远超 tier-2 默认 2x 门槛；本意是这一
+#             段不引入丢包，让排队证据先干净地立住，也给 Skyline Speeder 自己的
 #             10s 窗口 base_rtt（M2 护栏用）留时间往上飘、跟内核 min_rtt
 #             （tier-2 用，窗口长得多）产生"护栏放松但 tier-2 仍判定拥塞"
-#             的错位（这正是能观察到真实效果的窗口，不是缺陷）。
+#             的错位（这正是能观察到真实效果的窗口，不是缺陷）。注意：下面
+#             这一段的配置——也就是实际跑过的条件——仍是 0.5% gemodel 丢包。
 #   [35, 43)  segment 2：rate/queue 不变，loss 换成 gemodel 8%（复用已验
 #             证安全的 burst_length=220）——在已经成立的排队证据上叠加一
 #             次真实丢包突发，逼一次真实 RTO。

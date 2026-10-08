@@ -120,8 +120,9 @@ loss_inflation_max_ratio = 0.10
 
 # M1 per-flow 动态 RTO 下限（TCP_BPF_RTO_MIN），由 skyline_policy.bpf.c 在
 # BPF_SOCK_OPS_RTT_CB 里应用。目标环境下更快的丢包检测能直接减少停顿，
-# 默认开启（实验矩阵仍会按 case 通过 `ssctl set-rack-rto` 覆盖，见
-# config/speeder-guest.toml）。
+# 这里设为开启（实验矩阵仍会按 case 通过 `ssctl set-rack-rto` 覆盖，见
+# config/speeder-guest.toml）。daemon 启动时不下发这一段：要执行一次
+# `ssctl reset-rack-rto` 才生效，每次 daemon 重启后都一样。
 [rack_rto]
 enabled = true
 srtt_permille = 1100    # target = max(srtt_us, min_rtt_us) * this / 1000

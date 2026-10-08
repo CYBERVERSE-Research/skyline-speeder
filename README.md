@@ -36,7 +36,7 @@ BBR estimates bandwidth rather than reacting to each loss, yet it still gives gr
 - **Two phases.** STARTUP uses a high gain to find the path's bandwidth quickly. Once bandwidth stops growing for a few rounds, the flow settles into CRUISE.
 - **A congestion guardrail.** Only two signals count as real congestion: queueing delay rising above a threshold (a fixed value or a fraction of the base RTT, whichever is larger), and ECN marks. When either fires, that round's gain drops to `guardrail_gain`, below the measured bandwidth, and the next clean round restores it.
 - **A bounded RTO** (optional). A cgroup sockops program caps the kernel's retransmission timeout per connection, so a flap cannot leave a connection waiting up to two minutes.
-- **First-flight redundancy** (on by default). What holds a short response back on such a link is not the window but the wait for loss recovery: a tail-loss probe after about two round trips, a retransmission timeout after about three, a fixed second for a lost SYN-ACK. A TC egress program sends each skyline_cc connection's handshake and first 64 KiB twice, the copy 10 ms after the original, so one lost packet costs those milliseconds instead of a timer. The price is up to 64 KiB of extra traffic per connection.
+- **First-flight redundancy** (on by default). What holds a short response back on such a link is not the window but the wait for loss recovery: a tail-loss probe after about two round trips, a retransmission timeout after about three, a fixed second for a lost SYN-ACK. A TC egress program sends each skyline_cc connection's handshake and first 64 KiB twice, the copy 10 ms after the original, so one lost packet costs those milliseconds instead of a timer. The price is about 64 KiB of extra traffic per connection, more where segments in that range are retransmitted (each retransmission is copied too).
 
 A Rust daemon, `skyline-speederd`, loads the BPF objects (the kernel verifier checks each one at load) and pushes new coefficients online through a double-buffered slot that each flow switches to at an RTT boundary. `ssctl` is its command line.
 
@@ -137,7 +137,7 @@ sudo ./install.sh --uninstall --restore-pre-install   # ... but put back the
 
 The installer uses the distribution's own package manager and service manager — apt, dnf or apk; systemd, or OpenRC on Alpine, where `rc-service skyline-speederd restart` stands in for `systemctl restart skyline-speederd` in these docs. It checks the kernel, builds or downloads the three BPF objects and the daemon, points the TC program at the default-route interface (IPv4 or IPv6; when that route leaves through a tunnel such as WireGuard, it asks you to name the NIC), runs every object through the kernel verifier, then starts the daemon, attaches `skyline_cc` and enables both at boot. It shows one progress line and keeps every command's output in `/var/log/skyline-speeder-install.log`; when it finishes it prints the congestion control and qdisc before and after, then a short guide to `ssctl`, tuning and uninstalling. **It installs no proxy and opens no port.**
 
-`--uninstall` drains live flows, removes the units, binaries and BPF objects, puts the host on **bbr + fq**, and removes the packages the install added. It records which packages those were (`/etc/skyline-speeder/added-packages`) and removes only those: never `iproute2` (`iproute` and `iproute-tc` on Fedora/RHEL), `curl`, `ca-certificates` or `tar` (or `bash` on Alpine), never anything one of those still needs (keeping `curl` while removing the library under it is not something apt can do), and never anything dpkg calls *required* or *important* or dnf protects. The removal is planned first (by apt, or `rpm -e --test`; apk never removes what something still needs): a package something else on the host now needs is kept and named, and the rest is removed; only when no reduced plan stays inside the recorded list is nothing removed at all, and the command to do it by hand is printed instead. A rustup toolchain is removed only if the installer is the one that installed it. `bbr` and `fq` are set for that boot; no file under `/etc/sysctl.d` is written or edited, so those files decide again after a reboot. `--restore-pre-install` puts back the congestion control and qdiscs the host ran before instead — it also records those, including the egress interface's root qdisc. `/etc/skyline-speeder` is kept either way, so a reinstall keeps your settings.
+`--uninstall` drains live flows, removes the two services (systemd units, or the OpenRC scripts on Alpine), binaries and BPF objects, puts the host on **bbr + fq**, and removes the packages the install added. It records which packages those were (`/etc/skyline-speeder/added-packages`) and removes only those: never `iproute2` (`iproute` and `iproute-tc` on Fedora/RHEL), `curl`, `ca-certificates` or `tar` (or `bash` on Alpine), never anything one of those still needs (keeping `curl` while removing the library under it is not something apt can do), and never anything dpkg calls *required* or *important* or dnf protects. The removal is planned first (by apt, or `rpm -e --test`; apk never removes what something still needs): a package something else on the host now needs is kept and named, and the rest is removed; only when no reduced plan stays inside the recorded list is nothing removed at all, and the command to do it by hand is printed instead. A rustup toolchain is removed only if the installer is the one that installed it. `bbr` and `fq` are set for that boot; no file under `/etc/sysctl.d` is written or edited, so those files decide again after a reboot. `--restore-pre-install` puts back the congestion control and qdiscs the host ran before instead — it also records those, including the egress interface's root qdisc. `/etc/skyline-speeder` is kept either way, so a reinstall keeps your settings.
 
 The published release needs no toolchain, only `curl`, `tar` and `iproute2` (the installer installs them): the objects are CO-RE, compiled against a pinned 6.12 header and relocated against this kernel when they load. The prebuilt daemon comes in two builds: one built on Ubuntu 24.04, which needs glibc 2.38 or newer with `libelf.so.1` and `libz.so.1` (Debian 13, Ubuntu 24.04, Fedora 43, Rocky Linux 10 and later), and, from v0.4.1, one built in Alpine 3.21 against musl, which Alpine 3.21 and later install together with `libelf`, `zlib`, `zstd-libs` and `libgcc`. On older userspace the default install builds from source by itself, and `--source` does so anywhere. `--release <tag>` pins a version, and `SKYLINE_ARTIFACT_URL=/path/to/tarball sudo -E ./install.sh --prebuilt` installs a copied artifact on a host with no route to GitHub. What gets installed is a published release, which can be older than this README and than `main`: a change merged after the latest release reaches the one-line install only with the next one. A release that predates a feature described here (the v0.2.0 release has no qdisc guard, for one) is named as such by the installer.
 
@@ -154,7 +154,7 @@ ssctl drain     # graceful detach: fallback_cc for new connections, then wait fo
 
 Both reports are written to be read, with colour and symbols on a terminal and neither when piped. `--json` prints the daemon's raw reply instead, which is what a script should parse.
 
-`ssctl flows` lists every TCP connection the kernel currently runs on `skyline_cc` -- peer, RTT, congestion window, pacing rate, delivery rate, bytes sent and the retransmitted share of them -- followed by the coefficients in force on those connections and the counters showing what the algorithm decided. The per-connection numbers are the kernel's own, read back through `ss`: skyline_cc keeps its per-flow state in socket storage, which user space cannot enumerate, but cwnd, pacing rate and RTT are exactly what it writes into the socket.
+`ssctl flows` lists the TCP connections the kernel currently runs on `skyline_cc` (the 50 that have sent the most; the rest only counted, "N more, not shown") -- peer, RTT, congestion window, pacing rate, delivery rate, bytes sent and the retransmitted share of them -- followed by the coefficients in force on those connections and the counters showing what the algorithm decided. The per-connection numbers are the kernel's own, read back through `ss`: skyline_cc keeps its per-flow state in socket storage, which user space cannot enumerate, but cwnd, pacing rate and RTT are exactly what it writes into the socket.
 
 Over SSH, `ssctl drain` always runs into its timeout, because your own session is a skyline_cc flow. That is harmless: it switches new connections to `fallback_cc` before it starts waiting.
 
@@ -205,6 +205,7 @@ sudo /opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <your service command..
 skyline-speeder/
 ├── install.sh                    one-command install (Debian/Ubuntu, Fedora/RHEL, Alpine)
 ├── scripts/bootstrap.sh          remote installer entry point (curl | sudo bash, or wget | sh)
+├── Makefile                      make bpf, make check, make test
 ├── bpf/
 │   ├── skyline_cc.bpf.c          struct_ops congestion control, runs on every ACK
 │   ├── skyline_policy.bpf.c      cgroup sockops: CC selection and dynamic RTO floor/ceiling
@@ -218,9 +219,9 @@ skyline-speeder/
 ├── packaging/                    systemd units; openrc/ holds the same two services for OpenRC
 ├── infra/                        install helpers, cgroup wrapper, two-VM test bed
 ├── research/experiments/         test manifests, runner, analysis, field measurements
-├── docs/                         usage guide, deployment, interface reference, design, performance report
+├── docs/                         usage guide, interface reference, design, performance report
 ├── CHANGELOG.md                  release notes and upgrade instructions
-├── DEPLOY.md                     deterministic deployment manual for automation agents
+├── DEPLOY.md                     deployment and operations manual, written for automation agents
 └── CONTRIBUTING.md               invariants a change must not break
 ```
 
@@ -239,9 +240,9 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 make bpf                          # generate vmlinux.h, compile the three CO-RE objects
 cargo build --workspace --release
-make check                        # formatting, static checks, unit tests
+make check PYTHON="$(command -v python3)"   # formatting, static checks, unit tests (the harness tests need Python 3.11+)
 
-# Run every object through the kernel verifier, leaving no runtime state
+# Run every object through the kernel verifier, attaching nothing
 skyline-speederd --config config/speeder.toml --validate-only --verify-bpf
 ```
 
@@ -251,17 +252,16 @@ On a Debian 12 host running a 6.12 kernel from `bookworm-backports`, `libelf-dev
 
 ## Documentation
 
-The documents under `docs/` are in Chinese.
+The documents under `docs/` and DEPLOY.md are in Chinese.
 
 | Document | Contents |
 |---|---|
 | [docs/usage.md](docs/usage.md) | Beginner-facing: every switch and parameter, presets, troubleshooting |
-| [docs/01-deployment-guide.md](docs/01-deployment-guide.md) | Build, install, configure, verify, tune, roll back |
+| [DEPLOY.md](DEPLOY.md) | The deployment and operations manual, written for automation agents and followed by operators too: prerequisites, install, verification gates, upgrade, troubleshooting, removal |
 | [docs/02-interface-reference.md](docs/02-interface-reference.md) | `ssctl` commands, wire protocol, config fields, event codes |
 | [docs/03-design.md](docs/03-design.md) | Architecture and how each module works |
 | [docs/04-performance-report.md](docs/04-performance-report.md) | Controlled test bed: environment, results against bbr, limitations |
 | [research/experiments/README.md](research/experiments/README.md) | Reproducing the performance tests |
-| [DEPLOY.md](DEPLOY.md) | Deterministic deployment manual for automation agents |
 
 ## Contributing
 

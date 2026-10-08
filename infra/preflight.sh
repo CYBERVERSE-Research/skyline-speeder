@@ -45,7 +45,7 @@ check_bpftool() {
     # package for this host's running kernel, in which case invoking it
     # fails outright. A functional check (does it actually run) is the
     # only way to catch that; honors BPFTOOL the same way Makefile does,
-    # so a repo-local build (see docs/01-deployment-guide.md) is accepted.
+    # so a repo-local build (see DEPLOY.md section 3) is accepted.
     local bpftool_bin=${BPFTOOL:-bpftool}
     if ! command -v "$bpftool_bin" >/dev/null 2>&1; then
         printf 'missing command %s\n' "$bpftool_bin"
@@ -143,7 +143,7 @@ if [ -r /sys/kernel/btf/vmlinux ]; then
 else
     # Not a hard requirement: the double-VM formal/tcg-validation workflow
     # always builds BPF against a GUEST kernel's vmlinux via explicit
-    # `make VMLINUX_BTF=<path> bpf` (see docs/01-deployment-guide.md and
+    # `make VMLINUX_BTF=<path> bpf` (see DEPLOY.md section 3 and
     # research/experiments/README.md), never against the host's own
     # running kernel. Host BTF only matters if something on this host will
     # run `make bpf` with no VMLINUX_BTF override at all.
