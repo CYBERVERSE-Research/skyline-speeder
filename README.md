@@ -90,7 +90,7 @@ ssctl flows     # what is being accelerated? the connections, their parameters, 
 ssctl drain     # graceful detach: fallback_cc for new connections, then wait for old ones
 ```
 
-Both reports are written to be read, with colour and symbols on a terminal and neither when piped. `--json` prints the daemon's raw reply instead, which is what a script should parse.
+Both reports are written to be read, with colour and symbols on a terminal and neither when piped. `--json` prints the daemon's raw reply instead, which is what a script should parse. What every line means: [Reading `ssctl status` and `ssctl flows`](#reading-ssctl-status-and-ssctl-flows).
 
 `ssctl flows` lists the TCP connections the kernel currently runs on `skyline_cc` (the 50 that have sent the most; the rest only counted, "N more, not shown") -- peer, RTT, congestion window, pacing rate, delivery rate, bytes sent and the retransmitted share of them -- followed by the coefficients in force on those connections and the counters showing what the algorithm decided. The per-connection numbers are the kernel's own, read back through `ss`: skyline_cc keeps its per-flow state in socket storage, which user space cannot enumerate, but cwnd, pacing rate and RTT are exactly what it writes into the socket.
 
@@ -106,7 +106,7 @@ On a long-haul link that drops packets at random, for reasons that have nothing 
 - **One brake.** Only rising queueing delay and ECN marks count as congestion. Either one drops that round's rate below the measured bandwidth.
 - **Short responses first.** Each connection's handshake and first 64 KiB go out twice, 10 ms apart, so one lost packet costs milliseconds instead of a retransmission timer, for about 64 KiB of extra traffic per connection.
 
-A Rust daemon, `skyline-speederd`, loads the BPF programs, which the kernel verifier checks at load, and changes coefficients online; `ssctl` is its command line. Each mechanism in detail: [docs/03-design.md](docs/03-design.md) (Chinese).
+A Rust daemon, `skyline-speederd`, loads the BPF programs, which the kernel verifier checks at load, and changes coefficients online; `ssctl` is its command line. Every feature, with its default, its cost and its switch: [Configuration](#configuration). Each mechanism in detail: [docs/03-design.md](docs/03-design.md) (Chinese).
 
 > [!IMPORTANT]
 > **The assumption only holds for loss that is independent of queues.** If the loss on your path is queue overflow at a congested bottleneck, loss compensation and the guardrail push in opposite directions and you will make things worse. Rule of thumb: if a fixed-rate UDP flow shows no loss while TCP retransmits heavily, your loss is self-inflicted queue overflow and this is not the tool. Fairness is not a goal either: it does not try to share a link evenly with competing flows.
@@ -126,44 +126,196 @@ If you know your egress bandwidth, it is fixed and your kernel is old, tcp-bruta
 
 ## Configuration
 
-The shipped defaults are tuned values; **most deployments should change nothing.**
+The shipped defaults are tuned values; **most deployments should change nothing.** This is everything a default install runs, and where each part is switched:
 
-**Modules.** All four are on by default and can be switched individually:
+| Feature | Default | What it does | Switch |
+|---|---|---|---|
+| [skyline_cc and its modules](#modules) | on, for every new TCP connection | sets window and pacing from measured bandwidth | `ssctl enable`, `ssctl drain` |
+| [Coefficients](#coefficients) | tuned values | gains, guardrail, caps, startup behaviour | `ssctl set-module-config` |
+| [First-flight redundancy](#first-flight-redundancy) | on | sends each connection's handshake and first 64 KiB twice | `ssctl set-redundancy` |
+| [Drift guard](#drift-guard) | on, every 5 s | keeps skyline_cc and `fq` in place | `[guard]` |
+| [Dynamic RTO floor and ceiling](#dynamic-rto-floor-and-ceiling) | off | bounds each connection's retransmission timeout | `ssctl set-rack-rto` |
+| [Retransmit DSCP marking](#retransmit-dscp-marking) | off | marks retransmissions for the network upstream | `ssctl set-retransmit-dscp` |
+| [Global loss-detection sysctls](#global-loss-detection-sysctls) | the host's own | three `net.ipv4` sysctls the daemon can set at start | `[rack_tuning]` |
+| [Event log](#event-log) | on, rotated at 8 MiB | one line per mode switch, loss event and guardrail trip | `[runtime] events_max_mib` |
 
-| Module | What it does |
-|---|---|
-| `adaptive-cwnd` | Sets the window from measured bandwidth; this is where the speedup comes from |
-| `loss-classifier` | Loss compensation: scales the estimate up by the measured loss rate instead of backing off |
-| `pacing` | Spreads sending evenly at the target rate |
-| `early-loss` | Earlier loss visibility (an observation counter on current kernels) |
+An `ssctl set-*` command takes effect at once and lasts until the daemon restarts; [Keeping a change](#keeping-a-change-across-restarts) makes it permanent. Every line of `ssctl status` and `ssctl flows` is explained [at the end of this section](#reading-ssctl-status-and-ssctl-flows).
+
+### Modules
+
+`skyline_cc` is four modules, all on by default and switched individually. `ssctl status` lists them as M1-M4:
+
+| Module | What it does | Switched off |
+|---|---|---|
+| `adaptive-cwnd` (M2) | Sets the window from measured bandwidth; this is where the speedup comes from | the window grows and shrinks on loss as in the kernel's own TCP |
+| `loss-classifier` (M3) | Loss compensation: scales the estimate up by the measured loss rate instead of backing off | no compensation |
+| `pacing` (M4) | Spreads sending evenly at the target rate | the kernel's default pacing rate |
+| `early-loss` (M1) | Earlier loss visibility (an observation counter on current kernels) | no difference in what is sent |
 
 ```bash
 ssctl enable                                  # everything on (default)
 ssctl enable --modules adaptive-cwnd,pacing   # selected modules only
 ssctl enable --all-off                        # everything off, as a control baseline
+ssctl disable --module loss-classifier        # one module off, the others as they are
 ```
 
-`ssctl enable` takes effect host-wide: on a successful attach it sets `net.ipv4.tcp_congestion_control = skyline_cc`, so every new TCP connection on the machine uses it. It also sets `fq`, the qdisc pacing goes through, as `net.core.default_qdisc` and as the egress NIC's root qdisc (for a VLAN, bond or bridge, that of the physical NICs under it). Until `ssctl drain`, the daemon puts all three back whenever something else changes them, for instance a "one-click BBR" script's sysctl file being applied again, and logs each correction. A qdisc built on purpose (`htb`, `tbf`, `netem`, a `cake` with a bandwidth set, ...) is left alone, and `[guard] qdisc = false` in the config leaves qdiscs to you.
+`ssctl enable` without `--modules` keeps the current set, so after `--modules` or `--all-off` name all four to turn everything on again. With all four off, `skyline_cc` behaves like the kernel's own TCP: a neutral baseline for comparisons.
 
-**Coefficients.** Seventeen parameters (gains, guardrail, loss-compensation ceiling, queueing-delay threshold, startup behaviour, rate and window caps) change online with `ssctl set-module-config`, no restart. [docs/usage.md](docs/usage.md) (Chinese) explains each one and has four ready-made presets, including a "high random loss" preset for links that really do lose 10-20% at random.
+`ssctl enable` takes effect host-wide: on a successful attach it sets `net.ipv4.tcp_congestion_control = skyline_cc`, so every new TCP connection on the machine uses it, while connections already open keep the algorithm they started with. It also puts `fq` in place, arms the [drift guard](#drift-guard) and starts [first-flight redundancy](#first-flight-redundancy). `ssctl drain` hands new connections to `fallback_cc` and stops both.
+
+### Coefficients
+
+Seventeen parameters change online with `ssctl set-module-config`, no restart. Each open connection picks the new values up at its next round trip and starts its estimate over with them. `ssctl flows` shows them under *PARAMETERS IN FORCE*, one line per group:
+
+| `ssctl flows` line | Flags, with defaults | What they set |
+|---|---|---|
+| pacing rate | `--cruise-pacing-gain 1.25` `--startup-gain 3.0` `--max-pacing-mbps 1200` | The sending rate as a multiple of measured bandwidth in CRUISE and in STARTUP (the STARTUP gain applies to the window too), and a cap per connection in Mbit/s |
+| congestion window | `--initial-cwnd-packets 100` `--min-cwnd-packets 32` `--max-cwnd-packets 50000` `--cruise-inflight-gain 3.0` | The initial window (0 keeps the kernel's own), the window's floor and ceiling in packets, and how much may be in flight in CRUISE, as a multiple of bandwidth × base RTT |
+| queue guardrail | `--max-queue-delay-ms 70` `--max-queue-delay-ratio 0.6` `--guardrail-gain 0.8` | Queueing delay (smoothed RTT above base RTT) past the larger of 70 ms and 0.6 × base RTT, or an ECN mark, sets that round's gain to 0.8. At 1.0 the guardrail only cancels the boost and never cuts below the measured bandwidth |
+| loss compensation | `--loss-inflation-max-ratio 0.10` | The highest loss rate compensated for (0-0.5): rate × 1 / (1 − p), so at most × 1.11 by default |
+| bandwidth estimate | `--bw-window-rtts 6` `--min-rtt-window-s 30` `--startup-growth-ratio 0.20` `--startup-plateau-rtts 5` | Bandwidth is the highest delivery rate of the last 6 rounds, base RTT the lowest RTT of the last 30 s. STARTUP ends after 5 rounds in a row of less than 20% growth, or when the guardrail trips |
+| framework switches | `--disable-prr-pacing` `--disable-auto-pacing` | Used only with `adaptive-cwnd` or `pacing` off, to make that path behave like the kernel's own; leave them on |
 
 > [!CAUTION]
-> `set-module-config` is **absolute-overwrite**, not incremental: every parameter you leave out is reset to the CLI's built-in default, not to the value in your config file.
+> `set-module-config` is **absolute-overwrite**, not incremental: every parameter you leave out is reset to the CLI's built-in default, not to the value in your config file. Read the current values under *PARAMETERS IN FORCE* first and pass every one you want to keep; `ssctl reset-module-config` goes back to the config file.
 
-**Dynamic RTO floor and ceiling** (off by default). Only connections from processes inside `/sys/fs/cgroup/skyline-speeder` pass through `skyline_policy`, and a process outside it reports **no error**: `ssctl flows` simply shows 0 under *connections seen*. Start the service inside it:
+[docs/usage.md](docs/usage.md) (Chinese) has each parameter's permitted range and four ready-made presets, including a "high random loss" preset for links that really do lose 10-20% at random.
+
+### First-flight redundancy
+
+On by default. On a lossy long-haul path, a short response spends most of its time waiting for loss recovery rather than on the wire. A response that fits in the first window arrives in one round trip; one lost segment adds at least another, a lost last segment two or three (the tail-loss probe, then the retransmission timer), and a lost SYN-ACK a fixed second. These timers belong to the kernel, and no window size shortens them.
+
+So `skyline_tc`, on the egress NIC, sends the start of every connection twice:
+
+- every SYN-ACK the host sends while skyline_cc is enabled (a SYN-ACK has no congestion control yet, so this one is host-wide);
+- the SYN of every connection this host opens on skyline_cc;
+- every segment of a skyline_cc connection that starts within the first 64 KiB it sends, retransmissions included.
+
+The copy leaves 10 ms after the original, held back by `fq`: losses come in bursts, and two packets sent back to back are often lost together. Unless both are lost, a loss in that range costs 10 ms instead of a round trip or a timer. The receiving TCP discards whichever copy arrives second, so the client needs nothing.
+
+**Cost:** about 64 KiB and one handshake packet per connection when nothing is lost. A response under 64 KiB goes out twice in full; a large download pays only for its first 64 KiB or so, since the segment that crosses the boundary is copied whole. Retransmissions in that range are copied too, so the more is lost the more is sent, with no fixed cap per connection. Turn it off where egress is billed by volume, or on a path that does not lose packets.
 
 ```bash
-sudo /opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <your service command...>
+sudo ssctl set-redundancy --first-kib 32 --delay-ms 5   # absolute: a flag left out takes its default (64 KiB, 10 ms)
+sudo ssctl set-redundancy --disable                     # off
+sudo ssctl reset-redundancy                             # back to [redundancy] in the config file
 ```
 
-`skyline_cc` itself is global and needs no cgroup.
+In the config file these are `enabled`, `first_kib` (1-1024) and `delay_ms` (0-100; 0 sends the copy right behind the original) under `[redundancy]`. Copying runs only while skyline_cc is attached: `ssctl enable` starts it and `ssctl drain` stops it. It needs `skyline_tc` on an Ethernet `tc_interface`, and without `fq` as the root qdisc the copy leaves at once.
 
-**First-flight redundancy** (on by default). Change it in `[redundancy]` (`first_kib`, `delay_ms`) or on a running host with `ssctl set-redundancy` (`--disable` turns it off) and `ssctl reset-redundancy`. It runs only while skyline_cc is enabled and never copies a connection on another congestion control. The copy is held back by the `fq` qdisc the daemon keeps at the root; `ssctl flows` shows how many copies it has sent and how many bytes they cost.
+`ssctl flows` shows it twice. Under *PARAMETERS IN FORCE*, `first-flight copies` says whether it runs: `handshake + first 64 KiB of each connection sent twice, the copy +10 ms`; `configured, not running` when the TC program is not loaded; or `off`. Under *TC EGRESS*, `first-flight copies` says what it has cost since the daemon started: `52,113 sent, 58.2 MiB (9,870 handshakes)` is the number of copies (a GSO packet counts once), their bytes, and how many of them were SYNs or SYN-ACKs. A trailing `N could not be made` counts copies that failed and should never appear.
 
-**Retransmit DSCP marking** (off by default).
+### Drift guard
+
+On while skyline_cc is attached. `ssctl enable` sets three things and the daemon then keeps them: `net.ipv4.tcp_congestion_control = skyline_cc`; `net.core.default_qdisc = fq`, the qdisc pacing goes through; and `fq` as the egress NIC's root qdisc (for a VLAN, bond or bridge, that of the physical NICs under it). Until `ssctl drain`, it checks them every 5 seconds and puts back whatever something else changed, for instance a "one-click BBR" script's sysctl file being applied again, and logs each correction (`journalctl -u skyline-speederd | grep guard:`). A qdisc built on purpose (`htb`, `tbf`, `netem`, a `cake` with a bandwidth set, ...) is left alone.
+
+```toml
+[guard]
+interval_s = 5    # 0: check only at ssctl enable
+qdisc = true      # false: leave every qdisc to you and keep only the congestion control
+```
+
+`ssctl status` shows it under *DRIFT GUARD*: `ARMED`, each of the three with its current value and how many times it was put back, the last correction, the last error (kept until the next one, so it can be old), and a `note` for anything it deliberately left alone.
+
+### Dynamic RTO floor and ceiling
+
+Off by default. When no ACK comes back in time, TCP resends after its retransmission timeout (RTO) and doubles the timeout after every further miss, up to 120 seconds. Where losses are random, the next resend is no less likely to get through than the last, so a connection waiting that long is simply stuck. `skyline_policy` can bound the RTO of each connection:
+
+- **Floor.** The kernel's minimum RTO is 200 ms by default. This sets it per connection to its RTT × `srtt_permille` / 1000, clamped between `floor_us` and `ceiling_us` (200 ms at most), once `warmup_samples` RTT samples are in. Works on 6.12.
+- **Ceiling.** Caps the backed-off RTO at `rto_max_normal_permille` / 1000 × the connection's RTT, clamped to 1-120 s. It is worked out again at every RTT sample, and a sample that shows congestion (a new ECN mark, or a smoothed RTT above `rto_max_congestion_ratio_permille` / 1000 times the minimum, 2× by default) uses `rto_max_congested_permille` instead. 0 leaves the ceiling off. **It needs Linux 6.15 or newer**: 6.12 refuses the socket option, and only `rack_rto.stats.rto_max_rejected` in `ssctl flows --json` grows.
+
+For example (`set-rack-rto` is absolute too: a flag left out takes its default):
+
+```bash
+sudo ssctl set-rack-rto --srtt-permille 1100 --floor-us 20000 --ceiling-us 200000 --warmup-samples 4 \
+    --rto-max-normal-permille 3000 --rto-max-congested-permille 6000
+sudo ssctl set-rack-rto --disable
+```
+
+On a connection at 120 ms this sets a floor of 1.1 × 120 ms = 132 ms and a ceiling of 3 × 120 ms = 360 ms, raised to the 1 s minimum; once its smoothed RTT passes twice the minimum, at 250 ms say, the ceiling becomes 6 × 250 ms = 1.5 s.
+
+Three things to know before relying on it:
+
+- Only connections of processes inside `/sys/fs/cgroup/skyline-speeder` pass through `skyline_policy`, and a process outside it reports **no error**: `ssctl flows` simply shows 0 under *connections seen*. Start the service inside it with `sudo /opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <your service command...>`; for a systemd service, see [DEPLOY.md](DEPLOY.md) §7. `skyline_cc` itself is global and needs no cgroup.
+- **The daemon always starts with it off**, whatever `[rack_rto]` in the config says. After every start, run `ssctl reset-rack-rto`, which applies `[rack_rto]` from the file, or `ssctl set-rack-rto`.
+- It works under any congestion control, and `ssctl drain` does not stop it.
+
+`ssctl flows` shows `dynamic RTO floor` and `dynamic RTO ceiling` under *PARAMETERS IN FORCE*, and a *DYNAMIC RTO* section: `applied` counts floors set (then how many the kernel rejected, how many waited for warm-up and how many were already in place), and `connections seen` the connections that passed through `skyline_policy`. `applied` growing is what shows it is running.
+
+### Retransmit DSCP marking
+
+Off by default. Marks every retransmitted TCP segment leaving `tc_interface` with a DSCP codepoint, so that routers upstream can treat retransmissions differently, for instance carry them on a cleaner path, where your network has such a policy. It applies to all TCP on that interface whatever its congestion control, IPv4 and IPv6 alike, and `ssctl drain` does not stop it.
 
 > [!WARNING]
 > The shipped `dscp_value = 0` is a placeholder: DSCP 0 is best effort, so marking with it does nothing. The real value must come from whoever runs the network. A value already used for something else can get your traffic misclassified and policed.
+
+```bash
+sudo ssctl set-retransmit-dscp --dscp-value <value>   # 1-63, from your network; this also turns marking on
+sudo ssctl reset-retransmit-dscp                      # back to [retransmit_dscp] in the config file: off unless set there
+```
+
+Like the RTO bounds, `[retransmit_dscp]` in the config file is not applied when the daemon starts: run `ssctl reset-retransmit-dscp` after every start. Marking needs `skyline_tc` on an Ethernet `tc_interface`; on a tunnel device the command fails and `ssctl status` says why under *ATTENTION*. `ssctl flows` shows `retransmit DSCP  codepoint N on every TCP retransmission` under *PARAMETERS IN FORCE* and `retransmits marked  N of M detected` under *TC EGRESS*: retransmissions are counted only while marking runs, so `M` should grow with traffic, and `N` should equal it.
+
+### Global loss-detection sysctls
+
+The host's own values by default. A `[rack_tuning]` section in the config makes the daemon write `net.ipv4.tcp_recovery`, `tcp_reordering` and `tcp_early_retrans`, the kernel's loss-detection settings (RACK, the reordering threshold, tail-loss probes), when it starts; if a write is refused, it does not start. They are global: they apply to every TCP connection on the host, whatever its congestion control. The installed config has no such section. `ssctl status` lists the three under *GLOBAL SYSCTLS (M1 tier-1)*, marked `(host)` while the daemon does not own them; for values it owns, it warns when something has changed them since it started (restart it to write them again).
+
+### Event log
+
+On by default. The mode switches, loss events, guardrail trips, window undos and configuration switches of every skyline_cc connection go into `/run/skyline-speeder/events.jsonl`, one JSON line each, keyed by socket cookie. `/run` lives in memory, so past `events_max_mib` (8 MiB, under `[runtime]`) the file is rotated to `events.jsonl.1`, replacing the one before, so the log never takes much more than twice that; 0 turns the log off, and a change needs a daemon restart. The event codes are in [docs/02-interface-reference.md](docs/02-interface-reference.md) §8 (Chinese); guardrail trips are type 9, which `ssctl flows` points to under *guardrail trips*.
+
+### Keeping a change across restarts
+
+`ssctl` changes live in the daemon's memory and are gone after a restart or an upgrade. To keep one, put it in `/etc/skyline-speeder/speeder.toml` under the flag's name with `_` for `-`: `max_*`, `initial_cwnd_packets`, `min_cwnd_packets`, `prr_pacing_enabled` and `auto_pacing_enabled` at the top level, `loss_inflation_max_ratio` under `[loss_classifier]`, the gains and the bandwidth-estimate settings under `[adaptive_cwnd]`. Then check the file and restart:
+
+```bash
+sudo skyline-speederd --config /etc/skyline-speeder/speeder.toml --validate-only
+sudo systemctl restart skyline-speederd    # skyline_cc is attached again by the enable service
+```
+
+From 0.5.0, a misspelt key or one in the wrong section fails `--validate-only`, which names the section it belongs in. `[rack_rto]` and `[retransmit_dscp]` differ in two ways: in the file they also need `enabled = true`, which their `set-*` commands imply, and after the restart only `ssctl reset-rack-rto` and `ssctl reset-retransmit-dscp` apply them.
+
+### Reading `ssctl status` and `ssctl flows`
+
+`ssctl status` answers *has this host been taken over?*
+
+| Line | Meaning |
+|---|---|
+| top line | The running daemon's version (after an upgrade, `ssctl --version` can differ until the daemon restarts) and the verdict: `ACCELERATING`, attached and the host default; `ATTACHED, NOT DEFAULT`, something changed the default since and new connections bypass skyline_cc, so run `ssctl enable`; `STANDBY`, not attached, so run `ssctl enable` |
+| skyline_cc struct_ops | attached, and how long ago |
+| host default cc | `net.ipv4.tcp_congestion_control`: what new connections get |
+| fallback on drain | `fallback_cc`: what new connections get after `ssctl drain`; a fresh install sets it to the one the host's sysctl files select at boot, when this kernel has it |
+| modules | M1-M4; a tick means acting on traffic now, so nothing is ticked while detached |
+| live connections | connections on skyline_cc now |
+| DRIFT GUARD | see [Drift guard](#drift-guard) |
+| KERNEL | the kernel release; every item on `required` must be ticked. `RACK reorder hook` under `optional` needs a patched kernel, and grey is normal |
+| GLOBAL SYSCTLS | see [Global loss-detection sysctls](#global-loss-detection-sysctls) |
+| DAEMON | uptime, and the configuration generation, which goes up whenever the modules, the coefficients or the RTO bounds change |
+| ATTENTION | what needs a look, with the command to run where there is one. On a stock kernel with `early-loss` on, it always says that early-loss remains observation-only: expected, nothing to do |
+
+`ssctl flows` answers *what is being accelerated?*
+
+| Line | Meaning |
+|---|---|
+| top line | `ACCELERATING`; `IDLE`, attached but no connection on skyline_cc yet; `BYPASSED`, attached but not the host default; `NOT ACCELERATING`, not attached |
+| coverage | the share of the host's TCP connections that run on skyline_cc |
+| volume | bytes sent and retransmitted by the connections listed, from the kernel's own counters |
+| the table | per connection: RTT, window in packets, the pacing rate skyline_cc set, the kernel's delivery-rate estimate, bytes sent and the retransmitted share of them |
+| PARAMETERS IN FORCE | the [coefficients](#coefficients), then the RTO bounds, DSCP marking and first-flight copies |
+| window | the counters below run from the attach |
+| ack decisions | ACKs skyline_cc has acted on |
+| loss events | ACKs on which a loss was detected, as a share of ack decisions |
+| guardrail trips | rounds in which queueing delay or an ECN mark set the gain to `guardrail_gain`, as a share of the rounds checked |
+| cwnd at the cap | ACKs after which the window sat at `max_cwnd_packets`: a limit, not congestion |
+| last 1m | the same three over the last minute: whether it is still going on |
+| mode switches | changes between STARTUP and CRUISE |
+| pacing updates | times the pacing rate was recomputed |
+| delivery samples | a sum of overlapping rate samples, for comparing two runs; not a packet count |
+| PRR adjustments | appears only when it is not 0; with `adaptive-cwnd` on, that is a bug worth reporting |
+| TC EGRESS | since the daemon started, everything leaving `tc_interface` whatever its congestion control: `seen` counts packets, bytes and GSO packets; `drops` is always 0, since the program never drops; then [`retransmits marked`](#retransmit-dscp-marking) and [`first-flight copies`](#first-flight-redundancy) |
+| DYNAMIC RTO | see [Dynamic RTO floor and ceiling](#dynamic-rto-floor-and-ceiling) |
+
+`--json` prints the daemon's raw reply instead, for scripts. `ssctl snapshot <file>` has the daemon write the `status` part of it to a file (under systemd, `/run/skyline-speeder/` is the safe place), and `ssctl validate` checks the daemon's configuration in memory against the kernel.
 
 ## Repository layout
 
