@@ -240,7 +240,7 @@ Three things to know before relying on it:
 - **The daemon always starts with it off**, whatever `[rack_rto]` in the config says. After every start, run `ssctl reset-rack-rto`, which applies `[rack_rto]` from the file, or `ssctl set-rack-rto`.
 - It works under any congestion control, and `ssctl drain` does not stop it.
 
-`ssctl flows` shows `dynamic RTO floor` and `dynamic RTO ceiling` under *PARAMETERS IN FORCE*, and a *DYNAMIC RTO* section: `applied` counts floors set (then how many the kernel rejected, how many waited for warm-up and how many were already in place), and `connections seen` the connections that passed through `skyline_policy`. `applied` growing is what shows it is running.
+`ssctl flows` shows `dynamic RTO floor` and `dynamic RTO ceiling` under *PARAMETERS IN FORCE*, and a *DYNAMIC RTO* section: `applied` counts floors set (then how many the kernel rejected, how many waited for warm-up and how many were already in place), and `connections seen` the connections that passed through `skyline_policy`. `applied` growing, or `warmup` on connections too short to get past the warm-up, is what shows it is running.
 
 ### Retransmit DSCP marking
 

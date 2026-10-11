@@ -242,7 +242,7 @@ sudo ssctl set-rack-rto --disable
 - **daemon 每次启动时它都是关闭的**，不管配置里的 `[rack_rto]` 怎么写。每次启动之后都要执行 `ssctl reset-rack-rto`（下发配置文件里的 `[rack_rto]`）或 `ssctl set-rack-rto`。
 - 它在任何拥塞控制下都起作用，`ssctl drain` 也不会停掉它。
 
-`ssctl flows` 的 *PARAMETERS IN FORCE* 里显示 `dynamic RTO floor` 和 `dynamic RTO ceiling`，另有 *DYNAMIC RTO* 段落：`applied` 是设下下限的次数（后面依次是被内核拒绝、等待预热、与已设的值相同而跳过的次数），`connections seen` 是经过 `skyline_policy` 的连接数。`applied` 在增长，才说明它真的在运行。
+`ssctl flows` 的 *PARAMETERS IN FORCE* 里显示 `dynamic RTO floor` 和 `dynamic RTO ceiling`，另有 *DYNAMIC RTO* 段落：`applied` 是设下下限的次数（后面依次是被内核拒绝、等待预热、与已设的值相同而跳过的次数），`connections seen` 是经过 `skyline_policy` 的连接数。`applied` 在增长（连接短到过不了预热期时是 `warmup` 在增长），才说明它真的在运行。
 
 ### 重传包 DSCP 标记
 
