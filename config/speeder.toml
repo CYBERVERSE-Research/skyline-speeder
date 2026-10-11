@@ -77,8 +77,9 @@ min_rtt_window_s = 30
 # 带宽估计取最近几轮的峰值：窗口越长，被 ACK 压缩抬高的样本、瓶颈变窄之前的
 # 旧速率被记住得越久，pacing 速率就越容易脱离链路当前真实交付的速率。
 bw_window_rtts = 6
-# STARTUP 退出判定：连续这么多轮带宽涨幅低于 startup_growth_ratio。受应用限速
-# 的轮次同样会被算作"没涨"，判定太急会让流带着偏低的带宽估计永久进入 CRUISE。
+# STARTUP 退出判定：连续这么多轮带宽涨幅低于 startup_growth_ratio。只数有样本
+# 进入带宽滤波器的轮次：整轮受应用限速的轮次不算"没涨"（0.5.1 起；之前算，长连接上
+# 几个小响应就能让流带着偏低的带宽估计永久进入 CRUISE）。判定太急同样会这样。
 startup_plateau_rtts = 5
 startup_growth_ratio = 0.20
 # SKYLINE_MODE_STARTUP 的单一增益（cwnd 目标和 pacing 速率共用）。

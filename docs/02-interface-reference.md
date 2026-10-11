@@ -351,7 +351,7 @@ daemon 静默忽略它们；降级到这些版本时文件里多出的键没有�
 |---|---|---|
 | `min_rtt_window_s` | u32 | 最小 RTT 滑动窗口长度（秒） |
 | `bw_window_rtts` | u32 | 带宽估计窗口长度（RTT 个数），取值范围 1-10 |
-| `startup_plateau_rtts` | u32 | 判定"带宽增长平台期"所需的连续 RTT 数，用于触发 STARTUP→CRUISE 切换 |
+| `startup_plateau_rtts` | u32 | 判定"带宽增长平台期"所需的连续轮数，用于触发 STARTUP→CRUISE 切换；只数有样本进入带宽滤波器的轮次，整轮受应用限速的不算（0.5.1 起） |
 | `startup_growth_ratio` | f64 | 低于此增长比例视为平台期，取值范围 0.0-1.0 |
 | `startup_gain` | f64 | STARTUP 态单一增益，同时作用于 cwnd 目标和 pacing 速率，必须 ≥1.0 |
 | `cruise_inflight_gain` | f64 | CRUISE 态 cwnd 目标增益，必须 ≥1.0——刻意比 `cruise_pacing_gain` 更宽松，cwnd 只需不成为限制因素，真正的限速器是 pacing |
