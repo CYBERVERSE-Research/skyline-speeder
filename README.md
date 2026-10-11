@@ -26,68 +26,6 @@ English · **[简体中文](README.zh.md)**
 
 Skyline Speeder is single-sided TCP acceleration software. It runs as eBPF programs on the server that sends the data, and is meant for links with heavy packet loss and long round-trip times, where standard TCP collapses. It raises throughput on such links by keeping the sending rate at what the path actually delivers, instead of cutting it back every time a packet is lost. The receiving side is untouched.
 
-### How it works
-
-BBR estimates bandwidth rather than reacting to each loss, yet it still gives ground to loss: the kernel's BBR falls back to packet conservation at the start of every loss recovery, and to a single packet after every retransmission timeout. On a link that drops 10-20% of packets at random, for reasons that have nothing to do with queues, recovery and timeouts become the normal state, and at 100-300 ms RTT its throughput swings from run to run and often collapses. Skyline Speeder replaces the congestion control on the sender, through a `tcp_congestion_ops` implemented in eBPF (`struct_ops`), and works from one assumption: **loss by itself carries no congestion information.**
-
-- **Rate from measurement, not from loss.** Every round it measures the delivery rate (the peak of recent rounds) and the base RTT. On every ACK, in every TCP state including loss recovery, it sets the window directly to `bandwidth × base RTT × gain`. Loss by itself never shrinks it, and there is no packet-conservation phase to climb back out of.
-- **Loss compensation.** On a path that loses a fraction `p` of packets, the delivery rate understates what has to be sent by `(1 - p)`. The window and the rate are scaled up by `1 / (1 - p)`, using the flow's own measured loss rate, up to a configured ceiling.
-- **Pacing.** Data leaves at `bandwidth × gain × compensation` through the `fq` qdisc, evenly spaced rather than in bursts, under a hard rate cap. The window only has to stay out of the way.
-- **Two phases.** STARTUP uses a high gain to find the path's bandwidth quickly. Once bandwidth stops growing for a few rounds, the flow settles into CRUISE.
-- **A congestion guardrail.** Only two signals count as real congestion: queueing delay rising above a threshold (a fixed value or a fraction of the base RTT, whichever is larger), and ECN marks. When either fires, that round's gain drops to `guardrail_gain`, below the measured bandwidth, and the next clean round restores it.
-- **A bounded RTO** (optional). A cgroup sockops program caps the kernel's retransmission timeout per connection, so a flap cannot leave a connection waiting up to two minutes.
-- **First-flight redundancy** (on by default). What holds a short response back on such a link is not the window but the wait for loss recovery: a tail-loss probe after about two round trips, a retransmission timeout after about three, a fixed second for a lost SYN-ACK. A TC egress program sends each skyline_cc connection's handshake and first 64 KiB twice, the copy 10 ms after the original, so one lost packet costs those milliseconds instead of a timer. The price is about 64 KiB of extra traffic per connection, more where segments in that range are retransmitted (each retransmission is copied too).
-
-A Rust daemon, `skyline-speederd`, loads the BPF objects (the kernel verifier checks each one at load) and pushes new coefficients online through a double-buffered slot that each flow switches to at an RTT boundary. `ssctl` is its command line.
-
-> [!IMPORTANT]
-> **The assumption only holds for loss that is independent of queues.** If the loss on your path is queue overflow at a congested bottleneck, loss compensation and the guardrail push in opposite directions and you will make things worse. Rule of thumb: if a fixed-rate UDP flow shows no loss while TCP retransmits heavily, your loss is self-inflicted queue overflow and this is not the tool. Fairness is not a goal either: it does not try to share a link evenly with competing flows.
-
-## Measured performance
-
-bbr, [tcp-brutal](https://github.com/HyNetworks/tcp-brutal) and skyline_cc on one real cross-border path, each applied on the server only, through the same per-destination route override. The client ran stock TCP throughout.
-
-| | Where | Role |
-|---|---|---|
-| **Server** | KVM VPS in **Singapore** · 10 Gbps | sends; the only side that is accelerated |
-| **Client** | **Alibaba Cloud** ECS, **South China (Guangdong)** · 200 Mbps | receives; stock TCP, untouched |
-
-RTT 70-73 ms, 10-30% loss, measured at evening peak. skyline_cc ran the coefficients that shipped as the default in 0.1.0, now the "high random loss" preset in [docs/usage.md](docs/usage.md); **today's defaults have not been run on this path**. tcp-brutal was v2.0.0 at 200 Mbps; bbr was the kernel's own.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/single-ended-ataglance-dark.svg">
-  <img alt="tcp-brutal and skyline_cc measured against a bbr baseline across game, video, web and bulk traffic" src="docs/images/single-ended-ataglance-light.svg">
-</picture>
-
-8 rotations × 3 algorithms × 5 scenarios = 120 runs, 119 completed. The algorithm order changed every rotation, so a path that degrades mid-test cannot favour whoever went first. Winners are counted per rotation:
-
-| Scenario | Winner | Margin |
-|---|---|---|
-| **Video** (6 MB chunks @ 48 Mbps) | **tcp-brutal** | startup 7/8 rotations, chunk p95 6/8 |
-| **Game** (ping-pong, 60 msg/s) | **skyline_cc** | jitter 5/8, stalls >150 ms 4/8 |
-| **Bulk, 4 streams** | skyline_cc and tcp-brutal, both ahead of bbr | median 117 / 115 vs 77 Mbps |
-| **Bulk, 1 stream** | bbr and skyline_cc tie; tcp-brutal last | 4/8, 4/8, 0/8 rotations; median 59 / 53 / 46 Mbps |
-| **Web page load** | no stable winner | rotation-to-rotation spread exceeds the difference |
-| **Server retransmissions**, share of all segments sent, all scenarios | bbr lowest | bbr 9.1%, skyline_cc 10.4%, tcp-brutal 10.9% |
-
-The single-stream result says the most about the three designs. **tcp-brutal sent the most and delivered the least: 12.2% of its segments were retransmissions, against 9.0% for bbr and 10.0% for skyline_cc, for a median of 46 Mbps.** Its fixed 200 Mbps is far above what this path delivers at 10-30% loss, and an open loop that sends harder when packets are lost turns that gap into pure retransmission. skyline_cc estimates the rate itself, so there is no target rate to set too high.
-
-> [!NOTE]
-> This is a field measurement on one path, not the controlled two-VM test bed that formal results in this repository come from, and it is not a claim about your link. Its 70 ms RTT is also below this project's target of 100-300 ms, where bbr recovers from loss far more easily. Read it as evidence about how the three algorithms behave, not as a throughput benchmark. Per-rotation numbers and raw records: [research/experiments/single-ended/](research/experiments/single-ended/). Controlled test-bed results: [docs/04-performance-report.md](docs/04-performance-report.md) (Chinese).
-
-### How the three differ by design
-
-|  | bbr | tcp-brutal | Skyline Speeder |
-|---|---|---|---|
-| Control structure | Closed loop, probes bandwidth | **Open loop**: you supply the rate | Closed loop, estimates bandwidth |
-| Backs off on loss | Indirectly | No | No |
-| Needs the path bandwidth up front | No | **Yes** | No |
-| Congestion self-protection | Yes | None | Queueing-delay + ECN guardrail |
-| Form | In-kernel | Kernel module (DKMS) | eBPF CO-RE, verifier-checked |
-| Kernel floor | any | 5.10 | **6.12 LTS** |
-
-If you know your egress bandwidth, it is fixed and your kernel is old, tcp-brutal is the simpler answer. Skyline Speeder is for bandwidth that is unknown or changes, when you want a congestion guardrail and observability and can run a 6.12+ kernel. Neither belongs on a genuinely congested bottleneck.
-
 ## Kernel requirement
 
 **Linux 6.12 LTS or newer**, with `/sys/kernel/btf/vmlinux` present. `skyline_cc` implements the four-argument `cong_control(sk, ack, flag, rs)` callback, which exists only from 6.10; older kernels reject the program at load time. That rules out the 6.1 and 6.6 LTS branches and the stock Debian 12 and Ubuntu 22.04/24.04 kernels.
@@ -157,6 +95,34 @@ Both reports are written to be read, with colour and symbols on a terminal and n
 `ssctl flows` lists the TCP connections the kernel currently runs on `skyline_cc` (the 50 that have sent the most; the rest only counted, "N more, not shown") -- peer, RTT, congestion window, pacing rate, delivery rate, bytes sent and the retransmitted share of them -- followed by the coefficients in force on those connections and the counters showing what the algorithm decided. The per-connection numbers are the kernel's own, read back through `ss`: skyline_cc keeps its per-flow state in socket storage, which user space cannot enumerate, but cwnd, pacing rate and RTT are exactly what it writes into the socket.
 
 Over SSH, `ssctl drain` always runs into its timeout, because your own session is a skyline_cc flow. That is harmless: it switches new connections to `fallback_cc` before it starts waiting.
+
+## How it works
+
+On a long-haul link that drops packets at random, for reasons that have nothing to do with queues, a congestion control that slows down on every loss collapses. Even BBR, which estimates bandwidth instead, still falls back to packet conservation in every loss recovery and to a single packet after every timeout. Skyline Speeder replaces the congestion control on the sending server with `skyline_cc`, written in eBPF (`struct_ops`), and works from one assumption: **loss by itself carries no congestion information.**
+
+- **Measure, then send.** Every round it measures the delivery rate and the base RTT, and on every ACK, loss recovery included, it sets the window to `bandwidth × base RTT × gain`. A lost packet never shrinks it.
+- **Compensate and pace.** A path that loses a fraction `p` of packets delivers only `1 - p` of what is sent, so the rate is scaled up by `1 / (1 - p)`, to a ceiling, and leaves evenly spaced through the `fq` qdisc rather than in bursts.
+- **Two phases.** STARTUP climbs quickly to the path's bandwidth; once the measured bandwidth stops growing, CRUISE holds it.
+- **One brake.** Only rising queueing delay and ECN marks count as congestion. Either one drops that round's rate below the measured bandwidth.
+- **Short responses first.** Each connection's handshake and first 64 KiB go out twice, 10 ms apart, so one lost packet costs milliseconds instead of a retransmission timer, for about 64 KiB of extra traffic per connection.
+
+A Rust daemon, `skyline-speederd`, loads the BPF programs, which the kernel verifier checks at load, and changes coefficients online; `ssctl` is its command line. Each mechanism in detail: [docs/03-design.md](docs/03-design.md) (Chinese).
+
+> [!IMPORTANT]
+> **The assumption only holds for loss that is independent of queues.** If the loss on your path is queue overflow at a congested bottleneck, loss compensation and the guardrail push in opposite directions and you will make things worse. Rule of thumb: if a fixed-rate UDP flow shows no loss while TCP retransmits heavily, your loss is self-inflicted queue overflow and this is not the tool. Fairness is not a goal either: it does not try to share a link evenly with competing flows.
+
+### How the three differ by design
+
+|  | bbr | tcp-brutal | Skyline Speeder |
+|---|---|---|---|
+| Control structure | Closed loop, probes bandwidth | **Open loop**: you supply the rate | Closed loop, estimates bandwidth |
+| Backs off on loss | Indirectly | No | No |
+| Needs the path bandwidth up front | No | **Yes** | No |
+| Congestion self-protection | Yes | None | Queueing-delay + ECN guardrail |
+| Form | In-kernel | Kernel module (DKMS) | eBPF CO-RE, verifier-checked |
+| Kernel floor | any | 5.10 | **6.12 LTS** |
+
+If you know your egress bandwidth, it is fixed and your kernel is old, tcp-brutal is the simpler answer. Skyline Speeder is for bandwidth that is unknown or changes, when you want a congestion guardrail and observability and can run a 6.12+ kernel. Neither belongs on a genuinely congested bottleneck.
 
 ## Configuration
 
@@ -262,6 +228,38 @@ The documents under `docs/` and DEPLOY.md are in Chinese.
 | [docs/03-design.md](docs/03-design.md) | Architecture and how each module works |
 | [docs/04-performance-report.md](docs/04-performance-report.md) | Controlled test bed: environment, results against bbr, limitations |
 | [research/experiments/README.md](research/experiments/README.md) | Reproducing the performance tests |
+
+## Measured performance
+
+bbr, [tcp-brutal](https://github.com/HyNetworks/tcp-brutal) and skyline_cc on one real cross-border path, each applied on the server only, through the same per-destination route override. The client ran stock TCP throughout.
+
+| | Where | Role |
+|---|---|---|
+| **Server** | KVM VPS in **Singapore** · 10 Gbps | sends; the only side that is accelerated |
+| **Client** | **Alibaba Cloud** ECS, **South China (Guangdong)** · 200 Mbps | receives; stock TCP, untouched |
+
+RTT 70-73 ms, 10-30% loss, measured at evening peak. skyline_cc ran the coefficients that shipped as the default in 0.1.0, now the "high random loss" preset in [docs/usage.md](docs/usage.md); **today's defaults have not been run on this path**. tcp-brutal was v2.0.0 at 200 Mbps; bbr was the kernel's own.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/single-ended-ataglance-dark.svg">
+  <img alt="tcp-brutal and skyline_cc measured against a bbr baseline across game, video, web and bulk traffic" src="docs/images/single-ended-ataglance-light.svg">
+</picture>
+
+8 rotations × 3 algorithms × 5 scenarios = 120 runs, 119 completed. The algorithm order changed every rotation, so a path that degrades mid-test cannot favour whoever went first. Winners are counted per rotation:
+
+| Scenario | Winner | Margin |
+|---|---|---|
+| **Video** (6 MB chunks @ 48 Mbps) | **tcp-brutal** | startup 7/8 rotations, chunk p95 6/8 |
+| **Game** (ping-pong, 60 msg/s) | **skyline_cc** | jitter 5/8, stalls >150 ms 4/8 |
+| **Bulk, 4 streams** | skyline_cc and tcp-brutal, both ahead of bbr | median 117 / 115 vs 77 Mbps |
+| **Bulk, 1 stream** | bbr and skyline_cc tie; tcp-brutal last | 4/8, 4/8, 0/8 rotations; median 59 / 53 / 46 Mbps |
+| **Web page load** | no stable winner | rotation-to-rotation spread exceeds the difference |
+| **Server retransmissions**, share of all segments sent, all scenarios | bbr lowest | bbr 9.1%, skyline_cc 10.4%, tcp-brutal 10.9% |
+
+The single-stream result says the most about the three designs. **tcp-brutal sent the most and delivered the least: 12.2% of its segments were retransmissions, against 9.0% for bbr and 10.0% for skyline_cc, for a median of 46 Mbps.** Its fixed 200 Mbps is far above what this path delivers at 10-30% loss, and an open loop that sends harder when packets are lost turns that gap into pure retransmission. skyline_cc estimates the rate itself, so there is no target rate to set too high.
+
+> [!NOTE]
+> This is a field measurement on one path, not the controlled two-VM test bed that formal results in this repository come from, and it is not a claim about your link. Its 70 ms RTT is also below this project's target of 100-300 ms, where bbr recovers from loss far more easily. Read it as evidence about how the three algorithms behave, not as a throughput benchmark. Per-rotation numbers and raw records: [research/experiments/single-ended/](research/experiments/single-ended/). Controlled test-bed results: [docs/04-performance-report.md](docs/04-performance-report.md) (Chinese).
 
 ## Contributing
 
