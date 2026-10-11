@@ -596,6 +596,8 @@ ExecStartPost=+/bin/sh -c 'echo $MAINPID > /sys/fs/cgroup/skyline-speeder/cgroup
 - `[rack_tuning]` 整段留空：全局 sysctl 的默认值不由 `skyline-speederd` 接管；
 - `[rack_rto]`、`[retransmit_dscp]` 默认关闭，而且写进文件也**不会在 daemon 启动时下发**，要
   `ssctl reset-rack-rto` / `reset-retransmit-dscp`（下发文件里的值）或 `set-*`（下发命令行的值）。
+  0.5.1 起状态如实显示它们关闭（`--json` 里 `config.enabled` 为 `false`，文件值在 `declared`），文件开启而
+  未下发时 `ssctl status` 的 ATTENTION 会提示；0.5.0 及更早的 `config` 照着文件显示为开启。
   `dscp_value` 是占位值，启用前必须由网络侧给出具体编码（`docs/usage.md` 第六节）；
 - `[guard]` 默认 `interval_s = 5`、`qdisc = true`（§9）；
 - `fallback_cc`：`skyline_cc` 不在时新连接用的算法。每次 enable 挂载前、`ssctl drain`、enable unit 的 ExecStop

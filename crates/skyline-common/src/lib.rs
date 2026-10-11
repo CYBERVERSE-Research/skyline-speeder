@@ -1189,16 +1189,28 @@ pub struct RackTuningStatus {
     pub live: RackTuningConfig,
 }
 
+/// Dynamic RTO at run time. `config` is what `skyline_policy` is running,
+/// which after a daemon start is off whatever the file says: only
+/// `set-rack-rto` / `reset-rack-rto` turn it on. `declared` is the file's
+/// `[rack_rto]`, the one `reset-rack-rto` applies; `None` from a daemon
+/// older than 0.5.1, whose `config` reported the file's value even while
+/// the kernel ran nothing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RackRtoStatus {
     pub config: RackRtoConfig,
     pub stats: Option<RackRtoStats>,
+    #[serde(default)]
+    pub declared: Option<RackRtoConfig>,
 }
 
+/// Retransmit DSCP marking at run time: `config` and `declared` as in
+/// `RackRtoStatus`, with `reset-retransmit-dscp` applying `declared`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetransmitDscpStatus {
     pub config: RetransmitDscpConfig,
     pub stats: Option<RetransmitDscpStats>,
+    #[serde(default)]
+    pub declared: Option<RetransmitDscpConfig>,
 }
 
 /// `[redundancy]` at run time. Defaulted so a newer ssctl can decode the

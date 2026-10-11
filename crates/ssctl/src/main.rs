@@ -453,10 +453,12 @@ mod tests {
             rack_rto: RackRtoStatus {
                 config: shipped.rack_rto,
                 stats: None,
+                declared: Some(shipped.rack_rto),
             },
             retransmit_dscp: RetransmitDscpStatus {
                 config: shipped.retransmit_dscp,
                 stats: None,
+                declared: Some(shipped.retransmit_dscp),
             },
             redundancy: RedundancyStatus {
                 config: shipped.redundancy,
@@ -501,6 +503,11 @@ mod tests {
         assert!(fields.remove("attached_s").is_some());
         assert!(fields.remove("redundancy").is_some());
         assert!(fields.remove("metrics_recent").is_some());
+        // What the file declares, which 0.5.1 added next to what is running.
+        for feature in ["rack_rto", "retransmit_dscp"] {
+            let feature = fields[feature].as_object_mut().expect("feature object");
+            assert!(feature.remove("declared").is_some());
+        }
         // The two counters 0.5.0 added to the metrics.
         let metrics = fields["metrics"].as_object_mut().expect("metrics object");
         assert!(metrics.remove("guardrail_rounds").is_some());
@@ -517,6 +524,8 @@ mod tests {
         assert!(!decoded.redundancy.active);
         assert!(decoded.enabled);
         assert_eq!(decoded.metrics_recent, None);
+        assert_eq!(decoded.rack_rto.declared, None);
+        assert_eq!(decoded.retransmit_dscp.declared, None);
         let metrics = decoded.metrics.expect("metrics");
         assert_eq!(metrics.guardrail_hits, 193_027);
         assert_eq!((metrics.guardrail_rounds, metrics.cwnd_cap_hits), (0, 0));
