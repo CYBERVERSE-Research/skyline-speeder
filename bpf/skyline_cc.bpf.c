@@ -460,6 +460,56 @@ static __always_inline bool skyline_sample_measures_path(struct tcp_sock *tp,
     return !srtt_us || (__u64)sample->interval_us <= 2ULL * srtt_us;
 }
 
+/* SKB_DATA_ALIGN() (include/linux/skbuff.h) rounds to SMP_CACHE_BYTES: 64 on
+ * x86, the one target these objects are built for (-D__TARGET_ARCH_x86). */
+#define SKYLINE_SKB_DATA_ALIGN(x) (((x) + 63U) & ~63U)
+
+/* Marks the flow application-limited at an ACK, the way the kernel only does
+ * when the application writes. tcp_rate_check_app_limited() runs from
+ * tcp_sendmsg_locked(), and every packet sent before the flight it saw has
+ * been delivered carries is_app_limited -- the samples skyline_update_model()
+ * leaves out. A retransmission is not a write. When a segment near the end of
+ * a response is lost, the retransmission RACK sends for it, or a tail-loss
+ * probe, goes out after the marker of the response's own write has been
+ * delivered, so its sample counts as a measurement of the path, while all it
+ * covers is the handful of segments still in flight when the response ended:
+ * a few hundred kbit/s at the RTTs this controller targets. On a lossy path
+ * that is often the first sample a short response produces, and with nothing
+ * in the filter before it, it becomes the estimate. M2 then cuts cwnd from the
+ * initial window to min_cwnd_packets and M4 paces at
+ * skyline_pacing_floor_bps() -- and the next response on a keep-alive, HTTP/2
+ * or proxy-tunnel connection starts from there.
+ *
+ * So the kernel's test runs here too, on every ACK, after M2 and M4 have set
+ * this ACK's window and rate: less than one segment left to send, nothing
+ * waiting below TCP in the qdisc or the NIC (SKB_TRUESIZE(1), as the kernel
+ * compares), and the window not full. The retransmissions this ACK releases
+ * (tcp_xmit_recovery() runs after cong_control) and anything else sent before
+ * the current flight is delivered are then app-limited, as the next write
+ * would have made them. One of the kernel's conditions is left out on
+ * purpose: that every segment marked lost has been retransmitted. With
+ * nothing new to send, a retransmission cannot fill the pipe either. A flow
+ * with data still waiting in the socket is never marked, so a transfer that
+ * keeps its socket full is measured exactly as before.
+ */
+static __always_inline void skyline_mark_app_limited(struct sock *sk, struct tcp_sock *tp)
+{
+    __s32 queued = BPF_CORE_READ(sk, sk_wmem_alloc.refs.counter) - 1;
+    __u32 truesize_one = 1U +
+                         SKYLINE_SKB_DATA_ALIGN(bpf_core_type_size(struct sk_buff)) +
+                         SKYLINE_SKB_DATA_ALIGN(bpf_core_type_size(struct skb_shared_info));
+    __u32 in_flight;
+
+    if (tp->write_seq - tp->snd_nxt >= tp->mss_cache)
+        return;
+    if (queued >= (__s32)truesize_one)
+        return;
+    in_flight = tp->packets_out - (tp->sacked_out + tp->lost_out) + tp->retrans_out;
+    if (in_flight >= tp->snd_cwnd)
+        return;
+    tp->app_limited = (tp->delivered + in_flight) ?: 1U;
+}
+
 static __always_inline bool skyline_update_model(struct sock *sk,
                                              struct tcp_sock *tp,
                                              struct skyline_flow_state *flow,
@@ -469,6 +519,9 @@ static __always_inline bool skyline_update_model(struct sock *sk,
     __u64 now_us = bpf_ktime_get_ns() / 1000ULL;
     __u64 rate_bps = skyline_rate_sample_bps(tp, sample);
     bool new_round = skyline_new_round(tp, flow, sample);
+    /* Whether the round that just ended took a sample into the filter --
+     * see the STARTUP plateau check below. */
+    bool measured_round = false;
 
     if (sample->rtt_us > 0 &&
         (!flow->min_rtt_us || (__u64)sample->rtt_us < flow->min_rtt_us ||
@@ -500,6 +553,7 @@ static __always_inline bool skyline_update_model(struct sock *sk,
         flow->bw_samples[0] = flow->round_rate_bps;
         flow->bw_sample_index = 0;
         flow->round_rate_bps = 0;
+        measured_round = true;
 #pragma unroll
         for (int offset = 0; offset < 10; offset++) {
             if ((__u32)offset < window &&
@@ -508,8 +562,21 @@ static __always_inline bool skyline_update_model(struct sock *sk,
         }
         flow->bw_bps = maximum;
     }
+    /* An empty filter is not seeded from a retransmission. Its sample counts
+     * what was delivered between the resend and its ACK, and for the first
+     * resend after a flight that lost a large part of itself that is the
+     * resend alone: one packet over an RTT. As the first value in the filter
+     * it would set the estimate -- and M2's cwnd and M4's pacing with it --
+     * until something larger arrives. New data sent along with the resends
+     * is acked a moment later, and its sample covers what the whole round
+     * delivered; at the end of a response, where there is no new data,
+     * skyline_mark_app_limited() has already made the resend app-limited.
+     * Once there is an estimate, retransmission samples count as before: in
+     * a stretch of sustained loss they are what keeps it current.
+     */
     if (rate_bps && !sample->is_app_limited &&
-        skyline_sample_measures_path(tp, sample)) {
+        skyline_sample_measures_path(tp, sample) &&
+        (flow->bw_bps || !sample->is_retrans)) {
         if (rate_bps > flow->round_rate_bps)
             flow->round_rate_bps = rate_bps;
         if (rate_bps > flow->bw_bps)
@@ -564,13 +631,28 @@ static __always_inline bool skyline_update_model(struct sock *sk,
          * there is nothing left to check here every round.
          */
         if (flow->mode == SKYLINE_MODE_STARTUP) {
-            if (flow->prior_round_bw_bps &&
-                flow->bw_bps * 1000ULL <
-                    flow->prior_round_bw_bps *
-                        (1000U + config->startup_growth_permille))
-                flow->plateau_rounds++;
-            else
-                flow->plateau_rounds = 0;
+            /* Only a round that put a sample into the filter can show the
+             * estimate has stopped growing. A round without one -- every
+             * sample app-limited, which is every round of a connection that
+             * carries short responses with idle gaps between them
+             * (keep-alive, HTTP/2, a proxy's tunnel) -- leaves bw_bps where
+             * it was. Counted as "grew less than startup_growth_permille",
+             * a few such responses were enough to end STARTUP on whatever
+             * the first burst had measured (often an RTT the client's
+             * still-small receive window held back), and CRUISE then paced
+             * every later burst at cruise_pacing_permille times that. The
+             * kernel's BBR leaves app-limited rounds out of the same check
+             * (bbr_check_full_bw_reached(), net/ipv4/tcp_bbr.c).
+             */
+            if (measured_round) {
+                if (flow->prior_round_bw_bps &&
+                    flow->bw_bps * 1000ULL <
+                        flow->prior_round_bw_bps *
+                            (1000U + config->startup_growth_permille))
+                    flow->plateau_rounds++;
+                else
+                    flow->plateau_rounds = 0;
+            }
             if (flow->plateau_rounds >= config->startup_plateau_rtts ||
                 flow->queue_clamped)
                 skyline_transition(sk, flow, SKYLINE_MODE_CRUISE);
@@ -1094,6 +1176,11 @@ void BPF_PROG(skyline_cong_control, struct sock *sk, __u32 ack, int flag,
     } else if (config->feature_mask & SKYLINE_FEATURE_PRR) {
         skyline_apply_prr(tp, flow, sample, metric);
     }
+
+    /* Only M2 and M4 read the bandwidth filter; with both off the flow is
+     * on the kernel-CUBIC path and its rate samples stay the kernel's own. */
+    if (config->feature_mask & (SKYLINE_FEATURE_ADAPTIVE_CWND | SKYLINE_FEATURE_PACING))
+        skyline_mark_app_limited(sk, tp);
 
     if (metric) {
         metric->ack_events++;

@@ -8,6 +8,58 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 the layout of `bpf/include/skyline_abi.h` and any bump to it is a breaking change
 for anyone holding a prebuilt `.bpf.o`.
 
+## [0.5.1] - 2026-10-11
+
+### Upgrading from 0.5.0
+
+- **Re-run the installer the way the host was installed.** Only
+  `skyline_cc.bpf.o` changes and `SKYLINE_ABI_VERSION` stays 8, so the 0.5.0
+  daemon and the other two objects are compatible with it; the installer
+  replaces everything together as usual. Connections opened before the
+  upgrade stay on the 0.5.0 code until they close, as with every swap of the
+  struct_ops (DEPLOY.md §11.6).
+
+### Fixed
+
+- **A short response on a lossy path no longer hands its connection a
+  bandwidth estimate it never measured.** The kernel marks a flow
+  application-limited only when the application writes
+  (`tcp_rate_check_app_limited()` in `tcp_sendmsg_locked()`). When a segment
+  near the end of a response was lost, the retransmission RACK sent for it --
+  or a tail-loss probe -- went out after that mark had been delivered, so its
+  rate sample counted as a measurement of the path while it covered only the
+  segments still in flight when the response ended: a few hundred kbit/s at
+  long RTTs. With nothing in the filter before it, it became the estimate: M2
+  cut cwnd from the initial window to `min_cwnd_packets`, M4 paced at its
+  floor, and the next response on the same keep-alive, HTTP/2 or proxy-tunnel
+  connection started from there. Seen on a 76 ms path with a few percent loss:
+  after one 16 KB response with two retransmissions, the connection's cwnd
+  went from 100 to 32 and its pacing rate from unlimited to 4.7 Mbit/s. With
+  M2 or M4 on, `skyline_cc` now repeats the kernel's check at the end of every
+  ACK and marks the flow application-limited the same way when it has nothing
+  left to send, so those retransmissions and probes are app-limited samples.
+  It leaves out one of the kernel's conditions, that every lost segment has
+  been retransmitted: with no new data, a retransmission cannot fill the pipe
+  either. A flow with data still queued in its socket is never marked. And an
+  empty filter is no longer seeded from a retransmission at all: after a flight
+  that lost a large part of itself, the first resend's ACK often delivers that
+  resend alone, one packet over an RTT, while the new data sent with it covers
+  the whole round a moment later. Once there is an estimate, retransmission
+  samples count as before.
+- **STARTUP no longer takes an app-limited round as "bandwidth stopped
+  growing".** Such a round puts no sample into the filter and leaves `bw_bps`
+  where it was, and it counted toward `startup_plateau_rtts`. A connection
+  carrying short responses with idle gaps between them reached the count after
+  a few responses and entered CRUISE on whatever its first burst had measured,
+  often an RTT that the client's still-small receive window held back, and
+  every later burst was paced at `cruise_pacing_gain` times that. A burst
+  shorter than one RTT is app-limited from start to end and cannot correct the
+  estimate. Seen on a 150 ms path: a persistent connection's pacing rate fell
+  from 78 to 33 Mbit/s when it switched after a series of small responses, and
+  stayed there. Only rounds that put a sample into the filter are counted now,
+  as the kernel's BBR does in the same check (`bbr_check_full_bw_reached()`);
+  the guardrail still ends STARTUP at once.
+
 ## [0.5.0] - 2026-10-08
 
 ### Upgrading from 0.4.4
