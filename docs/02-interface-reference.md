@@ -82,14 +82,14 @@ Skyline Speeder 的运行期由一个守护进程 `skyline-speederd` 和一个�
 | 命令 | 作用 |
 |---|---|
 | `ssctl set-rack-rto [--disable] [--<字段> <值> ...]` | 配置每流动态 `TCP_BPF_RTO_MIN` 下限与 `TCP_RTO_MAX_MS` 上限，见第 6 节字段表。`--disable` 取消订阅 `BPF_SOCK_OPS_RTT_CB`，恢复内核默认 RTO 下限，是无条件的关闭。同样是绝对覆盖语义：没写的字段取 `ssctl` 内置默认值（`--srtt-permille 1000`、`--floor-us 5000`、`--ceiling-us 200000`、`--warmup-samples 8`，三个 `--rto-max-*` 为 0 即上限关闭），不是配置文件里的值 |
-| `ssctl reset-rack-rto` | 恢复为配置文件里声明的 `[rack_rto]`，也是把这一段下发到 BPF 的唯一途径：daemon 每次启动都把动态 RTO 初始化为关闭（第 6 节）。随附模板没有这一段，即关闭；文件里写了 `enabled = true` 的，它会把功能打开 |
+| `ssctl reset-rack-rto` | 恢复为配置文件里声明的 `[rack_rto]`，也是把这一段下发到 BPF 的唯一途径：daemon 每次启动都把动态 RTO 初始化为关闭（第 6 节）。随附模板没有这一段，即关闭；文件里写了 `enabled = true` 的，它会把功能打开。0.5.1 起，文件打开了而此刻是关闭时，`ssctl status` 的 ATTENTION 和 `ssctl flows` 都会提示执行它 |
 
 ### 2.5 重传包 DSCP 标记
 
 | 命令 | 作用 |
 |---|---|
 | `ssctl set-retransmit-dscp --dscp-value <0-63>` | 启用标记并指定 DSCP 编码值。这个值是占位参数——具体编码由网络侧策略决定，Skyline Speeder 本身不预设生产环境的取值；启用时必须提供非零值（0 在语义上等同于"剥除现有 DSCP"，不是无操作，因此被拒绝） |
-| `ssctl reset-retransmit-dscp` | 恢复为配置文件里声明的 `[retransmit_dscp]`（默认关闭） |
+| `ssctl reset-retransmit-dscp` | 恢复为配置文件里声明的 `[retransmit_dscp]`（默认关闭），也是把这一段下发到 BPF 的唯一途径：daemon 每次启动都把标记初始化为关闭。0.5.1 起，文件打开了而此刻是关闭时，`ssctl status` 的 ATTENTION 和 `ssctl flows` 都会提示执行它 |
 
 ### 2.6 首轮冗余
 
@@ -159,8 +159,8 @@ daemon 应答，旧 `ssctl` 也能解码新 daemon 的应答。`RuntimeStatus` �
 | `metrics` | M2/M3/M4 的决策计数器（见下表），**自这次挂载起累计**。没有已加载的 struct_ops 时为 `null`：从未启用、一次 drain 完成之后、daemon 重启之后都是；每次重新挂载从零计起 |
 | `metrics_recent` | 最近约一分钟里 `metrics` 的增量：`seconds`（实际覆盖的秒数）与 `metrics`（同一组计数器在这段时间里的增量）。挂载期间 daemon 每 5 秒读一次计数器，取当前值与最接近 60 秒前的那次读数之差；挂载不满一分钟时覆盖到最早的那次读数。用它区分"现在仍在发生"和"挂载以来某个时候发生过"。未挂载、刚挂载还没有读数、或来自 0.5.0 之前的 daemon 时为 `null` |
 | `rack_tuning` | M1 tier-1 全局 sysctl 的"配置声明值"与"当前实际值"对照 |
-| `rack_rto` | M1 tier-2 配置 + 运行计数器（`stats`，见下方 `rack_rto.stats` 表） |
-| `retransmit_dscp` | DSCP 标记配置 + 运行计数器（`stats`，见下方 `retransmit_dscp.stats` 表） |
+| `rack_rto` | M1 tier-2：`config` 是 `skyline_policy` 此刻在用的配置，daemon 启动后总是关闭，直到 `set-rack-rto`/`reset-rack-rto`；`declared` 是配置文件里的 `[rack_rto]`，即 `reset-rack-rto` 会下发的值；`stats` 是运行计数器（见下方 `rack_rto.stats` 表）。0.5.0 及更早没有 `declared`（解码为 `null`），`config` 报告的是文件里的值，即使 BPF 侧是关闭的 |
+| `retransmit_dscp` | DSCP 标记：`config` 是 TC 程序此刻在用的配置，daemon 启动后总是关闭，直到 `set-retransmit-dscp`/`reset-retransmit-dscp`；`declared` 是配置文件里的 `[retransmit_dscp]`，即 `reset-retransmit-dscp` 会下发的值；`stats` 是运行计数器（见下方 `retransmit_dscp.stats` 表）。0.5.0 及更早同 `rack_rto` |
 | `redundancy` | 首轮冗余：`config`（daemon 内存里的 `[redundancy]`）、`active`（TC 程序此刻是否在复制：skyline_cc 已启用、`enabled = true` 且 TC 程序已加载，三者同时成立）、`stats`（见下表；TC 程序未加载时为 `null`） |
 | `module_tuning` | M2/M3/M4 当前生效系数的完整回显 |
 | `capabilities` | 内核能力探测结果，见下方"能力探测" |
@@ -317,7 +317,8 @@ BPF 侧的四段配置各自独立维护自己的 ABI 版本号，互不联动�
   在线覆盖；
 - `[rack_rto]` 与 `[retransmit_dscp]`：daemon 启动时 BPF 侧初始化为关闭，文件里的值要执行一次
   `reset-rack-rto`/`reset-retransmit-dscp` 才下发（`set-*` 下发的是命令行给出的值）；在此之前
-  `ssctl status` 里这两段的 `config` 显示的是文件值，并不代表已经生效；
+  `ssctl status` 里这两段的 `config` 显示为关闭，文件值在 `declared` 里，ATTENTION 会提示（0.5.0 及
+  更早的 `config` 显示的是文件值，并不代表已经生效）；
 - `[redundancy]`：daemon 启动时同样读入内存、BPF 侧初始化为关闭；`ssctl enable` 成功后按内存里的值
   下发（整段省略 = 开启），`ssctl drain` 一开始就关闭；`set-redundancy`/`reset-redundancy` 可在线修改；
 - `[runtime]`、`[rack_tuning]`、`[guard]` 与 `fallback_cc`：没有在线命令，修改后需重启 `skyline-speederd`。
@@ -333,7 +334,7 @@ daemon 静默忽略它们；降级到这些版本时文件里多出的键没有�
 
 | 字段 | 类型 | 说明 | 可在线覆盖 |
 |---|---|---|---|
-| `generation` | u32 | 配置代际计数器，必须非零；每次 `enable` / `set-*` / `reset-*` 自动递增。BPF 侧用它标出每条连接在用哪一代配置（type 11 事件的新旧代际）；防止读到半新半旧配置靠的是另一个序号，见 `docs/03-design.md` 第 11 节 | 否（内部维护） |
+| `generation` | u32 | 配置代际计数器，必须非零；每次 `enable`、`disable`、`set-`/`reset-module-config`、`set-`/`reset-rack-rto` 自动递增（DSCP 标记与首轮冗余的命令不递增：它们的配置不带代际号）。BPF 侧用它标出每条连接在用哪一代配置（type 11 事件的新旧代际）；防止读到半新半旧配置靠的是另一个序号，见 `docs/03-design.md` 第 11 节 | 否（内部维护） |
 | `enabled_modules` | string[] | 启动时启用的 M1-M4 模块子集，取值 `early-loss`/`adaptive-cwnd`/`loss-classifier`/`pacing` | 是（`ssctl enable`） |
 | `prr_pacing_enabled` | bool | 框架级 PRR 重实现开关，独立于上面四个模块——即使 `enabled_modules` 为空也默认生效（修正的是"绕开内核 PRR 后基线不对等"这个问题，不是可选特性）。M2 开启时该路径不会被执行 | 是（`set-module-config`） |
 | `auto_pacing_enabled` | bool | M4 关闭时使用的、等价于内核默认行为的 pacing 速率上限，独立开关，语义同上 | 是（`set-module-config`） |

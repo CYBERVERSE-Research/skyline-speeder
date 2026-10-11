@@ -1037,14 +1037,15 @@ struct Daemon {
     tc_error: Option<String>,
     policy: Option<PolicyRuntime>,
     /// The `[rack_rto]` values present in the configuration file at startup,
-    /// restored by `Request::ResetRackRto`.
+    /// restored by `Request::ResetRackRto` and reported as `declared`.
     rack_rto_defaults: RackRtoConfig,
     /// The M2/M3/M4 coefficients (`[adaptive_cwnd]`/`[loss_classifier]`/the
     /// three top-level limits) present in the configuration file at startup,
     /// restored by `Request::ResetModuleConfig`.
     module_tuning_defaults: ModuleTuningConfig,
     /// The `[retransmit_dscp]` value present in the configuration file at
-    /// startup, restored by `Request::ResetRetransmitDscp`.
+    /// startup, restored by `Request::ResetRetransmitDscp` and reported as
+    /// `declared`.
     retransmit_dscp_defaults: RetransmitDscpConfig,
     /// The `[redundancy]` value present in the configuration file at
     /// startup, restored by `Request::ResetRedundancy`.
@@ -1067,12 +1068,22 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn new(config: SkylineConfig) -> Result<Self> {
+    fn new(mut config: SkylineConfig) -> Result<Self> {
         let capabilities = probe_capabilities(&config);
         let rack_rto_defaults = config.rack_rto;
         let module_tuning_defaults = ModuleTuningConfig::from_config(&config);
         let retransmit_dscp_defaults = config.retransmit_dscp;
         let redundancy_defaults = config.redundancy;
+        // Dynamic RTO and retransmit DSCP marking start off, whatever the
+        // file says: PolicyRuntime::load and TcRuntime::load write both BPF
+        // maps disabled, and only Set*/Reset* turn them on. `self.config` is
+        // what `status` reports as running, so it has to say off too. Until
+        // 0.5.1 it kept the file's `enabled = true`, and both reports showed
+        // a feature in force that the kernel was not running. The file's
+        // values stay in the *_defaults above, which `status` also reports
+        // (as `declared`) so that ssctl can say what to run.
+        config.rack_rto.enabled = false;
+        config.retransmit_dscp.enabled = false;
         let event_log = match config.runtime.events_max_mib {
             0 => None,
             max_mib => {
@@ -1181,10 +1192,12 @@ impl Daemon {
             rack_rto: RackRtoStatus {
                 config: self.config.rack_rto,
                 stats: rack_rto_stats,
+                declared: Some(self.rack_rto_defaults),
             },
             retransmit_dscp: RetransmitDscpStatus {
                 config: self.config.retransmit_dscp,
                 stats: retransmit_dscp_stats,
+                declared: Some(self.retransmit_dscp_defaults),
             },
             redundancy: RedundancyStatus {
                 config: self.config.redundancy,
@@ -2456,6 +2469,37 @@ mod tests {
         assert!(!status.armed);
         assert_eq!((status.interval_s, status.qdisc), (0, false));
         assert_eq!(status.live.interface, config.runtime.tc_interface);
+    }
+
+    /// `[rack_rto]` and `[retransmit_dscp]` are not applied at start -- both
+    /// BPF maps are written disabled -- so `status` has to say off, and give
+    /// the file's values as `declared`. Up to 0.5.0 it reported the file's
+    /// `enabled = true` while the kernel ran neither.
+    #[test]
+    fn a_started_daemon_reports_rto_and_dscp_off_and_the_file_as_declared() {
+        let mut config = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        assert!(
+            config.rack_rto.enabled,
+            "config/speeder.toml turns dynamic RTO on"
+        );
+        config.retransmit_dscp = RetransmitDscpConfig {
+            enabled: true,
+            dscp_value: 10,
+        };
+        config.runtime.events_max_mib = 0;
+        // No such interface, so the guard's live view runs no `tc`.
+        config.runtime.tc_interface = Some("skyline-none0".to_owned());
+        let file_rto = config.rack_rto;
+        let file_dscp = config.retransmit_dscp;
+
+        let status = Daemon::new(config).expect("daemon").status();
+        assert!(!status.rack_rto.config.enabled);
+        assert!(!status.retransmit_dscp.config.enabled);
+        assert_eq!(status.rack_rto.declared, Some(file_rto));
+        assert_eq!(status.retransmit_dscp.declared, Some(file_dscp));
+        // Only the switch is off; the values are the file's.
+        assert_eq!(status.rack_rto.config.floor_us, file_rto.floor_us);
+        assert_eq!(status.retransmit_dscp.config.dscp_value, 10);
     }
 
     /// A fresh directory per test; the crate has no tempfile dependency and

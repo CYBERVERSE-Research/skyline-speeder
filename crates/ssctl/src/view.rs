@@ -388,7 +388,7 @@ pub fn status(theme: &Theme, response: &Response) -> String {
         &format!(
             "{}  {}",
             status.generation,
-            theme.dim("raised by every enable / set-* / reset-*")
+            theme.dim("raised by module, coefficient and RTO changes")
         ),
     );
 
@@ -420,6 +420,7 @@ pub fn status(theme: &Theme, response: &Response) -> String {
             );
         }
     }
+    warnings.extend(declared_but_off(theme, status));
     warnings.extend(status.capabilities.notes.iter().cloned());
     if !warnings.is_empty() {
         page.blank();
@@ -648,6 +649,7 @@ pub fn flows(theme: &Theme, response: &Response) -> String {
     parameters(&mut page, theme, status);
     page.blank();
     decisions(&mut page, theme, status);
+    side_programs(&mut page, theme, status);
 
     page.finish()
 }
@@ -884,8 +886,11 @@ fn parameters(page: &mut Page<'_>, theme: &Theme, status: &RuntimeStatus) {
     );
     page.row(Mark::Info, "framework switches", &framework);
 
+    // Dynamic RTO and DSCP marking act on traffic whether skyline_cc is
+    // attached or not -- `drain` stops neither -- so unlike the rows above
+    // their tick does not wait for the attach.
     let rto = &status.rack_rto.config;
-    if rto.enabled && status.enabled {
+    if rto.enabled {
         page.row(
             Mark::Good,
             "dynamic RTO floor",
@@ -902,26 +907,52 @@ fn parameters(page: &mut Page<'_>, theme: &Theme, status: &RuntimeStatus) {
                 Mark::Good,
                 "dynamic RTO ceiling",
                 &format!(
-                    "{:.3}x base RTT, {:.3}x once congested",
+                    "{:.3}x base RTT, {:.3}x while congested",
                     f64::from(rto.rto_max_normal_permille) / 1000.0,
                     f64::from(rto.rto_max_congested_permille) / 1000.0
                 ),
             );
         }
         page.note("only connections from /sys/fs/cgroup/skyline-speeder pass through it");
+        if !status.enabled {
+            page.note("in force while skyline_cc is detached");
+        }
     } else {
         page.row(Mark::Off, "dynamic RTO", &theme.dim("off"));
+        if status
+            .rack_rto
+            .declared
+            .is_some_and(|declared| declared.enabled)
+        {
+            page.note(&format!(
+                "[rack_rto] in the configuration file turns it on; {} applies it",
+                theme.command("ssctl reset-rack-rto")
+            ));
+        }
     }
 
     let dscp = &status.retransmit_dscp.config;
-    if dscp.enabled && status.enabled {
+    if dscp.enabled {
         page.row(
             Mark::Good,
             "retransmit DSCP",
             &format!("codepoint {} on every TCP retransmission", dscp.dscp_value),
         );
+        if !status.enabled {
+            page.note("in force while skyline_cc is detached");
+        }
     } else {
         page.row(Mark::Off, "retransmit DSCP", &theme.dim("off"));
+        if status
+            .retransmit_dscp
+            .declared
+            .is_some_and(|declared| declared.enabled)
+        {
+            page.note(&format!(
+                "[retransmit_dscp] in the configuration file turns it on; {} applies it",
+                theme.command("ssctl reset-retransmit-dscp")
+            ));
+        }
     }
 
     let redundancy = &status.redundancy;
@@ -943,6 +974,41 @@ fn parameters(page: &mut Page<'_>, theme: &Theme, status: &RuntimeStatus) {
     } else {
         page.row(Mark::Off, "first-flight copies", &theme.dim("off"));
     }
+}
+
+/// Dynamic RTO and retransmit DSCP marking are never applied when the daemon
+/// starts, whatever the file says; only their set-* and reset-* commands turn
+/// them on. A file that turns one on and a feature that is off is the
+/// silence its author does not expect, so `status` says it, with the command.
+/// A daemon older than 0.5.1 reports no `declared` (its `config` showed the
+/// file's value instead), and gets nothing here.
+fn declared_but_off(theme: &Theme, status: &RuntimeStatus) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !status.rack_rto.config.enabled
+        && status
+            .rack_rto
+            .declared
+            .is_some_and(|declared| declared.enabled)
+    {
+        lines.push(format!(
+            "[rack_rto] in the configuration file turns dynamic RTO on, but it is off: the \
+             daemon starts it off, and {} applies the file",
+            theme.command("ssctl reset-rack-rto")
+        ));
+    }
+    if !status.retransmit_dscp.config.enabled
+        && status
+            .retransmit_dscp
+            .declared
+            .is_some_and(|declared| declared.enabled)
+    {
+        lines.push(format!(
+            "[retransmit_dscp] in the configuration file turns DSCP marking on, but it is off: \
+             the daemon starts it off, and {} applies the file",
+            theme.command("ssctl reset-retransmit-dscp")
+        ));
+    }
+    lines
 }
 
 /// The counters that prove the algorithm ran, and the two rates worth a bar.
@@ -1077,7 +1143,13 @@ fn decisions(page: &mut Page<'_>, theme: &Theme, status: &RuntimeStatus) {
             ),
         );
     }
+}
 
+/// What `skyline_tc` and `skyline_policy` counted. Neither program depends on
+/// skyline_cc -- `drain` stops neither DSCP marking nor dynamic RTO -- so
+/// their sections come with or without a skyline_cc object. Up to 0.5.0 they
+/// sat behind `decisions`' early return and went missing after a drain.
+fn side_programs(page: &mut Page<'_>, theme: &Theme, status: &RuntimeStatus) {
     if let Some(tc) = &status.tc_stats {
         page.blank();
         page.section("TC EGRESS (skyline_tc)");
@@ -1391,10 +1463,12 @@ mod tests {
             rack_rto: RackRtoStatus {
                 config: RackRtoConfig::disabled(),
                 stats: Some(RackRtoStats::default()),
+                declared: Some(RackRtoConfig::disabled()),
             },
             retransmit_dscp: RetransmitDscpStatus {
                 config: RetransmitDscpConfig::disabled(),
                 stats: None,
+                declared: Some(RetransmitDscpConfig::disabled()),
             },
             redundancy: RedundancyStatus {
                 config: shipped.redundancy,
@@ -1760,6 +1834,120 @@ mod tests {
             .find(|line| line.contains("optional"))
             .expect("an optional row");
         assert!(!optional.contains("fallback"), "{optional}");
+    }
+
+    /// Dynamic RTO and DSCP marking keep running after `drain`, which stops
+    /// neither: the flows report must not call them off once skyline_cc is
+    /// detached, as it did up to 0.5.0.
+    #[test]
+    fn rto_and_dscp_stay_in_force_after_a_drain() {
+        let theme = theme();
+        let mut drained = healthy();
+        drained.enabled = false;
+        drained.attached_s = None;
+        drained.metrics = None;
+        drained.guard.armed = false;
+        drained.redundancy.active = false;
+        drained.rack_rto.config = RackRtoConfig {
+            enabled: true,
+            ..RackRtoConfig::disabled()
+        };
+        drained.retransmit_dscp.config = RetransmitDscpConfig {
+            enabled: true,
+            dscp_value: 10,
+        };
+        let rendered = flows(&theme, &reply(drained.clone(), Some(sample_flows())));
+        assert!(rendered.contains("dynamic RTO floor"), "{rendered}");
+        assert!(
+            rendered.contains("codepoint 10 on every TCP retransmission"),
+            "{rendered}"
+        );
+        assert_eq!(
+            rendered
+                .matches("in force while skyline_cc is detached")
+                .count(),
+            2,
+            "{rendered}"
+        );
+        // The counters of both programs stay too, with no skyline_cc object.
+        assert!(rendered.contains("TC EGRESS (skyline_tc)"), "{rendered}");
+        assert!(
+            rendered.contains("DYNAMIC RTO (skyline_policy)"),
+            "{rendered}"
+        );
+        let off = |label: &str| {
+            rendered
+                .lines()
+                .any(|line| line.contains(label) && line.trim_end().ends_with(" off"))
+        };
+        assert!(!off("dynamic RTO") && !off("retransmit DSCP"), "{rendered}");
+
+        // Attached, the same rows say the same, without the reminder.
+        let mut attached = drained;
+        attached.enabled = true;
+        attached.attached_s = Some(60);
+        attached.guard.armed = true;
+        let rendered = flows(&theme, &reply(attached, Some(sample_flows())));
+        assert!(rendered.contains("dynamic RTO floor"), "{rendered}");
+        assert!(
+            !rendered.contains("while skyline_cc is detached"),
+            "{rendered}"
+        );
+    }
+
+    /// A daemon starts dynamic RTO and DSCP marking off whatever the file
+    /// says. When the file turns one on, both reports name the command that
+    /// applies it; when it is running, or the file leaves it off, or the
+    /// daemon is too old to say (`declared` absent), neither does.
+    #[test]
+    fn a_file_that_turns_rto_or_dscp_on_is_named_while_they_are_off() {
+        let words = |text: String| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let theme = theme();
+        let mut restarted = healthy();
+        restarted.rack_rto.declared = Some(RackRtoConfig {
+            enabled: true,
+            ..RackRtoConfig::disabled()
+        });
+        restarted.retransmit_dscp.declared = Some(RetransmitDscpConfig {
+            enabled: true,
+            dscp_value: 10,
+        });
+        let report = words(status(&theme, &reply(restarted.clone(), None)));
+        assert!(report.contains("ATTENTION"), "{report}");
+        assert!(
+            report.contains("sudo ssctl reset-rack-rto applies the file"),
+            "{report}"
+        );
+        assert!(
+            report.contains("sudo ssctl reset-retransmit-dscp applies the file"),
+            "{report}"
+        );
+        let report = words(flows(
+            &theme,
+            &reply(restarted.clone(), Some(sample_flows())),
+        ));
+        assert!(
+            report.contains("sudo ssctl reset-rack-rto applies it"),
+            "{report}"
+        );
+        assert!(
+            report.contains("sudo ssctl reset-retransmit-dscp applies it"),
+            "{report}"
+        );
+
+        let mut applied = restarted.clone();
+        applied.rack_rto.config = applied.rack_rto.declared.expect("declared");
+        applied.retransmit_dscp.config = applied.retransmit_dscp.declared.expect("declared");
+        let mut older = restarted;
+        older.rack_rto.declared = None;
+        older.retransmit_dscp.declared = None;
+        for state in [healthy(), applied, older] {
+            let response = reply(state, Some(sample_flows()));
+            for report in [status(&theme, &response), flows(&theme, &response)] {
+                assert!(!report.contains("reset-rack-rto"), "{report}");
+                assert!(!report.contains("reset-retransmit-dscp"), "{report}");
+            }
+        }
     }
 
     /// Eyeball the two reports: `cargo test -p ssctl -- --nocapture

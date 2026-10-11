@@ -350,7 +350,9 @@ sudo ssctl reset-module-config
 > 实测：仅靠配置文件时 `established_cb` 有 2169，但 `subscribe_ok` / `rtt_callbacks`
 > / `applied` 全是 0；执行命令后才开始增长。
 >
-> 因此**每次 daemon 重启后都要重跑一次**，或把它加进开机脚本。
+> 因此**每次 daemon 重启后都要重跑一次**，或把它加进开机脚本。0.5.1 起，配置文件开启而实际没开时，
+> `sudo ssctl status` 的 ATTENTION 段落会提示执行 `reset-rack-rto`，`ssctl flows` 里这一行也如实显示 `off`；
+> 0.5.0 及更早的两份报告照着文件把它显示为已开启。
 
 开启：
 
@@ -372,30 +374,34 @@ sudo ssctl set-rack-rto \
 **真正的「退避上限」是另外两个参数**（就是防卡死的关键，需内核 ≥ 6.15）：
 
 ```
-退避上限 = clamp(permille × 基准RTT ÷ 1000,  1000ms,  120000ms)
-                                             ↑ 夹住下限，所以 1 秒是能设到的最小值
+退避上限 = clamp(permille × RTT ÷ 1000,  1000ms,  120000ms)
+                                          ↑ 夹住下限，所以 1 秒是能设到的最小值
 ```
+
+RTT 取这条连接的平滑 RTT 与最小 RTT 中较大的那个；每来一个 RTT 样本都重新算一次。
 
 | 参数 | 大白话 | 说明 |
 |---|---|---|
 | `--rto-max-normal-permille` | 平时的退避上限倍数 | `0` = 关闭本功能，保持内核 120 秒默认 |
-| `--rto-max-congested-permille` | 检测到真拥塞后换用的倍数 | 必须 ≥ normal |
+| `--rto-max-congested-permille` | 显示出拥塞的样本改用的倍数（每个样本重新判断，拥塞迹象消失就换回 normal） | 必须 ≥ normal |
 | `--rto-max-congestion-ratio-permille` | 延迟涨到几倍算「真拥塞」 | `0` = 用内置默认 2000（2 倍） |
 
-以 RTT ≈ 120ms 的链路为例，想要**平时 1 秒、拥塞时 2 秒**：
+以一条 RTT 为 120ms 的连接为例：
 
 ```bash
 sudo ssctl set-rack-rto \
   --srtt-permille 1100 --floor-us 20000 --ceiling-us 200000 --warmup-samples 4 \
   --rto-max-normal-permille 3000 \
-  --rto-max-congested-permille 16700
+  --rto-max-congested-permille 6000
 ```
 
-算法：`3000` → 3.0 × 120ms = 360ms，低于 1000ms 下限 → 夹到 **1 秒**；
-`16700` → 16.7 × 120ms ≈ **2 秒**。
+算法：平时 `3000` → 3.0 × 120ms = 360ms，低于 1000ms 下限 → 夹到 **1 秒**。
+拥塞有两种判据，算出来不一样：平滑 RTT 超过最小 RTT 的 2 倍时，乘的是那时已经变大的 RTT，
+比如 250ms → 6.0 × 250ms = **1.5 秒**；RTT 没涨、只是来了新的 ECN 标记时，6.0 × 120ms = 720ms → 夹到 **1 秒**。
 
 > 注意公式挂在**每条连接各自的 RTT** 上，不是绝对值。RTT 更大的连接，同样的倍数会
-> 算出更大的上限。想要"任意 RTT 都是 1 秒"，把 normal 设小即可（夹住下限就是 1 秒）。
+> 算出更大的上限；按 RTT 判定拥塞时 RTT 已经翻倍，上限也跟着翻倍以上，所以 congested 倍数不必
+> 定得比 normal 大很多。想要"任意 RTT 都是 1 秒"，把 normal 设小即可（夹住下限就是 1 秒）。
 
 关闭：
 
@@ -458,6 +464,10 @@ sudo ssctl set-retransmit-dscp --dscp-value <值>
 
 > 注意：这条命令**同时就把功能打开了**（`enabled` 会被自动设为 true），
 > 不需要另外再执行开启命令。
+>
+> 写进配置文件（`[retransmit_dscp]` 段写 `enabled = true` 和 `dscp_value = <值>`）同样**不会在 daemon
+> 启动时生效**：每次启动之后都要执行一次 `sudo ssctl reset-retransmit-dscp`，下发文件里的值。0.5.1 起
+> `sudo ssctl status` 的 ATTENTION 段落会提示这件事。
 
 关闭：
 
