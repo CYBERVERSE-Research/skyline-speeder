@@ -8,16 +8,39 @@ this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 the layout of `bpf/include/skyline_abi.h` and any bump to it is a breaking change
 for anyone holding a prebuilt `.bpf.o`.
 
-## [0.5.1] - 2026-10-11
+## [0.5.1] - 2026-10-12
 
 ### Upgrading from 0.5.0
 
-- **Re-run the installer the way the host was installed.** Only
-  `skyline_cc.bpf.o` changes and `SKYLINE_ABI_VERSION` stays 8, so the 0.5.0
-  daemon and the other two objects are compatible with it; the installer
-  replaces everything together as usual. Connections opened before the
-  upgrade stay on the 0.5.0 code until they close, as with every swap of the
-  struct_ops (DEPLOY.md §11.6).
+- **Re-run the installer the way the host was installed.**
+  `skyline_cc.bpf.o`, `skyline-speederd` and `ssctl` change; the other two
+  objects do not, and `SKYLINE_ABI_VERSION` stays 8, so a 0.5.0 daemon runs
+  the 0.5.1 object and the other way round. The installer replaces them
+  together as usual. Connections opened before the upgrade stay on the 0.5.0
+  code until they close, as with every swap of the struct_ops (DEPLOY.md
+  §11.6).
+- **`ssctl status` may now name `[rack_rto]` or `[retransmit_dscp]` under
+  ATTENTION.** It does when the configuration file turns dynamic RTO or DSCP
+  marking on and the kernel is not running it. Under 0.5.0 that was the state
+  after every start of the daemon too -- the daemon has never applied these
+  two sections when it starts -- but its reports showed both in force (see
+  Fixed). Run the command it names, `sudo ssctl reset-rack-rto` or
+  `sudo ssctl reset-retransmit-dscp`, after every start of the daemon.
+- **In `ssctl status --json`, `rack_rto.config` and `retransmit_dscp.config`
+  are what the kernel runs.** After a start of the daemon they read
+  `"enabled": false` until a `set-` or `reset-` command; the configuration
+  file's sections are in the new `declared` field next to them. A script that
+  read `config` to learn what the file says should read `declared`. A 0.5.1
+  `ssctl` gets no `declared` from a 0.5.0 daemon, and a 0.5.0 `ssctl` ignores
+  it.
+
+### Changed
+
+- **`ssctl flows` shows when STARTUP ends on a line of its own, `startup
+  exit`, counted in measured rounds.** `bandwidth estimate` used to end with
+  `startup ends under 20% growth in 5 RTTs`; with rounds that put no sample
+  into the filter left out (see Fixed), STARTUP can now last longer than that
+  many RTTs.
 
 ### Fixed
 
@@ -59,6 +82,32 @@ for anyone holding a prebuilt `.bpf.o`.
   stayed there. Only rounds that put a sample into the filter are counted now,
   as the kernel's BBR does in the same check (`bbr_check_full_bw_reached()`);
   the guardrail still ends STARTUP at once.
+- **`ssctl status` and `ssctl flows` showed dynamic RTO and DSCP marking in
+  force after a start of the daemon, while the kernel ran neither.** The
+  daemon starts both off -- their BPF maps start zeroed, and only the `set-`
+  and `reset-` commands write them -- but it kept the configuration file's
+  `enabled = true` in its own copies, and the reports read those: *PARAMETERS
+  IN FORCE* ticked both, and DSCP marking's `retransmits marked 0 of 0
+  detected` read like a quiet link. Seen on a host whose file turned both on:
+  both lines ticked, with `rtt_callbacks` and `packets_seen` at 0. The
+  daemon's copies start off now, `status` carries the file's values as
+  `declared`, *ATTENTION* names the command that applies them, and
+  `ssctl flows` shows both off with the same command.
+- **After `ssctl drain`, `ssctl flows` showed dynamic RTO and DSCP marking as
+  off and left out the TC EGRESS and DYNAMIC RTO sections,** while both kept
+  running and their counters kept growing: neither depends on skyline_cc. The
+  lines now follow each feature's own state, with a note that it stays in
+  force while skyline_cc is detached, and the two sections stay.
+- **The `config generation` hint named the wrong commands.** It said
+  `raised by every enable / set-* / reset-*`, but `disable` raises it too and
+  the DSCP marking and first-flight commands do not. It now says
+  `raised by module, coefficient and RTO changes`.
+- **docs/usage.md's dynamic RTO example promised a 2-second ceiling under
+  congestion** with `--rto-max-congested-permille 16700` at a 120 ms RTT.
+  That holds only when a fresh ECN mark is what flags congestion. When the
+  RTT does -- smoothed RTT above twice the minimum -- the ceiling is that
+  multiple of the grown RTT: over 4 seconds at 250 ms. The example now uses
+  6000 and works through both cases.
 
 ## [0.5.0] - 2026-10-08
 

@@ -863,9 +863,19 @@ fn parameters(page: &mut Page<'_>, theme: &Theme, status: &RuntimeStatus) {
         if m2 { Mark::Good } else { Mark::Off },
         "bandwidth estimate",
         &format!(
-            "{} RTT window \u{00b7} min-RTT kept {} s \u{00b7} startup ends under {:.0}% growth in {} RTTs",
-            tuning.bw_window_rtts,
-            tuning.min_rtt_window_s,
+            "{} RTT window \u{00b7} min-RTT kept {} s",
+            tuning.bw_window_rtts, tuning.min_rtt_window_s
+        ),
+    );
+    // "Measured": a round in which every sample was app-limited -- a
+    // keep-alive connection's small responses -- neither counts towards
+    // startup_plateau_rtts nor resets it, so STARTUP can last longer than
+    // that many RTTs.
+    page.row(
+        if m2 { Mark::Good } else { Mark::Off },
+        "startup exit",
+        &format!(
+            "under {:.0}% growth in {} measured rounds, or a guardrail trip",
             tuning.startup_growth_ratio * 100.0,
             tuning.startup_plateau_rtts
         ),

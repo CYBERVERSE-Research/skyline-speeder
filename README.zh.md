@@ -175,7 +175,8 @@ ssctl disable --module loss-classifier        # 只关一个，其余不变
 | congestion window | `--initial-cwnd-packets 100` `--min-cwnd-packets 32` `--max-cwnd-packets 50000` `--cruise-inflight-gain 3.0` | 初始窗口（0 = 用内核自己的）、窗口的下限与上限（包数），以及 CRUISE 期间在途数据最多是带宽 × 基准 RTT 的几倍 |
 | queue guardrail | `--max-queue-delay-ms 70` `--max-queue-delay-ratio 0.6` `--guardrail-gain 0.8` | 排队时延（平滑 RTT 超出基准 RTT 的部分）超过 70 ms 与 0.6 × 基准 RTT 中的较大者，或收到 ECN 标记，这一轮的增益就降为 0.8。设为 1.0 时护栏只取消加速，不会压到测得带宽以下 |
 | loss compensation | `--loss-inflation-max-ratio 0.10` | 最多按多高的丢包率补偿（0-0.5）：速率 × 1 / (1 − p)，默认值下最多 × 1.11 |
-| bandwidth estimate | `--bw-window-rtts 6` `--min-rtt-window-s 30` `--startup-growth-ratio 0.20` `--startup-plateau-rtts 5` | 带宽取最近 6 轮里最高的交付速率，基准 RTT 取最近 30 秒里最低的 RTT；连续 5 轮增长不到 20%，或护栏触发，STARTUP 就结束 |
+| bandwidth estimate | `--bw-window-rtts 6` `--min-rtt-window-s 30` | 带宽取最近 6 轮里最高的交付速率，基准 RTT 取最近 30 秒里最低的 RTT |
+| startup exit | `--startup-growth-ratio 0.20` `--startup-plateau-rtts 5` | 连续 5 个测到带宽的轮次增长都不到 20%，或护栏触发，STARTUP 就结束。测到带宽的轮次，指有交付速率样本进入估计的轮次；连接还没填满窗口就没有数据可发的轮次（比如长连接上的小响应）既不计数，也不让计数清零 |
 | framework switches | `--disable-prr-pacing` `--disable-auto-pacing` | 只在 `adaptive-cwnd` 或 `pacing` 关掉时起作用，让那条路径的行为与内核自己的一致；保持开启即可 |
 
 > [!CAUTION]
