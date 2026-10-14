@@ -204,7 +204,7 @@ sudo ssctl reset-redundancy                             # back to [redundancy] i
 
 In the config file these are `enabled`, `first_kib` (1-1024) and `delay_ms` (0-100; 0 sends the copy right behind the original) under `[redundancy]`. Copying runs only while skyline_cc is attached: `ssctl enable` starts it and `ssctl drain` stops it. It needs `skyline_tc` on an Ethernet `tc_interface`, and without `fq` as the root qdisc the copy leaves at once.
 
-`ssctl flows` shows it twice. Under *PARAMETERS IN FORCE*, `first-flight copies` says whether it runs: `handshake + first 64 KiB of each connection sent twice, the copy +10 ms`; `configured, not running` when the TC program is not loaded; or `off`. Under *TC EGRESS*, `first-flight copies` says what it has cost since the daemon started: `52,113 sent, 58.2 MiB (9,870 handshakes)` is the number of copies (a GSO packet counts once), their bytes, and how many of them were SYNs or SYN-ACKs. A trailing `N could not be made` counts copies that failed and should never appear.
+`ssctl flows` shows it twice. Under *PARAMETERS IN FORCE*, `first-flight copies` says whether it runs: `handshake + first 64 KiB of each connection sent twice, the copy +10 ms`; `configured, not running` when it should run and does not (the TC program is not loaded, or the last `ssctl enable` said why); `stopped by the drain` while a drain waits for skyline_cc's last connections; or `off`. Under *TC EGRESS*, `first-flight copies` says what it has cost since the daemon started: `52,113 sent, 58.2 MiB (9,870 handshakes)` is the number of copies (a GSO packet counts once), their bytes, and how many of them were SYNs or SYN-ACKs. A trailing `N could not be made` counts copies that failed and should never appear.
 
 ### Drift guard
 
@@ -237,11 +237,11 @@ On a connection at 120 ms this sets a floor of 1.1 × 120 ms = 132 ms and a ceil
 
 Three things to know before relying on it:
 
-- Only connections of processes inside `/sys/fs/cgroup/skyline-speeder` pass through `skyline_policy`, and a process outside it reports **no error**: `ssctl flows` simply shows 0 under *connections seen*. Start the service inside it with `sudo /opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <your service command...>`; for a systemd service, see [DEPLOY.md](DEPLOY.md) §7. `skyline_cc` itself is global and needs no cgroup.
+- Only connections of processes inside `/sys/fs/cgroup/skyline-speeder` (`runtime.cgroup_path`) pass through `skyline_policy`, and a process outside it reports **no error**: `ssctl flows` simply shows 0 under *connections seen*, a row it shows whether dynamic RTO is on or off. Start the service inside it with `sudo /opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <your service command...>`; for a systemd service, see [DEPLOY.md](DEPLOY.md) §7. `skyline_cc` itself is global and needs no cgroup.
 - **The daemon always starts with it off**, whatever `[rack_rto]` in the config says. After every start, run `ssctl reset-rack-rto`, which applies `[rack_rto]` from the file, or `ssctl set-rack-rto`.
 - It works under any congestion control, and `ssctl drain` does not stop it.
 
-`ssctl flows` shows `dynamic RTO floor` and `dynamic RTO ceiling` under *PARAMETERS IN FORCE*, and a *DYNAMIC RTO* section: `applied` counts floors set (then how many the kernel rejected, how many waited for warm-up and how many were already in place), and `connections seen` the connections that passed through `skyline_policy`. `applied` growing, or `warmup` on connections too short to get past the warm-up, is what shows it is running.
+`ssctl flows` shows `dynamic RTO floor` and `dynamic RTO ceiling` under *PARAMETERS IN FORCE*, and a *DYNAMIC RTO* section (*CGROUP POLICY* while it is off, with `connections seen` alone): `applied` counts floors set (then how many the kernel rejected, how many waited for warm-up and how many were already in place), and `connections seen` the connections that passed through `skyline_policy`. `applied` growing, or `warmup` on connections too short to get past the warm-up, is what shows it is running.
 
 ### Retransmit DSCP marking
 
@@ -252,6 +252,7 @@ Off by default. Marks every retransmitted TCP segment leaving `tc_interface` wit
 
 ```bash
 sudo ssctl set-retransmit-dscp --dscp-value <value>   # 1-63, from your network; this also turns marking on
+sudo ssctl set-retransmit-dscp --disable              # off, whatever the config file says
 sudo ssctl reset-retransmit-dscp                      # back to [retransmit_dscp] in the config file: off unless set there
 ```
 
@@ -282,7 +283,7 @@ From 0.5.0, a misspelt key or one in the wrong section fails `--validate-only`, 
 
 | Line | Meaning |
 |---|---|
-| top line | The running daemon's version (after an upgrade, `ssctl --version` can differ until the daemon restarts) and the verdict: `ACCELERATING`, attached and the host default; `ATTACHED, NOT DEFAULT`, something changed the default since and new connections bypass skyline_cc, so run `ssctl enable`; `STANDBY`, not attached, so run `ssctl enable` |
+| top line | The running daemon's version (after an upgrade, `ssctl --version` can differ until the daemon restarts) and the verdict: `ACCELERATING`, attached and the host default; `ATTACHED, NOT DEFAULT`, something changed the default since and new connections bypass skyline_cc, so run `ssctl enable`; `DRAINING`, a drain has moved new connections to `fallback_cc` and skyline_cc only serves the connections it still has (one run over SSH always ends here; `ssctl enable` takes the host back); `STANDBY`, not attached, so run `ssctl enable` |
 | skyline_cc struct_ops | attached, and how long ago |
 | host default cc | `net.ipv4.tcp_congestion_control`: what new connections get |
 | fallback on drain | `fallback_cc`: what new connections get after `ssctl drain`; a fresh install sets it to the one the host's sysctl files select at boot, when this kernel has it |
@@ -298,7 +299,7 @@ From 0.5.0, a misspelt key or one in the wrong section fails `--validate-only`, 
 
 | Line | Meaning |
 |---|---|
-| top line | `ACCELERATING`; `IDLE`, attached but no connection on skyline_cc yet; `BYPASSED`, attached but not the host default; `NOT ACCELERATING`, not attached |
+| top line | `ACCELERATING`; `IDLE`, attached but no connection on skyline_cc yet; `DRAINING`, a drain is waiting for the connections listed; `BYPASSED`, attached but not the host default; `NOT ACCELERATING`, not attached |
 | coverage | the share of the host's TCP connections that run on skyline_cc |
 | volume | bytes sent and retransmitted by the connections listed, from the kernel's own counters |
 | the table | per connection: RTT, window in packets, the pacing rate skyline_cc set, the kernel's delivery-rate estimate, bytes sent and the retransmitted share of them |
@@ -314,9 +315,9 @@ From 0.5.0, a misspelt key or one in the wrong section fails `--validate-only`, 
 | delivery samples | a sum of overlapping rate samples, for comparing two runs; not a packet count |
 | PRR adjustments | appears only when it is not 0; with `adaptive-cwnd` on, that is a bug worth reporting |
 | TC EGRESS | since the daemon started, everything leaving `tc_interface` whatever its congestion control: `seen` counts packets, bytes and GSO packets; `drops` is always 0, since the program never drops; then [`retransmits marked`](#retransmit-dscp-marking) and [`first-flight copies`](#first-flight-redundancy) |
-| DYNAMIC RTO | see [Dynamic RTO floor and ceiling](#dynamic-rto-floor-and-ceiling) |
+| DYNAMIC RTO, or CGROUP POLICY while it is off | see [Dynamic RTO floor and ceiling](#dynamic-rto-floor-and-ceiling); `connections seen` is how to tell whether any process is in the cgroup |
 
-`--json` prints the daemon's raw reply instead, for scripts. `ssctl snapshot <file>` has the daemon write the `status` part of it to a file (under systemd, `/run/skyline-speeder/` is the safe place), and `ssctl validate` checks the daemon's configuration in memory against the kernel.
+`--json` prints the daemon's raw reply instead, for scripts. `ssctl snapshot <file>` has the daemon write the `status` part of it to a regular file (under systemd, `/run/skyline-speeder/` is the safe place), and `ssctl validate` checks the daemon's configuration in memory against the kernel.
 
 ## Repository layout
 

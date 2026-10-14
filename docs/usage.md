@@ -283,9 +283,13 @@ sudo systemctl restart skyline-speederd.service    # 挂载单元会随之重启
 | `--loss-inflation-max-ratio` | **0 – 0.5** | 默认 0.10；0.5 是 BPF 侧硬编码的上限（500‰） |
 | `--guardrail-gain` | 0 – 1.0 | 1.0 = 只取消加速、不降速；0 的效果和 1.0 一样（不是关掉护栏） |
 | `--startup-growth-ratio` | 0 – 1.0 | |
-| `--startup-gain` / `--cruise-*-gain` | ≥ 1.0 | 无上限，但越大越容易堆队列 |
+| `--startup-gain` / `--cruise-*-gain` | **1.0 – 1000** | 越大越容易堆队列。上限是 0.5.2 加的：再大，内核侧把增益和丢包补偿在 32 位里相乘会回绕成一个很小的值 |
 | `--max-cwnd-packets` | ≥ 4 | |
 | `--min-cwnd-packets` | **4 – `--max-cwnd-packets`** | 低于 4 会被拒绝（BPF 侧本来就不会让窗口低于 4） |
+| `--initial-cwnd-packets` | **0 – `--max-cwnd-packets`** | 0 = 用内核自己的初始窗口（0.5.2 起不能超过上限） |
+| `--min-rtt-window-s` | **1 – 4294** | 0 会让基准 RTT 恒等于当前 RTT，护栏永远看不到排队（0.5.2 起拒绝） |
+
+所有小数参数都必须是普通的数：`nan`、`inf` 这类写法，`ssctl` 和配置文件都会拒绝（0.5.2 起）。
 
 > 命令是**全量覆盖**的：只要有**任何一个**参数越界，**整条命令都会被拒绝**，
 > 已生效的配置保持不变。返回里写明被拒绝的原因（多数会点名参数和允许范围）。
@@ -415,8 +419,8 @@ sudo ssctl set-rack-rto --disable
 > [!IMPORTANT]
 > **这个功能有个前提：进程必须在指定的 cgroup 里，否则完全不生效，而且不报错。**
 >
-> 检查：`sudo ssctl flows` 的 DYNAMIC RTO 段落里，如果 *connections seen* 一直是 0，就是没生效
-> （它下面会直接写明这不是错误，而是没有进程在那个 cgroup 里）。
+> 检查：`sudo ssctl flows` 的 DYNAMIC RTO 段落（动态 RTO 关闭时叫 CGROUP POLICY，这一行一直都在）里，
+> 如果 *connections seen* 一直是 0，就是没生效（它下面会直接写明这不是错误，而是没有进程在那个 cgroup 里）。
 >
 > 让你的服务进入 cgroup：
 > ```bash
@@ -472,8 +476,11 @@ sudo ssctl set-retransmit-dscp --dscp-value <值>
 关闭：
 
 ```bash
-sudo ssctl reset-retransmit-dscp
+sudo ssctl set-retransmit-dscp --disable    # 不管配置文件怎么写，都关闭（0.5.2 起）
 ```
+
+（`sudo ssctl reset-retransmit-dscp` 是回到配置文件里的设置：出厂配置是关闭；文件里打开了的，它反而会打开。
+0.5.1 及更早没有 `--disable`，只能用它，或者重启 daemon。）
 
 ### 补充说明
 
@@ -497,11 +504,13 @@ sudo ssctl status
 ```
 ● ACCELERATING            <- 已挂载，而且是全机默认，新连接都走它
 ○ ATTACHED, NOT DEFAULT   <- 挂载了但新连接绕开了它，等于没生效（见下）
+○ DRAINING                <- 执行过 drain：新连接已回到 fallback_cc，skyline_cc 只服务剩下的连接
+                             （SSH 里执行的 drain 总会停在这里；想恢复加速，跑 sudo ssctl enable）
 ○ STANDBY                 <- 没挂载，跑 sudo ssctl enable
 ```
 
-`ACCELERATING` 之外的两种，报告最下面的 **ATTENTION** 段落会逐条写明问题和对应的处理
-动作。四个关键行也各自带标记：
+`ATTACHED, NOT DEFAULT` 和 `STANDBY`，报告最下面的 **ATTENTION** 段落会逐条写明问题和对应的处理
+动作；`DRAINING` 是你自己执行 drain 的结果，不算问题。四个关键行也各自带标记：
 
 ```
 ✔ skyline_cc struct_ops   attached, 3h 12m ago     <- 加速已挂载
@@ -737,7 +746,7 @@ sudo ./install.sh --uninstall --restore-pre-install
 **DSCP 标记和 RTO 调节不受 `drain` 影响**，要单独关：
 
 ```bash
-sudo ssctl reset-retransmit-dscp     # 回到配置文件的设置：出厂是关闭
+sudo ssctl set-retransmit-dscp --disable
 sudo ssctl set-rack-rto --disable
 ```
 

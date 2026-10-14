@@ -5,8 +5,150 @@ Notable changes to Skyline Speeder. Format follows
 this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 `SKYLINE_ABI_VERSION` is versioned separately from the release number: it tracks
-the layout of `bpf/include/skyline_abi.h` and any bump to it is a breaking change
-for anyone holding a prebuilt `.bpf.o`.
+the layout of `struct skyline_config`, `struct skyline_flow_state` and
+`struct skyline_metrics` in `bpf/include/skyline_abi.h` (the dynamic RTO, DSCP
+marking and first-flight redundancy structs there have versions of their own,
+docs/02-interface-reference.md section 5), and any bump to it is a breaking
+change for anyone holding a prebuilt `.bpf.o`.
+
+## [0.5.2] - 2026-10-14
+
+### Upgrading from 0.5.1
+
+- **Re-run the installer the way the host was installed.** All three BPF
+  objects, `skyline-speederd` and `ssctl` change. `SKYLINE_ABI_VERSION` and the
+  three other ABI versions stay where they were, so a 0.5.1 daemon runs the
+  0.5.2 objects and the other way round. The installer now verifies the new
+  daemon and objects before it replaces anything (see Fixed): a refused
+  upgrade leaves 0.5.1 installed and running.
+- **Configuration values the kernel side cannot honour are refused.** A file
+  that has one now fails `--validate-only` and the daemon's start, and the
+  upgrade stops at the verifier with the old version in place: `nan` or `inf`
+  in any float; `startup_gain`, `cruise_inflight_gain` or
+  `cruise_pacing_gain` above 1000; `min_rtt_window_s = 0` or above 4294;
+  `initial_cwnd_packets` above `max_cwnd_packets`; `fallback_cc =
+  "skyline_cc"`. `ssctl set-module-config` refuses the same values, and
+  `nan`/`inf` on its command line.
+- **The control socket is `0600` whatever the umask.** Under systemd it
+  already was in effect (only root could connect); a daemon started by hand
+  with a permissive umask no longer takes requests from other users.
+- **`ssctl status --json` has two more fields:** `draining`, true while a
+  drain waits for skyline_cc's last connections, and `cgroup_path`. A script
+  that took `enabled` with a host default other than `skyline_cc` for "the
+  default was changed behind the daemon's back" should check `draining`
+  first: a drain that timed out looks the same otherwise. A 0.5.1 daemon's
+  reply decodes with `draining` false.
+- **`pin_dir` may be left out of `[runtime]`.** Keep it if the host may go
+  back to 0.5.1 or older, which require it.
+
+### Added
+
+- **`ssctl set-retransmit-dscp --disable`** turns marking off whatever the
+  configuration file says. Until now a restart of the daemon, or
+  `reset-retransmit-dscp` -- which turns marking on when the file does --
+  were the only ways to stop it.
+- **CI compiles the BPF objects the way a release does,** against the pinned
+  6.12 reference header, in a job of its own; until now that path first ran
+  at tag time.
+
+### Changed
+
+- **`ssctl flows` always shows `connections seen`,** the count of connections
+  that passed through `skyline_policy`, which is how to tell whether any
+  process is in the cgroup (CLAUDE.md's first silent failure point, DEPLOY.md
+  §7). It was shown only while dynamic RTO was on, which since 0.5.1 it never
+  is after a start of the daemon; it counts either way. While dynamic RTO is
+  off the section is called CGROUP POLICY and shows that row alone, and the
+  hints name `runtime.cgroup_path` instead of the default path.
+- **`ssctl snapshot` writes only a regular file.** The daemon writes it as
+  root, and followed symlinks into any file and wrote into devices; a FIFO
+  blocked every other request.
+
+### Fixed
+
+- **An upgrade that the verifier or the configuration check refused left the
+  new files installed.** `install.sh` replaced the binaries, objects, scripts
+  and units first and ran the verifier on them afterwards; when it failed,
+  the old daemon kept running beside the new files, and it reads
+  `skyline_cc.bpf.o` from disk again at the first `ssctl enable` after a
+  drain: a half-new pair, which after an ABI change stalls every new
+  connection without an error. The verifier now runs on the new daemon and
+  objects, with the installed configuration pointed at them, before anything
+  is replaced. (The installer comes from `main`, so this applies from the
+  merge on, to upgrades to any release.)
+- **`ssctl drain` always failed on a host without a loaded TC object** --
+  `tc_interface` unset, a tunnel, a NIC that is not there -- and on one
+  whose `skyline_policy` failed to load. It wrote `fallback_cc`, then stopped
+  at switching off what was not running, before waiting for a single
+  connection, and left `skyline_cc` registered. Switching off what is not
+  loaded now succeeds; only switching it on fails. An enable whose cgroup
+  policy cannot be switched on no longer fails after its attach.
+- **A drain that timed out was reported as `skyline_cc` being switched off
+  behind the daemon's back.** Both reports said ATTACHED, NOT DEFAULT or
+  BYPASSED, "something rewrote net.ipv4.tcp_congestion_control; re-run:
+  ssctl enable", the guard not armed, and first-flight copies "not running:
+  the TC program on runtime.tc_interface is not loaded". A drain run over
+  SSH always ends there. They now say DRAINING and how many connections
+  skyline_cc still serves.
+- **A refused request could change the daemon anyway.** A refused `enable`
+  kept its module set and generation, so `status` reported a configuration
+  the kernel never received and the next `disable` or `set-module-config`
+  published it; `set-rack-rto`, `set-retransmit-dscp` and the `reset-`
+  commands kept their values when the write to the kernel failed --
+  `set-retransmit-dscp` on a tunnel host then showed marking in force. A
+  failed request now leaves the configuration as it was, and
+  `reset-module-config` validates what it restores.
+- **One client could hold the control socket.** The daemon serves one request
+  at a time and had no deadline: a client that connected and never ended its
+  line held every request, SIGTERM's shutdown included, until SIGKILL, which
+  leaves the struct_ops registered and the TC filter attached. Each read and
+  write now has 5 seconds, a request at most 64 KiB, and a request the
+  daemon cannot decode gets an answer instead of a closed connection.
+- **Rounds stopped advancing on a connection that had delivered 2^32
+  segments,** about 6 TB, 14 hours at 1 Gbit/s: the round comparisons did not
+  allow for `tp->delivered` wrapping, and the bandwidth window, the loss EMA,
+  the guardrail, the end of STARTUP and configuration adoption could stop for
+  the rest of the connection. They now compare as BBR does.
+- **First-flight redundancy copied the first `first_kib` of every further
+  4 GiB of a connection,** taking the offset in 32-bit sequence space.
+- **A flow without a bandwidth estimate lost the window floor an RTO left it
+  on the first ACK after Loss,** when its window was above ssthresh:
+  `tcp_slow_start()` cuts such a window down. It is now called only below
+  ssthresh. (That such a flow grows no further than ssthresh, which is the
+  window of its first loss, is unchanged; docs/03 section 13.)
+- **`skyline_policy` never checked the version of its RTO slot;** a slot of
+  another layout now counts as none.
+- **NaN and infinity passed validation** for `startup_gain`, the two cruise
+  gains and `max_queue_delay_ratio`: a NaN compares false with everything.
+  They reached the kernel as 0 or `u32::MAX` -- a NaN `cruise_pacing_gain`
+  paced every connection at its floor -- and `status` as `null`, which no
+  `ssctl` decodes.
+- **After OpenRC restarted the daemon, the enable service could find the old
+  socket file and fail,** leaving the host on `fallback_cc` with no error
+  anyone would see. `boot-enable.sh` and the installer now wait for the
+  daemon to answer, and the daemon removes its socket when it stops. Both
+  boot scripts use `SKYLINE_SOCKET` for the commands they run as well, and
+  the drain in `boot-disable.sh` has an outer bound.
+- **A misplaced key's hint** named only the first table it belongs to (any
+  `enabled` was put down to `[rack_rto]`), and none for optional keys such as
+  `tc_interface`.
+- **Each request computed the daemon's status up to three times,** each
+  running `tc`; `state.json` is now exactly what the reply carries.
+- **Installer:** a `--release` to an older tag said "upgraded"; the
+  commands it prints carry `sudo` wherever the host has it, and the root
+  check and `--help` work when the script is piped; `SKYLINE_ARTIFACT_URL` is
+  said to override `--release` and to go unused on a source build;
+  `--uninstall` drains once, through the configured socket, and reports an
+  unexpected stop; the bbr + fq restore leaves alone a NIC the configuration
+  does not name; a glibc host with a musl package is no longer taken for a
+  musl host; and an install over a host already on `skyline_cc` without a
+  pre-install snapshot no longer records skyline_cc as what was there
+  before. `bootstrap.sh --check` and `--uninstall` place no source tree.
+- **Comments and documents that said otherwise than the code,** among them:
+  which branch of the M2-off PRR is PRR-SSRB (the two were swapped), that
+  SYN-ACKs are copied whatever congestion control their connection will run,
+  and what a mismatched ABI version does to a connection (it keeps the
+  kernel's initial window; it is not handed back to the kernel).
 
 ## [0.5.1] - 2026-10-12
 
@@ -1386,7 +1528,9 @@ rather than as fixes to a version nobody could have installed.
   socket file permissions. Multi-tenant hosts need additional access control.
 - The experiment harness requires **Python 3.11 or newer** (`tomllib`).
 
-[Unreleased]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.4...HEAD
+[0.5.2]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.4...v0.5.0
 [0.4.4]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/CYBERVERSE-Research/skyline-speeder/compare/v0.4.1...v0.4.2
