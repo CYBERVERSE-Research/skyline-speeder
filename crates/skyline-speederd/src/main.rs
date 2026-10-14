@@ -656,7 +656,6 @@ impl TcRuntime {
             total.packets = total.packets.saturating_add(stats.packets);
             total.bytes = total.bytes.saturating_add(stats.bytes);
             total.gso_packets = total.gso_packets.saturating_add(stats.gso_packets);
-            total.drops = total.drops.saturating_add(stats.drops);
         }
         Some(total)
     }

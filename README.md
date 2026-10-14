@@ -314,7 +314,7 @@ From 0.5.0, a misspelt key or one in the wrong section fails `--validate-only`, 
 | pacing updates | times the pacing rate was recomputed |
 | delivery samples | a sum of overlapping rate samples, for comparing two runs; not a packet count |
 | PRR adjustments | appears only when it is not 0; with `adaptive-cwnd` on, that is a bug worth reporting |
-| TC EGRESS | since the daemon started, everything leaving `tc_interface` whatever its congestion control: `seen` counts packets, bytes and GSO packets; `drops` is always 0, since the program never drops; then [`retransmits marked`](#retransmit-dscp-marking) and [`first-flight copies`](#first-flight-redundancy) |
+| TC EGRESS | since the daemon started, everything leaving `tc_interface` whatever its congestion control: `seen` counts packets, bytes and GSO packets; then [`retransmits marked`](#retransmit-dscp-marking) and [`first-flight copies`](#first-flight-redundancy) |
 | DYNAMIC RTO, or CGROUP POLICY while it is off | see [Dynamic RTO floor and ceiling](#dynamic-rto-floor-and-ceiling); `connections seen` is how to tell whether any process is in the cgroup |
 
 `--json` prints the daemon's raw reply instead, for scripts. `ssctl snapshot <file>` has the daemon write the `status` part of it to a regular file (under systemd, `/run/skyline-speeder/` is the safe place), and `ssctl validate` checks the daemon's configuration in memory against the kernel.

@@ -1244,15 +1244,6 @@ fn side_programs(page: &mut Page<'_>, theme: &Theme, status: &RuntimeStatus) {
                 count(tc.gso_packets)
             ),
         );
-        page.row(
-            if tc.drops == 0 {
-                Mark::Good
-            } else {
-                Mark::Warn
-            },
-            "drops",
-            &count(tc.drops),
-        );
         if let Some(dscp) = &status.retransmit_dscp.stats {
             if status.retransmit_dscp.config.enabled || dscp.retransmits_marked > 0 {
                 page.row(
@@ -1525,7 +1516,6 @@ mod tests {
                 packets: 8_402_113,
                 bytes: 12_034_998_221,
                 gso_packets: 1_002,
-                drops: 0,
             }),
             metrics: Some(SkylineMetrics {
                 ack_events: 1_204_551,

@@ -316,7 +316,7 @@ sudo systemctl restart skyline-speederd    # 挂载服务随之重新挂载 skyl
 | pacing updates | pacing 速率重新计算的次数 |
 | delivery samples | 相互重叠的速率样本之和，用于比较两次测试；不是包数 |
 | PRR adjustments | 只在不为 0 时出现；`adaptive-cwnd` 开着时出现它，就是值得报告的缺陷 |
-| TC EGRESS | daemon 启动以来从 `tc_interface` 发出的全部流量，不论拥塞控制：`seen` 是包数、字节数和 GSO 包数；`drops` 恒为 0，这个程序从不丢包；然后是 [`retransmits marked`](#重传包-dscp-标记) 和 [`first-flight copies`](#首轮冗余) |
+| TC EGRESS | daemon 启动以来从 `tc_interface` 发出的全部流量，不论拥塞控制：`seen` 是包数、字节数和 GSO 包数；然后是 [`retransmits marked`](#重传包-dscp-标记) 和 [`first-flight copies`](#首轮冗余) |
 | DYNAMIC RTO，关闭时是 CGROUP POLICY | 见[动态 RTO 上下限](#动态-rto-上下限)；`connections seen` 用来判断 cgroup 里有没有进程 |
 
 要给脚本解析就加 `--json`，打印 daemon 的原始应答。`ssctl snapshot <文件>` 让 daemon 把其中的 `status` 部分写进一个普通文件（systemd 下写到 `/run/skyline-speeder/` 最稳妥），`ssctl validate` 对照内核校验 daemon 内存里的配置。

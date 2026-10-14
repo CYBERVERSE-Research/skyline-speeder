@@ -29,9 +29,6 @@
 /* Real CUBIC's "already past the curve's current target" growth rate --
  * see skyline_grow_cwnd()'s doc comment for why this must be ~cwnd, not 1. */
 #define SKYLINE_CUBIC_STALLED_WEIGHT_SCALE 100U
-/* Absolute floor for every min-RTT-relative "queue is basically empty"
- * threshold -- see skyline_low_queue_us()'s doc comment. */
-#define SKYLINE_QUEUE_LOW_FLOOR_US 1000ULL
 /* skyline_loss_inflation_permille()'s ceiling: cap compensation at a measured
  * loss rate of 50% (1/(1-0.5) = 2.0x) regardless of how much higher the
  * flow's own EMA reads -- the target box's upper bound is 20% loss, and
@@ -298,7 +295,6 @@ static __always_inline bool skyline_new_round(struct tcp_sock *tp,
     if (!skyline_round_reached(sample, flow->next_round_delivered))
         return false;
     flow->next_round_delivered = tp->delivered + tp->packets_out;
-    flow->round_count++;
     return true;
 }
 
@@ -322,7 +318,6 @@ static __always_inline void skyline_reset_generation(struct skyline_flow_state *
                                                   struct tcp_sock *tp)
 {
     flow->mode = SKYLINE_MODE_STARTUP;
-    flow->round_count = 0;
     flow->plateau_rounds = 0;
     flow->prior_cwnd = tp->snd_cwnd;
     flow->w_max = tp->snd_cwnd;
@@ -335,7 +330,6 @@ static __always_inline void skyline_reset_generation(struct skyline_flow_state *
     flow->bw_bps = 0;
     flow->prior_round_bw_bps = 0;
     flow->round_rate_bps = 0;
-    flow->bw_sample_index = 0;
 #pragma unroll
     for (int index = 0; index < 10; index++)
         flow->bw_samples[index] = 0;
@@ -390,15 +384,6 @@ static __always_inline void skyline_transition(struct sock *sk,
 static __always_inline __u64 skyline_base_rtt_us(struct skyline_flow_state *flow)
 {
     return max_t(__u64, flow->min_rtt_us, flow->min_srtt_us);
-}
-
-/* Floor + shared definition for every "queue_delay <= (basically empty)"
- * exit check. At rtt=2ms, base_rtt/8 alone would be 250us -- below
- * scheduler/NIC timing noise -- hence the absolute floor.
- */
-static __always_inline __u64 skyline_low_queue_us(struct skyline_flow_state *flow)
-{
-    return max_t(__u64, skyline_base_rtt_us(flow) / 8U, SKYLINE_QUEUE_LOW_FLOOR_US);
 }
 
 /* The queue-delay guardrail threshold, as max(fixed floor, ratio-of-base-RTT)
@@ -567,7 +552,6 @@ static __always_inline bool skyline_update_model(struct sock *sk,
         for (int offset = 9; offset > 0; offset--)
             flow->bw_samples[offset] = flow->bw_samples[offset - 1];
         flow->bw_samples[0] = flow->round_rate_bps;
-        flow->bw_sample_index = 0;
         flow->round_rate_bps = 0;
         measured_round = true;
 #pragma unroll

@@ -85,7 +85,7 @@ map 里——这是**逐 socket**存储，随连接创建自动分配、随连�
 
 | 类别 | 代表字段 | 消费者 |
 |---|---|---|
-| 拥塞/带宽估计 | `min_rtt_us`/`min_srtt_us`/`bw_bps`/`bw_samples[10]`/`round_count` | 所有模块共享的底层估计器 |
+| 拥塞/带宽估计 | `min_rtt_us`/`min_srtt_us`/`bw_bps`/`bw_samples[10]`/`next_round_delivered` | 所有模块共享的底层估计器 |
 | 模式机状态 | `mode`（STARTUP/CRUISE）、`plateau_rounds`、`queue_clamped` | M2 |
 | 丢包率信号 | `loss_rate_permille`、`last_lost`、`last_loss_rate_delivered` | M3 消费，计算本身独立于 `feature_mask` |
 | CUBIC 增长核心状态（仅 M2 关闭路径） | `w_max`、`epoch_start_ns`、`epoch_k_ms`、`tcp_cwnd`、`ack_cnt` | 框架层的 CUBIC 增长核心 + M2 关闭时的降窗 |

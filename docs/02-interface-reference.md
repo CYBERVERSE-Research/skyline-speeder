@@ -165,7 +165,7 @@ daemon 应答，旧 `ssctl` 也能解码新 daemon 的应答。`RuntimeStatus` �
 | `modules` | 当前启用的 M1-M4 模块子集 |
 | `fallback_cc` | 未启用/摘除后新连接使用的拥塞控制算法名 |
 | `active_flows` | 当前正在使用 `skyline_cc` 的连接数 |
-| `tc_stats` | TC 程序看到的包数、字节数与 GSO 包数（`packets`/`bytes`/`gso_packets`；`gso_packets` 数的是 `gso_segs > 1` 的 skb，不是段数）；`drops` 字段恒为 0——TC 程序始终 fail open，不主动丢包 |
+| `tc_stats` | TC 程序看到的包数、字节数与 GSO 包数（`packets`/`bytes`/`gso_packets`；`gso_packets` 数的是 `gso_segs > 1` 的 skb，不是段数）。TC 程序始终 fail open，从不丢包 |
 | `metrics` | M2/M3/M4 的决策计数器（见下表），**自这次挂载起累计**。没有已加载的 struct_ops 时为 `null`：从未启用、一次 drain 完成之后、daemon 重启之后都是；每次重新挂载从零计起 |
 | `metrics_recent` | 最近约一分钟里 `metrics` 的增量：`seconds`（实际覆盖的秒数）与 `metrics`（同一组计数器在这段时间里的增量）。挂载期间 daemon 每 5 秒读一次计数器，取当前值与最接近 60 秒前的那次读数之差；挂载不满一分钟时覆盖到最早的那次读数。用它区分"现在仍在发生"和"挂载以来某个时候发生过"。未挂载、刚挂载还没有读数、或来自 0.5.0 之前的 daemon 时为 `null` |
 | `rack_tuning` | M1 tier-1 全局 sysctl 的"配置声明值"与"当前实际值"对照 |

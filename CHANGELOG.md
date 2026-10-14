@@ -40,6 +40,9 @@ change for anyone holding a prebuilt `.bpf.o`.
   reply decodes with `draining` false.
 - **`pin_dir` may be left out of `[runtime]`.** Keep it if the host may go
   back to 0.5.1 or older, which require it.
+- **`tc_stats` in `ssctl status --json` has no `drops` any more,** and the
+  TC EGRESS section of `ssctl flows` no `drops` row. Nothing ever wrote it:
+  the TC program fails open and never drops a packet.
 
 ### Added
 

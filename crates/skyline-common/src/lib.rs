@@ -1163,7 +1163,6 @@ pub struct TcStats {
     pub packets: u64,
     pub bytes: u64,
     pub gso_packets: u64,
-    pub drops: u64,
 }
 
 /// Mirrors `struct skyline_rto_stats` (`bpf/include/skyline_abi.h`).

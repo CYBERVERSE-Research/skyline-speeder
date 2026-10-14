@@ -211,7 +211,6 @@ struct skyline_flow_state {
     __u32 config_seq;
     __u32 mode;
     __u32 counted;
-    __u32 round_count;
     __u32 plateau_rounds;
     __u32 prior_cwnd;
     __u32 w_max;
@@ -232,7 +231,6 @@ struct skyline_flow_state {
     __u64 prior_round_bw_bps;
     __u64 round_rate_bps;
     __u64 bw_samples[10];
-    __u32 bw_sample_index;
     /* K (the cubic-curve time-to-reach-w_max constant, milliseconds),
      * frozen once per growth epoch by skyline_cubic_target() the first time it
      * runs after flow->epoch_start_ns is reset to 0. Must NOT be recomputed
@@ -359,7 +357,6 @@ struct skyline_tc_stats {
     __u64 packets;
     __u64 bytes;
     __u64 gso_packets;
-    __u64 drops;
 };
 
 /* M1 per-flow dynamic RTO floor + ceiling tuning. Deliberately independent
