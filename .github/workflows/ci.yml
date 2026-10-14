@@ -3,8 +3,10 @@
 # What CI can and cannot do for this project, stated plainly because it changes
 # how you should read a green check mark:
 #
-#   CAN   compile the three CO-RE BPF objects, build and test the Rust control
-#         plane, lint the shell scripts, run the experiment-harness unit tests.
+#   CAN   compile the three CO-RE BPF objects -- against the runner's own
+#         kernel BTF, and against the pinned reference header the release
+#         builds with -- build and test the Rust control plane, lint the
+#         shell scripts, run the experiment-harness unit tests.
 #   CANNOT load any BPF object: no job runs the kernel verifier, so a green
 #         check says nothing about whether the objects load. That is checked by
 #         hand on a test host running a supported kernel (6.12 or later; the
@@ -161,6 +163,62 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # What release.yml compiles: the objects against the pinned 6.12 reference
+  # header (PREBUILT_VMLINUX_H), without the -DBPF_NO_KFUNC_PROTOTYPES a
+  # header generated from the runner's kernel gets. The job above builds
+  # against that newer BTF only, so a change that breaks against the
+  # reference header -- a type or field 6.12 does not have, a clashing kfunc
+  # prototype -- surfaced first at tag time, in a release job that then
+  # publishes nothing. A job of its own, on a fresh checkout: the Makefile
+  # copies the header by mtime, and would keep a vmlinux.h already there.
+  bpf-reference:
+    name: BPF (compile against the release's reference header)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install clang and libbpf
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang llvm libbpf-dev
+
+      # The same fetch and checks as release.yml's, from the same repository
+      # variables. A pull request from a fork gets no variables: then this
+      # says so and compiles nothing, rather than failing a change it cannot
+      # check.
+      - name: Fetch the pinned reference vmlinux.h
+        id: reference
+        env:
+          REFERENCE_URL: ${{ vars.SKYLINE_REFERENCE_VMLINUX_URL }}
+          REFERENCE_SHA256: ${{ vars.SKYLINE_REFERENCE_VMLINUX_SHA256 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${REFERENCE_URL:-}" ] || [ -z "${REFERENCE_SHA256:-}" ]; then
+            echo "::warning::SKYLINE_REFERENCE_VMLINUX_URL and SKYLINE_REFERENCE_VMLINUX_SHA256 are not available to this run, so the release's compile path was not checked"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          curl -fsSL --proto '=https' --tlsv1.2 -o reference.h.gz "$REFERENCE_URL"
+          echo "${REFERENCE_SHA256}  reference.h.gz" | sha256sum -c -
+          gunzip -c reference.h.gz > reference-vmlinux.h
+          grep -q 'preserve_access_index' reference-vmlinux.h \
+            || { echo "::error::reference header lacks the preserve_access_index pragma"; exit 1; }
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build BPF objects against the reference header
+        if: steps.reference.outputs.available == 'true'
+        run: make bpf PREBUILT_VMLINUX_H="$PWD/reference-vmlinux.h"
+
+      - name: Assert CO-RE relocations are present
+        if: steps.reference.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          for object in build/bpf/*.bpf.o; do
+            readelf -S "$object" | grep -q '\.BTF\.ext' \
+              || { echo "::error::$object has no .BTF.ext section"; exit 1; }
+            echo "ok   $object"
+          done
+
   shell:
     name: Shell (shellcheck, syntax)
     runs-on: ubuntu-24.04
@@ -175,14 +233,16 @@ jobs:
       - name: shellcheck
         run: |
           shellcheck -S warning install.sh scripts/*.sh infra/*.sh \
-            infra/kernel/*.sh research/experiments/*.sh packaging/openrc/*
+            infra/kernel/*.sh research/experiments/*.sh \
+            research/experiments/single-ended/*.sh packaging/openrc/*
 
       # scripts/bootstrap.sh and the OpenRC scripts are POSIX sh: bootstrap is
       # piped into busybox sh on Alpine, where bash is not there yet. dash
       # parses nothing that sh cannot.
       - name: Syntax
         run: |
-          bash -n install.sh scripts/*.sh infra/*.sh infra/kernel/*.sh research/experiments/*.sh
+          bash -n install.sh scripts/*.sh infra/*.sh infra/kernel/*.sh research/experiments/*.sh \
+            research/experiments/single-ended/*.sh
           dash -n scripts/bootstrap.sh packaging/openrc/*
 
   python:

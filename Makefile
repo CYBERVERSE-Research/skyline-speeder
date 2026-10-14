@@ -64,8 +64,10 @@ venv: .venv/bin/python
 	$(PYTHON) -m pip install --upgrade pip
 	$(PYTHON) -m pip install --requirement requirements-dev.txt
 
+# The same scripts CI's syntax step parses.
 check:
-	bash -n infra/*.sh infra/kernel/*.sh research/experiments/*.sh
+	bash -n install.sh scripts/*.sh infra/*.sh infra/kernel/*.sh research/experiments/*.sh \
+		research/experiments/single-ended/*.sh
 	@test -x $(PYTHON) || { echo "Run 'make venv' first" >&2; exit 1; }
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -m unittest discover -s research/experiments/tests -v
 	cargo fmt --all -- --check
