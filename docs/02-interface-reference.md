@@ -312,8 +312,9 @@ BPF 侧的四段配置各自独立维护自己的 ABI 版本号，互不联动�
   计数器。
 - 首轮冗余（`SKYLINE_REDUNDANCY_ABI_VERSION`）：与 DSCP 标记相同——不匹配时不复制，
   递增 `redundancy.stats` 里的 `abi_mismatch`。
-- M1 tier-2 动态 RTO（`SKYLINE_RTO_TUNING_ABI_VERSION`）：BPF 侧当前不校验这个
-  版本号。
+- M1 tier-2 动态 RTO（`SKYLINE_RTO_TUNING_ABI_VERSION`）：0.5.2 起 `skyline_policy` 校验它，
+  不匹配时当作没有配置——新连接不订阅 RTT 回调，已订阅的在下一个 RTT 样本上退订，与功能关闭
+  时一样；没有对应的计数器。0.5.1 及更早不校验，不匹配就按错位的结构读取。
 
 这只会发生在 `skyline-speederd` 与它加载的 `.bpf.o` 不是同一次构建产物时，正常部署
 （`skyline-speederd`/`ssctl`/BPF 对象来自同一次 `make`）不会遇到。
@@ -365,7 +366,7 @@ daemon 静默忽略它们；降级到这些版本时文件里多出的键没有�
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `min_rtt_window_s` | u32 | 最小 RTT 滑动窗口长度（秒），取值范围 1-4294（0.5.2 起：`0` 让基准 RTT 恒等于当前 RTT，队列时延护栏永远看不到排队；内核侧以 32 位微秒保存） |
-| `bw_window_rtts` | u32 | 带宽估计窗口长度（RTT 个数），取值范围 1-10 |
+| `bw_window_rtts` | u32 | 带宽估计窗口长度：有样本进入滤波器的轮数（一轮约两个 RTT，`docs/03-design.md` 第 3 节），取值范围 1-10 |
 | `startup_plateau_rtts` | u32 | 判定"带宽增长平台期"所需的连续轮数，用于触发 STARTUP→CRUISE 切换；只数有样本进入带宽滤波器的轮次，整轮受应用限速的不算（0.5.1 起） |
 | `startup_growth_ratio` | f64 | 低于此增长比例视为平台期，取值范围 0.0-1.0 |
 | `startup_gain` | f64 | STARTUP 态单一增益，同时作用于 cwnd 目标和 pacing 速率，取值范围 1.0-1000 |
