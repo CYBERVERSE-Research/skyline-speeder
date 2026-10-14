@@ -245,19 +245,18 @@ struct skyline_flow_state {
     __u32 epoch_k_ms;
     __u64 next_round_delivered;
     __u64 epoch_start_ns;
-    __u64 neutral_pacing_rate;
-    __u32 neutral_pacing_status;
     /* PRR (RFC 6937) accounting, mirroring the kernel's own
-     * tp->prr_delivered/tp->prr_out (net/ipv4/tcp_input.c's
-     * tcp_cwnd_reduction()) -- Skyline Speeder must keep its own copies because
-     * cong_control makes the kernel skip that function entirely. Only
-     * exercised on the M2-off path (see skyline_abi.h's top-of-file comment --
-     * M2 on bypasses PRR entirely). Reset to 0 by skyline_set_state() on every
-     * fresh TCP_CA_Recovery/TCP_CA_CWR entry (a new epoch) and by
+     * tp->prr_delivered (net/ipv4/tcp_input.c's tcp_cwnd_reduction()) --
+     * cong_control makes the kernel skip that function, the only place it
+     * counts delivered segments. tp->prr_out it still keeps (the transmit
+     * paths add what they send during CWR and Recovery), and
+     * skyline_apply_prr() reads that one. Only exercised on the M2-off path
+     * (see skyline_abi.h's top-of-file comment -- M2 on bypasses PRR
+     * entirely). Reset to 0 by skyline_set_state() on every fresh
+     * TCP_CA_Recovery/TCP_CA_CWR entry (a new epoch) and by
      * skyline_reset_generation(). See skyline_apply_prr().
      */
     __u32 prr_delivered;
-    __u32 prr_out;
     /* Real CUBIC's "TCP-friendly region" Reno estimate (net/ipv4/tcp_cubic.c's
      * bictcp_update():219,237-238,299-316) -- mirrors ca->tcp_cwnd/ca->ack_cnt.
      * Reset to the pre-cut cwnd / 0 whenever skyline_grow_cwnd() (M2 off) starts a

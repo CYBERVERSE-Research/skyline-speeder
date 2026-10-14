@@ -159,6 +159,22 @@ change for anyone holding a prebuilt `.bpf.o`.
   musl host; and an install over a host already on `skyline_cc` without a
   pre-install snapshot no longer records skyline_cc as what was there
   before. `bootstrap.sh --check` and `--uninstall` place no source tree.
+- **With M4 and auto pacing both off, every connection was held to the
+  pacing rate the kernel set at the handshake** -- two initial windows of 10
+  per round trip, 5.7 Mbit/s at 40 ms -- wherever `fq` is the qdisc: the
+  kernel never updates the pacing rate of a `cong_control` algorithm, and
+  that rate was put back on every ACK. Such connections are now unpaced (an
+  application's `SO_MAX_PACING_RATE` still applies). Only profiles that
+  switch `auto_pacing_enabled` off are affected.
+- **The M2-off path followed the kernel's CUBIC and PRR more loosely than it
+  says:** PRR also ran in Loss, on the counters of the previous recovery; it
+  counted what it allowed instead of what was sent (`tp->prr_out`); its
+  PRR-SSRB extra segment did not wait for `snd_una` to move; and the CUBIC
+  core grew a window that was not limiting the flow, by up to one segment per
+  acked one. Each now does what `tcp_cwnd_reduction()` and
+  `bictcp_cong_avoid()` do. Only M2-off profiles run this path; the
+  neutrality figures in docs/03 section 4, zero-loss bulk transfers, do not
+  exercise any of it.
 - **Comments and documents that said otherwise than the code,** among them:
   which branch of the M2-off PRR is PRR-SSRB (the two were swapped), that
   SYN-ACKs are copied whatever congestion control their connection will run,

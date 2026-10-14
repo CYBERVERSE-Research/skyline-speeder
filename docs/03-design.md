@@ -89,7 +89,7 @@ map 里——这是**逐 socket**存储，随连接创建自动分配、随连�
 | 模式机状态 | `mode`（STARTUP/CRUISE）、`plateau_rounds`、`queue_clamped` | M2 |
 | 丢包率信号 | `loss_rate_permille`、`last_lost`、`last_loss_rate_delivered` | M3 消费，计算本身独立于 `feature_mask` |
 | CUBIC 增长核心状态（仅 M2 关闭路径） | `w_max`、`epoch_start_ns`、`epoch_k_ms`、`tcp_cwnd`、`ack_cnt` | 框架层的 CUBIC 增长核心 + M2 关闭时的降窗 |
-| PRR 状态（仅 M2 关闭路径） | `prior_cwnd`、`prr_delivered`、`prr_out`、`recovery_active` | 框架层的 PRR 实现，M2 开启时完全绕开 |
+| PRR 状态（仅 M2 关闭路径） | `prior_cwnd`、`prr_delivered`、`recovery_active`（已发出的量读内核的 `tp->prr_out`） | 框架层的 PRR 实现，M2 开启时完全绕开 |
 | 配置副本 | `config`、`config_seq` | 这条连接读的全部系数都来自这份副本，只在连接开始时与轮边界上更新（第 11 节） |
 
 无论模块开关如何，持续更新的底层估计器：`min_rtt_us`（历史最低 RTT，超过
@@ -113,16 +113,26 @@ M2 开启时，`skyline_cong_control()` 直接掌管 cwnd，完全不经过这�
 struct_ops 回调，内核会因此把自己的 PRR 恢复期限速逻辑整段跳过。Skyline Speeder 自己
 重新实现一份等价的逐 ACK 限速（`skyline_apply_prr()`），在整个恢复期内每次
 ACK 都限制发送量，而不是只在恢复开始时降一次窗——否则 cwnd 降低了，但发
-送节奏不受控，一个 RTT 内就能把降低后的 cwnd 打满。
+送节奏不受控，一个 RTT 内就能把降低后的 cwnd 打满。和内核一样只在 CWR 与 Recovery
+里执行，已发出的量取内核自己记的 `tp->prr_out`（内核对任何拥塞控制都维护它），
+PRR-SSRB 多放的那一个包也只在这个 ACK 推进了 `snd_una` 时给；Loss 里由下面的增长路径
+从 `tcp_enter_loss()` 留下的窗口慢启动回去（0.5.2 之前 Loss 里也走 PRR，计数沿用上一次
+恢复的）。
 
 **Auto-pacing**（`auto_pacing_enabled`，默认开启）：M4 关闭时，pacing 速率
 按内核自身公式（慢启动阶段/拥塞避免阶段两档比例）计算一个等价的封顶速率，
-保证"M4 关闭"和"内核原生 pacing 行为"一致。
+保证"M4 关闭"和"内核原生 pacing 行为"一致。auto-pacing 也关掉时不设 pacing 速率：
+每个 ACK 把它放回 socket 自己的上限（`sk_max_pacing_rate`，应用没设 `SO_MAX_PACING_RATE`
+时就是不限速）。内核不为带 `cong_control` 的算法更新 pacing 速率（跳过
+`tcp_update_pacing_rate()`），握手完成时按初始窗口 10 算出的那个值会一直留着；0.5.2
+之前每个 ACK 放回的正是这个值，`fq` 下整条连接都被它卡住（实验网 40 ms 时约 5.7 Mbit/s）。
 
 **CUBIC 增长核心**（M2 关闭时的 cwnd 增长路径）：完整复刻内核 CUBIC 的三次
 函数增长公式（`K` 在每个增长周期开始时算一次并冻结）、"曲线还没追上当前
 cwnd"时的近似冻结分支，以及一个独立维护的 Reno 风格增长下限（TCP-
-friendliness 地板，防止极短拥塞周期下增长长期趋近于 0）。
+friendliness 地板，防止极短拥塞周期下增长长期趋近于 0）。和 `bictcp_cong_avoid()`
+一样，窗口不是限制因素时不增长（`tcp_is_cwnd_limited()`），每确认两个段至多加一个
+（0.5.2 起；之前应用受限的流也照样涨，Reno 地板领先很多时每个确认都能加一个）。
 
 这三块合起来保证：无论 M1-M4 开关如何组合，只要 M2/M4 关闭，cwnd 增长和
 pacing 行为都精确对齐内核原生实现。
@@ -363,8 +373,8 @@ ACK 的末尾（M2、M4 都已定好这一 ACK 的窗口和速率之后）再做
 **激进初始窗口**：`initial_cwnd_packets` 支持覆盖内核自身的初始窗口（标准
 IW10 在高 RTT 场景下需要多个 RTT 才能涨到较大 cwnd）；`0` 表示不覆盖。
 
-**M2 关闭时**：走 `icsk_ca_state < TCP_CA_CWR` 才增长、否则走 PRR 的框架层
-CUBIC 对等路径（第 4 节）。
+**M2 关闭时**：走框架层的 CUBIC 对等路径（第 4 节）：CWR 与 Recovery 里走 PRR，
+其余状态（Loss 在内）增长。
 
 ## 7. M3：丢包率补偿
 

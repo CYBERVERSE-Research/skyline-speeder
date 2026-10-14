@@ -352,7 +352,6 @@ static __always_inline void skyline_reset_generation(struct skyline_flow_state *
      */
     flow->epoch_k_ms = 0;
     flow->prr_delivered = 0;
-    flow->prr_out = 0;
     flow->tcp_cwnd = tp->snd_cwnd;
     flow->ack_cnt = 0;
     flow->recovery_active = 0;
@@ -474,6 +473,9 @@ static __always_inline bool skyline_sample_measures_path(struct tcp_sock *tp,
 /* SKB_DATA_ALIGN() (include/linux/skbuff.h) rounds to SMP_CACHE_BYTES: 64 on
  * x86, the one target these objects are built for (-D__TARGET_ARCH_x86). */
 #define SKYLINE_SKB_DATA_ALIGN(x) (((x) + 63U) & ~63U)
+/* FLAG_SND_UNA_ADVANCED (net/ipv4/tcp_input.c), a bit of the flag argument
+ * cong_control receives: this ACK moved snd_una. */
+#define SKYLINE_FLAG_SND_UNA_ADVANCED 0x400
 
 /* Marks the flow application-limited at an ACK, the way the kernel only does
  * when the application writes. tcp_rate_check_app_limited() runs from
@@ -686,6 +688,20 @@ static __always_inline __u32 skyline_min_cwnd(const struct skyline_config *confi
     return max_t(__u32, config->min_cwnd_packets, SKYLINE_MIN_CWND);
 }
 
+/* tcp_is_cwnd_limited() (include/net/tcp.h): the window limited the flow in
+ * the last round trip (is_cwnd_limited, kept by tcp_cwnd_validate() for every
+ * congestion control), or, in slow start, it is below twice the most the
+ * flow had in flight in that time.
+ */
+static __always_inline bool skyline_cwnd_limited(struct tcp_sock *tp)
+{
+    if (BPF_CORE_READ_BITFIELD(tp, is_cwnd_limited))
+        return true;
+    if (tp->snd_cwnd < tp->snd_ssthresh)
+        return tp->snd_cwnd < 2U * tp->max_packets_out;
+    return false;
+}
+
 static __always_inline __u32 skyline_bdp_packets(struct tcp_sock *tp,
                                              struct skyline_flow_state *flow,
                                              const struct skyline_config *config,
@@ -786,8 +802,16 @@ static __always_inline void skyline_apply_pacing(struct sock *sk,
         if (config->feature_mask & SKYLINE_FEATURE_AUTO_PACING) {
             skyline_apply_auto_pacing_rate(sk, tp);
         } else {
-            sk->sk_pacing_rate = flow->neutral_pacing_rate;
-            sk->sk_pacing_status = flow->neutral_pacing_status;
+            /* No pacing rate of ours -- and none of the kernel's either:
+             * it skips tcp_update_pacing_rate() for a cong_control
+             * algorithm, so the rate it set when the handshake completed
+             * (two initial windows of 10 per round trip) is never updated.
+             * Put back on every ACK, as before 0.5.2, that rate capped
+             * the connection for its whole life wherever fq is the qdisc
+             * -- 5.7 Mbit/s at 40 ms. The socket's own ceiling instead:
+             * unpaced, unless the application set SO_MAX_PACING_RATE.
+             */
+            sk->sk_pacing_rate = sk->sk_max_pacing_rate;
         }
         return;
     }
@@ -931,6 +955,10 @@ static __always_inline void skyline_grow_cwnd(struct tcp_sock *tp,
 
     if (!acked)
         return;
+    /* As bictcp_cong_avoid() starts: a window that is not what limits the
+     * flow is not grown. */
+    if (!skyline_cwnd_limited(tp))
+        return;
     if (tp->snd_cwnd < tp->snd_ssthresh) {
         acked = tcp_slow_start(tp, acked);
         if (!acked) {
@@ -991,6 +1019,10 @@ static __always_inline void skyline_grow_cwnd(struct tcp_sock *tp,
         if (weight > friendly_weight)
             weight = friendly_weight;
     }
+    /* bictcp_update() ends with ca->cnt = max(ca->cnt, 2U): at most one
+     * segment per two acked, 1.5x per round trip, whatever the Reno
+     * estimate says. */
+    weight = max_t(__u32, weight, 2U);
     tcp_cong_avoid_ai(tp, weight, acked);
 
     if (config->max_cwnd_packets && tp->snd_cwnd > config->max_cwnd_packets)
@@ -1005,13 +1037,14 @@ static __always_inline void skyline_grow_cwnd(struct tcp_sock *tp,
  * this reimplements it: the continuous per-ACK rate limiting through CWR and
  * Recovery that a non-cong_control CC gets for free, which is what makes a
  * zero-module Skyline Speeder flow track real CUBIC's lossy-scenario goodput
- * instead of massively overshooting it. Two differences from the kernel's:
- * it runs in Loss too (skyline_cong_control() calls it for every state from
- * CWR on), and SSRB's extra segment below is not gated on snd_una advancing.
+ * instead of massively overshooting it. Like the kernel's, it runs only in
+ * CWR and Recovery (skyline_cong_control()) and counts what has been sent in
+ * the reduction by tp->prr_out, which the kernel keeps for every congestion
+ * control.
  */
 static __always_inline void skyline_apply_prr(struct tcp_sock *tp,
                                           struct skyline_flow_state *flow,
-                                          const struct rate_sample *sample,
+                                          const struct rate_sample *sample, int flag,
                                           struct skyline_metrics *metric)
 {
     __s64 packets_in_flight;
@@ -1040,19 +1073,18 @@ static __always_inline void skyline_apply_prr(struct tcp_sock *tp,
         __u64 dividend = (__u64)tp->snd_ssthresh * (__u64)flow->prr_delivered +
                           (__u64)flow->prior_cwnd - 1ULL;
 
-        sndcnt = (__s64)(dividend / (__u64)flow->prior_cwnd) - (__s64)flow->prr_out;
+        sndcnt = (__s64)(dividend / (__u64)flow->prior_cwnd) - (__s64)tp->prr_out;
     } else {
         /* PRR-SSRB, RFC 6937's Slow Start Reduction Bound: in flight is at
          * or below ssthresh -- send what has been delivered, at least what
-         * this ACK newly acked, plus one when this ACK marked nothing newly
-         * lost (the kernel adds that one only when snd_una also advanced:
-         * FLAG_SND_UNA_ADVANCED), and never more than takes in-flight back
-         * up to ssthresh.
+         * this ACK newly acked, plus one when this ACK moved snd_una and
+         * marked nothing newly lost, and never more than takes in-flight
+         * back up to ssthresh.
          */
-        sndcnt = (__s64)flow->prr_delivered - (__s64)flow->prr_out;
+        sndcnt = (__s64)flow->prr_delivered - (__s64)tp->prr_out;
         if (sndcnt < (__s64)newly_acked)
             sndcnt = (__s64)newly_acked;
-        if (sample->losses <= 0)
+        if ((flag & SKYLINE_FLAG_SND_UNA_ADVANCED) && sample->losses <= 0)
             sndcnt++;
         if (sndcnt > delta)
             sndcnt = delta;
@@ -1061,12 +1093,11 @@ static __always_inline void skyline_apply_prr(struct tcp_sock *tp,
      * retransmit), matching tcp_cwnd_reduction()'s
      * `max(sndcnt, prr_out ? 0 : 1)`.
      */
-    if (sndcnt < (flow->prr_out ? 0 : 1))
-        sndcnt = flow->prr_out ? 0 : 1;
+    if (sndcnt < (tp->prr_out ? 0 : 1))
+        sndcnt = tp->prr_out ? 0 : 1;
     if (sndcnt < 0)
         sndcnt = 0;
 
-    flow->prr_out += (__u32)sndcnt;
     new_cwnd = (__u32)(packets_in_flight + sndcnt);
     tp->snd_cwnd = max_t(__u32, new_cwnd, SKYLINE_MIN_CWND);
     if (metric)
@@ -1082,8 +1113,6 @@ void BPF_PROG(skyline_init, struct sock *sk)
 
     if (!flow)
         return;
-    flow->neutral_pacing_rate = sk->sk_pacing_rate;
-    flow->neutral_pacing_status = sk->sk_pacing_status;
     /* Counted whether or not a configuration is adopted below: the socket
      * holds the struct_ops either way, and drain waits for it.
      */
@@ -1202,10 +1231,16 @@ void BPF_PROG(skyline_cong_control, struct sock *sk, __u32 ack, int flag,
     if (config->feature_mask & SKYLINE_FEATURE_ADAPTIVE_CWND) {
         skyline_set_cwnd_target(tp, flow, config, sample->acked_sacked,
                                 icsk->icsk_ca_state == TCP_CA_Loss);
-    } else if (icsk->icsk_ca_state < TCP_CA_CWR) {
+    } else if (icsk->icsk_ca_state == TCP_CA_CWR || icsk->icsk_ca_state == TCP_CA_Recovery) {
+        /* The kernel's own split (tcp_cong_control()): PRR while a
+         * reduction is under way -- CWR and Recovery -- and growth
+         * otherwise, Loss included, where tcp_enter_loss() has set the
+         * window and the kernel slow-starts it back up to ssthresh.
+         */
+        if (config->feature_mask & SKYLINE_FEATURE_PRR)
+            skyline_apply_prr(tp, flow, sample, flag, metric);
+    } else {
         skyline_grow_cwnd(tp, flow, config, sample->acked_sacked);
-    } else if (config->feature_mask & SKYLINE_FEATURE_PRR) {
-        skyline_apply_prr(tp, flow, sample, metric);
     }
 
     /* Only M2 and M4 read the bandwidth filter; with both off the flow is
@@ -1291,7 +1326,6 @@ void BPF_PROG(skyline_set_state, struct sock *sk, __u8 new_state)
          * skyline_cong_control()'s doc comment).
          */
         flow->prr_delivered = 0;
-        flow->prr_out = 0;
         flow->recovery_active = 1;
     } else if (new_state == TCP_CA_Open || new_state == TCP_CA_Disorder) {
         if (!flow->recovery_active)
