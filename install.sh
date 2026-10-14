@@ -50,9 +50,11 @@
 # /etc/sysctl.d is written or edited, so those files decide again after a
 # reboot.
 #
-# Running it again on an installed host upgrades it: the new objects must pass
-# the kernel verifier first, and only then is skyline-speederd restarted (live
-# flows are drained for up to 60 s, then skyline_cc is attached again).
+# Running it again on an installed host upgrades it: the new daemon and objects
+# must pass the kernel verifier before any installed file is replaced, and only
+# then is skyline-speederd restarted (live flows are drained for up to 60 s,
+# then skyline_cc is attached again). A refused upgrade leaves the installed
+# version as it was.
 #
 # Once skyline_cc is attached, skyline-speederd also keeps fq as the qdisc on
 # the egress NIC (config [guard]). A bbr / cake / fq_pie left behind by a
@@ -79,7 +81,9 @@ CALLER_LOCALE=${LC_ALL:-${LC_CTYPE:-${LANG:-}}}
 # real messages are not buried.
 export LC_ALL=C.UTF-8 LANG=C.UTF-8 LANGUAGE=
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Piped in (curl ... | bash) there is no file and BASH_SOURCE is empty, which
+# set -u turned into an "unbound variable" error on every such run.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 KVER="$(uname -r)"
 MODE=install
 ENABLE=1
@@ -165,6 +169,9 @@ LOG_READY=0     # 1: $LOG has been started for this run
 BAR_SHOWN=0     # 1: the progress line is on screen and must be cleared first
 STEP_NO=0 STEP_TOTAL=0 STEP_NAME= STEP_T0=0 STEP_OPEN=0 STEP_RAN=0 STEP_LOG_LINE=0
 SPIN_I=0 COLS=80 BG_PID= WORK= FAILED=0 INTERRUPTED=0 APT_SIM=
+# The new daemon, put beside the installed one to be verified before it
+# replaces it; see "Running the kernel verifier". on_exit removes what is left.
+STAGED_DAEMON=
 
 # Skyline Speeder has no revenue of its own. Every run of this script, and
 # every ssctl command, names who funds it -- once on the way in and once on
@@ -343,7 +350,15 @@ on_interrupt() {
 on_exit() {
     local rc=$?
     set +e
-    if [ "$rc" -ne 0 ] && [ "$FAILED" -eq 0 ] && [ "$LOG_READY" -eq 1 ]; then
+    if [ "$rc" -ne 0 ] && [ "$FAILED" -eq 0 ] && [ "$LOG_READY" -eq 0 ]; then
+        # --uninstall and --check keep no log and run no steps: a command that
+        # `set -e` stopped them on used to end the run without a word.
+        if [ "$INTERRUPTED" -eq 1 ]; then
+            fail_report "interrupted; nothing after that point ran" 0
+        else
+            fail_report "$MODE stopped unexpectedly (exit status $rc); nothing after that point ran" 0
+        fi
+    elif [ "$rc" -ne 0 ] && [ "$FAILED" -eq 0 ]; then
         if [ "$INTERRUPTED" -eq 1 ]; then
             fail_report "interrupted during step $STEP_NO/$STEP_TOTAL ($STEP_NAME); nothing after it ran" 0
         elif [ -s "$WORK/failure" ]; then
@@ -357,6 +372,7 @@ on_exit() {
     [ "$BAR" -eq 0 ] || printf '\033[?25h' >&3
     [ -z "$WORK" ] || rm -rf "$WORK"
     [ -z "$APT_SIM" ] || rm -f "$APT_SIM"
+    [ -z "$STAGED_DAEMON" ] || rm -f "$STAGED_DAEMON"
 }
 trap on_exit EXIT
 trap on_interrupt INT TERM
@@ -405,9 +421,14 @@ detect_platform() {
 }
 
 # The C library, as the published binaries care about it: musl or glibc.
-# getconf answers for glibc only; musl's loader is what gives Alpine away.
+# getconf answers for glibc only; musl's loader is what gives Alpine away. A
+# glibc host can have that loader too -- Debian's and Fedora's musl packages
+# install it -- so glibc's own answer comes first: such a host used to get the
+# musl artifact, which cannot load there, or a source build "because musl is
+# too old".
 host_is_musl() {
     local f
+    if getconf GNU_LIBC_VERSION >/dev/null 2>&1; then return 1; fi
     for f in /lib/ld-musl-*.so.1; do
         [ -e "$f" ] && return 0
     done
@@ -543,12 +564,12 @@ svc_hint() {
         systemd:enable)      REPLY="${SUDO}systemctl enable $2.service" ;;
         systemd:restart)     REPLY="${SUDO}systemctl restart $2" ;;
         systemd:disable-now) REPLY="${SUDO}systemctl disable --now $2.service" ;;
-        systemd:logs)        REPLY="journalctl -u $2.service" ;;
+        systemd:logs)        REPLY="${SUDO}journalctl -u $2.service" ;;
         openrc:enable-now)   REPLY="${SUDO}rc-update add $2 default && ${SUDO}rc-service $2 start" ;;
         openrc:enable)       REPLY="${SUDO}rc-update add $2 default" ;;
         openrc:restart)      REPLY="${SUDO}rc-service $2 restart" ;;
         openrc:disable-now)  REPLY="${SUDO}rc-service $2 stop && ${SUDO}rc-update del $2 default" ;;
-        openrc:logs)         REPLY="grep $2 /var/log/messages" ;;
+        openrc:logs)         REPLY="${SUDO}grep $2 /var/log/messages" ;;
         *)                   REPLY="(no service manager on this host)" ;;
     esac
 }
@@ -1054,7 +1075,7 @@ ensure_fq_root() {
     shaping=$(root_qdisc_shaping "$dev")
     if [ -n "$shaping" ] || ! qdisc_replaceable "$now"; then
         warn "$dev root qdisc is $now${shaping:+ ($shaping)}; it looks built on purpose, so it was left alone"
-        warn "  to put fq there: tc qdisc replace dev $dev root fq"
+        warn "  to put fq there: ${SUDO}tc qdisc replace dev $dev root fq"
         return 0
     fi
     queues=$(tx_queue_count "$dev")
@@ -1067,7 +1088,7 @@ ensure_fq_root() {
         if [ "$(sysctl -n net.core.default_qdisc 2>/dev/null || true)" != fq ]; then
             warn "$dev has $queues transmit queues and net.core.default_qdisc is not fq;"
             warn "  its root qdisc ($now) was left alone. Set it by hand with:"
-            warn "  sysctl -w net.core.default_qdisc=fq && tc qdisc replace dev $dev root mq"
+            warn "  ${SUDO}sysctl -w net.core.default_qdisc=fq && ${SUDO}tc qdisc replace dev $dev root mq"
             return 0
         fi
         # `replace root mq` over an mq that tc created -- which is what
@@ -1141,8 +1162,10 @@ restore_bbr_fq() {
     # carried skyline-speederd's fq are set explicitly. They are resolved the
     # way the guard resolved them, from the config --uninstall keeps; the
     # snapshot's list is the fallback for a host whose config or NIC has since
-    # changed.
-    dev=$(planned_interface)
+    # changed. Not planned_interface: its default-route stand-in for the
+    # template's placeholder is the install's fix-up, and a NIC the guard
+    # never managed (the config still saying data0) is not ours to change.
+    if [ -r "$CFG" ]; then dev=$(configured_interface); else dev=$(ethernet_route_interface); fi
     load_managed "$dev"
     if [ "${#MANAGED_DEVS[@]}" -eq 0 ] && [ -n "${PRE_INSTALL_QDISC_DEV:-}" ]; then
         read -ra MANAGED_DEVS <<<"$PRE_INSTALL_QDISC_DEV"
@@ -1170,8 +1193,13 @@ restore_pre_install() {
     if [ -n "${PRE_INSTALL_CC:-}" ]; then
         if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null \
             | grep -qw -- "$PRE_INSTALL_CC"; then
-            sysctl -qw "net.ipv4.tcp_congestion_control=$PRE_INSTALL_CC"
-            ok "congestion control restored to $PRE_INSTALL_CC"
+            # A failed write is said and the restore goes on: under set -e a
+            # bare write stopped the uninstall here, without a word.
+            if sysctl -qw "net.ipv4.tcp_congestion_control=$PRE_INSTALL_CC" 2>/dev/null; then
+                ok "congestion control restored to $PRE_INSTALL_CC"
+            else
+                warn "could not restore congestion control to $PRE_INSTALL_CC"
+            fi
         else
             warn "cannot restore '$PRE_INSTALL_CC': no longer available on this kernel"
         fi
@@ -1625,7 +1653,7 @@ purge_toolchain() {
             # file documents beside apt_unmet. awk reads to the end instead.
             REPLY=$(awk '!done && /^E: / { sub(/^E: /, ""); print; done = 1 }' "$sim")
             [ -z "$REPLY" ] || warn "  apt: $REPLY"
-            warn "  to remove them by hand: apt-get --purge remove ${want[*]}"
+            warn "  to remove them by hand: ${SUDO}apt-get --purge remove ${want[*]}"
             rm -f "$sim" "$out" "$protected"
             return 0
         fi
@@ -1637,7 +1665,7 @@ purge_toolchain() {
         if [ "$round" -ge 3 ]; then
             warn "removing what this installer added would also remove: ${extra[*]}"
             warn "  Something on this host depends on them now, so nothing was removed."
-            warn "  If that is what you want: apt-get --purge remove ${want[*]}"
+            warn "  If that is what you want: ${SUDO}apt-get --purge remove ${want[*]}"
             rm -f "$sim" "$out" "$protected"
             return 0
         fi
@@ -1655,7 +1683,7 @@ purge_toolchain() {
         if [ "${#keep[@]}" -eq "${#want[@]}" ]; then
             warn "removing what this installer added would also remove: ${extra[*]}"
             warn "  apt does not say which of ours they need, so nothing was removed."
-            warn "  If that is what you want: apt-get --purge remove ${want[*]}"
+            warn "  If that is what you want: ${SUDO}apt-get --purge remove ${want[*]}"
             rm -f "$sim" "$out" "$protected"
             return 0
         fi
@@ -1722,7 +1750,7 @@ purge_toolchain_dnf() {
         if [ "${#keep[@]}" -eq 0 ] || [ "$round" -ge 10 ]; then
             warn "rpm cannot plan removing the packages this installer added, so none were removed:"
             while IFS= read -r p; do warn "  $p"; done < <(tail -n 5 "$out")
-            warn "  to remove them by hand: dnf remove ${want[*]}"
+            warn "  to remove them by hand: ${SUDO}dnf remove ${want[*]}"
             rm -f "$out"
             return 0
         fi
@@ -1913,6 +1941,15 @@ release_lacks_musl() {
     return "$rc"
 }
 
+# The installer as a command to paste back: $0 is "bash" when this file was
+# piped in (curl ... | bash) and a bare "install.sh" after `bash install.sh`,
+# and neither names a file anybody can run. The arguments go with it.
+ARGV=("$@")
+if [ -f "${BASH_SOURCE[0]:-}" ]; then
+    SELF=$REPO_ROOT/install.sh
+else
+    SELF="<a Skyline Speeder source tree>/install.sh"
+fi
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --check) MODE=check; shift ;;
@@ -1925,12 +1962,30 @@ while [ "$#" -gt 0 ]; do
         --verbose) VERBOSE=1; shift ;;
         # The header comment, to its end, rather than a hand-counted line
         # range that goes stale the moment a flag is documented above.
-        -h|--help) awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
+        -h|--help)
+            # Piped in, there is no file to read it from.
+            if [ -f "${BASH_SOURCE[0]:-}" ]; then
+                awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "${BASH_SOURCE[0]}"
+            else
+                printf 'Usage: the comment at the top of install.sh, %s\n' \
+                    "https://github.com/${REPO_SLUG}/blob/main/install.sh"
+            fi
+            exit 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
     esac
 done
 
-[ "$(id -u)" -eq 0 ] || die "must run as root (try: sudo $0)"
+if [ "$(id -u)" -ne 0 ]; then
+    # Before detect_platform, which is what sets SUDO for every other hint.
+    if command -v sudo >/dev/null 2>&1; then SUDO="sudo "; fi
+    if [ -f "${BASH_SOURCE[0]:-}" ]; then
+        REPLY=
+        [ "${#ARGV[@]}" -eq 0 ] || printf -v REPLY ' %q' "${ARGV[@]}"
+        die "must run as root (try: ${SUDO:-as root: }$SELF$REPLY)"
+    fi
+    if [ -n "$SUDO" ]; then die "must run as root: pipe it into 'sudo bash' instead"; fi
+    die "must run as root: pipe it into bash from a root shell instead"
+fi
 detect_platform
 
 printf '\n %sSkyline Speeder%s\n' "$BLD" "$RST" >&3
@@ -1983,9 +2038,18 @@ if [ "$MODE" = uninstall ]; then
     # reference-counting behaviour a kernel module shows when it is "in use".
     # Drain also stops skyline-speederd's guard, so nothing puts skyline_cc or
     # fq back while the steps below restore what was there before.
-    if [ -S /run/skyline-speeder/speeder.sock ] && command -v ssctl >/dev/null 2>&1; then
+    #
+    # The enable service drains on its own stop (infra/boot-disable.sh), which
+    # svc_remove runs next; draining here as well waited twice, over SSH 120 s
+    # for "up to 60s". Without it, ssctl itself, at the configured socket, with
+    # an outer bound in case the daemon does not answer.
+    SOCKET=$(awk -F'"' '/^socket_path[[:space:]]*=/ { print $2; exit }' "$CFG" 2>/dev/null || true)
+    SOCKET=${SOCKET:-/run/skyline-speeder/speeder.sock}
+    if svc_active skyline-speeder-enable; then
+        info "draining active flows (up to 60s, as skyline-speeder-enable$SVC_SUFFIX stops)"
+    elif [ -S "$SOCKET" ] && [ -x /usr/local/bin/ssctl ]; then
         info "draining active flows (up to 60s)"
-        ssctl drain --timeout 60 >/dev/null 2>&1 || true
+        timeout 75 /usr/local/bin/ssctl --socket "$SOCKET" drain --timeout 60 >/dev/null 2>&1 || true
     fi
     svc_remove skyline-speeder-enable
     svc_remove skyline-speederd
@@ -2092,7 +2156,7 @@ case "$SOURCE" in
         ;;
     prebuilt)
         [ -z "$BLOCKER" ] || die "--prebuilt/--release cannot install here: $BLOCKER.
-   Build from source instead: ${SUDO}$0 --source"
+   Build from source instead: ${SUDO}$SELF --source"
         ;;
 esac
 
@@ -2108,7 +2172,9 @@ if [ "$MODE" = install ]; then
     # The one fallback worth interrupting the progress line for: the operator
     # asked for nothing and is about to wait for a compiler.
     if [ -n "$SOURCE_REASON" ]; then
-        warn "building from source: $SOURCE_REASON. This installs a build toolchain and takes several minutes; --uninstall removes it again."
+        warn "building from source: $SOURCE_REASON${SKYLINE_ARTIFACT_URL:+ (so SKYLINE_ARTIFACT_URL is not used)}. This installs a build toolchain and takes several minutes; --uninstall removes it again."
+    elif [ "$SOURCE" = build ] && [ -n "${SKYLINE_ARTIFACT_URL:-}" ]; then
+        warn "--source builds this tree; SKYLINE_ARTIFACT_URL is not used"
     fi
     if [ "$SOURCE" = build ]; then STEP_TOTAL=11; else STEP_TOTAL=9; fi
     [ "$ENABLE" -eq 1 ] || STEP_TOTAL=$((STEP_TOTAL - 2))
@@ -2459,8 +2525,12 @@ apt_plan() {
 if [ "$MODE" = check ]; then
     info "preflight only; no changes will be made"
     if [ "$SOURCE" = prebuilt ]; then
-        if host_is_musl; then REPLY=" (its musl build)"; else REPLY=; fi
-        ok "would install the published release${RELEASE_TAG:+ $RELEASE_TAG}$REPLY"
+        if [ -n "${SKYLINE_ARTIFACT_URL:-}" ]; then
+            ok "would install the artifact SKYLINE_ARTIFACT_URL names: $SKYLINE_ARTIFACT_URL${RELEASE_TAG:+ (not --release $RELEASE_TAG)}"
+        else
+            if host_is_musl; then REPLY=" (its musl build)"; else REPLY=; fi
+            ok "would install the published release${RELEASE_TAG:+ $RELEASE_TAG}$REPLY"
+        fi
     elif [ -n "$SOURCE_REASON" ]; then
         warn "would build from source: $SOURCE_REASON"
     else
@@ -2709,7 +2779,7 @@ run "${IN_TREE[@]}" cargo build --workspace --release \
     || die "building the Rust control plane failed"
 fi
 
-# --- 7. obtain and install the artifacts -----------------------------------
+# --- 7. obtain the artifacts, verify them, then install them ---------------
 PREBUILT_ROOT=     # the unpacked artifact's top directory
 PROVENANCE=        # one line for the summary; MANIFEST itself goes to the log
 
@@ -2762,10 +2832,15 @@ fetch_prebuilt() {
           "$staging/release.json" | head -1) || true
     if [ -z "$url" ] && [ "$libc" = musl ]; then
         die "no prebuilt musl artifact for $arch in that release: releases publish one
-   from v0.4.1 on. Build from source instead: ${SUDO}$0 --source"
+   from v0.4.1 on. Build from source instead: ${SUDO}$SELF --source"
     fi
     [ -n "$url" ] || die "no prebuilt artifact for $arch in that release.
    Published artifacts are per-architecture; build from source instead."
+    fi
+    # The precedence DEPLOY.md §2.2 documents, said where it applies: a
+    # --release beside the variable used to be dropped without a word.
+    if [ -n "${SKYLINE_ARTIFACT_URL:-}" ] && [ -n "$RELEASE_TAG" ]; then
+        warn "SKYLINE_ARTIFACT_URL is set, so --release $RELEASE_TAG is not used: installing $(basename -- "${local_artifact:-$url}")"
     fi
 
     if [ -n "$local_artifact" ]; then
@@ -2792,6 +2867,9 @@ fetch_prebuilt() {
    actual:   $got"
         ok "sha256 verified"
         verified="sha256 verified"
+    elif [ -n "$local_artifact" ]; then
+        # No TLS was involved in a file copied over by hand.
+        warn "no ${local_artifact}.sha256 beside the local artifact, so its integrity was not checked"
     else
         warn "no published .sha256 beside the artifact; trusting TLS alone"
     fi
@@ -2827,7 +2905,9 @@ install_prebuilt_files() {
     install -d /opt/skyline-speeder/bpf /opt/skyline-speeder/infra \
         /etc/skyline-speeder /run/skyline-speeder /sys/fs/bpf/skyline-speeder \
         /usr/local/sbin /usr/local/bin
-    install -m 0755 "$root/bin/skyline-speederd" /usr/local/sbin/skyline-speederd
+    # The very file the verifier ran: a rename on one filesystem.
+    mv -f -- "$STAGED_DAEMON" /usr/local/sbin/skyline-speederd
+    STAGED_DAEMON=
     install -m 0755 "$root/bin/ssctl" /usr/local/bin/ssctl
     install -m 0644 "$root"/bpf/*.bpf.o /opt/skyline-speeder/bpf/
     install -m 0755 "$root"/infra/*.sh /opt/skyline-speeder/infra/
@@ -2855,21 +2935,65 @@ install_prebuilt_files() {
 if [ "$SOURCE" = prebuilt ]; then
     step "Downloading the release artifact"
     fetch_prebuilt
-    step "Installing files"
+    NEW_DAEMON=$PREBUILT_ROOT/bin/skyline-speederd NEW_BPF=$PREBUILT_ROOT/bpf
+    TEMPLATE=$PREBUILT_ROOT/config/speeder.toml
+else
+    NEW_DAEMON=$REPO_ROOT/target/release/skyline-speederd NEW_BPF=$REPO_ROOT/build/bpf
+    TEMPLATE=$REPO_ROOT/config/speeder-guest.toml
+fi
+
+# --validate-only --verify-bpf pushes all three objects through the verifier,
+# attaching nothing and writing no sysctl (it does create the event log's
+# directory and an empty events.jsonl, DEPLOY.md §4), so a kernel/BTF mismatch
+# surfaces here rather than as a half-started daemon. It runs on the new daemon
+# and objects BEFORE they replace anything. Installed first, as they used to
+# be, a refused upgrade left the old daemon running beside them -- and that
+# daemon loads skyline_cc.bpf.o from disk again at the first enable after a
+# drain: a half-new pair, which after an ABI change stalls every new
+# connection without an error. The configuration is the installed one or, on
+# a first install, the template, with bpf_dir pointed at the new objects. What
+# "Configuring speeder.toml" changes in it afterwards cannot change the verdict:
+# tc_interface is not validated, and fallback_cc only ever becomes an algorithm
+# this kernel has.
+step "Running the kernel verifier"
+# Beside the binary it replaces rather than in $WORK, which may be on a noexec
+# /tmp; on the same filesystem, installing it is then a rename.
+STAGED_DAEMON=/usr/local/sbin/.skyline-speederd.new
+install -d /usr/local/sbin
+install -m 0755 "$NEW_DAEMON" "$STAGED_DAEMON"
+if [ -e "$CFG" ]; then VERIFY_FROM=$CFG; else VERIFY_FROM=$TEMPLATE; fi
+# bpf_dir is a required key, one `bpf_dir = "..."` line in every shipped
+# configuration; anything else is refused rather than guessed at.
+awk -v dir="$NEW_BPF" '
+    /^[[:space:]]*bpf_dir[[:space:]]*=/ { print "bpf_dir = \"" dir "\""; n++; next }
+    { print }
+    END { exit (n == 1 ? 0 : 1) }' "$VERIFY_FROM" >"$WORK/verify.toml" \
+    || die "cannot point bpf_dir in $VERIFY_FROM at the new objects: it needs exactly one line bpf_dir = \"...\""
+# The failure is not necessarily the verifier's: a missing kernel capability
+# stops the run before any object is loaded, and a key the new daemon does not
+# know stops it before that.
+run "$STAGED_DAEMON" --config "$WORK/verify.toml" --validate-only --verify-bpf \
+    || die "validation failed (the reason is on the 'Error:' line in the log below).
+   Nothing was installed or replaced: what was installed before, and a running
+   skyline-speederd, are as they were."
+ok "all BPF objects passed the kernel verifier"
+
+step "Installing files"
+if [ "$SOURCE" = prebuilt ]; then
     quietly install_prebuilt_files
 else
-    step "Installing files"
     # The make and cargo runs inside install-guest.sh find everything already
-    # built by the two steps above and do nothing.
+    # built by the two steps above and do nothing. It installs the same daemon
+    # the verifier ran, from the tree; on_exit removes the staged copy.
     run "$REPO_ROOT/infra/install-guest.sh" --confirm-install || die "installing the files failed"
 fi
 
 # --- 8. adapt the template: egress interface, fallback_cc -------------------
 # The shipped template targets the reference test bed's interface name, which
-# almost never matches a real host. Fix it up on first install only -- an
-# existing operator-edited config is never rewritten. The replacement is the
-# first Ethernet device a default route (IPv4, then IPv6) leaves through; see
-# ethernet_route_interface for why a tunnel is not taken.
+# almost never matches a real host. It is replaced on any run that still finds
+# that placeholder line -- a value the operator set is never rewritten. The
+# replacement is the first Ethernet device a default route (IPv4, then IPv6)
+# leaves through; see ethernet_route_interface for why a tunnel is not taken.
 step "Configuring speeder.toml"
 ROUTE_DEV=$(default_route_interface)
 ETH_DEV=$(ethernet_route_interface)
@@ -2928,20 +3052,7 @@ if [ "$CFG_FRESH" -eq 1 ]; then
     fi
 fi
 
-# --- 9. validate before starting anything ----------------------------------
-# --validate-only --verify-bpf pushes all three objects through the verifier and
-# exits without leaving runtime state, so a kernel/BTF mismatch surfaces here
-# rather than as a half-started daemon.
-step "Running the kernel verifier"
-# The failure is not necessarily the verifier's: a missing kernel capability
-# stops the run before any object is loaded. Hand over the whole command --
-# someone who came in through `curl | bash` has no idea where its output went.
-run /usr/local/sbin/skyline-speederd --config "$CFG" --validate-only --verify-bpf \
-    || die "validation failed (the reason is on the 'Error:' line in the log below).
-   For the capability report and the verifier log, run:
-     /usr/local/sbin/skyline-speederd --config $CFG --validate-only --verify-bpf"
-ok "all BPF objects passed the kernel verifier"
-
+# --- 9. record what was there, then start -----------------------------------
 # Snapshot before anything starts changing sysctls: the daemon writes
 # fallback_cc on load and `ssctl enable` writes skyline_cc after it attaches.
 # Only written once -- a reinstall must not record skyline_cc as the "original".
@@ -2951,7 +3062,13 @@ ROOTS_SEEN=
 for i in "${!BEFORE_DEVS[@]}"; do
     ROOTS_SEEN="${ROOTS_SEEN:+$ROOTS_SEEN, }${BEFORE_DEVS[i]} ${BEFORE_ROOTS[i]}"
 done
-if [ ! -e "$STATE" ]; then
+if [ ! -e "$STATE" ] && [ "$BEFORE_CC" = skyline_cc ]; then
+    # Attached already, with no snapshot: an install made by hand, or a
+    # snapshot that was deleted. What the host ran before skyline_cc is not
+    # known any more, and this run's view -- skyline_cc, and the guard's fq --
+    # recorded as the "original" would be what --restore-pre-install puts back.
+    log "no pre-install snapshot written: skyline_cc is already the default, so what came before it is not known"
+elif [ ! -e "$STATE" ]; then
     install -d /etc/skyline-speeder
     cat > "$STATE" <<EOF
 PRE_INSTALL_CC=$BEFORE_CC
@@ -2990,7 +3107,11 @@ SOCKET=${SOCKET:-/run/skyline-speeder/speeder.sock}
 # does OpenRC's supervise-daemon, which answers "started" as soon as it runs.
 wait_for_daemon() {
     local deadline=$((SECONDS + 60)) state
-    while [ ! -S "$SOCKET" ]; do
+    # An answer, not the socket file: under OpenRC nothing removes the old
+    # daemon's socket when it stops, so the file is there before the new
+    # daemon listens on it.
+    until [ -S "$SOCKET" ] \
+        && timeout 10 /usr/local/bin/ssctl --socket "$SOCKET" status --json >/dev/null 2>&1; do
         # "activating" is Restart=on-failure between attempts: keep waiting.
         # (supervise-daemon respawning it still reads "started".)
         state=$(svc_state skyline-speederd)
@@ -3069,7 +3190,7 @@ if [ "$HAS_GUARD" -eq 0 ]; then
     warn "this skyline-speederd${NEW_VERSION:+ ($NEW_VERSION)} is a release older than the guard: it attaches skyline_cc, but does not keep it the host default and manages no qdisc. A later release, or a source build (without --prebuilt/--release), has the guard."
 fi
 
-VERSION_ROW=
+VERSION_ROW= VERSION_WORD=upgraded
 if [ "$HAD_BINARY" -eq 1 ]; then
     if [ -z "$OLD_VERSION" ]; then
         # A binary without --version: the published v0.2.0 release or older.
@@ -3078,6 +3199,10 @@ if [ "$HAD_BINARY" -eq 1 ]; then
         VERSION_ROW="from a release without --version (v0.2.0 or older)${NEW_VERSION:+ to $NEW_VERSION}"
     elif [ "$OLD_VERSION" != "$NEW_VERSION" ]; then
         VERSION_ROW="$OLD_VERSION -> ${NEW_VERSION:-unknown}"
+        # --release with an older tag goes back (DEPLOY.md §10.3); say so.
+        if [ -n "$NEW_VERSION" ] && version_older "$NEW_VERSION" "$OLD_VERSION"; then
+            VERSION_WORD=downgraded
+        fi
     fi
 fi
 
@@ -3163,7 +3288,7 @@ if [ "$ENABLE" -eq 0 ]; then
     finish_bar
     printf ' %sok%s  Skyline Speeder %sis installed; %s.\n' \
         "$GRN" "$RST" "${NEW_VERSION:+$NEW_VERSION }" "$ATTACH_STATE" >&3
-    [ -z "$VERSION_ROW" ] || row "upgraded" "$VERSION_ROW"
+    [ -z "$VERSION_ROW" ] || row "$VERSION_WORD" "$VERSION_ROW"
     [ "$UPGRADE" -eq 0 ] || row "restarted" "$RESTART_ROW"
     [ -z "$PROVENANCE" ] || row "artifact" "$PROVENANCE"
     row "congestion control" "$NOW_CC (host default)"
@@ -3342,7 +3467,7 @@ row "congestion control" "skyline_cc$(was skyline_cc "$BEFORE_CC") -- every new 
 row "qdisc" "${QDISC_ROWS[0]}"
 for text in "${QDISC_ROWS[@]:1}"; do row "" "$text"; done
 [ "$HAS_GUARD" -eq 0 ] || row "kept in place by" "$GUARD_ROW"
-[ -z "$VERSION_ROW" ] || row "upgraded" "$VERSION_ROW"
+[ -z "$VERSION_ROW" ] || row "$VERSION_WORD" "$VERSION_ROW"
 [ "$UPGRADE" -eq 0 ] || row "restarted" "$RESTART_ROW"
 [ -z "$PROVENANCE" ] || row "artifact" "$PROVENANCE"
 row "install log" "$LOG"
@@ -3402,6 +3527,11 @@ fi
 # what this run sees now. Without a snapshot yet, this run's own observation is
 # what is about to be written into one.
 RESTORE_DESC=$(
+    if [ ! -r "$STATE" ] && [ "$BEFORE_CC" = skyline_cc ]; then
+        # No snapshot was written; see "record what was there".
+        printf '%s' "nothing: there is no record of this host from before skyline_cc"
+        exit 0
+    fi
     PRE_INSTALL_CC=$BEFORE_CC PRE_INSTALL_QDISC=$BEFORE_DQ
     PRE_INSTALL_QDISC_DEV="${BEFORE_DEVS[*]}" PRE_INSTALL_ROOT_QDISC="${BEFORE_ROOTS[*]}"
     # shellcheck disable=SC1090  # a generated key=value file
