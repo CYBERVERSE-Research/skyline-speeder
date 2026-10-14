@@ -2040,6 +2040,11 @@ fn serve(mut daemon: Daemon) -> Result<()> {
             Err(error) => eprintln!("accept failed: {error}"),
         }
     }
+    // Nothing answers on it any more. systemd's RuntimeDirectory= empties
+    // the directory after a stop, OpenRC does not, and a socket file left
+    // behind read as a running daemon to whatever waited for the next one.
+    drop(listener);
+    let _ = fs::remove_file(&socket_path);
     // `daemon` drops here: Daemon's own Drop stops the guard thread first,
     // then BpfRuntime/PolicyRuntime/TcRuntime's Drop impls run, cleanly
     // detaching every link -- this is the ONLY path (besides a fatal accept
