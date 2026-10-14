@@ -385,6 +385,7 @@ dependencies = [
  "bytemuck",
  "clap",
  "libbpf-rs",
+ "libc",
  "serde_json",
  "signal-hook",
  "skyline-common",

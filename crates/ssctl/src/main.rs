@@ -136,7 +136,7 @@ enum Command {
         /// Ratio of base RTT added to max-queue-delay-ms to form the actual
         /// guardrail (max of the two). 0.0 keeps the guardrail exactly at
         /// max-queue-delay-ms.
-        #[arg(long, default_value_t = 0.6)]
+        #[arg(long, default_value_t = 0.6, value_parser = finite)]
         max_queue_delay_ratio: f64,
         /// Aggressive initial window (packets). 0 leaves the kernel's
         /// own IW alone.
@@ -154,28 +154,28 @@ enum Command {
         bw_window_rtts: u32,
         #[arg(long, default_value_t = 5)]
         startup_plateau_rtts: u32,
-        #[arg(long, default_value_t = 0.20)]
+        #[arg(long, default_value_t = 0.20, value_parser = finite)]
         startup_growth_ratio: f64,
         /// SKYLINE_MODE_STARTUP's single gain (cwnd target and pacing rate both
         /// use it while M2 is on).
-        #[arg(long, default_value_t = 3.0)]
+        #[arg(long, default_value_t = 3.0, value_parser = finite)]
         startup_gain: f64,
         /// SKYLINE_MODE_CRUISE's cwnd-target gain.
-        #[arg(long, default_value_t = 3.0)]
+        #[arg(long, default_value_t = 3.0, value_parser = finite)]
         cruise_inflight_gain: f64,
         /// SKYLINE_MODE_CRUISE's pacing-rate gain.
-        #[arg(long, default_value_t = 1.25)]
+        #[arg(long, default_value_t = 1.25, value_parser = finite)]
         cruise_pacing_gain: f64,
         /// Gain applied to both cwnd and pacing for the rest of a round in
         /// which the queue-delay/ECN guardrail trips. 0.0 keeps the
         /// guardrail neutral (cancels the boost but never cuts below it);
         /// a value below 1.0 makes it a real self-protective cut.
-        #[arg(long, default_value_t = 0.8)]
+        #[arg(long, default_value_t = 0.8, value_parser = finite)]
         guardrail_gain: f64,
         /// Ceiling on the measured per-flow loss rate to compensate for when
         /// inflating BDP-derived targets/pacing rate. 0.0 disables this
         /// (inflation always exactly 1.0x).
-        #[arg(long, default_value_t = 0.10)]
+        #[arg(long, default_value_t = 0.10, value_parser = finite)]
         loss_inflation_max_ratio: f64,
         /// Turn off the PRR-style continuous recovery-phase rate limiting
         /// (on by default, independent of --modules -- see
@@ -202,11 +202,16 @@ enum Command {
     /// not something to hardcode. Absolute-replace semantics, same as
     /// SetRackRto/SetModuleConfig.
     SetRetransmitDscp {
-        /// 0-63. Required (rejected by the daemon if left at 0 while the
-        /// feature is enabled -- that would actively strip any DSCP the
-        /// socket already carries, not a no-op).
-        #[arg(long)]
-        dscp_value: u8,
+        /// Turn marking off, whatever the configuration file says. Before
+        /// this, the only ways to stop it were a restart and a reset, and a
+        /// reset turns it on when the file does.
+        #[arg(long, conflicts_with = "dscp_value")]
+        disable: bool,
+        /// 1-63, from your network. Required unless --disable (0 is refused
+        /// while marking is on: it would strip the DSCP a socket already
+        /// carries, not leave it alone).
+        #[arg(long, required_unless_present = "disable")]
+        dscp_value: Option<u8>,
     },
     /// Restore [retransmit_dscp] to whatever the configuration file
     /// declared at daemon startup (disabled, unless explicitly configured).
@@ -233,6 +238,18 @@ enum Command {
     /// Restore [redundancy] to whatever the configuration file declared at
     /// daemon startup (on, unless explicitly configured otherwise).
     ResetRedundancy,
+}
+
+/// The float flags of set-module-config: clap's own f64 parser takes `nan`
+/// and `inf`, which JSON cannot carry (they go out as null, and the daemon
+/// then fails to decode the request at all).
+fn finite(text: &str) -> Result<f64, String> {
+    let value: f64 = text.parse().map_err(|error| format!("{error}"))?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(format!("{text} is not a finite number"))
+    }
 }
 
 fn request(command: Command) -> Request {
@@ -308,10 +325,13 @@ fn request(command: Command) -> Request {
             },
         },
         Command::ResetModuleConfig => Request::ResetModuleConfig,
-        Command::SetRetransmitDscp { dscp_value } => Request::SetRetransmitDscp {
+        Command::SetRetransmitDscp {
+            disable,
+            dscp_value,
+        } => Request::SetRetransmitDscp {
             config: RetransmitDscpConfig {
-                enabled: true,
-                dscp_value,
+                enabled: !disable,
+                dscp_value: dscp_value.unwrap_or(0),
             },
         },
         Command::ResetRetransmitDscp => Request::ResetRetransmitDscp,
@@ -483,6 +503,8 @@ mod tests {
             },
             uptime_s: 1234,
             attached_s: Some(60),
+            draining: true,
+            cgroup_path: Some("/sys/fs/cgroup/skyline-speeder".into()),
         };
         let response = Response {
             ok: true,
@@ -503,6 +525,9 @@ mod tests {
         assert!(fields.remove("attached_s").is_some());
         assert!(fields.remove("redundancy").is_some());
         assert!(fields.remove("metrics_recent").is_some());
+        // The two fields 0.5.2 added.
+        assert!(fields.remove("draining").is_some());
+        assert!(fields.remove("cgroup_path").is_some());
         // What the file declares, which 0.5.1 added next to what is running.
         for feature in ["rack_rto", "retransmit_dscp"] {
             let feature = fields[feature].as_object_mut().expect("feature object");
@@ -526,6 +551,8 @@ mod tests {
         assert_eq!(decoded.metrics_recent, None);
         assert_eq!(decoded.rack_rto.declared, None);
         assert_eq!(decoded.retransmit_dscp.declared, None);
+        assert!(!decoded.draining);
+        assert_eq!(decoded.cgroup_path, None);
         let metrics = decoded.metrics.expect("metrics");
         assert_eq!(metrics.guardrail_hits, 193_027);
         assert_eq!((metrics.guardrail_rounds, metrics.cwnd_cap_hits), (0, 0));
@@ -548,6 +575,50 @@ mod tests {
             panic!("set-redundancy --disable did not build a SetRedundancy request");
         };
         assert!(!config.enabled);
+    }
+
+    /// Marking could only be turned off by a restart, or by a reset that
+    /// turns it on whenever the file does.
+    #[test]
+    fn set_retransmit_dscp_can_turn_marking_off() {
+        let arguments = Arguments::parse_from(["ssctl", "set-retransmit-dscp", "--disable"]);
+        let Request::SetRetransmitDscp { config } = request(arguments.command) else {
+            panic!("set-retransmit-dscp --disable did not build a SetRetransmitDscp request");
+        };
+        assert_eq!(config, RetransmitDscpConfig::disabled());
+        let mut shipped = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        shipped.retransmit_dscp = config;
+        shipped.validate().expect("the daemon takes it");
+
+        let arguments =
+            Arguments::parse_from(["ssctl", "set-retransmit-dscp", "--dscp-value", "10"]);
+        let Request::SetRetransmitDscp { config } = request(arguments.command) else {
+            panic!("set-retransmit-dscp did not build a SetRetransmitDscp request");
+        };
+        assert_eq!((config.enabled, config.dscp_value), (true, 10));
+
+        assert!(Arguments::try_parse_from(["ssctl", "set-retransmit-dscp"]).is_err());
+        assert!(Arguments::try_parse_from([
+            "ssctl",
+            "set-retransmit-dscp",
+            "--disable",
+            "--dscp-value",
+            "10"
+        ])
+        .is_err());
+    }
+
+    /// clap's f64 parser takes them, and JSON cannot carry them.
+    #[test]
+    fn set_module_config_refuses_non_finite_numbers() {
+        for value in ["nan", "inf", "-inf", "NaN"] {
+            let flag = format!("--cruise-pacing-gain={value}");
+            let error = Arguments::try_parse_from(["ssctl", "set-module-config", &flag])
+                .expect_err("not a finite number");
+            assert!(error.to_string().contains("is not a finite number"));
+        }
+        Arguments::try_parse_from(["ssctl", "set-module-config", "--startup-gain", "2.5"])
+            .expect("a finite number");
     }
 
     /// The same trap for `set-rack-rto`: a bare one must send the installed
