@@ -4,15 +4,19 @@
 #ifndef __SKYLINE_ABI_H
 #define __SKYLINE_ABI_H
 
-/* ABI version for struct skyline_config / struct skyline_flow_state /
- * struct skyline_metrics below. The BPF object and its userspace loader must
- * agree on this value -- skyline_adopt_config() in skyline_cc.bpf.c checks it
- * and adopts nothing on a mismatch rather than misinterpreting the struct
- * layout. That is no hand-back to the kernel: cong_control has replaced the
- * kernel's own window growth, so a connection without a configuration keeps
- * the kernel's initial window (after an RTO, what tcp_enter_loss() leaves),
- * and nothing sets its pacing rate. Nothing reports it -- active_flows grows
- * while metrics.ack_events does not. A struct skyline_config of another size
+/* ABI version for struct skyline_config and struct skyline_metrics below,
+ * the two layouts skyline-speederd writes and reads. (struct
+ * skyline_flow_state lives in the object's socket storage, which user space
+ * never reads: its layout is the object's own.) The BPF object and its
+ * userspace loader must agree on this value. skyline-speederd checks before
+ * it loads skyline_cc.bpf.o -- the object carries the version it was built
+ * for in its .rodata.abi section (skyline_abi_version) -- and refuses
+ * another, or none. Behind that, skyline_adopt_config() in skyline_cc.bpf.c
+ * adopts nothing on a mismatch rather than misinterpreting the struct
+ * layout, which an older daemon that does not check can still bring about:
+ * such a connection grows its window as the kernel's Reno would, gets no
+ * pacing rate, and nothing reports it -- active_flows grows while
+ * metrics.ack_events does not. A struct skyline_config of another size
  * fails loudly instead, when skyline-speederd writes it into config_slots.
  *
  * The target deployment environment is fixed: 10-20% sustained random loss,

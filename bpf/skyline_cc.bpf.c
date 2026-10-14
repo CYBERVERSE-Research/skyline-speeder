@@ -42,9 +42,19 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
+/* The ABI this object was built for, in a section of its own so that
+ * skyline-speederd can read it from the file before loading anything --
+ * libbpf makes the section a map named after it, whose initial value is this
+ * variable alone -- and refuse an object built for another ABI than its own
+ * (load_cc_object() in crates/skyline-speederd/src/main.rs). Without that a
+ * mismatched pair loads, and skyline_adopt_config() takes no configuration.
+ */
+const volatile __u32 skyline_abi_version SEC(".rodata.abi") = SKYLINE_ABI_VERSION;
+
 extern __u32 tcp_slow_start(struct tcp_sock *tp, __u32 acked) __ksym;
 extern void tcp_cong_avoid_ai(struct tcp_sock *tp, __u32 w, __u32 acked) __ksym;
 extern __u32 tcp_reno_undo_cwnd(struct sock *sk) __ksym;
+extern void tcp_reno_cong_avoid(struct sock *sk, __u32 ack, __u32 acked) __ksym;
 
 /* Written only by skyline-speederd, which publishes configuration number N
  * by writing it into config_slots[N & 1] and only then setting config_seq to
@@ -1125,10 +1135,21 @@ void BPF_PROG(skyline_cong_control, struct sock *sk, __u32 ack, int flag,
          * Later, only after an init that adopted nothing (see there). Take
          * the configuration now, without waiting for a round, since there is
          * no old one to finish the round on; init starts the model over
-         * right after anyway. Still nothing: leave this ACK alone.
+         * right after anyway.
+         *
+         * Still nothing -- the configuration on offer is for another ABI
+         * (an object and a daemon from different releases: skyline-speederd
+         * refuses to load such an object, an older one does not), or the
+         * rare copy that raced a publish: grow the window as the kernel's
+         * Reno would. Nothing in the configuration may be read, and
+         * cong_control has taken the kernel's own growth away, so before
+         * this such a flow kept its initial window for life. It gets no
+         * pacing rate either way.
          */
-        if (!skyline_adopt_config(flow))
+        if (!skyline_adopt_config(flow)) {
+            tcp_reno_cong_avoid(sk, ack, sample->acked_sacked > 0 ? (__u32)sample->acked_sacked : 0U);
             return;
+        }
         skyline_reset_generation(flow, tp);
     } else if (skyline_round_reached(sample, flow->next_round_delivered)) {
         /* A newer configuration is adopted only here, at a round boundary,

@@ -303,10 +303,16 @@ BPF 侧的四段配置各自独立维护自己的 ABI 版本号，互不联动�
 
 各段配置的版本校验行为并不完全一致：
 
-- M2/M3/M4（`SKYLINE_ABI_VERSION`）：每条连接复制配置时（`skyline_adopt_config()`）校验
-  版本号，不匹配就不复制，这条连接就没有配置：`skyline_cong_control` 直接返回，不再为任何
-  连接调整 cwnd 与 pacing，也没有对应的计数器记录这件事。`metrics` 按布局读取，大小对不上的
-  每 CPU 值被跳过，计数器全是 0。加载时没有谁拒绝不匹配的一对。
+- M2/M3/M4（`SKYLINE_ABI_VERSION`）：0.5.2 起 `skyline-speederd` 加载 `skyline_cc.bpf.o`
+  之前先读对象自己记下的版本（`.rodata.abi` 段里的 `skyline_abi_version`），与自己的不同、或者
+  对象里没有这一段（0.5.1 及更早构建的对象），就拒绝加载并说明原因——`ssctl enable`、
+  `--validate-only --verify-bpf` 与安装器的验证步骤都会报这个错。对象一侧，每条连接复制配置时
+  （`skyline_adopt_config()`）仍然校验版本号，不匹配就不复制，这条连接就没有配置——只有不做
+  上述检查的旧 daemon 加载了新对象时才会出现。这不是交还给内核：`cong_control` 已经取代了内核
+  自己的增长逻辑。0.5.2 起这样的连接按内核 Reno 的方式增长窗口（之前一直停在内核的初始窗口，
+  RTO 之后停在 `tcp_enter_loss()` 留下的大小），没有谁设 pacing，也没有对应的计数器记录这件事
+  （`active_flows` 在涨、`metrics.ack_events` 不动）。`struct skyline_config` 大小变了的话，
+  daemon 写配置槽时就会报错。`metrics` 按布局读取，大小对不上的每 CPU 值被跳过，计数器全是 0。
 - DSCP 标记（`SKYLINE_RETRANSMIT_DSCP_ABI_VERSION`）：版本不匹配时跳过标记逻辑
   （相当于功能关闭），并递增 `retransmit_dscp.stats` 里的 `abi_mismatch`
   计数器。

@@ -17,7 +17,7 @@ use skyline_common::{
     RackRtoStats, RackRtoStatus, RackTuningConfig, RackTuningStatus, RedundancyConfig,
     RedundancyStats, RedundancyStatus, Request, Response, RetransmitDscpConfig,
     RetransmitDscpStats, RetransmitDscpStatus, RuntimeStatus, SkylineConfig, SkylineEvent,
-    SkylineMetrics, TcStats, SKYLINE_CC_NAME,
+    SkylineMetrics, TcStats, ABI_VERSION, SKYLINE_CC_NAME,
 };
 use std::collections::VecDeque;
 use std::ffi::OsStr;
@@ -943,6 +943,45 @@ fn struct_ops_map_for_kernel() -> &'static str {
     }
 }
 
+/// The section skyline_cc.bpf.o keeps `skyline_abi_version` in. libbpf makes
+/// a map of every data section and names one of a custom `.rodata.*` section
+/// after the section itself.
+const ABI_SECTION: &str = ".rodata.abi";
+
+/// The ABI skyline_cc.bpf.o was built for, read from the file before anything
+/// is loaded: the initial value of its `.rodata.abi` map. None for an object
+/// from before the section existed.
+fn object_abi_version(object: &OpenObject) -> Option<u32> {
+    let map = object
+        .maps()
+        .find(|map| map.name() == OsStr::new(ABI_SECTION))?;
+    let bytes = map.initial_value()?.get(..4)?;
+    Some(u32::from_ne_bytes(bytes.try_into().ok()?))
+}
+
+/// An object built for another ABI loads and attaches without complaint,
+/// and then no connection ever adopts the configuration this daemon writes
+/// (skyline_adopt_config() checks the version): every flow runs on the Reno
+/// fallback in skyline_cong_control(), unpaced, and nothing reports it. So
+/// such an object is refused here, where the operator sees why.
+fn check_object_abi(path: &Path, version: Option<u32>) -> Result<()> {
+    match version {
+        Some(version) if version == ABI_VERSION => Ok(()),
+        Some(version) => bail!(
+            "{} was built for ABI {version}, this skyline-speederd for ABI {ABI_VERSION}: \
+             install the BPF objects that came with this binary",
+            path.display()
+        ),
+        None => bail!(
+            "{} does not say which ABI it was built for, so it is older than this \
+             skyline-speederd ({}, ABI {ABI_VERSION}): install the BPF objects that came \
+             with this binary",
+            path.display(),
+            env!("CARGO_PKG_VERSION")
+        ),
+    }
+}
+
 /// Loads skyline_cc.bpf.o with only the struct_ops map this kernel takes, and
 /// returns that map's name. libbpf then loads only the programs that map uses
 /// (bpf_object_adjust_struct_ops_autoload), so the op the other layout lacks
@@ -951,6 +990,7 @@ fn struct_ops_map_for_kernel() -> &'static str {
 /// any kernel.
 fn load_cc_object(path: &Path) -> Result<(Object, &'static str)> {
     let mut object = open_object(path)?;
+    check_object_abi(path, object_abi_version(&object))?;
     let mut wanted = struct_ops_map_for_kernel();
     if !object
         .maps()
@@ -2185,6 +2225,21 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_object_for_another_abi_is_refused() {
+        let path = Path::new("/opt/skyline-speeder/bpf/skyline_cc.bpf.o");
+        assert!(check_object_abi(path, Some(ABI_VERSION)).is_ok());
+        let other = check_object_abi(path, Some(ABI_VERSION + 1))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            other.contains(&format!("built for ABI {}", ABI_VERSION + 1)),
+            "{other}"
+        );
+        let unmarked = check_object_abi(path, None).unwrap_err().to_string();
+        assert!(unmarked.contains("does not say which ABI"), "{unmarked}");
+    }
+
     use super::*;
 
     const BTF_KIND_INT: u32 = 1;

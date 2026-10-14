@@ -10,10 +10,12 @@ use std::str::FromStr;
 use thiserror::Error;
 
 /// ABI version for `KernelConfig` and `SkylineMetrics`, matched against
-/// `bpf/include/skyline_abi.h`'s `SKYLINE_ABI_VERSION`. `skyline_adopt_config()`
-/// on the BPF side adopts nothing on a version mismatch rather than
-/// misinterpreting the struct layout, and skyline_cc then leaves every
-/// connection alone without reporting anything. See
+/// `bpf/include/skyline_abi.h`'s `SKYLINE_ABI_VERSION`. skyline-speederd
+/// refuses a skyline_cc.bpf.o built for another (its `.rodata.abi` section
+/// says which); behind that, `skyline_adopt_config()` on the BPF side adopts
+/// nothing on a mismatch rather than misinterpreting the struct layout, and
+/// such a connection runs unpaced, its window grown as Reno's, without
+/// anything reporting it. See
 /// `bpf/include/skyline_abi.h`'s top-of-file comment for what the current
 /// layout encodes (target deployment envelope, M2/M3 semantics, the
 /// queue-delay/ECN guardrail's `guardrail_gain_permille`).

@@ -16,9 +16,12 @@ change for anyone holding a prebuilt `.bpf.o`.
 ### Upgrading from 0.5.1
 
 - **Re-run the installer the way the host was installed.** All three BPF
-  objects, `skyline-speederd` and `ssctl` change. `SKYLINE_ABI_VERSION` and the
-  three other ABI versions stay where they were, so a 0.5.1 daemon runs the
-  0.5.2 objects and the other way round. The installer now verifies the new
+  objects, `skyline-speederd` and `ssctl` change, and they go together:
+  `SKYLINE_ABI_VERSION` and the three other ABI versions stay where they
+  were, but a 0.5.2 daemon refuses a `skyline_cc.bpf.o` that does not say
+  which ABI it was built for, which no 0.5.1 object does (see Changed). A
+  0.5.1 daemon still runs the 0.5.2 objects, except that its TC statistics
+  read 0: their layout lost a field. The installer now verifies the new
   daemon and objects before it replaces anything (see Fixed): a refused
   upgrade leaves 0.5.1 installed and running.
 - **Configuration values the kernel side cannot honour are refused.** A file
@@ -66,6 +69,15 @@ change for anyone holding a prebuilt `.bpf.o`.
 - **`ssctl snapshot` writes only a regular file.** The daemon writes it as
   root, and followed symlinks into any file and wrote into devices; a FIFO
   blocked every other request.
+- **skyline-speederd refuses a `skyline_cc.bpf.o` built for another ABI.**
+  The object now records the ABI it was built for in a section of its own
+  (`.rodata.abi`), and `ssctl enable`, `--verify-bpf` and the installer's
+  verifier step stop on one that says another, or nothing, with the reason.
+  Such a pair used to load and attach, and then no connection took the
+  configuration: every one kept the kernel's initial window, unpaced, with
+  nothing reported. A connection that still ends up without one -- an object
+  of a later ABI under a daemon that predates the check -- now grows its
+  window as the kernel's Reno would.
 
 ### Fixed
 
