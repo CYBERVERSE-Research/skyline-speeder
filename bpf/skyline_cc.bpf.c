@@ -275,11 +275,27 @@ static __always_inline __u32 skyline_cubic_target(struct skyline_flow_state *flo
     return flow->w_max + cubic_delta;
 }
 
+/* Whether this ACK ends the round whose end is `next`: it delivered a packet
+ * sent once `next` packets had been delivered. Compared as BBR compares it,
+ * !before() in 32 bits, because tp->delivered wraps after 2^32 segments --
+ * about 6 TB, 14 hours at 1 Gbit/s on one connection. Compared as plain
+ * integers, rounds at the wrap either ended on every ACK for a round trip or
+ * two or, when the end fell just past the wrap, were never reached again --
+ * and with them everything that runs on rounds stopped for the rest of the
+ * connection: the bandwidth window, the loss EMA, the guardrail, the end of
+ * STARTUP, configuration adoption. An ACK that timed no packet
+ * (prior_mstamp 0) has a prior_delivered of 0 and ends no round, as before.
+ */
+static __always_inline bool skyline_round_reached(const struct rate_sample *sample, __u64 next)
+{
+    return sample->prior_mstamp && (__s32)(sample->prior_delivered - (__u32)next) >= 0;
+}
+
 static __always_inline bool skyline_new_round(struct tcp_sock *tp,
                                           struct skyline_flow_state *flow,
                                           const struct rate_sample *sample)
 {
-    if ((__u64)sample->prior_delivered < flow->next_round_delivered)
+    if (!skyline_round_reached(sample, flow->next_round_delivered))
         return false;
     flow->next_round_delivered = tp->delivered + tp->packets_out;
     flow->round_count++;
@@ -841,7 +857,14 @@ static __always_inline void skyline_set_cwnd_target(struct tcp_sock *tp,
          * back to standard slow start to make some progress instead of
          * freezing until the first bw sample lands.
          */
-        if (acked)
+        /* tcp_slow_start() grows the window up to ssthresh, never past it:
+         * after the first loss episode, where M2's ssthresh() keeps the cwnd
+         * of that moment, a flow without an estimate grows no further (see
+         * docs/03-design.md section 13). Above ssthresh it would also cut the
+         * window down to it -- the floor below after an RTO, say, on the
+         * first ACK once Loss is over -- so it is not called there at all.
+         */
+        if (acked && tp->snd_cwnd < tp->snd_ssthresh)
             tcp_slow_start(tp, acked);
         /* tcp_slow_start() adds every ACKed packet, whether or not the
          * window was what limited the flow, so a flow that stays app-limited
@@ -985,10 +1008,12 @@ static __always_inline void skyline_grow_cwnd(struct tcp_sock *tp,
 /* RFC 6937 PRR, M2-off path only (B1/B2 neutrality) -- see
  * skyline_cong_control()'s doc comment for why M2 on bypasses this entirely.
  * cong_control makes the kernel skip its own PRR (tcp_cwnd_reduction()), so
- * this reimplements it: applies exactly the same continuous per-ACK rate
- * limiting throughout Recovery/CWR that a non-cong_control CC would get for
- * free, which is what makes a zero-module Skyline Speeder flow track real CUBIC's
- * lossy-scenario goodput instead of massively overshooting it.
+ * this reimplements it: the continuous per-ACK rate limiting through CWR and
+ * Recovery that a non-cong_control CC gets for free, which is what makes a
+ * zero-module Skyline Speeder flow track real CUBIC's lossy-scenario goodput
+ * instead of massively overshooting it. Two differences from the kernel's:
+ * it runs in Loss too (skyline_cong_control() calls it for every state from
+ * CWR on), and SSRB's extra segment below is not gated on snd_una advancing.
  */
 static __always_inline void skyline_apply_prr(struct tcp_sock *tp,
                                           struct skyline_flow_state *flow,
@@ -1013,21 +1038,22 @@ static __always_inline void skyline_apply_prr(struct tcp_sock *tp,
 
     delta = (__s64)tp->snd_ssthresh - packets_in_flight;
     if (delta < 0) {
-        /* Below ssthresh already (in-flight has fallen further than the
-         * target) -- pace new sends so in-flight converges toward ssthresh
-         * proportionally to how much has been delivered this epoch (PRR
-         * proper), rather than the SSRB branch below.
+        /* In flight is still above ssthresh: PRR proper, RFC 6937's
+         * proportional part -- release ssthresh/prior_cwnd of what this
+         * episode has delivered, so in-flight comes down to ssthresh
+         * smoothly instead of all at once.
          */
         __u64 dividend = (__u64)tp->snd_ssthresh * (__u64)flow->prr_delivered +
                           (__u64)flow->prior_cwnd - 1ULL;
 
         sndcnt = (__s64)(dividend / (__u64)flow->prior_cwnd) - (__s64)flow->prr_out;
     } else {
-        /* PRR-SSRB: still above ssthresh -- send at most enough to track
-         * delivered packets 1:1 (plus one extra per ACK when nothing new
-         * was lost this round, mirroring the kernel's own
-         * FLAG_SND_UNA_ADVANCED-and-no-newly_lost bonus), capped at delta
-         * so in-flight never overshoots ssthresh.
+        /* PRR-SSRB, RFC 6937's Slow Start Reduction Bound: in flight is at
+         * or below ssthresh -- send what has been delivered, at least what
+         * this ACK newly acked, plus one when this ACK marked nothing newly
+         * lost (the kernel adds that one only when snd_una also advanced:
+         * FLAG_SND_UNA_ADVANCED), and never more than takes in-flight back
+         * up to ssthresh.
          */
         sndcnt = (__s64)flow->prr_delivered - (__s64)flow->prr_out;
         if (sndcnt < (__s64)newly_acked)
@@ -1120,7 +1146,7 @@ void BPF_PROG(skyline_cong_control, struct sock *sk, __u32 ack, int flag,
         if (!skyline_adopt_config(flow))
             return;
         skyline_reset_generation(flow, tp);
-    } else if ((__u64)sample->prior_delivered >= flow->next_round_delivered) {
+    } else if (skyline_round_reached(sample, flow->next_round_delivered)) {
         /* A newer configuration is adopted only here, at a round boundary,
          * so that no round runs on a mix of two. If several were published
          * during the round, the latest is the one adopted.

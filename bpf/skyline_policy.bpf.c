@@ -25,8 +25,12 @@
 
 /* Kernel bounds on TCP_RTO_MAX_MS (net/ipv4/tcp.c): [MSEC_PER_SEC,
  * TCP_RTO_MAX_SEC * MSEC_PER_SEC]. Also what a flow's ceiling is reset to
- * when this feature is turned off out from under a live flow -- the actual
- * kernel default, not a value Skyline Speeder invented.
+ * when this feature is turned off out from under a live flow -- the kernel's
+ * compiled-in default, not a value Skyline Speeder invented. Not necessarily
+ * what the flow had before, though: a net.ipv4.tcp_rto_max_ms (6.15+), like
+ * a tcp_rto_min_us (6.11+) for the floor, or a value the application set,
+ * is not put back. (A route's locked rto_min is applied by the kernel at
+ * use time and is never overridden in the first place.)
  */
 #define SKYLINE_RTO_MAX_FLOOR_MS 1000U
 #define SKYLINE_RTO_MAX_KERNEL_DEFAULT_MS 120000U
@@ -111,11 +115,19 @@ struct {
     __type(value, struct skyline_rto_stats);
 } rto_stats SEC(".maps");
 
+/* The slot, unless skyline-speederd wrote it in another layout: then none,
+ * as skyline_cc.bpf.c and skyline_tc.bpf.c treat a mismatched slot of
+ * theirs, rather than tuning RTOs from a misread struct -- a subscribed flow
+ * is unsubscribed on its next RTT sample, as when the feature is off.
+ */
 static __always_inline struct skyline_rto_tuning *skyline_rto_config(void)
 {
     __u32 key = 0;
+    struct skyline_rto_tuning *tuning = bpf_map_lookup_elem(&rto_tuning, &key);
 
-    return bpf_map_lookup_elem(&rto_tuning, &key);
+    if (tuning && tuning->abi_version != SKYLINE_RTO_TUNING_ABI_VERSION)
+        return NULL;
+    return tuning;
 }
 
 static __always_inline struct skyline_rto_stats *skyline_rto_stats_get(void)
@@ -253,9 +265,11 @@ static __always_inline void skyline_update_rto_max(struct bpf_sock_ops *ops,
         stats->rto_max_applied++;
 }
 
-/* Core of M1 tier-2: called on (approximately) every RTT for a subscribed
- * flow. Resolves the shared per-flow state once, then drives the floor
- * (TCP_BPF_RTO_MIN) and ceiling (TCP_RTO_MAX_MS) halves independently.
+/* Core of M1 tier-2: called on every RTT sample of a subscribed flow --
+ * most of its ACKs, not once per round trip, which is also what
+ * warmup_samples counts. Resolves the shared per-flow state once, then
+ * drives the floor (TCP_BPF_RTO_MIN) and ceiling (TCP_RTO_MAX_MS) halves
+ * independently.
  */
 static __always_inline void skyline_update_rto_tuning(struct bpf_sock_ops *ops,
                                                    const struct skyline_rto_tuning *tuning)

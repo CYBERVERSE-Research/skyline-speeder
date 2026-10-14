@@ -8,9 +8,12 @@
  * struct skyline_metrics below. The BPF object and its userspace loader must
  * agree on this value -- skyline_adopt_config() in skyline_cc.bpf.c checks it
  * and adopts nothing on a mismatch rather than misinterpreting the struct
- * layout, so skyline_cc then leaves every connection's cwnd and pacing alone.
- * Nothing reports that: it only shows as connections that are on skyline_cc
- * and are never adjusted.
+ * layout. That is no hand-back to the kernel: cong_control has replaced the
+ * kernel's own window growth, so a connection without a configuration keeps
+ * the kernel's initial window (after an RTO, what tcp_enter_loss() leaves),
+ * and nothing sets its pacing rate. Nothing reports it -- active_flows grows
+ * while metrics.ack_events does not. A struct skyline_config of another size
+ * fails loudly instead, when skyline-speederd writes it into config_slots.
  *
  * The target deployment environment is fixed: 10-20% sustained random loss,
  * 100-300ms RTT, fairness explicitly not a goal. M2 owns cwnd directly in
@@ -295,11 +298,14 @@ struct skyline_flow_state {
      */
     __u32 queue_clamped;
     /* The flow's own copy of the configuration it runs on, taken by
-     * skyline_adopt_config() at skyline_init() and then only at a round
-     * boundary. Every coefficient the flow reads comes from here, never from
-     * config_slots directly, so a configuration published in the middle of
-     * a round cannot change a value under the flow before the round ends --
-     * however many are published, and however long the flow sits idle.
+     * skyline_adopt_config() when the flow starts -- on the ACK that
+     * completes the handshake, which reaches cong_control before init, and
+     * again at skyline_init() -- and then only at a round boundary; a flow
+     * without one tries again on every ACK. Every coefficient the flow
+     * reads comes from here, never from config_slots directly, so a
+     * configuration published in the middle of a round cannot change a value
+     * under the flow before the round ends -- however many are published,
+     * and however long the flow sits idle.
      * abi_version != SKYLINE_ABI_VERSION means none has been adopted yet.
      */
     struct skyline_config config;
@@ -426,7 +432,7 @@ struct skyline_rto_stats {
  * deployment, not every round, so a single fully-overwritten array-map slot
  * is enough -- no double-buffering concern. Consumed only by skyline_tc.bpf.c
  * (bpf/skyline_tc.bpf.c), which is interface-wide (not cgroup-scoped) egress on
- * data0, so this marks retransmits for ALL TCP flows on that interface
+ * runtime.tc_interface, so this marks retransmits for ALL TCP flows on it
  * regardless of which congestion control they run (stock CUBIC, BBR, or
  * skyline_cc alike) -- a deliberate scope choice, not an oversight: detection
  * happens by comparing the packet's own TCP sequence number against
@@ -520,10 +526,12 @@ struct skyline_retransmit_dscp_stats {
 };
 
 /* First-flight redundancy, carried out by skyline_tc.bpf.c: every SYN-ACK
- * this host sends, every SYN a skyline_cc socket sends, and every segment of
- * a skyline_cc connection that starts within the first `bytes` of what the
- * connection has sent goes out twice -- the original at once, a copy
- * `delay_us` later.
+ * that leaves tc_interface with a socket -- whichever congestion control its
+ * connection will run, since none is chosen yet when it leaves; a syncookie
+ * SYN-ACK carries no socket and is not copied -- every SYN a skyline_cc
+ * socket sends, and every segment of a skyline_cc connection that starts
+ * within the first `bytes` of what the connection has sent goes out twice --
+ * the original at once, a copy `delay_us` later.
  *
  * Why: on a lossy long-haul path a short response spends most of its life
  * waiting for loss recovery, not transferring. A 15-35 KB response fits in
@@ -546,7 +554,7 @@ struct skyline_retransmit_dscp_stats {
  * timestamp -- a packet with a socket is never taken for a copy, and a copy
  * is never copied again.
  *
- * Cost: the first `bytes` of every connection a second time -- up to one
+ * Cost: the first `bytes` of every skyline_cc connection a second time -- up to one
  * GSO packet more, since a segment is copied when it starts inside the
  * range -- plus every retransmission of that range and every SYN or SYN-ACK,
  * retransmitted ones included. There is no per-connection bound: a
