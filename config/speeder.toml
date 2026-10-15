@@ -56,98 +56,130 @@ initial_cwnd_packets = 100
 # adaptive-cwnd (M2) is on.
 min_cwnd_packets = 32
 
-# 这两段（[adaptive_cwnd]/[loss_classifier]）的全部数值现在都可以在不重启
-# skyline-speederd 的情况下用 `ssctl set-module-config`/`reset-module-config` 在线覆盖
-# ——这里的值只是 daemon 启动时的初始默认值，运行期实际生效的值以
-# `ssctl status` 里的 `module_tuning` 字段为准。
+# Every value in these two sections ([adaptive_cwnd] / [loss_classifier]) can be
+# overridden at run time with `ssctl set-module-config` / `reset-module-config`,
+# without restarting skyline-speederd -- the values here are only the daemon's
+# defaults at start, and what is in effect is the `module_tuning` field of
+# `ssctl status`.
 #
-# 针对目标部署环境（丢包率10-20%、RTT 100-300ms、带宽数十到数百Mbps，公平性
-# 不是目标）：M2 是 STARTUP/CRUISE 两态状态机，开启时直接掌管全部 CA 状态下
-# 的 cwnd（不被 PRR 接管），cruise_inflight_gain/cruise_pacing_gain 是 CRUISE
-# 终态的增益系数。见 bpf/include/skyline_abi.h 顶部注释与 docs/03-design.md。
+# For the target deployment (10-20% loss, 100-300 ms RTT, tens to hundreds of
+# Mbit/s, fairness not a goal): M2 is a two-state machine, STARTUP/CRUISE. While
+# it is on it owns cwnd in every CA state (PRR does not take over), and
+# cruise_inflight_gain / cruise_pacing_gain are the gains of the CRUISE end
+# state. See the comment at the top of bpf/include/skyline_abi.h and
+# docs/03-design.md.
 #
-# 下面这组默认值来自一台生产部署上的交替对照调参（大量并发连接、基准 RTT 约
-# 100-150ms、丢包以拥塞型为主而不是纯随机），不是来自测试台矩阵；
-# docs/04-performance-report.md 测的是调整之前的那组系数（见该文 3.4 节）。
-# 链路确实是 10%-20% 纯随机丢包时，用 docs/usage.md 的「高随机丢包档」。
+# The defaults below come from alternating A/B tuning on a production deployment
+# (many concurrent connections, base RTT about 100-150 ms, loss mostly from
+# congestion rather than purely random), not from the test-bed matrix;
+# docs/04-performance-report.md measured the coefficients from before that
+# tuning (its section 3.4). Where a link really has 10%-20% purely random loss,
+# use the "high random loss" preset in docs/usage.md.
 [adaptive_cwnd]
-# min-RTT 窗口：CRUISE 增益恒 >= 1.0 且没有排空阶段，窗口太短时基准 RTT 会把
-# 这条流自己堆出来的常驻队列算进去，护栏阈值和 cwnd 目标跟着往上漂。
+# min-RTT window: the CRUISE gains are always >= 1.0 and there is no drain
+# phase, so with too short a window the base RTT takes in the standing queue
+# this flow built itself, and the guardrail threshold and the cwnd target drift
+# up with it.
 min_rtt_window_s = 30
-# 带宽估计取最近几轮的峰值：窗口越长，被 ACK 压缩抬高的样本、瓶颈变窄之前的
-# 旧速率被记住得越久，pacing 速率就越容易脱离链路当前真实交付的速率。
+# The bandwidth estimate is the peak of the last few rounds: the longer the
+# window, the longer it remembers samples inflated by ACK compression and rates
+# from before the bottleneck narrowed, and the easier the pacing rate drifts
+# away from what the link delivers now.
 bw_window_rtts = 6
-# STARTUP 退出判定：连续这么多轮带宽涨幅低于 startup_growth_ratio。只数有样本
-# 进入带宽滤波器的轮次：整轮受应用限速的轮次不算"没涨"（0.5.1 起；之前算，长连接上
-# 几个小响应就能让流带着偏低的带宽估计永久进入 CRUISE）。判定太急同样会这样。
+# STARTUP exit: this many consecutive rounds of bandwidth growth below
+# startup_growth_ratio. Only rounds that put a sample into the bandwidth filter
+# count: a round that was application-limited throughout is not "no growth"
+# (since 0.5.1; before, a few small responses on a long-lived connection could
+# send a flow into CRUISE for good with too low an estimate). A test that fires
+# too early does the same.
 startup_plateau_rtts = 5
 startup_growth_ratio = 0.20
-# SKYLINE_MODE_STARTUP 的单一增益（cwnd 目标和 pacing 速率共用）。
+# The single gain of SKYLINE_MODE_STARTUP (shared by the cwnd target and the
+# pacing rate).
 startup_gain = 3.0
-# SKYLINE_MODE_CRUISE 的 cwnd 目标增益——刻意比 cruise_pacing_gain 更宽松，
-# cwnd 只需要不成为限制因素，真正的限速器是 pacing。生产部署上退回 2.0 时
-# RTO 超时明显增多（窗口余量不够，丢包后更容易只剩等超时这一条路），再加到
-# 4.0 没有看到额外收益。
+# The cwnd-target gain of SKYLINE_MODE_CRUISE -- deliberately looser than
+# cruise_pacing_gain: cwnd only has to stay out of the way, pacing is the real
+# limiter. Back at 2.0 on the production deployment, RTO timeouts rose clearly
+# (not enough window headroom, so after a loss waiting for the timeout was more
+# often the only way left); going up to 4.0 showed no further gain.
 cruise_inflight_gain = 3.0
-# SKYLINE_MODE_CRUISE 的 pacing 速率增益——M4 开启时真正生效的限速值。CRUISE 是
-# 终态且没有周期性探测，带宽估计只能靠这个 > 1.0 的增益往上刷新，增益太低时
-# 估计值爬升很慢。1.25 是和收紧后的丢包补偿/护栏一起选定的：不收紧那两项、
-# 单独调高它只会增加重传而换不来速度，再往上（1.4）同样如此。
+# The pacing-rate gain of SKYLINE_MODE_CRUISE -- the rate limit actually in
+# force while M4 is on. CRUISE is the end state and has no periodic probing, so
+# the bandwidth estimate can only be refreshed upwards through this > 1.0 gain;
+# too low a gain and the estimate climbs slowly. 1.25 was chosen together with
+# the tightened loss compensation and guardrail: raising it alone, without
+# tightening those two, only adds retransmissions and buys no speed, and going
+# higher (1.4) is the same.
 cruise_pacing_gain = 1.25
-# 队列时延/ECN 护栏触发时对 cwnd 目标和 pacing 速率共同生效的增益——
-# 这是 Skyline Speeder 唯一还承认的真实拥塞信号，触发时不该只是"停止加速"（增益回到
-# 1.0），而应该主动降速。0.8 = 降到测得带宽的 80%，是一个尚待用小规模实验
-# 验证的初始值，不是已经证明最优的数值；0.0 表示只取消加速、不主动降速
-# （增益回到 1.0）。
+# The gain applied to both the cwnd target and the pacing rate when the
+# queue-delay/ECN guardrail trips -- the one real congestion signal Skyline
+# Speeder still accepts, so tripping it should not merely "stop accelerating"
+# (gain back to 1.0) but actively slow down. 0.8 = down to 80% of the measured
+# bandwidth, a starting value still to be validated by small experiments, not a
+# value proven optimal; 0.0 means only cancel the acceleration without slowing
+# down (gain back to 1.0).
 guardrail_gain = 0.8
 
 [loss_classifier]
-# M3 是单一丢包率补偿系数（1/(1-p)，见 bpf/skyline_cc.bpf.c 的
-# skyline_loss_inflation_permille() 文档注释），不做多路丢包分类——目标环境下
-# "永远不因丢包降窗"才是正确答案。补偿封顶 0.10（最多 1.11x）：足够抵消
-# 个位数百分比随机丢包造成的带宽低估。封顶放得更高时，它在拥塞型瓶颈上是一条
-# 正反馈——丢得越多补得越多、发得越多、丢得更多，只有护栏能打断。链路确实是
-# 10%-20% 纯随机丢包（docs/04-performance-report.md 测的环境）时调回 0.5
-# （2.0x，覆盖该丢包上界并留出重传开销的余量）。
+# M3 is a single loss-rate compensation factor (1/(1-p); see the doc comment of
+# skyline_loss_inflation_permille() in bpf/skyline_cc.bpf.c), with no
+# multi-way loss classification -- in the target environment "never cut the
+# window for a loss" is the right answer. Compensation is capped at 0.10 (at
+# most 1.11x): enough to offset the bandwidth underestimate that single-digit
+# percentages of random loss cause. Capped higher, it is a positive feedback
+# loop on a congestion bottleneck -- the more it loses, the more it compensates,
+# the more it sends, the more it loses -- and only the guardrail can break it.
+# Where a link really has 10%-20% purely random loss (the environment
+# docs/04-performance-report.md measured), set it back to 0.5 (2.0x, covering
+# that upper loss bound with headroom for the retransmission overhead).
 loss_inflation_max_ratio = 0.10
 
 # [rack_tuning]
-# 全局 RACK sysctl 默认值。留空/整段省略 = skyline-speederd 不接管，所有权交给实验矩阵
-# 的 infra/apply-guest-profile.sh 逐 case 控制。取消注释表示 skyline-speederd 启动时会把
-# 这些值写入 /proc/sys/net/ipv4/*，写入失败则守护进程启动失败。
-# tcp_recovery = 1        # 位掩码，仅 1|3|5|7 合法
+# Defaults for the global RACK sysctls. Empty / the whole section left out =
+# skyline-speederd does not take them over, and they belong to the experiment
+# matrix's infra/apply-guest-profile.sh, per case. Uncommented, skyline-speederd
+# writes these values to /proc/sys/net/ipv4/* at start, and a failed write fails
+# the daemon's start.
+# tcp_recovery = 1        # bitmask; only 1|3|5|7 are valid
 # tcp_reordering = 3      # 1..=300
 # tcp_early_retrans = 3   # 0..=4
 
-# M1 per-flow 动态 RTO 下限（TCP_BPF_RTO_MIN），由 skyline_policy.bpf.c 在
-# BPF_SOCK_OPS_RTT_CB 里应用。目标环境下更快的丢包检测能直接减少停顿，
-# 这里设为开启（实验矩阵仍会按 case 通过 `ssctl set-rack-rto` 覆盖，见
-# config/speeder-guest.toml）。daemon 启动时不下发这一段：要执行一次
-# `ssctl reset-rack-rto` 才生效，每次 daemon 重启后都一样。
+# M1 per-flow dynamic RTO floor (TCP_BPF_RTO_MIN), applied by
+# skyline_policy.bpf.c in BPF_SOCK_OPS_RTT_CB. In the target environment faster
+# loss detection directly cuts stalls, so it is on here (the experiment matrix
+# still overrides it per case with `ssctl set-rack-rto`; see
+# config/speeder-guest.toml). The daemon does not send this section at start:
+# it takes effect after an `ssctl reset-rack-rto`, after every daemon restart
+# alike.
 [rack_rto]
 enabled = true
 srtt_permille = 1100    # target = max(srtt_us, min_rtt_us) * this / 1000
-floor_us = 20000        # 绝对安全下限（微秒）
-ceiling_us = 200000     # 绝对安全上限（微秒），不超过内核 TCP_RTO_MIN=200ms
-warmup_samples = 4      # 前 N 个 RTT 样本只观测不下发
+floor_us = 20000        # absolute safety floor (microseconds)
+ceiling_us = 200000     # absolute safety ceiling (microseconds), no higher than the kernel's TCP_RTO_MIN = 200 ms
+warmup_samples = 4      # the first N RTT samples are only observed, nothing is applied
 
-# TCP_RTO_MAX_MS（RTO 退避的真正上限，内核默认 ~120s）。ceiling =
-# clamp(k * base_rtt, 1000ms, 120000ms)，base_rtt = max(srtt_us, min_rtt_us)，
-# 与上面 RTO_MIN floor 用的基线算法一致（对重排序导致 min_rtt 塌陷到 0 有防护）。
-# 出现真实拥塞证据（收到新的 CE 标记，或 srtt 明显超过 min_rtt）时用
-# rto_max_congested_permille 代替 rto_max_normal_permille——不会回退到内核
-# 120s 默认值，只是换一个更大的倍数，公式始终挂在 base_rtt 上。
-# 倍数直接拍定：没有拥塞证据时 3 倍 base_rtt，出现证据后 6 倍——不做额外的
-# 矩阵实验筛选，后续如有真实数据显示需要调整再改。
+# TCP_RTO_MAX_MS (the real cap of RTO backoff, ~120 s by kernel default).
+# ceiling = clamp(k * base_rtt, 1000 ms, 120000 ms), base_rtt =
+# max(srtt_us, min_rtt_us), the same baseline as the RTO_MIN floor above (with
+# its guard against min_rtt collapsing to 0 under reordering). On real
+# congestion evidence (a new CE mark, or srtt clearly above min_rtt)
+# rto_max_congested_permille replaces rto_max_normal_permille -- it never falls
+# back to the kernel's 120 s default, it only switches to a larger multiple, and
+# the formula always hangs off base_rtt.
+# The multiples were set outright: 3x base_rtt without congestion evidence, 6x
+# with it -- with no further matrix experiments to pick them; change them if real
+# data later shows a need.
 rto_max_normal_permille = 3000
 rto_max_congested_permille = 6000
-rto_max_congestion_ratio_permille = 0  # 0 = 使用内置默认 2000（即 srtt > 2x min_rtt 算拥塞证据）
+rto_max_congestion_ratio_permille = 0  # 0 = use the built-in default 2000 (srtt > 2x min_rtt counts as congestion evidence)
 
-# 给重传包打 DSCP 标记，供网络侧按 DSCP 走不同
-# upstream。dscp_value 是"占位参数"——具体编码值由网络侧策略决定，这里不
-# 应该硬编码一个真实生产值，默认关闭（enabled=false）。由
-# bpf/skyline_tc.bpf.c（接口级 TC egress，不分 cgroup）实施，对
-# runtime.tc_interface 上的全部 TCP 流一致生效，不区分跑的是哪种拥塞控制。
+# DSCP-mark retransmitted packets, so the network can send them upstream by a
+# different path. dscp_value is a placeholder: the actual code point is the
+# network side's policy, and a real production value should not be hard-coded
+# here, so it is off by default (enabled = false). Carried out by
+# bpf/skyline_tc.bpf.c (interface-level TC egress, not per cgroup), it applies
+# the same to every TCP flow on runtime.tc_interface, whatever congestion
+# control it runs.
 [retransmit_dscp]
 enabled = false
 dscp_value = 0

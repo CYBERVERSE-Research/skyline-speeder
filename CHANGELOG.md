@@ -11,7 +11,7 @@ marking and first-flight redundancy structs there have versions of their own,
 docs/02-interface-reference.md section 5), and any bump to it is a breaking
 change for anyone holding a prebuilt `.bpf.o`.
 
-## [0.5.2] - 2026-10-14
+## [0.5.2] - 2026-10-15
 
 ### Upgrading from 0.5.1
 
@@ -78,6 +78,11 @@ change for anyone holding a prebuilt `.bpf.o`.
   nothing reported. A connection that still ends up without one -- an object
   of a later ABI under a daemon that predates the check -- now grows its
   window as the kernel's Reno would.
+- **The configuration templates' comments are in English.** In
+  `config/speeder-guest.toml`, which the installer puts in place as
+  `/etc/skyline-speeder/speeder.toml`, and in `config/speeder.toml`, only
+  comments changed. An upgrade keeps the configuration a host already has,
+  so its comments stay as they were.
 
 ### Fixed
 
