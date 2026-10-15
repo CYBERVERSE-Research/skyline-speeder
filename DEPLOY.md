@@ -56,7 +56,8 @@ wget -qO- https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/
 它运行的 `install.sh` 来自 `--ref`（默认 `main`），装上的产物却来自最新 release（或 `--release` 指定
 的那个）：`--ref` 选的是安装器，不是安装的版本。之后升级或卸载可以直接用那份树：
 `/usr/local/src/skyline-speeder/install.sh --uninstall`；经引导脚本传 `--uninstall` 时它也直接用这份树，
-不再下载。
+不再下载。没有这份树时，经引导脚本的 `--uninstall` 与 `--check` 直接运行下载来的安装器，不放置、也不挪动
+任何源码树。每次经引导脚本升级都多出一份 `<目录>.bak-<时间戳>`，多于一份时它提醒清理（它自己从不删除）。
 
 ### 0.2 成功判据
 
@@ -164,7 +165,7 @@ C 库够新。两种 C 库各有一个产物：
   （`getconf GNU_LIBC_VERSION`）以及 `libelf.so.1`、`libz.so.1`。Debian 13、Ubuntu 24.04、Fedora 43、
   Rocky Linux 10 及更新版本满足。
 - musl 版 `skyline-speeder-<tag>-x86_64-musl.tar.gz`（v0.4.1 起）：在 Alpine 3.21 容器里构建，需要
-  **musl ≥ 1.2.5**（`/lib/ld-musl-*.so.1` 存在即是 musl，版本由它自己报出），即 Alpine 3.21 及更新，以及
+  **musl ≥ 1.2.5**（`getconf GNU_LIBC_VERSION` 答不出 glibc、且 `/lib/ld-musl-*.so.1` 存在即是 musl——装了 Debian、Fedora 的 musl 包的 glibc 主机也有这个文件，所以先问 glibc；版本由加载器自己报出），即 Alpine 3.21 及更新，以及
   `libelf`、`zlib`、`zstd-libs`、`libgcc`。
 
 两个产物里的 BPF 对象是同一套文件，逐字节相同。能运行就装产物，否则在 stderr 打印一行
@@ -178,7 +179,7 @@ C 库够新。两种 C 库各有一个产物：
 | 目标机需要 | 不需要任何工具链；安装器只装运行期依赖（§2.4 的包列表） | 编译工具链（clang/LLVM、bpftool、libbpf/libelf/zlib 开发包、Rust），安装器自动安装并记录，`--uninstall` 再卸掉 |
 | 装的是什么 | 最新（或 `--release` 指定的）release：`main` 上在它之后合并的改动不在其中 | 运行的这份源码树（一键安装时即 `--ref`，默认 `main`） |
 | BPF 对象的类型来源 | 发布流水线固定的 6.12 LTS 参考头；加载时由 CO-RE 按本机内核的 BTF 修正字段偏移 | 本机 `/sys/kernel/btf/vmlinux` |
-| 完整性校验 | 产物旁的 `.sha256` 必须匹配；取不到 `.sha256` 时告警、只信任 TLS | 源码树本身（`scripts/bootstrap.sh` 可用 `SKYLINE_SHA256` 固定 tarball 的摘要） |
+| 完整性校验 | 产物旁的 `.sha256` 必须匹配；取不到 `.sha256` 时告警：下载的产物只信任 TLS，本机文件不作校验 | 源码树本身（`scripts/bootstrap.sh` 可用 `SKYLINE_SHA256` 固定 tarball 的摘要） |
 
 其余步骤完全相同：同样过验证器，同样的服务（systemd unit 或 OpenRC 脚本）与配置模板。
 
@@ -190,7 +191,7 @@ C 库够新。两种 C 库各有一个产物：
 | `--source` | 无条件从这份源码树构建 |
 | `--prebuilt` | 只装已发布的产物：本机跑不了时在第一步之前就以 `error --prebuilt/--release cannot install here: <原因>` 中止，不会改为构建 |
 | `--release <tag>` | 同 `--prebuilt`，固定到该版本（也是装回旧版本的办法，§10.3） |
-| `--check` | 只做前置检查，不改动任何东西：报告将走哪条路径（`would install the published release` / `would build from source: <原因>`）、包能否装上、当前拥塞控制与 qdisc（含 guard 将要维护的网卡）、开机时 systemd-sysctl 会写入的相关设置、`/etc/sysctl.conf` 里只由 `sysctl -p`/`sysctl --system` 应用的设置，以及新建配置会得到的 `fallback_cc` |
+| `--check` | 只做前置检查，不改动任何东西：报告将走哪条路径（`would install the published release` / `would build from source: <原因>`）、包能否装上、当前拥塞控制与 qdisc（含 guard 将要维护的网卡）、开机时 systemd-sysctl 会写入的相关设置、`/etc/sysctl.conf` 里只由 `sysctl -p`/`sysctl --system` 应用的设置，以及新建配置会得到的 `fallback_cc`。设了 `SKYLINE_ARTIFACT_URL` 时报告将装它 |
 | `--no-enable` | 安装或升级并启动 daemon，但不新挂载 `skyline_cc`：不启用 `skyline-speeder-enable.service`，此前已经启用的也不停用；升级前是用裸 `ssctl enable` 挂着的，重启后再 `ssctl enable` 一次（仍是手工挂载，开机不会自动挂）。结束时按新 daemon 的 `enabled` 与当前默认拥塞控制报告实际的挂载状态，并给出挂载命令 |
 | `--verbose` | 不画进度条，所有子命令的输出同时打到屏幕；环境变量 `SKYLINE_VERBOSE=1` 同效 |
 | `--uninstall` | 卸载，切到 bbr + fq，并卸掉安装时装上的包（§11.3） |
@@ -202,7 +203,7 @@ C 库够新。两种 C 库各有一个产物：
 
 | 环境变量 | 作用 |
 |---|---|
-| `SKYLINE_ARTIFACT_URL` | 跳过 release 查找，直接用一个 https URL（镜像、内网制品库）或本机文件路径作为产物；优先于 `--release`；`<URL 或路径>.sha256` 存在就校验（§2.3） |
+| `SKYLINE_ARTIFACT_URL` | 跳过 release 查找，直接用一个 https URL（镜像、内网制品库）或本机文件路径作为产物；优先于 `--release`，两者同时给出时告警说 `--release` 没有用上；`<URL 或路径>.sha256` 存在就校验（§2.3）。改为源码构建（本机跑不了产物，或 `--source`）时它不起作用，同样告警 |
 | `SKYLINE_VERBOSE=1` | 同 `--verbose` |
 | `SKYLINE_REPO` | 查询 release 的仓库，默认 `CYBERVERSE-Research/skyline-speeder` |
 
@@ -222,7 +223,8 @@ SKYLINE_ARTIFACT_URL=https://mirror.example/skyline-speeder-<tag>-x86_64.tar.gz 
 SKYLINE_ARTIFACT_URL=/path/to/skyline-speeder-<tag>-x86_64.tar.gz ./install.sh --prebuilt
 ```
 
-产物旁发布的 `<产物>.sha256` 必须与下载（或拷来）的 tarball 一致，不一致即中止。tarball 里的 `MANIFEST`
+产物旁发布的 `<产物>.sha256` 必须与下载（或拷来）的 tarball 一致，不一致即中止；本机文件旁没有 `.sha256`
+时告警它未经校验。tarball 里的 `MANIFEST`
 记录 tag、commit、参考头摘要、`libc=` 以及每个二进制与对象的 SHA-256：完整内容写进安装日志，摘要里显示
 一行出处（产物名、commit、是否已校验 sha256）。`libc=` 与本机 C 库不符的产物（例如
 `SKYLINE_ARTIFACT_URL` 指错了文件）在验证器之前就被拒绝，并说明该用哪一个。
@@ -238,9 +240,9 @@ SKYLINE_ARTIFACT_URL=/path/to/skyline-speeder-<tag>-x86_64.tar.gz ./install.sh -
 | Installing packages | 见下面的包列表与计划规则 |
 | Downloading the release artifact | 预编译路径：取产物、校验 sha256 与 `MANIFEST` |
 | Preparing the Rust toolchain / Building the BPF objects / Building the Rust control plane | 源码构建路径：rustup（`rust-toolchain.toml` 固定版本）、`make bpf`、`cargo build --release` |
-| Installing files | 预编译路径直接复制产物里的文件；源码构建路径执行 `infra/install-guest.sh`。文件清单见 §2.5 |
-| Configuring speeder.toml | 配置不存在时才用模板新建；改写出口网卡与 `fallback_cc`（见下） |
-| Running the kernel verifier | `skyline-speederd --validate-only --verify-bpf`（§4）；失败即中止 |
+| Running the kernel verifier | 在替换任何文件之前，用**新的** daemon 和新的对象跑 `--validate-only --verify-bpf`（§4）：配置用已装的那份，首次安装用模板，`bpf_dir` 指向新对象；daemon 先放在 `/usr/local/sbin/.skyline-speederd.new`（`/tmp` 可能是 noexec）。失败即中止，已装的文件与正在运行的 daemon 原样不动 |
+| Installing files | 预编译路径直接复制产物里的文件（daemon 就是验证器跑过的那个文件，改名到位）；源码构建路径执行 `infra/install-guest.sh`。文件清单见 §2.5 |
+| Configuring speeder.toml | 配置不存在时才用模板新建；改写出口网卡与 `fallback_cc`（见下）。这里的改动不影响上一步的结论：`tc_interface` 不参与校验，`fallback_cc` 只会改成本机内核有的算法 |
 | Starting skyline-speederd | 升级时是 `Draining live flows (up to 60 s), restarting skyline-speederd`（§10） |
 | Attaching skyline_cc | `systemctl enable --now skyline-speeder-enable.service`（`--no-enable` 时跳过） |
 | Verifying | 向新 daemon 确认 `enabled` 为 `true`（带 guard 的版本还要 `armed`），且默认拥塞控制确实是 `skyline_cc`；不满足时重启一次 enable unit 再查，仍不满足就失败，并提示 `ssctl enable` 与 enable unit 的日志 |
@@ -435,8 +437,8 @@ done
 # ① 启动常驻进程
 systemctl enable --now skyline-speederd.service
 
-# ② 等控制 socket —— 必须等，不能假设立即可用
-timeout 60 sh -c 'until test -S /run/skyline-speeder/speeder.sock; do sleep 1; done'
+# ② 等 daemon 应答 —— 必须等，不能假设立即可用
+timeout 60 sh -c 'until ssctl status --json >/dev/null 2>&1; do sleep 1; done'
 
 # ③ 挂载 skyline_cc 并切换默认算法（开机自启走的也是这条路径）
 systemctl enable --now skyline-speeder-enable.service
@@ -444,13 +446,14 @@ systemctl enable --now skyline-speeder-enable.service
 
 `skyline-speederd.service` 没有 readiness 通知：进程起来的头几秒 socket 可能还不存在，此时执行 `ssctl` 会报
 `connect to /run/skyline-speeder/speeder.sock (is skyline-speederd running?)`，下一行 `Caused by` 是
-`No such file or directory`。这只是启动竞态，所以第 ② 步要等。
+`No such file or directory`。这只是启动竞态，所以第 ② 步要等——等它应答，而不是等 socket 文件出现：被杀掉的
+daemon 会留下 socket 文件，OpenRC 也不像 systemd 的 `RuntimeDirectory=` 那样在停止时清空 `/run/skyline-speeder`。
 
 > [!IMPORTANT]
 > **`skyline-speederd.service` 启动后不会自动挂载 `skyline_cc`。** 它只保持进程常驻，除了 `[rack_tuning]`
 > 里声明的 tier-1 sysctl（随附模板不声明）之外不写任何 sysctl；
 > 不执行第 ③ 步，新连接就一直走主机当前的默认算法，**且不报任何错误**。`skyline-speeder-enable.service`
-> 正是为消除这个静默失效而存在：它的 `boot-enable.sh` 先等 socket（最多 60 秒）再执行 `ssctl enable`，
+> 正是为消除这个静默失效而存在：它的 `boot-enable.sh` 先等 daemon 应答（最多 60 秒）再执行 `ssctl enable`，
 > 每次开机都挂载一次；停止它时 `boot-disable.sh` 执行 drain（§11）。
 
 ### 5.2 `ssctl enable` 做了什么
@@ -513,7 +516,8 @@ q=$(ssctl status --json | grep -E '^ +"qdisc": ("|null)' | sed -E 's/.*"qdisc": 
 ```
 
 `ssctl status` 报告标题右侧就是结论：`● ACCELERATING`（已挂载且是全机默认）、`○ ATTACHED, NOT DEFAULT`
-（挂上了但新连接绕开了它，等于没生效）、`○ STANDBY`（没挂载）。不是 `ACCELERATING` 时，最下面的
+（挂上了但新连接绕开了它，等于没生效）、`○ DRAINING`（执行过 drain，新连接已回到 `fallback_cc`，skyline_cc
+只服务剩下的连接，§11.1）、`○ STANDBY`（没挂载）。是 `ATTACHED, NOT DEFAULT` 或 `STANDBY` 时，最下面的
 ATTENTION 段落逐条写明问题与处理动作。所有 `ssctl` 子命令默认打印给人看的报告，脚本解析一律加 `--json`；
 应答 `ok` 为 `false` 时 `ssctl` 的退出码是 1。
 
@@ -573,11 +577,12 @@ After=skyline-speederd.service skyline-speeder-enable.service
 ExecStartPost=+/bin/sh -c 'echo $MAINPID > /sys/fs/cgroup/skyline-speeder/cgroup.procs'
 ```
 
-诊断（`ssctl flows` 的 DYNAMIC RTO 段落；`--json` 里是 `rack_rto.stats`）：
+诊断（`ssctl flows` 的 DYNAMIC RTO 段落；动态 RTO 关闭时是 CGROUP POLICY 段落，只显示 *connections seen*；
+全部计数在 `--json` 的 `rack_rto.stats` 里）：
 
 | 现象 | 结论 |
 |---|---|
-| `established_cb`（*connections seen*）为 0 | 没有进程的连接经过 `skyline_policy` → 目标进程不在 cgroup 内（RTO 调节打开时 ATTENTION 段落也会写明） |
+| `established_cb`（*connections seen*）为 0 | 没有进程的连接经过 `skyline_policy` → 目标进程不在 cgroup 内。这一行不论 RTO 调节开没开都显示（0.5.1 及更早只在打开后显示）；RTO 调节打开时 ATTENTION 段落也会写明 |
 | `established_cb` 增长，`subscribe_ok`、`rtt_callbacks` 为 0 | RTO 调节没有打开（daemon 启动后默认关闭）→ 执行上面的 `set-rack-rto` / `reset-rack-rto` |
 | `subscribe_err` 非零 | 订阅 RTT 回调失败 → 检查内核的 sockops 能力 |
 | `subscribe_ok` 非零、`applied` 为 0、`rejected` 非零 | 内核拒绝下发的值 → 取值超出内核对 RTO 的合法区间 |
@@ -703,7 +708,8 @@ journalctl -u skyline-speederd.service | grep 'guard:'
 再运行一次安装器即可，当初带了 `--source`/`--no-enable` 的照样带上（从源码构建的主机不带 `--source` 重跑，会
 换成已发布的产物）。经引导脚本安装的主机重跑同一条一键命令。安装器的做法：
 
-1. 新的二进制、对象与 unit 先就位，新对象通过内核验证器之后才动正在运行的 daemon；
+1. 新的 daemon 与对象先通过内核验证器（配置用已装的那份，`bpf_dir` 指向新对象），然后才替换已装的二进制、对象、
+   脚本与 unit，再动正在运行的 daemon；验证不过时什么都不替换（§10.3）；
 2. `skyline-speederd.service` 处于 active 时，执行 `systemctl restart skyline-speederd.service`。enable unit
    处于 active 时随之重启：它的 ExecStop（`boot-disable.sh`）执行 `ssctl drain`——先解除 guard、写回
    `fallback_cc`，再等存量连接至多 60 秒（经 SSH 必然走到超时，无害）——新 daemon 起来后重新挂载；
@@ -716,12 +722,12 @@ journalctl -u skyline-speederd.service | grep 'guard:'
 升级之后：
 
 - 已有的 `/etc/skyline-speeder/speeder.toml` 不会被覆盖，缺少的新配置段按默认值生效。升级到 0.5.0 及以后时，
-  文件里有新 daemon 不认识的键（写错段落、拼错）的，安装器在验证器这一步停下，报错列出这些键，旧 daemon 继续
-  运行（§10.3）：按报错改好文件再重跑；
+  文件里有新 daemon 不认识的键（写错段落、拼错）的，安装器在验证器这一步停下，报错列出这些键，已装的文件与旧
+  daemon 原样不动（§10.3）：按报错改好文件再重跑；
 - 用 `ssctl` 做的在线修改只在旧 daemon 的内存里，重启后不保留；安装器把旧的 `ssctl status --json` 写进了安装
   日志，需要时照着重新下发；
-- 摘要里显示 `upgraded <旧> -> <新>`（v0.2.0 及更早的二进制没有 `--version`，显示
-  `from a release without --version (v0.2.0 or older)`）；用 §0.2 的判据确认运行的是新版本；
+- 摘要里显示 `upgraded <旧> -> <新>`，装回旧版本时是 `downgraded <旧> -> <新>`（v0.2.0 及更早的二进制没有
+  `--version`，显示 `from a release without --version (v0.2.0 or older)`）；用 §0.2 的判据确认运行的是新版本；
 - 各版本的升级注意事项见 `CHANGELOG.md` 里对应的 *Upgrading from ...* 小节。
 
 ### 10.2 手动安装的主机
@@ -742,9 +748,10 @@ enable unit 此前不是 active、而这台主机应当挂载 `skyline_cc` 的�
 
 ### 10.3 验证器失败、或要装回旧版本
 
-安装器在验证器**之前**就替换了文件：验证器失败时它停下，旧 daemon 继续运行，但磁盘上已是新文件，下一次重启或
-开机运行的就是新文件。先看 §4 的输出排除原因再重跑；要回到旧版本，用 `--release <旧 tag>` 安装那个版本——配置
-文件原样保留。0.4.x 及更早的 daemon 会忽略它不认识的新键；0.5.0 及以后的会拒绝它们，要先删掉报错列出的键。
+安装器在替换任何文件**之前**跑验证器：验证器失败时它停下，已装的文件与正在运行的 daemon 原样不动。（2026-10 之前
+的安装器先替换文件、后跑验证器：验证失败时磁盘上已是新文件，旧 daemon 在 drain 之后的下一次 enable 会读入新的
+`skyline_cc.bpf.o`，与它自己不配对。那样留下的主机，重跑现在的安装器即可。）先看 §4 的输出排除原因再重跑；要回到
+旧版本，用 `--release <旧 tag>` 安装那个版本，摘要会写 `downgraded`——配置文件原样保留。0.4.x 及更早的 daemon 会忽略它不认识的新键；0.5.0 及以后的会拒绝它们，要先删掉报错列出的键。
 
 ---
 
@@ -766,7 +773,9 @@ cgroup 里的进程不再被切到 `skyline_cc` → 停止首轮冗余 →
 > 超时时 `ssctl` 打印 `drain timeout expired; struct_ops remains attached, but the default congestion control is
 > already back on <fallback_cc> ...` 并以 1 退出——按这行消息识别，属预期。此时 sysctl 早已写回、guard 已解除，
 > "新连接不再使用 `skyline_cc`"已经成立；`skyline_cc` 本身仍保持注册（`sv enabled` 仍为 `true`、`sv armed`
-> 为 `false`），直到之后某次 drain 等到连接归零、或 daemon 停止。要恢复加速执行 `ssctl enable`；要让 drain
+> 为 `false`、`sv draining` 为 `true`），直到之后某次 drain 等到连接归零、或 daemon 停止。`ssctl status` 与
+> `ssctl flows` 这时显示 `DRAINING` 和还剩的连接数（0.5.1 及更早显示 `ATTACHED, NOT DEFAULT` / `BYPASSED`，
+> 并提示重新 enable，那是误报）。要恢复加速执行 `ssctl enable`；要让 drain
 > 真正等到归零并注销，从串口控制台或一条不走本机 `skyline_cc` 的通道执行它。
 
 daemon 一次只处理一个请求：`drain` 等待期间，其他 `ssctl` 调用都排在它后面，不要在 drain 期间轮询状态。
@@ -775,7 +784,7 @@ M1 动态 RTO 与重传 DSCP 标记**不受 drain 影响**，要单独关：
 
 ```bash
 ssctl set-rack-rto --disable      # 无条件关闭 RTO 调节（reset-rack-rto 是回到配置文件的设置）
-ssctl reset-retransmit-dscp       # 回到配置文件的设置：除非 [retransmit_dscp] 显式开启，即关闭
+ssctl set-retransmit-dscp --disable   # 无条件关闭标记（0.5.2 起；reset-retransmit-dscp 是回到配置文件的设置）
 ```
 
 ### 11.2 停止
@@ -800,13 +809,14 @@ systemctl stop skyline-speeder-enable.service skyline-speederd.service
 /usr/local/src/skyline-speeder/install.sh --uninstall
 ```
 
-它先 drain（同时解除 guard），停用并删除两个 unit（或两个 OpenRC 脚本）、二进制与 `/opt/skyline-speeder`，
+它先 drain（同时解除 guard；enable unit 是 active 时由它停止时的 ExecStop 来 drain，不重复等待），停用并删除两个
+unit（或两个 OpenRC 脚本）、二进制与 `/opt/skyline-speeder`，
 **保留** `/etc/skyline-speeder`（重装时配置还在）、安装日志、引导脚本的源码树与
 `/sys/fs/{cgroup,bpf}/skyline-speeder`，然后：
 
 1. **切到 bbr + fq**（默认）：`net.ipv4.tcp_congestion_control=bbr`、`net.core.default_qdisc=fq`，并把
-   `runtime.tc_interface` 解析出来的网卡（guard 武装时维护的正是这些，与 `[guard] qdisc` 是否关过无关）的根 qdisc
-   确认成 `fq`（多队列网卡是子队列全为 `fq` 的 `mq`）。已经是 `fq` 的不动；`htb`/`tbf`/`netem`/设了带宽的 `cake`
+   `runtime.tc_interface` 解析出来的网卡（guard 武装时维护的正是这些，与 `[guard] qdisc` 是否关过无关；它在本机
+   不存在时——例如仍是模板值 `data0`——不动任何网卡，只用快照里记下的网卡）的根 qdisc 确认成 `fq`（多队列网卡是子队列全为 `fq` 的 `mq`）。已经是 `fq` 的不动；`htb`/`tbf`/`netem`/设了带宽的 `cake`
    这类看起来特意建的原样留下、只告警并给出手工命令。内核没有 bbr 时先 `modprobe tcp_bbr`，仍然没有则退回
    `PRE_INSTALL_CC`，再退 cubic、reno，并告警用了哪一个。**只在本次运行时生效**：不写也不改 `/etc/sysctl.d`
    下的任何文件，重启后仍由那些文件决定，结束时会提示。
@@ -924,6 +934,7 @@ ss -tin | grep -c skyline_cc       # 仍在引用它的连接数
 | `ssctl` 报 `connect to /run/skyline-speeder/speeder.sock` | daemon 没起来或还在启动（§5.1）；`journalctl -u skyline-speederd.service` |
 | 状态是 `○ STANDBY` | 没挂载：`systemctl enable --now skyline-speeder-enable.service` 或 `ssctl enable`（§5） |
 | 状态是 `○ ATTACHED, NOT DEFAULT` | 默认拥塞控制被改走了：看 DRIFT GUARD 段落与 `guard:` 日志（§9） |
+| 状态是 `○ DRAINING` | 执行过 drain、还在等存量连接（经 SSH 必然如此，§11.1）：要恢复加速就 `ssctl enable` |
 | 重启后没有挂载 | enable unit 没有启用：G6（§6） |
 | `rack_rto.stats` 一直是 0 | §7 的诊断表 |
 | 网卡 qdisc 不是 `fq` | DRIFT GUARD 段落的 `notes`（§9） |
@@ -946,7 +957,8 @@ ss -tin | grep -c skyline_cc       # 仍在引用它的连接数
   触发，§13.3），其余就是顶到上限的 ACK。
 - `/run/skyline-speeder/state.json` 只在 daemon 启动时和每次成功处理请求后改写，**不是**实时状态；监控请调用
   `ssctl status --json`。
-- `ssctl snapshot <路径>` 由 daemon 写文件，相对路径按 daemon 的工作目录解析。systemd 主机上 daemon 跑在
+- `ssctl snapshot <路径>` 由 daemon 写文件，相对路径按 daemon 的工作目录解析；只写普通文件，目标是符号链接、
+  目录、设备或 FIFO 时拒绝（0.5.2 起）。systemd 主机上 daemon 跑在
   `ProtectSystem=strict` 与私有 `/tmp` 里：大部分路径对它只读，它写进 `/tmp` 的文件你看不到，写到
   `/run/skyline-speeder/` 下最稳妥。
 

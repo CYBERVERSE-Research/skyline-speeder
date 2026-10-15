@@ -10,10 +10,12 @@ use std::str::FromStr;
 use thiserror::Error;
 
 /// ABI version for `KernelConfig` and `SkylineMetrics`, matched against
-/// `bpf/include/skyline_abi.h`'s `SKYLINE_ABI_VERSION`. `skyline_adopt_config()`
-/// on the BPF side adopts nothing on a version mismatch rather than
-/// misinterpreting the struct layout, and skyline_cc then leaves every
-/// connection alone without reporting anything. See
+/// `bpf/include/skyline_abi.h`'s `SKYLINE_ABI_VERSION`. skyline-speederd
+/// refuses a skyline_cc.bpf.o built for another (its `.rodata.abi` section
+/// says which); behind that, `skyline_adopt_config()` on the BPF side adopts
+/// nothing on a mismatch rather than misinterpreting the struct layout, and
+/// such a connection runs unpaced, its window grown as Reno's, without
+/// anything reporting it. See
 /// `bpf/include/skyline_abi.h`'s top-of-file comment for what the current
 /// layout encodes (target deployment envelope, M2/M3 semantics, the
 /// queue-delay/ECN guardrail's `guardrail_gain_permille`).
@@ -147,7 +149,11 @@ pub struct LossClassifierConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
     pub bpf_dir: PathBuf,
-    pub pin_dir: PathBuf,
+    /// Not read: nothing is pinned. Optional, and still accepted -- every
+    /// installed configuration has it, and `from_toml` would refuse it as an
+    /// unknown key if the field went away.
+    #[serde(default)]
+    pub pin_dir: Option<PathBuf>,
     pub cgroup_path: PathBuf,
     pub socket_path: PathBuf,
     pub state_path: PathBuf,
@@ -617,7 +623,7 @@ impl SkylineConfig {
         let config: Self = toml::Value::Table(file.clone())
             .try_into()
             .map_err(ConfigError::Parse)?;
-        let Ok(toml::Value::Table(known)) = toml::Value::try_from(&config) else {
+        let Ok(toml::Value::Table(known)) = toml::Value::try_from(&with_every_key(&config)) else {
             return Err(ConfigError::Invalid(
                 "the configuration could not be written back out to check it for unknown keys",
             ));
@@ -640,8 +646,61 @@ impl SkylineConfig {
                 "fallback_cc must contain between 1 and 15 bytes",
             ));
         }
+        // fallback_cc is what new connections get while skyline_cc is not
+        // there: drain writes it and then unregisters skyline_cc, which would
+        // leave the default naming an algorithm that no longer exists.
+        if self.fallback_cc == SKYLINE_CC_NAME {
+            return Err(ConfigError::Invalid(
+                "fallback_cc must name another algorithm than skyline_cc",
+            ));
+        }
+        // Every float below goes to the kernel through permille(), which turns
+        // a NaN into 0 and an infinity into u32::MAX, and serde_json writes
+        // either as null, which no reader of `status` decodes. A NaN also
+        // compares false with everything, so a check such as `< 1.0` lets it
+        // through. TOML spells both (`nan`, `inf`), and so does a shell.
+        for (name, value) in [
+            ("max_queue_delay_ratio", self.max_queue_delay_ratio),
+            (
+                "startup_growth_ratio",
+                self.adaptive_cwnd.startup_growth_ratio,
+            ),
+            ("startup_gain", self.adaptive_cwnd.startup_gain),
+            (
+                "cruise_inflight_gain",
+                self.adaptive_cwnd.cruise_inflight_gain,
+            ),
+            ("cruise_pacing_gain", self.adaptive_cwnd.cruise_pacing_gain),
+            ("guardrail_gain", self.adaptive_cwnd.guardrail_gain),
+            (
+                "loss_inflation_max_ratio",
+                self.loss_classifier.loss_inflation_max_ratio,
+            ),
+        ] {
+            if !value.is_finite() {
+                return Err(ConfigError::NotFinite(name, value));
+            }
+        }
         if self.max_cwnd_packets < 4 {
             return Err(ConfigError::Invalid("max_cwnd_packets must be at least 4"));
+        }
+        // skyline_init() writes the initial window as it is, before any ACK
+        // has gone through the cap.
+        if self.initial_cwnd_packets > self.max_cwnd_packets {
+            return Err(ConfigError::Invalid(
+                "initial_cwnd_packets must not exceed max_cwnd_packets",
+            ));
+        }
+        // 0 makes the min-RTT filter forget every sample at once, so the base
+        // RTT is always the current one and the queue-delay guardrail, which
+        // measures against it, never sees a queue. The kernel side holds the
+        // window in microseconds in 32 bits.
+        if !(1..=MAX_MIN_RTT_WINDOW_S).contains(&self.adaptive_cwnd.min_rtt_window_s) {
+            return Err(ConfigError::Range(
+                "min_rtt_window_s",
+                "1..=4294",
+                self.adaptive_cwnd.min_rtt_window_s,
+            ));
         }
         // The BPF side takes max(min_cwnd_packets, SKYLINE_MIN_CWND), so a
         // smaller value would be silently ignored -- reject it here instead.
@@ -684,13 +743,20 @@ impl SkylineConfig {
         }
         // Every mode gain must be >= 1.0 -- fairness is not a design goal;
         // nothing here is meant to ever send slower than the neutral rate.
-        if self.adaptive_cwnd.startup_gain < 1.0
-            || self.adaptive_cwnd.cruise_inflight_gain < 1.0
-            || self.adaptive_cwnd.cruise_pacing_gain < 1.0
-        {
-            return Err(ConfigError::Invalid(
-                "adaptive_cwnd gains must all be >= 1.0",
-            ));
+        // And at most MAX_MODE_GAIN: skyline_apply_pacing() multiplies the
+        // gain by M3's compensation (up to 2.0x, see above) in 32-bit
+        // permille, which wraps a little above 2147x into a small gain.
+        for (name, gain) in [
+            ("startup_gain", self.adaptive_cwnd.startup_gain),
+            (
+                "cruise_inflight_gain",
+                self.adaptive_cwnd.cruise_inflight_gain,
+            ),
+            ("cruise_pacing_gain", self.adaptive_cwnd.cruise_pacing_gain),
+        ] {
+            if !(1.0..=MAX_MODE_GAIN).contains(&gain) {
+                return Err(ConfigError::Gain(name, gain));
+            }
         }
         // The guardrail gain is the one deliberate exception to "gains
         // are always >= 1.0" above -- it exists specifically to cut below
@@ -888,18 +954,43 @@ fn unknown_keys(
     }
 }
 
+/// `config` with every optional key given a value, for `from_toml` to write
+/// out: the TOML writer leaves out a `None`, and a key written in the wrong
+/// table is by construction not also set in its own, so neither check could
+/// tell it is a key of the configuration at all. The values are never used.
+fn with_every_key(config: &SkylineConfig) -> SkylineConfig {
+    let mut full = config.clone();
+    let tuning = &mut full.rack_tuning;
+    tuning.tcp_recovery.get_or_insert(0);
+    tuning.tcp_reordering.get_or_insert(0);
+    tuning.tcp_early_retrans.get_or_insert(0);
+    full.runtime.tc_interface.get_or_insert_with(String::new);
+    full.runtime.pin_dir.get_or_insert_with(PathBuf::new);
+    full
+}
+
 /// Where `key` is a key of the configuration, other than in the table named
-/// `not_in` ("" for the top level).
+/// `not_in` ("" for the top level). Every table that has it: `enabled` is a
+/// key of three.
 fn home_of(root: &toml::Table, key: &str, not_in: &str) -> Option<String> {
     if !not_in.is_empty() && root.get(key).is_some_and(|value| !value.is_table()) {
         return Some("a top-level key, written above the first [table]".to_owned());
     }
-    root.iter().find_map(|(name, value)| match value {
-        toml::Value::Table(table) if name != not_in && table.contains_key(key) => {
-            Some(format!("a key of [{name}]"))
-        }
-        _ => None,
-    })
+    let homes: Vec<String> = root
+        .iter()
+        .filter(|(name, value)| {
+            name.as_str() != not_in
+                && value
+                    .as_table()
+                    .is_some_and(|table| table.contains_key(key))
+        })
+        .map(|(name, _)| format!("[{name}]"))
+        .collect();
+    match homes.as_slice() {
+        [] => None,
+        [one] => Some(format!("a key of {one}")),
+        [rest @ .., last] => Some(format!("a key of {} or {last}", rest.join(", "))),
+    }
 }
 
 fn default_true() -> bool {
@@ -909,6 +1000,17 @@ fn default_true() -> bool {
 /// `SKYLINE_MIN_CWND` in `bpf/skyline_cc.bpf.c` -- the fixed floor the M2-off
 /// path keeps, and the lowest value `min_cwnd_packets` may take.
 pub const MIN_CWND_FLOOR: u32 = 4;
+
+/// The largest `startup_gain` / `cruise_inflight_gain` / `cruise_pacing_gain`:
+/// far above anything that means something, and clear of the 32-bit wrap
+/// in skyline_apply_pacing(), where the gain in permille is multiplied by
+/// M3's compensation in permille (up to 2000, at `loss_inflation_max_ratio`
+/// 0.5): 1,000,000 x 2000 still fits, 2,147,484 x 2000 does not.
+pub const MAX_MODE_GAIN: f64 = 1000.0;
+
+/// The largest `min_rtt_window_s`: the kernel side holds the window in
+/// microseconds in a u32.
+pub const MAX_MIN_RTT_WINDOW_S: u32 = 4294;
 
 fn default_min_cwnd_packets() -> u32 {
     MIN_CWND_FLOOR
@@ -1063,7 +1165,6 @@ pub struct TcStats {
     pub packets: u64,
     pub bytes: u64,
     pub gso_packets: u64,
-    pub drops: u64,
 }
 
 /// Mirrors `struct skyline_rto_stats` (`bpf/include/skyline_abi.h`).
@@ -1346,6 +1447,18 @@ pub struct RuntimeStatus {
     /// than the field.
     #[serde(default)]
     pub attached_s: Option<u64>,
+    /// A drain has moved new connections to `fallback_cc`, disarmed the guard
+    /// and stopped first-flight copies, and skyline_cc stays registered until
+    /// its last connections close: what a drain that timed out leaves behind
+    /// (one run over SSH always does, that connection being one of them).
+    /// Without it that state read as skyline_cc having been switched off
+    /// behind the daemon's back. False from a daemon older than the field.
+    #[serde(default)]
+    pub draining: bool,
+    /// `runtime.cgroup_path`, where skyline_policy is attached. `None` from a
+    /// daemon older than the field.
+    #[serde(default)]
+    pub cgroup_path: Option<PathBuf>,
 }
 
 /// One TCP connection the kernel currently runs on `skyline_cc`, as
@@ -1509,6 +1622,12 @@ pub enum ConfigError {
     /// The name, the largest value it takes, and the value given.
     #[error("{0} must be between 0.0 and {1:?}, got {2:?}")]
     Ratio(&'static str, f64, f64),
+    /// A mode gain's name and the value given; see `MAX_MODE_GAIN`.
+    #[error("{0} must be between 1.0 and {max:?}, got {1:?}", max = MAX_MODE_GAIN)]
+    Gain(&'static str, f64),
+    /// The name and the value given: a NaN or an infinity.
+    #[error("{0} must be a finite number, got {1}")]
+    NotFinite(&'static str, f64),
     /// Keys the file has and the configuration does not: see
     /// `SkylineConfig::from_toml`.
     #[error("the configuration has keys skyline-speederd does not know and would ignore: {0}")]
@@ -2101,7 +2220,10 @@ mod tests {
         let mut tuning = ModuleTuningConfig::from_config(&config);
         tuning.cruise_inflight_gain = 0.5;
         tuning.apply_to(&mut config);
-        assert!(matches!(config.validate(), Err(ConfigError::Invalid(_))));
+        assert_eq!(
+            config.validate().expect_err("below 1.0").to_string(),
+            "cruise_inflight_gain must be between 1.0 and 1000.0, got 0.5"
+        );
 
         let mut config = base.clone();
         let mut tuning = ModuleTuningConfig::from_config(&config);
@@ -2211,5 +2333,141 @@ mod tests {
         assert_eq!(config.redundancy.first_kib, 32);
         assert_eq!(config.redundancy.delay_ms, 5);
         assert_eq!(config.rack_tuning.tcp_recovery, Some(1));
+    }
+
+    /// An optional key that is not set anywhere else still has a home, and a
+    /// key of several tables names them all: `enabled` used to be put down
+    /// to [rack_rto] alone, the first table in name order.
+    #[test]
+    fn a_misplaced_key_names_every_table_it_belongs_to() {
+        let refused = |text: &str| {
+            SkylineConfig::from_toml(text)
+                .expect_err("misplaced key")
+                .to_string()
+        };
+        let text = shipped_text().replacen("\n[guard]\n", "\n[guard]\nenabled = false\n", 1);
+        assert!(refused(&text).ends_with(
+            "enabled in [guard] (it is a key of [rack_rto], [redundancy] or [retransmit_dscp])"
+        ));
+        let text =
+            shipped_text().replacen("generation = 1\n", "generation = 1\ntcp_recovery = 1\n", 1);
+        assert!(refused(&text)
+            .ends_with("tcp_recovery at the top level (it is a key of [rack_tuning])"));
+        let shipped = shipped_text();
+        let interface = shipped
+            .lines()
+            .find(|line| line.starts_with("tc_interface = "))
+            .expect("the shipped config names an interface");
+        let text = shipped.replacen(&format!("{interface}\n"), "", 1).replacen(
+            "generation = 1\n",
+            &format!("generation = 1\n{interface}\n"),
+            1,
+        );
+        assert!(
+            refused(&text).ends_with("tc_interface at the top level (it is a key of [runtime])")
+        );
+    }
+
+    /// Nothing reads it, and a configuration without it is as good as one
+    /// with it; every installed configuration still has it.
+    #[test]
+    fn pin_dir_is_optional() {
+        let shipped = shipped_text();
+        let line = shipped
+            .lines()
+            .find(|line| line.starts_with("pin_dir = "))
+            .expect("the shipped config has pin_dir");
+        assert!(SkylineConfig::from_toml(&shipped)
+            .expect("with pin_dir")
+            .runtime
+            .pin_dir
+            .is_some());
+        let without = shipped.replacen(&format!("{line}\n"), "", 1);
+        let config = SkylineConfig::from_toml(&without).expect("without pin_dir");
+        assert_eq!(config.runtime.pin_dir, None);
+        config.validate().expect("valid without pin_dir");
+    }
+
+    /// TOML spells `nan` and `inf`. Neither may reach permille(), and a NaN
+    /// passed the `< 1.0`-style checks because it compares false with
+    /// everything.
+    #[test]
+    fn non_finite_floats_are_refused() {
+        let text = shipped_text().replacen("startup_gain = 3.0", "startup_gain = nan", 1);
+        let config = SkylineConfig::from_toml(&text).expect("TOML takes nan");
+        assert_eq!(
+            config.validate().expect_err("nan").to_string(),
+            "startup_gain must be a finite number, got NaN"
+        );
+        let base = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        let setters: [fn(&mut ModuleTuningConfig); 7] = [
+            |tuning: &mut ModuleTuningConfig| tuning.cruise_pacing_gain = f64::INFINITY,
+            |tuning: &mut ModuleTuningConfig| tuning.cruise_inflight_gain = f64::NAN,
+            |tuning: &mut ModuleTuningConfig| tuning.max_queue_delay_ratio = f64::INFINITY,
+            |tuning: &mut ModuleTuningConfig| tuning.max_queue_delay_ratio = f64::NAN,
+            |tuning: &mut ModuleTuningConfig| tuning.startup_growth_ratio = f64::NAN,
+            |tuning: &mut ModuleTuningConfig| tuning.guardrail_gain = f64::NAN,
+            |tuning: &mut ModuleTuningConfig| tuning.loss_inflation_max_ratio = f64::NAN,
+        ];
+        for set in setters {
+            let mut config = base.clone();
+            let mut tuning = ModuleTuningConfig::from_config(&config);
+            set(&mut tuning);
+            tuning.apply_to(&mut config);
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::NotFinite(_, _))
+            ));
+        }
+    }
+
+    #[test]
+    fn mode_gains_stay_below_the_kernel_side_wrap() {
+        let base = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        let mut config = base.clone();
+        config.adaptive_cwnd.startup_gain = MAX_MODE_GAIN;
+        config.loss_classifier.loss_inflation_max_ratio = 0.5;
+        config
+            .validate()
+            .expect("the largest gain at the largest compensation");
+        // What the kernel side computes: permille x permille in 32 bits.
+        let gain = permille(MAX_MODE_GAIN);
+        let compensation = 1_000_000 / (1000 - permille(0.5));
+        assert!(gain.checked_mul(compensation).is_some());
+
+        let mut config = base;
+        config.adaptive_cwnd.cruise_pacing_gain = 2148.0;
+        assert_eq!(
+            config.validate().expect_err("wraps").to_string(),
+            "cruise_pacing_gain must be between 1.0 and 1000.0, got 2148.0"
+        );
+    }
+
+    #[test]
+    fn values_the_kernel_side_cannot_honour_are_refused() {
+        let base = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+
+        let mut config = base.clone();
+        config.fallback_cc = SKYLINE_CC_NAME.to_owned();
+        assert_eq!(
+            config.validate().expect_err("skyline_cc").to_string(),
+            "fallback_cc must name another algorithm than skyline_cc"
+        );
+
+        let mut config = base.clone();
+        config.initial_cwnd_packets = config.max_cwnd_packets + 1;
+        assert!(config.validate().is_err());
+        config.initial_cwnd_packets = config.max_cwnd_packets;
+        config.validate().expect("at the cap");
+
+        let mut config = base.clone();
+        config.adaptive_cwnd.min_rtt_window_s = 0;
+        assert_eq!(
+            config.validate().expect_err("0").to_string(),
+            "min_rtt_window_s must be 1..=4294, got 0"
+        );
+        config.adaptive_cwnd.min_rtt_window_s = MAX_MIN_RTT_WINDOW_S;
+        config.validate().expect("the largest window");
+        assert!(MAX_MIN_RTT_WINDOW_S.checked_mul(1_000_000).is_some());
     }
 }

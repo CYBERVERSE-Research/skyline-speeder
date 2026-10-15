@@ -19,23 +19,29 @@
 # whatever root qdisc it had come up with, and a later `sysctl --system`
 # re-applying a "one-click BBR" file undid it anyway.)
 #
-# skyline-speederd.service has no systemd readiness notification, so the control
-# socket may not exist yet when this runs; wait for it rather than racing it.
+# skyline-speederd.service has no systemd readiness notification, so the
+# daemon may not be listening yet when this runs; wait for it to answer rather
+# than racing it. An answer, not the socket file: a daemon that was killed
+# leaves its socket behind, and under OpenRC nothing empties
+# /run/skyline-speeder between a stop and the next start, so after a restart
+# the file could be there before anything listened on it, `ssctl enable`
+# failed, and the host stayed on fallback_cc.
 set -eu
 
 SOCKET=${SKYLINE_SOCKET:-/run/skyline-speeder/speeder.sock}
 TIMEOUT=${SKYLINE_SOCKET_TIMEOUT:-60}
 DEADLINE=$(( $(date +%s) + TIMEOUT ))
 
-while [ ! -S "$SOCKET" ]; do
+until [ -S "$SOCKET" ] \
+    && timeout 10 /usr/local/bin/ssctl --socket "$SOCKET" status --json >/dev/null 2>&1; do
     if [ "$(date +%s)" -ge "$DEADLINE" ]; then
-        echo "timed out after ${TIMEOUT}s waiting for $SOCKET" >&2
+        echo "timed out after ${TIMEOUT}s waiting for skyline-speederd to answer on $SOCKET" >&2
         exit 1
     fi
     sleep 1
 done
 
-/usr/local/bin/ssctl enable >/dev/null
+/usr/local/bin/ssctl --socket "$SOCKET" enable >/dev/null
 
 # Read the sysctl back rather than trusting the exit status: this is the line
 # that would catch `ssctl enable` succeeding while the default silently stayed

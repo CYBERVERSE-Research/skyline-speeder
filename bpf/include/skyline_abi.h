@@ -4,13 +4,20 @@
 #ifndef __SKYLINE_ABI_H
 #define __SKYLINE_ABI_H
 
-/* ABI version for struct skyline_config / struct skyline_flow_state /
- * struct skyline_metrics below. The BPF object and its userspace loader must
- * agree on this value -- skyline_adopt_config() in skyline_cc.bpf.c checks it
- * and adopts nothing on a mismatch rather than misinterpreting the struct
- * layout, so skyline_cc then leaves every connection's cwnd and pacing alone.
- * Nothing reports that: it only shows as connections that are on skyline_cc
- * and are never adjusted.
+/* ABI version for struct skyline_config and struct skyline_metrics below,
+ * the two layouts skyline-speederd writes and reads. (struct
+ * skyline_flow_state lives in the object's socket storage, which user space
+ * never reads: its layout is the object's own.) The BPF object and its
+ * userspace loader must agree on this value. skyline-speederd checks before
+ * it loads skyline_cc.bpf.o -- the object carries the version it was built
+ * for in its .rodata.abi section (skyline_abi_version) -- and refuses
+ * another, or none. Behind that, skyline_adopt_config() in skyline_cc.bpf.c
+ * adopts nothing on a mismatch rather than misinterpreting the struct
+ * layout, which an older daemon that does not check can still bring about:
+ * such a connection grows its window as the kernel's Reno would, gets no
+ * pacing rate, and nothing reports it -- active_flows grows while
+ * metrics.ack_events does not. A struct skyline_config of another size
+ * fails loudly instead, when skyline-speederd writes it into config_slots.
  *
  * The target deployment environment is fixed: 10-20% sustained random loss,
  * 100-300ms RTT, fairness explicitly not a goal. M2 owns cwnd directly in
@@ -208,7 +215,6 @@ struct skyline_flow_state {
     __u32 config_seq;
     __u32 mode;
     __u32 counted;
-    __u32 round_count;
     __u32 plateau_rounds;
     __u32 prior_cwnd;
     __u32 w_max;
@@ -229,7 +235,6 @@ struct skyline_flow_state {
     __u64 prior_round_bw_bps;
     __u64 round_rate_bps;
     __u64 bw_samples[10];
-    __u32 bw_sample_index;
     /* K (the cubic-curve time-to-reach-w_max constant, milliseconds),
      * frozen once per growth epoch by skyline_cubic_target() the first time it
      * runs after flow->epoch_start_ns is reset to 0. Must NOT be recomputed
@@ -240,19 +245,18 @@ struct skyline_flow_state {
     __u32 epoch_k_ms;
     __u64 next_round_delivered;
     __u64 epoch_start_ns;
-    __u64 neutral_pacing_rate;
-    __u32 neutral_pacing_status;
     /* PRR (RFC 6937) accounting, mirroring the kernel's own
-     * tp->prr_delivered/tp->prr_out (net/ipv4/tcp_input.c's
-     * tcp_cwnd_reduction()) -- Skyline Speeder must keep its own copies because
-     * cong_control makes the kernel skip that function entirely. Only
-     * exercised on the M2-off path (see skyline_abi.h's top-of-file comment --
-     * M2 on bypasses PRR entirely). Reset to 0 by skyline_set_state() on every
-     * fresh TCP_CA_Recovery/TCP_CA_CWR entry (a new epoch) and by
+     * tp->prr_delivered (net/ipv4/tcp_input.c's tcp_cwnd_reduction()) --
+     * cong_control makes the kernel skip that function, the only place it
+     * counts delivered segments. tp->prr_out it still keeps (the transmit
+     * paths add what they send during CWR and Recovery), and
+     * skyline_apply_prr() reads that one. Only exercised on the M2-off path
+     * (see skyline_abi.h's top-of-file comment -- M2 on bypasses PRR
+     * entirely). Reset to 0 by skyline_set_state() on every fresh
+     * TCP_CA_Recovery/TCP_CA_CWR entry (a new epoch) and by
      * skyline_reset_generation(). See skyline_apply_prr().
      */
     __u32 prr_delivered;
-    __u32 prr_out;
     /* Real CUBIC's "TCP-friendly region" Reno estimate (net/ipv4/tcp_cubic.c's
      * bictcp_update():219,237-238,299-316) -- mirrors ca->tcp_cwnd/ca->ack_cnt.
      * Reset to the pre-cut cwnd / 0 whenever skyline_grow_cwnd() (M2 off) starts a
@@ -295,11 +299,14 @@ struct skyline_flow_state {
      */
     __u32 queue_clamped;
     /* The flow's own copy of the configuration it runs on, taken by
-     * skyline_adopt_config() at skyline_init() and then only at a round
-     * boundary. Every coefficient the flow reads comes from here, never from
-     * config_slots directly, so a configuration published in the middle of
-     * a round cannot change a value under the flow before the round ends --
-     * however many are published, and however long the flow sits idle.
+     * skyline_adopt_config() when the flow starts -- on the ACK that
+     * completes the handshake, which reaches cong_control before init, and
+     * again at skyline_init() -- and then only at a round boundary; a flow
+     * without one tries again on every ACK. Every coefficient the flow
+     * reads comes from here, never from config_slots directly, so a
+     * configuration published in the middle of a round cannot change a value
+     * under the flow before the round ends -- however many are published,
+     * and however long the flow sits idle.
      * abi_version != SKYLINE_ABI_VERSION means none has been adopted yet.
      */
     struct skyline_config config;
@@ -353,7 +360,6 @@ struct skyline_tc_stats {
     __u64 packets;
     __u64 bytes;
     __u64 gso_packets;
-    __u64 drops;
 };
 
 /* M1 per-flow dynamic RTO floor + ceiling tuning. Deliberately independent
@@ -426,7 +432,7 @@ struct skyline_rto_stats {
  * deployment, not every round, so a single fully-overwritten array-map slot
  * is enough -- no double-buffering concern. Consumed only by skyline_tc.bpf.c
  * (bpf/skyline_tc.bpf.c), which is interface-wide (not cgroup-scoped) egress on
- * data0, so this marks retransmits for ALL TCP flows on that interface
+ * runtime.tc_interface, so this marks retransmits for ALL TCP flows on it
  * regardless of which congestion control they run (stock CUBIC, BBR, or
  * skyline_cc alike) -- a deliberate scope choice, not an oversight: detection
  * happens by comparing the packet's own TCP sequence number against
@@ -520,10 +526,12 @@ struct skyline_retransmit_dscp_stats {
 };
 
 /* First-flight redundancy, carried out by skyline_tc.bpf.c: every SYN-ACK
- * this host sends, every SYN a skyline_cc socket sends, and every segment of
- * a skyline_cc connection that starts within the first `bytes` of what the
- * connection has sent goes out twice -- the original at once, a copy
- * `delay_us` later.
+ * that leaves tc_interface with a socket -- whichever congestion control its
+ * connection will run, since none is chosen yet when it leaves; a syncookie
+ * SYN-ACK carries no socket and is not copied -- every SYN a skyline_cc
+ * socket sends, and every segment of a skyline_cc connection that starts
+ * within the first `bytes` of what the connection has sent goes out twice --
+ * the original at once, a copy `delay_us` later.
  *
  * Why: on a lossy long-haul path a short response spends most of its life
  * waiting for loss recovery, not transferring. A 15-35 KB response fits in
@@ -546,7 +554,7 @@ struct skyline_retransmit_dscp_stats {
  * timestamp -- a packet with a socket is never taken for a copy, and a copy
  * is never copied again.
  *
- * Cost: the first `bytes` of every connection a second time -- up to one
+ * Cost: the first `bytes` of every skyline_cc connection a second time -- up to one
  * GSO packet more, since a segment is copied when it starts inside the
  * range -- plus every retransmission of that range and every SYN or SYN-ACK,
  * retransmitted ones included. There is no per-connection bound: a

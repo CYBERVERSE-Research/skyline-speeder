@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "skyline-common"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "bitflags",
  "bytemuck",
@@ -379,12 +379,13 @@ dependencies = [
 
 [[package]]
 name = "skyline-speederd"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "bytemuck",
  "clap",
  "libbpf-rs",
+ "libc",
  "serde_json",
  "signal-hook",
  "skyline-common",
@@ -392,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "ssctl"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "clap",

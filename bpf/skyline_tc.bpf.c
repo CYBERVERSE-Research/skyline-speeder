@@ -492,13 +492,15 @@ static __always_inline bool skyline_redundancy_copy(struct __sk_buff *skb)
 /* First pass: decides whether this packet is one skyline_abi.h's
  * struct skyline_redundancy_config says to send twice, and if so clones it
  * back to the same device. Everything that is not clearly one of those --
- * a packet this parser cannot place, a socket that is not skyline_cc, a
- * segment past the first `bytes` -- goes out once, untouched.
+ * a packet this parser cannot place, a SYN or data segment of a socket that
+ * is not skyline_cc, a segment past the first `bytes` -- goes out once,
+ * untouched. A SYN-ACK is the exception: see below.
  *
  * The data offset is where the segment starts within everything the
- * connection has sent: snd_una - bytes_acked is the first data sequence
- * number (ISN + 1) for the connection's whole life, so this needs no
- * per-connection state. Retransmissions of that range are copied too.
+ * connection has sent: bytes_acked, which the kernel counts in 64 bits for
+ * the connection's whole life, plus how far past snd_una the segment
+ * starts, so this needs no per-connection state. Retransmissions of that
+ * range are copied too.
  */
 static __always_inline void skyline_redundancy_duplicate(struct __sk_buff *skb,
                                                      struct skyline_redundancy_config *cfg,
@@ -535,8 +537,13 @@ static __always_inline void skyline_redundancy_duplicate(struct __sk_buff *skb,
     if (!sk)
         return;
     if (!(tcp->syn && tcp->ack)) {
-        /* A SYN-ACK belongs to a request socket, which has no congestion
-         * control yet; everything else must come from a skyline_cc socket.
+        /* A SYN-ACK leaves before its connection has a congestion control --
+         * the socket it carries is the listener's request socket (a Fast
+         * Open SYN-ACK's is the new child), and the route, the listener's
+         * own setsockopt, the namespace default and skyline_policy all
+         * still have a say -- so every SYN-ACK with a socket is copied,
+         * whatever its connection will run. Everything else must come from
+         * a skyline_cc socket.
          */
         tp = bpf_skc_to_tcp_sock(sk);
         if (!tp || !skyline_runs_skyline_cc(tp))
@@ -546,7 +553,11 @@ static __always_inline void skyline_redundancy_duplicate(struct __sk_buff *skb,
 
             if (skb->len <= header_len)
                 return; /* pure ACK, bare FIN */
-            if (bpf_ntohl(tcp->seq) - (tp->snd_una - (__u32)tp->bytes_acked) >= cfg->bytes)
+            /* In 64 bits: the 32-bit sequence space comes round every
+             * 4 GiB, and an offset taken in it put the first `bytes` of
+             * every 4 GiB of a connection inside the range again.
+             */
+            if (tp->bytes_acked + (__u32)(bpf_ntohl(tcp->seq) - tp->snd_una) >= cfg->bytes)
                 return;
         }
     }

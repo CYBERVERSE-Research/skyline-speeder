@@ -132,6 +132,22 @@ fn carrying_traffic(status: &RuntimeStatus) -> bool {
     status.enabled && status.guard.live.tcp_congestion_control == SKYLINE_CC_NAME
 }
 
+/// A drain that has not finished: new connections are on fallback_cc by the
+/// operator's own command, and skyline_cc only serves the ones it had. Not
+/// the "switched back behind the daemon's back" a bare `!carrying` reads as.
+fn draining(status: &RuntimeStatus) -> bool {
+    status.enabled && status.draining && !carrying_traffic(status)
+}
+
+/// Where skyline_policy is attached: `runtime.cgroup_path`, or the shipped
+/// default from a daemon that does not report it.
+fn cgroup(status: &RuntimeStatus) -> String {
+    status.cgroup_path.as_deref().map_or_else(
+        || "/sys/fs/cgroup/skyline-speeder".to_owned(),
+        |path| path.display().to_string(),
+    )
+}
+
 fn module_label(module: Module) -> &'static str {
     match module {
         Module::EarlyLoss => "M1 early-loss",
@@ -162,8 +178,11 @@ pub fn status(theme: &Theme, response: &Response) -> String {
     let live = &status.guard.live;
     let carrying = carrying_traffic(status);
 
+    let draining = draining(status);
     let (verdict, verdict_mark) = if carrying {
         ("ACCELERATING", Mark::Good)
+    } else if draining {
+        ("DRAINING", Mark::Info)
     } else if status.enabled {
         ("ATTACHED, NOT DEFAULT", Mark::Warn)
     } else {
@@ -212,6 +231,18 @@ pub fn status(theme: &Theme, response: &Response) -> String {
                 theme.dim("every new connection")
             ),
         );
+    } else if draining {
+        page.row(Mark::Off, "host default cc", &theme.dim(default_cc));
+        page.note(&format!(
+            "draining: new connections use {default_cc}; skyline_cc stays registered until its \
+             last {} connections close",
+            count(status.active_flows)
+        ));
+        page.note(&format!(
+            "{} waits for them again, {} takes the host back",
+            theme.command("ssctl drain"),
+            theme.command("ssctl enable")
+        ));
     } else if status.enabled {
         page.row(Mark::Bad, "host default cc", &theme.red(default_cc));
         page.note("skyline_cc is loaded but new connections do not use it");
@@ -267,7 +298,7 @@ pub fn status(theme: &Theme, response: &Response) -> String {
     );
 
     page.blank();
-    guard_section(&mut page, theme, &status.guard, status.enabled);
+    guard_section(&mut page, theme, &status.guard, status.enabled, draining);
 
     // --- kernel support ----------------------------------------------------
     page.blank();
@@ -399,12 +430,12 @@ pub fn status(theme: &Theme, response: &Response) -> String {
             "skyline_cc is not attached: this host is not accelerated ({})",
             theme.command("ssctl enable")
         ));
-    } else if !carrying {
+    } else if !carrying && !draining {
         warnings.push(format!(
             "new connections use {default_cc}, not skyline_cc -- the acceleration is bypassed"
         ));
     }
-    if status.enabled && !status.guard.armed {
+    if status.enabled && !status.guard.armed && !draining {
         warnings.push(
             "the guard is not armed: a sysctl file or a \"one-click BBR\" script can move this \
              host off skyline_cc without any error"
@@ -413,11 +444,11 @@ pub fn status(theme: &Theme, response: &Response) -> String {
     }
     if let Some(stats) = &status.rack_rto.stats {
         if status.rack_rto.config.enabled && stats.established_cb == 0 {
-            warnings.push(
+            warnings.push(format!(
                 "dynamic RTO is on but skyline_policy has seen no connection: only processes \
-                 inside /sys/fs/cgroup/skyline-speeder pass through it"
-                    .to_owned(),
-            );
+                 inside {} pass through it",
+                cgroup(status)
+            ));
         }
     }
     warnings.extend(declared_but_off(theme, status));
@@ -443,13 +474,21 @@ pub fn status(theme: &Theme, response: &Response) -> String {
     page.finish()
 }
 
-fn guard_section(page: &mut Page<'_>, theme: &Theme, guard: &GuardStatus, enabled: bool) {
+fn guard_section(
+    page: &mut Page<'_>,
+    theme: &Theme,
+    guard: &GuardStatus,
+    enabled: bool,
+    draining: bool,
+) {
     let armed = if guard.armed {
         format!(
             "{}  {}",
             theme.bold_green("ARMED"),
             theme.dim(&format!("re-checked every {} s", guard.interval_s))
         )
+    } else if draining {
+        theme.dim("not armed (draining)").to_string()
     } else if enabled {
         theme.bold_yellow("NOT ARMED").to_string()
     } else {
@@ -457,7 +496,13 @@ fn guard_section(page: &mut Page<'_>, theme: &Theme, guard: &GuardStatus, enable
     };
     page.section("DRIFT GUARD");
     page.row(
-        if guard.armed { Mark::Good } else { Mark::Warn },
+        if guard.armed {
+            Mark::Good
+        } else if draining {
+            Mark::Off
+        } else {
+            Mark::Warn
+        },
         "state",
         &armed,
     );
@@ -602,8 +647,11 @@ pub fn flows(theme: &Theme, response: &Response) -> String {
     let carrying = carrying_traffic(status);
     let report = response.flows.clone().unwrap_or_default();
 
+    let draining = draining(status);
     let (verdict, mark) = if !status.enabled {
         ("NOT ACCELERATING", Mark::Bad)
+    } else if draining {
+        ("DRAINING", Mark::Info)
     } else if !carrying {
         ("BYPASSED", Mark::Warn)
     } else if report.on_skyline_cc == 0 {
@@ -630,6 +678,16 @@ pub fn flows(theme: &Theme, response: &Response) -> String {
             "attach it with: {}",
             theme.command("ssctl enable")
         ));
+        page.blank();
+    } else if draining {
+        page.row(
+            Mark::Off,
+            "host default cc",
+            &theme.dim(&status.guard.live.tcp_congestion_control),
+        );
+        page.note(
+            "draining: new connections no longer use skyline_cc; the ones below are its last",
+        );
         page.blank();
     } else if !carrying {
         page.row(
@@ -923,7 +981,10 @@ fn parameters(page: &mut Page<'_>, theme: &Theme, status: &RuntimeStatus) {
                 ),
             );
         }
-        page.note("only connections from /sys/fs/cgroup/skyline-speeder pass through it");
+        page.note(&format!(
+            "only connections from {} pass through it",
+            cgroup(status)
+        ));
         if !status.enabled {
             page.note("in force while skyline_cc is detached");
         }
@@ -975,11 +1036,21 @@ fn parameters(page: &mut Page<'_>, theme: &Theme, status: &RuntimeStatus) {
                 redundancy.config.first_kib, redundancy.config.delay_ms
             ),
         );
+    } else if redundancy.config.enabled && draining(status) {
+        page.row(
+            Mark::Off,
+            "first-flight copies",
+            &theme.dim("stopped by the drain; the next ssctl enable starts them again"),
+        );
     } else if redundancy.config.enabled && status.enabled {
         page.row(
             Mark::Warn,
             "first-flight copies",
-            "configured, not running: the TC program on runtime.tc_interface is not loaded",
+            if status.tc_stats.is_none() {
+                "configured, not running: the TC program on runtime.tc_interface is not loaded"
+            } else {
+                "configured, not running: see the message of the last ssctl enable"
+            },
         );
     } else {
         page.row(Mark::Off, "first-flight copies", &theme.dim("off"));
@@ -1173,15 +1244,6 @@ fn side_programs(page: &mut Page<'_>, theme: &Theme, status: &RuntimeStatus) {
                 count(tc.gso_packets)
             ),
         );
-        page.row(
-            if tc.drops == 0 {
-                Mark::Good
-            } else {
-                Mark::Warn
-            },
-            "drops",
-            &count(tc.drops),
-        );
         if let Some(dscp) = &status.retransmit_dscp.stats {
             if status.retransmit_dscp.config.enabled || dscp.retransmits_marked > 0 {
                 page.row(
@@ -1220,10 +1282,19 @@ fn side_programs(page: &mut Page<'_>, theme: &Theme, status: &RuntimeStatus) {
         }
     }
 
+    // skyline_policy counts every connection established in its cgroup,
+    // dynamic RTO on or off: "connections seen" is how to tell whether any
+    // process is in the cgroup at all. It used to show only while dynamic RTO
+    // was on, which since 0.5.1 it never is after a start.
     if let Some(rto) = &status.rack_rto.stats {
-        if status.rack_rto.config.enabled || rto.applied > 0 {
-            page.blank();
-            page.section("DYNAMIC RTO (skyline_policy)");
+        let dynamic_rto = status.rack_rto.config.enabled || rto.applied > 0;
+        page.blank();
+        page.section(if dynamic_rto {
+            "DYNAMIC RTO (skyline_policy)"
+        } else {
+            "CGROUP POLICY (skyline_policy)"
+        });
+        if dynamic_rto {
             page.row(
                 if rto.applied > 0 {
                     Mark::Good
@@ -1242,18 +1313,24 @@ fn side_programs(page: &mut Page<'_>, theme: &Theme, status: &RuntimeStatus) {
                     ))
                 ),
             );
-            page.row(
-                if rto.established_cb > 0 {
-                    Mark::Good
-                } else {
-                    Mark::Warn
-                },
-                "connections seen",
-                &count(rto.established_cb),
-            );
-            if rto.established_cb == 0 {
-                page.note("0 means no process is in /sys/fs/cgroup/skyline-speeder, not an error");
-            }
+        }
+        page.row(
+            match (rto.established_cb > 0, dynamic_rto) {
+                (true, _) => Mark::Good,
+                (false, true) => Mark::Warn,
+                // skyline_cc is host-wide either way; an empty cgroup only
+                // matters to dynamic RTO.
+                (false, false) => Mark::Off,
+            },
+            "connections seen",
+            &count(rto.established_cb),
+        );
+        if rto.established_cb == 0 {
+            page.note(&format!(
+                "0 means no process in {} has opened a connection since the daemon started, \
+                 not an error",
+                cgroup(status)
+            ));
         }
     }
 }
@@ -1439,7 +1516,6 @@ mod tests {
                 packets: 8_402_113,
                 bytes: 12_034_998_221,
                 gso_packets: 1_002,
-                drops: 0,
             }),
             metrics: Some(SkylineMetrics {
                 ack_events: 1_204_551,
@@ -1528,6 +1604,8 @@ mod tests {
             },
             uptime_s: 439_200,
             attached_s: Some(11_520),
+            draining: false,
+            cgroup_path: Some("/sys/fs/cgroup/skyline-speeder".into()),
         }
     }
 
@@ -1638,8 +1716,83 @@ mod tests {
         let mut missing_tc = healthy();
         missing_tc.redundancy.active = false;
         missing_tc.redundancy.stats = None;
+        missing_tc.tc_stats = None;
         let text = flows(&theme, &reply(missing_tc, Some(sample_flows())));
-        assert!(text.contains("configured, not running"));
+        assert!(text.contains("configured, not running: the TC program"));
+
+        // Loaded, and still not copying: not "not loaded".
+        let mut not_started = healthy();
+        not_started.redundancy.active = false;
+        let text = flows(&theme, &reply(not_started, Some(sample_flows())));
+        assert!(text.contains("configured, not running: see the message of the last ssctl enable"));
+        assert!(!text.contains("is not loaded"));
+    }
+
+    /// What a drain that timed out leaves -- and one run over SSH always
+    /// does: new connections on fallback_cc, the guard disarmed, no copies,
+    /// skyline_cc still serving its last connections. Both reports used to
+    /// call that a bypass and ask for `ssctl enable`.
+    #[test]
+    fn a_drain_in_progress_is_not_a_bypass() {
+        let theme = theme();
+        let mut draining = healthy();
+        draining.draining = true;
+        draining.guard.armed = false;
+        draining.guard.live.tcp_congestion_control = "bbr".to_owned();
+        draining.redundancy.active = false;
+        draining.active_flows = 3;
+
+        let text = status(&theme, &reply(draining.clone(), None));
+        assert!(text.contains("DRAINING"));
+        assert!(text.contains("last 3 connections close"));
+        assert!(text.contains("not armed (draining)"));
+        for wrong in [
+            "ATTACHED, NOT DEFAULT",
+            "something rewrote",
+            "the acceleration is bypassed",
+            "the guard is not armed",
+        ] {
+            assert!(!text.contains(wrong), "{wrong}");
+        }
+
+        let text = flows(&theme, &reply(draining.clone(), Some(sample_flows())));
+        assert!(text.contains("DRAINING"));
+        assert!(text.contains("stopped by the drain"));
+        assert!(!text.contains("BYPASSED"));
+        assert!(!text.contains("is not loaded"));
+
+        // Taken back by an enable, or switched back by something else: the
+        // field alone does not make it a drain.
+        let mut taken_back = draining;
+        taken_back.guard.live.tcp_congestion_control = SKYLINE_CC_NAME.to_owned();
+        let text = status(&theme, &reply(taken_back, None));
+        assert!(text.contains("ACCELERATING"));
+    }
+
+    /// skyline_policy counts every connection in its cgroup whether or not
+    /// dynamic RTO is on, and since 0.5.1 dynamic RTO is off after every
+    /// start: the row that tells whether anything is in the cgroup has to
+    /// be there then too, naming the cgroup the daemon was configured with.
+    #[test]
+    fn connections_seen_is_shown_while_dynamic_rto_is_off() {
+        let theme = theme();
+        let mut status = healthy();
+        assert!(!status.rack_rto.config.enabled);
+        status.cgroup_path = Some("/sys/fs/cgroup/proxies".into());
+        let text = flows(&theme, &reply(status.clone(), Some(sample_flows())));
+        assert!(text.contains("CGROUP POLICY (skyline_policy)"));
+        assert!(text.contains("connections seen"));
+        assert!(text.contains("no process in /sys/fs/cgroup/proxies has opened a connection"));
+        assert!(!text.contains("DYNAMIC RTO (skyline_policy)"));
+
+        // A daemon that does not report the path: the shipped default.
+        status.cgroup_path = None;
+        if let Some(stats) = status.rack_rto.stats.as_mut() {
+            stats.established_cb = 41;
+        }
+        let text = flows(&theme, &reply(status, Some(sample_flows())));
+        assert!(text.contains("connections seen"));
+        assert!(text.contains("41"));
     }
 
     /// Attached but not the host default is the project's worst silent

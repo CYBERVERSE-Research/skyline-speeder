@@ -31,7 +31,10 @@ FALLBACK=${SKYLINE_FALLBACK_CC:-$(sed -n -e '/^\[/q' \
     -e "s/^fallback_cc[[:space:]]*=[[:space:]]*[\"']\([A-Za-z0-9_-]*\)[\"'].*/\1/p" "$CONFIG" 2>/dev/null)}
 FALLBACK=${FALLBACK:-cubic}
 
-[ -S "$SOCKET" ] && /usr/local/bin/ssctl drain --timeout 60 >/dev/null 2>&1
+# The drain waits up to 60 s; the outer bound is for a daemon that does not
+# answer at all, which under OpenRC nothing else would cut short.
+[ -S "$SOCKET" ] \
+    && timeout 75 /usr/local/bin/ssctl --socket "$SOCKET" drain --timeout 60 >/dev/null 2>&1
 if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" = skyline_cc ]; then
     sysctl -qw "net.ipv4.tcp_congestion_control=$FALLBACK" 2>/dev/null || true
 fi

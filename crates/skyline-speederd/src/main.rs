@@ -17,14 +17,14 @@ use skyline_common::{
     RackRtoStats, RackRtoStatus, RackTuningConfig, RackTuningStatus, RedundancyConfig,
     RedundancyStats, RedundancyStatus, Request, Response, RetransmitDscpConfig,
     RetransmitDscpStats, RetransmitDscpStatus, RuntimeStatus, SkylineConfig, SkylineEvent,
-    SkylineMetrics, TcStats, SKYLINE_CC_NAME,
+    SkylineMetrics, TcStats, ABI_VERSION, SKYLINE_CC_NAME,
 };
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, ErrorKind, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -99,24 +99,28 @@ impl BpfRuntime {
                 .context("attach skyline_cc struct_ops")?
         };
         runtime.links.push(struct_ops_link);
+        // Into `objects` before anything below can fail: Drop unregisters the
+        // struct_ops through it, and detaching the link alone leaves
+        // skyline_cc registered (see Drop).
+        runtime.objects.push(cc_object);
         eprintln!("skyline_cc attached through struct_ops map {struct_ops_map}");
+        let cc_object = &runtime.objects[0];
         // With the log off nothing drains the ring buffer: once it is full,
         // bpf_ringbuf_reserve() fails and skyline_emit() drops the event,
         // which costs less than reading and discarding every one.
         if let Some(event_log) = event_log {
             runtime.threads.push(start_event_reader(
-                &cc_object,
+                cc_object,
                 "events",
                 event_log,
                 runtime.running.clone(),
             )?);
         }
         runtime.threads.push(start_metrics_sampler(
-            &cc_object,
+            cc_object,
             runtime.samples.clone(),
             runtime.running.clone(),
         )?);
-        runtime.objects.push(cc_object);
 
         Ok(runtime)
     }
@@ -372,12 +376,15 @@ impl PolicyRuntime {
         }
     }
 
+    /// Switching off what was never loaded is done: a drain must not stop on
+    /// a policy object that failed to load (`errors` says why) before it has
+    /// waited for a single connection.
     fn set_policy_enabled(&mut self, enabled: bool) -> Result<()> {
-        let object = self
-            .object
-            .as_mut()
-            .ok_or_else(|| anyhow!("policy object is not loaded"))?;
-        update_u32_map(object, "policy_enabled", 0, u32::from(enabled))
+        match self.object.as_mut() {
+            Some(object) => update_u32_map(object, "policy_enabled", 0, u32::from(enabled)),
+            None if enabled => bail!("policy object is not loaded"),
+            None => Ok(()),
+        }
     }
 
     fn set_rto_tuning(&mut self, config: &RackRtoConfig, generation: u32) -> Result<()> {
@@ -536,32 +543,41 @@ impl TcRuntime {
         Ok(runtime)
     }
 
+    /// Without a loaded object nothing marks, so switching marking off
+    /// succeeds and only switching it on fails.
     fn set_retransmit_dscp(&mut self, config: &RetransmitDscpConfig) -> Result<()> {
-        let object = self
-            .objects
-            .iter_mut()
-            .find(|object| {
-                object
-                    .maps()
-                    .any(|map| map.name() == OsStr::new("retransmit_dscp_config"))
-            })
-            .ok_or_else(|| anyhow!("TC object is not loaded (runtime.tc_interface unset?)"))?;
-        write_retransmit_dscp_config(object, config)
+        let object = self.objects.iter_mut().find(|object| {
+            object
+                .maps()
+                .any(|map| map.name() == OsStr::new("retransmit_dscp_config"))
+        });
+        match object {
+            Some(object) => write_retransmit_dscp_config(object, config),
+            None if config.enabled => {
+                bail!("TC object is not loaded (runtime.tc_interface unset?)")
+            }
+            None => Ok(()),
+        }
     }
 
     /// `active` is whether skyline_cc is enabled; see
-    /// `RedundancyConfig::kernel_config`.
+    /// `RedundancyConfig::kernel_config`. Without a loaded object nothing is
+    /// copied, so only a request to start copying fails: a drain on a host
+    /// whose tc_interface is unset, a tunnel or missing failed here, before
+    /// it had waited for a single connection, and left skyline_cc attached.
     fn set_redundancy(&mut self, config: &RedundancyConfig, active: bool) -> Result<()> {
-        let object = self
-            .objects
-            .iter_mut()
-            .find(|object| {
-                object
-                    .maps()
-                    .any(|map| map.name() == OsStr::new("redundancy_config"))
-            })
-            .ok_or_else(|| anyhow!("TC object is not loaded (runtime.tc_interface unset?)"))?;
-        write_redundancy_config(object, config, active)?;
+        let object = self.objects.iter_mut().find(|object| {
+            object
+                .maps()
+                .any(|map| map.name() == OsStr::new("redundancy_config"))
+        });
+        match object {
+            Some(object) => write_redundancy_config(object, config, active)?,
+            None if config.enabled && active => {
+                bail!("TC object is not loaded (runtime.tc_interface unset?)")
+            }
+            None => {}
+        }
         self.redundancy_active = config.enabled && active;
         Ok(())
     }
@@ -640,7 +656,6 @@ impl TcRuntime {
             total.packets = total.packets.saturating_add(stats.packets);
             total.bytes = total.bytes.saturating_add(stats.bytes);
             total.gso_packets = total.gso_packets.saturating_add(stats.gso_packets);
-            total.drops = total.drops.saturating_add(stats.drops);
         }
         Some(total)
     }
@@ -928,6 +943,45 @@ fn struct_ops_map_for_kernel() -> &'static str {
     }
 }
 
+/// The section skyline_cc.bpf.o keeps `skyline_abi_version` in. libbpf makes
+/// a map of every data section and names one of a custom `.rodata.*` section
+/// after the section itself.
+const ABI_SECTION: &str = ".rodata.abi";
+
+/// The ABI skyline_cc.bpf.o was built for, read from the file before anything
+/// is loaded: the initial value of its `.rodata.abi` map. None for an object
+/// from before the section existed.
+fn object_abi_version(object: &OpenObject) -> Option<u32> {
+    let map = object
+        .maps()
+        .find(|map| map.name() == OsStr::new(ABI_SECTION))?;
+    let bytes = map.initial_value()?.get(..4)?;
+    Some(u32::from_ne_bytes(bytes.try_into().ok()?))
+}
+
+/// An object built for another ABI loads and attaches without complaint,
+/// and then no connection ever adopts the configuration this daemon writes
+/// (skyline_adopt_config() checks the version): every flow runs on the Reno
+/// fallback in skyline_cong_control(), unpaced, and nothing reports it. So
+/// such an object is refused here, where the operator sees why.
+fn check_object_abi(path: &Path, version: Option<u32>) -> Result<()> {
+    match version {
+        Some(version) if version == ABI_VERSION => Ok(()),
+        Some(version) => bail!(
+            "{} was built for ABI {version}, this skyline-speederd for ABI {ABI_VERSION}: \
+             install the BPF objects that came with this binary",
+            path.display()
+        ),
+        None => bail!(
+            "{} does not say which ABI it was built for, so it is older than this \
+             skyline-speederd ({}, ABI {ABI_VERSION}): install the BPF objects that came \
+             with this binary",
+            path.display(),
+            env!("CARGO_PKG_VERSION")
+        ),
+    }
+}
+
 /// Loads skyline_cc.bpf.o with only the struct_ops map this kernel takes, and
 /// returns that map's name. libbpf then loads only the programs that map uses
 /// (bpf_object_adjust_struct_ops_autoload), so the op the other layout lacks
@@ -936,6 +990,7 @@ fn struct_ops_map_for_kernel() -> &'static str {
 /// any kernel.
 fn load_cc_object(path: &Path) -> Result<(Object, &'static str)> {
     let mut object = open_object(path)?;
+    check_object_abi(path, object_abi_version(&object))?;
     let mut wanted = struct_ops_map_for_kernel();
     if !object
         .maps()
@@ -1055,6 +1110,11 @@ struct Daemon {
     /// redundancy is gated on -- the TC program copies SYN-ACKs by host
     /// state, since a request socket has no congestion control yet.
     accelerating: bool,
+    /// True from a `Drain` that has handed new connections to fallback_cc
+    /// until skyline_cc is unregistered or enabled again; see
+    /// `RuntimeStatus::draining`. Not `!accelerating`: an enable that failed
+    /// after its attach leaves that false too.
+    draining: bool,
     /// Opened once at startup by `Daemon::new()` -- see `BpfRuntime::load`'s
     /// doc comment. `None` when `events_max_mib = 0`.
     event_log: Option<Arc<Mutex<EventLog>>>,
@@ -1110,6 +1170,7 @@ impl Daemon {
             retransmit_dscp_defaults,
             redundancy_defaults,
             accelerating: false,
+            draining: false,
             event_log,
             started: Instant::now(),
             attached_at: None,
@@ -1151,6 +1212,18 @@ impl Daemon {
                 "TC runtime is not loaded, so nothing can be copied; check runtime.tc_interface \
                  and tc_error in status"
             ),
+            None => Ok(()),
+        }
+    }
+
+    /// Pushes `[retransmit_dscp]` to the TC program. Turning marking off
+    /// where nothing could mark succeeds.
+    fn apply_retransmit_dscp(&mut self) -> Result<()> {
+        match &mut self.tc {
+            Some(tc) => tc.set_retransmit_dscp(&self.config.retransmit_dscp),
+            None if self.config.retransmit_dscp.enabled => {
+                bail!("TC runtime is not loaded; check runtime.tc_interface and tc_error in status")
+            }
             None => Ok(()),
         }
     }
@@ -1209,6 +1282,8 @@ impl Daemon {
             guard: self.guard.status(),
             uptime_s: self.started.elapsed().as_secs(),
             attached_s: self.attached_at.map(|at| at.elapsed().as_secs()),
+            draining: self.draining && self.runtime.is_some(),
+            cgroup_path: Some(self.config.runtime.cgroup_path.clone()),
         }
     }
 
@@ -1217,9 +1292,28 @@ impl Daemon {
         // through `ss`; only the request that asks for the listing pays for
         // it. Decided before `try_handle` consumes the request.
         let wants_flows = matches!(request, Request::Flows);
-        let (ok, message) = match self.try_handle(request) {
+        // A request that fails changes nothing: not the configuration
+        // `status` reports as running, and not what a later request
+        // publishes -- DisableModule and SetModuleConfig publish all of it,
+        // so a module set an Enable was refused for used to reach the kernel
+        // with the next of them. Every request below writes the kernel last,
+        // so its failure leaves the kernel as it was too. Enable is the
+        // exception and sees to it itself: once it has attached or
+        // published, the kernel runs the new configuration whatever fails
+        // after.
+        let previous = (!matches!(request, Request::Enable { .. })).then(|| self.config.clone());
+        let result = self.try_handle(request);
+        if let (Err(_), Some(previous)) = (&result, previous) {
+            self.config = previous;
+        }
+        // One status per request: each runs `tc` for the guard's live view,
+        // and state.json is then exactly what the reply carries.
+        let status = self.status();
+        let (ok, message) = match result {
             Ok(message) => {
-                let _ = self.persist_state();
+                if let Err(error) = self.persist(&status) {
+                    eprintln!("{error:#}");
+                }
                 (true, message)
             }
             Err(error) => (false, format!("{error:#}")),
@@ -1227,8 +1321,24 @@ impl Daemon {
         Response {
             ok,
             message,
-            status: Some(self.status()),
+            status: Some(status),
             flows: wants_flows.then(|| flows::collect(SKYLINE_CC_NAME)),
+        }
+    }
+
+    /// The part of `Enable` that can fail before the kernel runs the new
+    /// configuration: on an error here it still runs the previous one (or
+    /// none), which the caller then reports again.
+    fn publish_or_attach(&mut self) -> Result<()> {
+        self.config.validate()?;
+        validate_capabilities(&self.capabilities)?;
+        match &mut self.runtime {
+            Some(runtime) => runtime.update_config(&self.config),
+            None => {
+                self.runtime = Some(BpfRuntime::load(&self.config, self.event_log.clone())?);
+                self.attached_at = Some(Instant::now());
+                Ok(())
+            }
         }
     }
 
@@ -1240,20 +1350,24 @@ impl Daemon {
                 Ok("configuration and kernel capabilities are valid".to_owned())
             }
             Request::Enable { modules } => {
+                let previous = (self.config.enabled_modules.clone(), self.config.generation);
                 if let Some(modules) = modules {
                     self.config.enabled_modules = modules;
                 }
                 self.config.generation = self.config.generation.saturating_add(1);
-                self.config.validate()?;
-                validate_capabilities(&self.capabilities)?;
-                if let Some(runtime) = &mut self.runtime {
-                    runtime.update_config(&self.config)?;
-                } else {
-                    self.runtime = Some(BpfRuntime::load(&self.config, self.event_log.clone())?);
-                    self.attached_at = Some(Instant::now());
+                if let Err(error) = self.publish_or_attach() {
+                    (self.config.enabled_modules, self.config.generation) = previous;
+                    return Err(error);
                 }
+                // The cgroup's own switch to skyline_cc, which the namespace
+                // default set below gives every process anyway: not a reason
+                // to fail an enable whose struct_ops is attached by now and
+                // would then be left registered but not the default.
+                let mut notes = Vec::new();
                 if let Some(policy) = &mut self.policy {
-                    policy.set_policy_enabled(true)?;
+                    if let Err(error) = policy.set_policy_enabled(true) {
+                        notes.push(format!("cgroup policy not switched on: {error:#}"));
+                    }
                 }
                 // Attaching the struct_ops only adds skyline_cc to
                 // tcp_available_congestion_control -- registration is not
@@ -1281,9 +1395,9 @@ impl Daemon {
                      default congestion control for every new connection on this host",
                     display_modules(&self.config.enabled_modules)
                 );
-                for line in report.lines() {
+                for line in report.lines().cloned().chain(notes) {
                     message.push_str("; ");
-                    message.push_str(line);
+                    message.push_str(&line);
                 }
                 // First-flight redundancy starts with skyline_cc and not
                 // before (see `accelerating`). Like the guard, it cannot fail
@@ -1291,6 +1405,7 @@ impl Daemon {
                 // a redundancy that did not start is said here and shows as
                 // inactive in status.
                 self.accelerating = true;
+                self.draining = false;
                 if let Err(error) = self.apply_redundancy() {
                     message.push_str(&format!("; first-flight redundancy not started: {error:#}"));
                 }
@@ -1302,7 +1417,9 @@ impl Daemon {
                 if let Some(runtime) = &mut self.runtime {
                     runtime.update_config(&self.config)?;
                 }
-                Ok(format!("module {module} disabled at the next RTT boundary"))
+                Ok(format!(
+                    "module {module} disabled from each connection's next round"
+                ))
             }
             Request::Status => Ok("status returned".to_owned()),
             // The listing itself is attached by `handle()`, not built here:
@@ -1311,7 +1428,7 @@ impl Daemon {
             Request::Flows => Ok("accelerated connections enumerated".to_owned()),
             Request::Snapshot { path } => {
                 let payload = serde_json::to_vec_pretty(&self.status())?;
-                fs::write(&path, payload)
+                write_snapshot(&path, &payload)
                     .with_context(|| format!("write snapshot {}", path.display()))?;
                 Ok(format!("snapshot written to {}", path.display()))
             }
@@ -1348,10 +1465,17 @@ impl Daemon {
                 // connections still draining are no longer copied either.
                 self.accelerating = false;
                 self.apply_redundancy()?;
+                // From here on, until the unregister below or the next
+                // enable, skyline_cc only serves the connections it has.
+                self.draining = true;
                 // active_flows() rather than status(): status() now also runs
                 // `tc` for the guard's live view, five times a second here.
-                let deadline = Instant::now() + Duration::from_secs(timeout_s);
-                while self.active_flows() > 0 && Instant::now() < deadline {
+                // No deadline at all for a timeout too large to add: it means
+                // "wait", not a panic after fallback_cc has been written.
+                let deadline = Instant::now().checked_add(Duration::from_secs(timeout_s));
+                while self.active_flows() > 0
+                    && deadline.map_or(true, |deadline| Instant::now() < deadline)
+                {
                     std::thread::sleep(Duration::from_millis(200));
                 }
                 if self.active_flows() > 0 {
@@ -1367,6 +1491,7 @@ impl Daemon {
                 }
                 self.runtime = None;
                 self.attached_at = None;
+                self.draining = false;
                 Ok(format!(
                     "new sockets use {}; Skyline Speeder CC links detached (TC stats and RTO tuning, \
                      if enabled, remain active)",
@@ -1424,6 +1549,10 @@ impl Daemon {
             }
             Request::ResetModuleConfig => {
                 self.module_tuning_defaults.apply_to(&mut self.config);
+                // The file's values passed at startup, but with the module
+                // set an enable has changed since: pacing on and the file's
+                // max_pacing_mbps = 0 would publish pacing without a cap.
+                self.config.validate()?;
                 self.config.generation = self.config.generation.saturating_add(1);
                 if let Some(runtime) = &mut self.runtime {
                     runtime.update_config(&self.config)?;
@@ -1441,20 +1570,12 @@ impl Daemon {
                 // struct carries no generation field and nothing reads one
                 // for it -- see the doc comment on
                 // struct skyline_retransmit_dscp_config in skyline_abi.h.
-                if let Some(tc) = &mut self.tc {
-                    tc.set_retransmit_dscp(&self.config.retransmit_dscp)?;
-                } else {
-                    bail!("TC runtime is not loaded; check runtime.tc_interface and tc_error in status");
-                }
+                self.apply_retransmit_dscp()?;
                 Ok("retransmit DSCP marking updated".to_owned())
             }
             Request::ResetRetransmitDscp => {
                 self.config.retransmit_dscp = self.retransmit_dscp_defaults;
-                if let Some(tc) = &mut self.tc {
-                    tc.set_retransmit_dscp(&self.config.retransmit_dscp)?;
-                } else {
-                    bail!("TC runtime is not loaded; check runtime.tc_interface and tc_error in status");
-                }
+                self.apply_retransmit_dscp()?;
                 Ok("retransmit DSCP marking reset to configuration defaults".to_owned())
             }
             Request::SetRedundancy { config } => {
@@ -1492,13 +1613,17 @@ impl Daemon {
     }
 
     fn persist_state(&self) -> Result<()> {
+        self.persist(&self.status())
+    }
+
+    fn persist(&self, status: &RuntimeStatus) -> Result<()> {
         if let Some(parent) = self.config.runtime.state_path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create state directory {}", parent.display()))?;
         }
         fs::write(
             &self.config.runtime.state_path,
-            serde_json::to_vec_pretty(&self.status())?,
+            serde_json::to_vec_pretty(status)?,
         )
         .with_context(|| {
             format!(
@@ -1920,6 +2045,12 @@ fn serve(mut daemon: Daemon) -> Result<()> {
     }
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("bind Unix socket {}", socket_path.display()))?;
+    // Whoever can connect can drain, enable, stop the daemon and have it
+    // write files as root. Not left to the umask: under systemd's 0022 only
+    // root could connect, but a daemon started by hand with 0000 took
+    // requests from every local user.
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restrict Unix socket {}", socket_path.display()))?;
     daemon.persist_state()?;
     // Here and not in Daemon::new(): `--validate-only` must not start a
     // thread. It does nothing until an `Enable` arms it.
@@ -1948,6 +2079,11 @@ fn serve(mut daemon: Daemon) -> Result<()> {
             Err(error) => eprintln!("accept failed: {error}"),
         }
     }
+    // Nothing answers on it any more. systemd's RuntimeDirectory= empties
+    // the directory after a stop, OpenRC does not, and a socket file left
+    // behind read as a running daemon to whatever waited for the next one.
+    drop(listener);
+    let _ = fs::remove_file(&socket_path);
     // `daemon` drops here: Daemon's own Drop stops the guard thread first,
     // then BpfRuntime/PolicyRuntime/TcRuntime's Drop impls run, cleanly
     // detaching every link -- this is the ONLY path (besides a fatal accept
@@ -1956,6 +2092,18 @@ fn serve(mut daemon: Daemon) -> Result<()> {
     Ok(())
 }
 
+/// How long a client has to send its request line, and to take the reply.
+/// One client is served at a time, and SIGTERM's Shutdown request queues
+/// behind it: unbounded, a client that connected and never ended its line --
+/// an `nc -U` left open, a script that writes no newline and waits for the
+/// answer -- held up every other request, and a stop then ended in SIGKILL,
+/// which runs no Drop: neither the struct_ops unregister nor the TC detach.
+const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A request is one line of JSON; the largest, set-module-config, is well
+/// under 1 KiB.
+const MAX_REQUEST_BYTES: u64 = 64 * 1024;
+
 /// Returns `Ok(true)` iff the request was `Request::Shutdown`, signalling
 /// the caller to stop the accept loop. A failure to write the response
 /// back does NOT cancel that signal -- the shutdown-signal watcher below
@@ -1963,21 +2111,63 @@ fn serve(mut daemon: Daemon) -> Result<()> {
 /// to do once the request is sent), so the write below routinely loses
 /// its peer first; treating that as fatal would silently swallow the one
 /// request whose delivery matters most.
-fn handle_stream(daemon: &mut Daemon, mut stream: UnixStream) -> Result<bool> {
-    let mut line = String::new();
-    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
-    let request: Request = serde_json::from_str(line.trim()).context("decode request")?;
-    let should_shutdown = matches!(request, Request::Shutdown);
-    let response = daemon.handle(request);
-    match serde_json::to_writer(&mut stream, &response) {
-        Ok(()) => {
-            if let Err(error) = stream.write_all(b"\n") {
-                eprintln!("failed to write response: {error:#}");
-            }
-        }
-        Err(error) => eprintln!("failed to write response: {error:#}"),
+fn handle_stream(daemon: &mut Daemon, stream: UnixStream) -> Result<bool> {
+    let line = read_request(&stream, CLIENT_IO_TIMEOUT)?;
+    stream.set_write_timeout(Some(CLIENT_IO_TIMEOUT))?;
+    let (should_shutdown, response) = match serde_json::from_str::<Request>(line.trim()) {
+        Ok(request) => (matches!(request, Request::Shutdown), daemon.handle(request)),
+        // An answer rather than a closed connection, which ssctl reports as
+        // "EOF while parsing" -- what a command this daemon does not know,
+        // from a newer ssctl, used to get.
+        Err(error) => (
+            false,
+            Response {
+                ok: false,
+                message: format!("decode request: {error}"),
+                status: None,
+                flows: None,
+            },
+        ),
+    };
+    // One write. serde_json writing into the socket itself made one write(2)
+    // per JSON token, hundreds for a status.
+    let mut reply = serde_json::to_vec(&response)?;
+    reply.push(b'\n');
+    if let Err(error) = (&stream).write_all(&reply) {
+        eprintln!("failed to write response: {error:#}");
     }
     Ok(should_shutdown)
+}
+
+/// The request line, read with `timeout` for each read and at most
+/// `MAX_REQUEST_BYTES` of it.
+fn read_request(stream: &UnixStream, timeout: Duration) -> Result<String> {
+    stream.set_read_timeout(Some(timeout))?;
+    let mut line = String::new();
+    BufReader::new(stream.take(MAX_REQUEST_BYTES))
+        .read_line(&mut line)
+        .context("read request")?;
+    Ok(line)
+}
+
+/// Written as root for whoever reached the socket, so only ever to a
+/// regular file: never through a symlink, never to a device (`ssctl snapshot
+/// /dev/sda` wrote JSON over the start of a disk), and never to a FIFO, whose
+/// open would block this one-request-at-a-time loop. A FIFO without a reader
+/// fails to open (O_NONBLOCK); a device opens, and is refused before
+/// anything is written.
+fn write_snapshot(path: &Path, payload: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        bail!("not a regular file");
+    }
+    file.set_len(0)?;
+    file.write_all(payload)?;
+    Ok(())
 }
 
 /// Spawns a background thread that, on SIGTERM/SIGINT, sends a single
@@ -2035,6 +2225,21 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_object_for_another_abi_is_refused() {
+        let path = Path::new("/opt/skyline-speeder/bpf/skyline_cc.bpf.o");
+        assert!(check_object_abi(path, Some(ABI_VERSION)).is_ok());
+        let other = check_object_abi(path, Some(ABI_VERSION + 1))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            other.contains(&format!("built for ABI {}", ABI_VERSION + 1)),
+            "{other}"
+        );
+        let unmarked = check_object_abi(path, None).unwrap_err().to_string();
+        assert!(unmarked.contains("does not say which ABI"), "{unmarked}");
+    }
+
     use super::*;
 
     const BTF_KIND_INT: u32 = 1;
@@ -2500,6 +2705,190 @@ mod tests {
         // Only the switch is off; the values are the file's.
         assert_eq!(status.rack_rto.config.floor_us, file_rto.floor_us);
         assert_eq!(status.retransmit_dscp.config.dscp_value, 10);
+    }
+
+    /// A daemon on config/speeder.toml that touches nothing on this host:
+    /// no event log, its state file in `dir`, a network interface that does
+    /// not exist (so the guard's live view runs no `tc`), and neither the
+    /// TC nor the policy object loaded. Only requests that fail before
+    /// BPF -- and before any sysctl -- may be sent to it.
+    fn offline_daemon(dir: &Path) -> Daemon {
+        let mut config = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        config.runtime.events_max_mib = 0;
+        config.runtime.tc_interface = Some("skyline-none0".to_owned());
+        config.runtime.state_path = dir.join("state.json");
+        config.runtime.socket_path = dir.join("speeder.sock");
+        Daemon::new(config).expect("daemon")
+    }
+
+    #[test]
+    fn a_request_line_that_never_ends_does_not_hold_the_daemon() {
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        (&client)
+            .write_all(br#"{"command":"status"}"#)
+            .expect("write");
+        let started = Instant::now();
+        let error = read_request(&server, Duration::from_millis(100)).expect_err("no newline");
+        assert!(started.elapsed() < Duration::from_secs(2), "{error:#}");
+
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        (&client)
+            .write_all(b"{\"command\":\"status\"}\n")
+            .expect("write");
+        let line = read_request(&server, Duration::from_millis(100)).expect("one line");
+        assert!(matches!(
+            serde_json::from_str::<Request>(line.trim()),
+            Ok(Request::Status)
+        ));
+    }
+
+    /// A request this daemon cannot decode -- a command from a newer ssctl,
+    /// say -- gets an answer that says so, not a closed connection.
+    #[test]
+    fn an_undecodable_request_is_answered() {
+        let dir = scratch_dir("undecodable");
+        let mut daemon = offline_daemon(&dir);
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        (&client)
+            .write_all(b"{\"command\":\"rewind\"}\n")
+            .expect("write");
+        assert!(!handle_stream(&mut daemon, server).expect("handled"));
+        let mut line = String::new();
+        BufReader::new(&client).read_line(&mut line).expect("reply");
+        let response: Response = serde_json::from_str(line.trim()).expect("a response");
+        assert!(!response.ok);
+        assert!(response.message.starts_with("decode request: "));
+        fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    /// state.json is the status the reply carries, from one `status()`.
+    #[test]
+    fn the_state_file_is_what_the_reply_says() {
+        let dir = scratch_dir("state");
+        let mut daemon = offline_daemon(&dir);
+        let response = daemon.handle(Request::Status);
+        assert!(response.ok);
+        let written: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("state.json")).expect("state.json"))
+                .expect("JSON");
+        assert_eq!(
+            written,
+            serde_json::to_value(response.status.expect("a status")).expect("JSON")
+        );
+        fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    /// A refused request leaves the configuration as it was: `status` used
+    /// to report the module set an enable had just been refused, and the
+    /// next disable or set-module-config published it to the kernel.
+    #[test]
+    fn a_failed_request_changes_nothing() {
+        let dir = scratch_dir("refused");
+        let mut daemon = offline_daemon(&dir);
+        // Valid as long as pacing is off; turning it on cannot pass.
+        daemon
+            .config
+            .enabled_modules
+            .retain(|module| *module != Module::Pacing);
+        daemon.config.max_pacing_mbps = 0;
+        daemon.config.validate().expect("valid without pacing");
+        let refused = Request::Enable {
+            modules: Some(vec![Module::AdaptiveCwnd, Module::Pacing]),
+        };
+        // Enable reaches BPF and the sysctl only past validate(); make sure
+        // this one cannot get there on the machine running the test.
+        let mut would_be = daemon.config.clone();
+        would_be.enabled_modules = vec![Module::AdaptiveCwnd, Module::Pacing];
+        assert!(would_be.validate().is_err());
+        let before = daemon.status();
+
+        let response = daemon.handle(refused);
+        assert!(!response.ok);
+        let after = response.status.expect("a status");
+        assert_eq!(after.modules, before.modules);
+        assert_eq!(after.generation, before.generation);
+
+        // No TC object: marking cannot start, and the request leaves it off.
+        let response = daemon.handle(Request::SetRetransmitDscp {
+            config: RetransmitDscpConfig {
+                enabled: true,
+                dscp_value: 10,
+            },
+        });
+        assert!(!response.ok);
+        assert!(
+            !response
+                .status
+                .expect("a status")
+                .retransmit_dscp
+                .config
+                .enabled
+        );
+        // Turning off what cannot run succeeds.
+        let response = daemon.handle(Request::SetRetransmitDscp {
+            config: RetransmitDscpConfig::disabled(),
+        });
+        assert!(response.ok, "{}", response.message);
+
+        // No policy object: dynamic RTO cannot start, and the generation
+        // it would have taken is not spent either.
+        let response = daemon.handle(Request::SetRackRto {
+            config: RackRtoConfig {
+                enabled: true,
+                ..daemon.rack_rto_defaults
+            },
+        });
+        assert!(!response.ok);
+        let status = response.status.expect("a status");
+        assert!(!status.rack_rto.config.enabled);
+        assert_eq!(status.generation, before.generation);
+        fs::remove_dir_all(&dir).expect("clean up");
+    }
+
+    /// No TC object loaded -- tc_interface unset, a tunnel, a NIC that is
+    /// not there: stopping the copies succeeds, so a drain gets past it.
+    #[test]
+    fn redundancy_stops_without_a_tc_object() {
+        let mut config = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        config.runtime.tc_interface = None;
+        let mut tc = TcRuntime::load(&config).expect("nothing to load");
+        assert!(tc.objects.is_empty());
+        let redundancy = RedundancyConfig::default();
+        assert!(redundancy.enabled);
+        tc.set_redundancy(&redundancy, false).expect("off");
+        assert!(!tc.redundancy_active);
+        tc.set_redundancy(&RedundancyConfig::disabled(), true)
+            .expect("disabled");
+        assert!(tc.set_redundancy(&redundancy, true).is_err());
+        tc.set_retransmit_dscp(&RetransmitDscpConfig::disabled())
+            .expect("off");
+        assert!(tc
+            .set_retransmit_dscp(&RetransmitDscpConfig {
+                enabled: true,
+                dscp_value: 10
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn a_snapshot_is_only_written_to_a_regular_file() {
+        let dir = scratch_dir("snapshot");
+        let file = dir.join("status.json");
+        write_snapshot(&file, b"one").expect("a new file");
+        write_snapshot(&file, b"two").expect("an existing file");
+        assert_eq!(fs::read(&file).expect("read"), b"two");
+
+        let target = dir.join("target");
+        fs::write(&target, b"keep").expect("seed");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert!(write_snapshot(&link, b"over").is_err());
+        assert_eq!(fs::read(&target).expect("read"), b"keep");
+
+        assert!(write_snapshot(&dir, b"over").is_err());
+        let error = write_snapshot(Path::new("/dev/null"), b"over").expect_err("a device");
+        assert_eq!(format!("{error:#}"), "not a regular file");
+        fs::remove_dir_all(&dir).expect("clean up");
     }
 
     /// A fresh directory per test; the crate has no tempfile dependency and

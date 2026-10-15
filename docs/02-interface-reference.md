@@ -38,7 +38,7 @@ Skyline Speeder 的运行期由一个守护进程 `skyline-speederd` 和一个�
 | `ssctl validate` | 校验 daemon **内存里**的当前配置（启动时读入的文件加上之后的在线修改）与内核能力，不改变运行状态。它不重新读取磁盘上的文件：校验文件用 `skyline-speederd --config <文件> --validate-only` |
 | `ssctl status` | **接管状态**：skyline_cc 是否已附加、是否是全机默认拥塞控制、guard 守住了什么又纠正过多少次、内核能力、M1 tier-1 全局 sysctl、daemon 运行时长，以及一个 `ATTENTION` 段落列出所有异常与对应处理动作 |
 | `ssctl flows`（别名 `ssctl flow`） | **被加速的流量**：逐条列出内核当前跑在 `skyline_cc` 上的 TCP 连接（对端、RTT、cwnd、pacing 速率、交付速率、已发字节、重传占比，按已发字节排序，最多 50 行），以及这些连接上生效中的系数与算法决策计数器。见第 4.1 节 |
-| `ssctl snapshot <path>` | 让 daemon 把 `status` 的完整 JSON 写入指定文件，供外部脚本采集（不受下面的输出格式影响，始终是 JSON）。文件由 daemon 写：相对路径按 daemon 的工作目录解析；systemd 下 daemon 运行在 `ProtectSystem=strict` 与私有 `/tmp` 里：大部分路径对它只读，它写进 `/tmp` 的文件调用者看不到，写到 `/run/skyline-speeder/` 下最稳妥 |
+| `ssctl snapshot <path>` | 让 daemon 把 `status` 的完整 JSON 写入指定文件，供外部脚本采集（不受下面的输出格式影响，始终是 JSON）。文件由 daemon 写：相对路径按 daemon 的工作目录解析；systemd 下 daemon 运行在 `ProtectSystem=strict` 与私有 `/tmp` 里：大部分路径对它只读，它写进 `/tmp` 的文件调用者看不到，写到 `/run/skyline-speeder/` 下最稳妥。0.5.2 起只写普通文件：目标是符号链接、目录、设备或 FIFO 时拒绝，不写任何东西（daemon 以 root 运行，之前 `ssctl snapshot /dev/sda` 会把 JSON 写进磁盘开头，FIFO 会卡住整个请求循环） |
 
 #### 输出格式
 
@@ -66,9 +66,9 @@ Skyline Speeder 的运行期由一个守护进程 `skyline-speederd` 和一个�
 
 | 命令 | 作用 |
 |---|---|
-| `ssctl enable [--modules m1,m2,...] [--all-off]` | 启用 `skyline_cc` struct_ops，`--modules` 指定要打开的模块子集（`early-loss`/`adaptive-cwnd`/`loss-classifier`/`pacing`，逗号分隔），省略则使用当前生效的 `enabled_modules`（daemon 内存态，启动时来自配置文件）；`--all-off` 等价于传一个空集合——仍然注册 `skyline_cc` 作为拥塞控制算法，但四个模块全部关闭（见 `docs/03-design.md` 第 4 节"中性基线"的语义）。**附加成功后会把 `net.ipv4.tcp_congestion_control` 写成 `skyline_cc`**，即全机新连接默认走本算法；写 sysctl 发生在附加之后，因为内核会拒绝一个尚未注册的算法名。随后**武装 guard 并立即做一次完整检查**（`[guard] interval_s = 0` 时也做）：`[guard] qdisc = true`（默认）时把 `net.core.default_qdisc` 写成 `fq`、把 `runtime.tc_interface` 的根 qdisc 换成 `fq`（它是 VLAN、bond、网桥时换的是它下面的物理网卡），此后直到下一次 `drain` 持续守住这几项，见第 9 节；周期检查正在退避的替换，`enable` 不等退避、立即重试。这次检查改了什么、发现了什么、哪一步没做成，都以 `; <内容>` 的形式追加在响应 `message` 末尾；qdisc 这一步失败**不会**让 `enable` 失败（此时 `skyline_cc` 已挂载且已是默认），只记进 message 和 `guard.last_error`。已发布的 v0.2.0 及更早 release 的 `enable` 不碰 qdisc；不想让它碰，设 `[guard] qdisc = false`。最后打开首轮冗余（第 2.6 节） |
+| `ssctl enable [--modules m1,m2,...] [--all-off]` | 启用 `skyline_cc` struct_ops，`--modules` 指定要打开的模块子集（`early-loss`/`adaptive-cwnd`/`loss-classifier`/`pacing`，逗号分隔），省略则使用当前生效的 `enabled_modules`（daemon 内存态，启动时来自配置文件）；`--all-off` 等价于传一个空集合——仍然注册 `skyline_cc` 作为拥塞控制算法，但四个模块全部关闭（见 `docs/03-design.md` 第 4 节"中性基线"的语义）。**附加成功后会把 `net.ipv4.tcp_congestion_control` 写成 `skyline_cc`**，即全机新连接默认走本算法；写 sysctl 发生在附加之后，因为内核会拒绝一个尚未注册的算法名。随后**武装 guard 并立即做一次完整检查**（`[guard] interval_s = 0` 时也做）：`[guard] qdisc = true`（默认）时把 `net.core.default_qdisc` 写成 `fq`、把 `runtime.tc_interface` 的根 qdisc 换成 `fq`（它是 VLAN、bond、网桥时换的是它下面的物理网卡），此后直到下一次 `drain` 持续守住这几项，见第 9 节；周期检查正在退避的替换，`enable` 不等退避、立即重试。这次检查改了什么、发现了什么、哪一步没做成，都以 `; <内容>` 的形式追加在响应 `message` 末尾；qdisc 这一步失败**不会**让 `enable` 失败（此时 `skyline_cc` 已挂载且已是默认），只记进 message 和 `guard.last_error`。已发布的 v0.2.0 及更早 release 的 `enable` 不碰 qdisc；不想让它碰，设 `[guard] qdisc = false`。最后打开首轮冗余（第 2.6 节）。被拒绝的 `enable`（模块组合不合法、内核能力不足、加载或附加失败）不改变任何东西：模块集合与代际号保持原样（0.5.2 起；之前被拒绝的模块集合会留在内存里，`status` 把它当作在用的报告，下一次 `disable` 或 `set-module-config` 还会把它下发到内核）。cgroup 派发打不开（例如 `skyline_policy` 没有加载）时 `enable` 照常完成，原因追加在 message 末尾：随后写入的全机默认算法同样覆盖 cgroup 里的进程 |
 | `ssctl disable --module <name>` | 关闭单个模块，不影响其余已启用的模块 |
-| `ssctl drain [--timeout <秒>]` | 优雅摘除：**先解除 guard 的武装，并在仍持有 guard 锁时把 `net.ipv4.tcp_congestion_control` 写回 `fallback_cc`**（正在进行的一次周期检查会先跑完，它写的值随即被覆盖；即使 rtnl 锁被卡住，这段等待也只有约一个 `tc` 超时，即 10 秒左右，见第 9 节"失败处理"；此后不会再有检查把 `skyline_cc` 写回去。无论 drain 最终成功还是超时，guard 都保持解除），再关闭 cgroup 派发——两条准入路径都要先关，全局 sysctl 先关，因为它放行的是全机进程而不只是 cgroup 内的；然后等待已有连接自然结束（默认超时 300 秒，超时仍有活跃连接则报错、不强制摘除），确认无活跃连接后注销 struct_ops（此时全局默认早已不指向它，不会出现"注销一个正被当作默认算法的 struct_ops"）。超时报错时 struct_ops 仍挂着，但 sysctl 已经落回，不会有新连接使用它（**通过 SSH 执行时必然走到这个分支**——执行者自己的 SSH 连接就是一条存量 skyline_cc 流）；已在用 TC 统计/M1 tier-2 RTO 调节的连接不受影响，只摘除 `skyline_cc` 一项。drain 不动任何 qdisc：`default_qdisc` 与网卡根 qdisc 保持 `fq` |
+| `ssctl drain [--timeout <秒>]` | 优雅摘除：**先解除 guard 的武装，并在仍持有 guard 锁时把 `net.ipv4.tcp_congestion_control` 写回 `fallback_cc`**（正在进行的一次周期检查会先跑完，它写的值随即被覆盖；即使 rtnl 锁被卡住，这段等待也只有约一个 `tc` 超时，即 10 秒左右，见第 9 节"失败处理"；此后不会再有检查把 `skyline_cc` 写回去。无论 drain 最终成功还是超时，guard 都保持解除），再关闭 cgroup 派发——两条准入路径都要先关，全局 sysctl 先关，因为它放行的是全机进程而不只是 cgroup 内的；然后等待已有连接自然结束（默认超时 300 秒，超时仍有活跃连接则报错、不强制摘除），确认无活跃连接后注销 struct_ops（此时全局默认早已不指向它，不会出现"注销一个正被当作默认算法的 struct_ops"）。超时报错时 struct_ops 仍挂着，但 sysctl 已经落回，不会有新连接使用它（**通过 SSH 执行时必然走到这个分支**——执行者自己的 SSH 连接就是一条存量 skyline_cc 流）；已在用 TC 统计/M1 tier-2 RTO 调节的连接不受影响，只摘除 `skyline_cc` 一项。drain 不动任何 qdisc：`default_qdisc` 与网卡根 qdisc 保持 `fq`。超时之后到注销或下一次 `enable` 之前，`status` 的 `draining` 为 `true`，两份报告显示 `DRAINING` 和 skyline_cc 还在服务的连接数（0.5.1 及更早把这个状态报成 skyline_cc 被别人改掉了，并提示重新 `enable`）。没有加载 TC 对象（`runtime.tc_interface` 未设、是隧道、网卡不存在）或 `skyline_policy` 没有加载时，drain 不再失败：关掉没有运行的东西算作完成（0.5.1 及更早在写回 `fallback_cc` 之后、等待任何连接之前就报错退出，struct_ops 一直挂着） |
 
 ### 2.3 M2/M3/M4 系数在线调整
 
@@ -88,7 +88,8 @@ Skyline Speeder 的运行期由一个守护进程 `skyline-speederd` 和一个�
 
 | 命令 | 作用 |
 |---|---|
-| `ssctl set-retransmit-dscp --dscp-value <0-63>` | 启用标记并指定 DSCP 编码值。这个值是占位参数——具体编码由网络侧策略决定，Skyline Speeder 本身不预设生产环境的取值；启用时必须提供非零值（0 在语义上等同于"剥除现有 DSCP"，不是无操作，因此被拒绝） |
+| `ssctl set-retransmit-dscp --dscp-value <1-63>` | 启用标记并指定 DSCP 编码值。这个值是占位参数——具体编码由网络侧策略决定，Skyline Speeder 本身不预设生产环境的取值；启用时必须提供非零值（0 在语义上等同于"剥除现有 DSCP"，不是无操作，因此被拒绝）。TC 程序没有加载时失败，标记保持关闭 |
+| `ssctl set-retransmit-dscp --disable` | 关闭标记，不管配置文件怎么写（0.5.2 起；之前只能重启 daemon，或者用 `reset-retransmit-dscp`——而文件打开了标记时，reset 是把它打开）。TC 程序没有加载时同样成功：本来就没有在标记 |
 | `ssctl reset-retransmit-dscp` | 恢复为配置文件里声明的 `[retransmit_dscp]`（默认关闭），也是把这一段下发到 BPF 的唯一途径：daemon 每次启动都把标记初始化为关闭。0.5.1 起，文件打开了而此刻是关闭时，`ssctl status` 的 ATTENTION 和 `ssctl flows` 都会提示执行它 |
 
 ### 2.6 首轮冗余
@@ -123,7 +124,16 @@ skyline_cc 启用期间，TC 程序把本机发出的每个 SYN-ACK、skyline_cc
 （与 SIGTERM 相同：注销 struct_ops，不写 sysctl），所以 socket 的文件权限就是全部的访问控制。
 
 daemon **一次只处理一个请求**。`drain` 在自己的请求里等到存量连接结束或超时，期间其他请求（包括 SIGTERM
-触发的 `shutdown`）都排在后面，`ssctl` 一侧没有超时。
+触发的 `shutdown`）都排在后面，`ssctl` 一侧没有超时。0.5.2 起每个客户端读写各有 5 秒期限、请求行最长
+64 KiB：连上之后迟迟不发完一行（开着不关的 `nc -U`、不写换行就等应答的脚本）的客户端会被断开，
+不再卡住其后的所有请求——之前这样会一直卡到 systemd 或 OpenRC 用 SIGKILL 结束 daemon，而 SIGKILL 不跑任何
+清理，struct_ops 留在内核里、TC 过滤器留在网卡上。daemon 解不出来的请求（例如新 `ssctl` 的命令发给旧
+daemon）得到一个 `ok: false` 的应答，而不是被直接断开。socket 文件权限固定为 `0600`，不再取决于 daemon
+启动时的 umask；daemon 正常退出时删除它。
+
+**失败的请求不改变配置**（0.5.2 起）：`enable`、`disable`、`set-*`、`reset-*` 中途失败时，daemon 内存里
+的配置与代际号回到请求之前，`status` 里看到的就是内核此刻在用的。唯一的例外是 `enable` 已经完成附加或
+下发之后才失败（例如写 sysctl 被拒）：这时内核已经在用新配置，`status` 照实报告它。
 
 响应统一为：
 
@@ -138,9 +148,9 @@ struct Response {
 
 `flows` 字段在线协议上是可选的（serde `default`），所以新 `ssctl` 能解码不带它的旧
 daemon 应答，旧 `ssctl` 也能解码新 daemon 的应答。`RuntimeStatus` 的 `version`、
-`guard`、`uptime_s`、`attached_s`、`redundancy`、`metrics_recent` 以及 `metrics` 里的
-`guardrail_rounds`、`cwnd_cap_hits` 同理（旧 daemon 的 `redundancy` 解码为未生效，缺的计数器
-解码为 0）。
+`guard`、`uptime_s`、`attached_s`、`redundancy`、`metrics_recent`、`draining`、`cgroup_path` 以及
+`metrics` 里的 `guardrail_rounds`、`cwnd_cap_hits` 同理（旧 daemon 的 `redundancy` 解码为未生效，
+`draining` 为 `false`，缺的计数器解码为 0）。
 
 ## 4. 状态与计数器字段（`ssctl status --json` 的输出结构）
 
@@ -155,7 +165,7 @@ daemon 应答，旧 `ssctl` 也能解码新 daemon 的应答。`RuntimeStatus` �
 | `modules` | 当前启用的 M1-M4 模块子集 |
 | `fallback_cc` | 未启用/摘除后新连接使用的拥塞控制算法名 |
 | `active_flows` | 当前正在使用 `skyline_cc` 的连接数 |
-| `tc_stats` | TC 程序看到的包数、字节数与 GSO 包数（`packets`/`bytes`/`gso_packets`；`gso_packets` 数的是 `gso_segs > 1` 的 skb，不是段数）；`drops` 字段恒为 0——TC 程序始终 fail open，不主动丢包 |
+| `tc_stats` | TC 程序看到的包数、字节数与 GSO 包数（`packets`/`bytes`/`gso_packets`；`gso_packets` 数的是 `gso_segs > 1` 的 skb，不是段数）。TC 程序始终 fail open，从不丢包 |
 | `metrics` | M2/M3/M4 的决策计数器（见下表），**自这次挂载起累计**。没有已加载的 struct_ops 时为 `null`：从未启用、一次 drain 完成之后、daemon 重启之后都是；每次重新挂载从零计起 |
 | `metrics_recent` | 最近约一分钟里 `metrics` 的增量：`seconds`（实际覆盖的秒数）与 `metrics`（同一组计数器在这段时间里的增量）。挂载期间 daemon 每 5 秒读一次计数器，取当前值与最接近 60 秒前的那次读数之差；挂载不满一分钟时覆盖到最早的那次读数。用它区分"现在仍在发生"和"挂载以来某个时候发生过"。未挂载、刚挂载还没有读数、或来自 0.5.0 之前的 daemon 时为 `null` |
 | `rack_tuning` | M1 tier-1 全局 sysctl 的"配置声明值"与"当前实际值"对照 |
@@ -167,6 +177,8 @@ daemon 应答，旧 `ssctl` 也能解码新 daemon 的应答。`RuntimeStatus` �
 | `guard` | cc/qdisc 守护的状态与计数器，见下方 `guard` 表；来自不带此字段的旧 daemon 时解码为全默认值（未武装、计数为 0） |
 | `uptime_s` | 当前 `skyline-speederd` 进程启动至今的秒数；来自不带此字段的旧 daemon 时为 0 |
 | `attached_s` | 当前这次 struct_ops 附加至今的秒数；未附加时为 `null`。只推新系数、没有重新加载的 `enable` 不会重置它 |
+| `draining` | 一次 `drain` 已经把新连接交给 `fallback_cc`、解除了 guard、停了首轮冗余，正在等 skyline_cc 的存量连接结束：超时的 drain 留下的就是这个状态（通过 SSH 执行的 drain 总是如此）。struct_ops 注销或再次 `enable` 后回到 `false`；来自 0.5.1 及更早的 daemon 时为 `false`（0.5.2 起） |
+| `cgroup_path` | `runtime.cgroup_path`：`skyline_policy` 挂载的 cgroup，报告里的 cgroup 提示按它写。来自 0.5.1 及更早的 daemon 时为 `null`，`ssctl` 按模板默认值 `/sys/fs/cgroup/skyline-speeder` 显示（0.5.2 起） |
 
 `metrics`（`SkylineMetrics`，percpu 计数器求和）：
 
@@ -187,7 +199,7 @@ daemon 应答，旧 `ssctl` 也能解码新 daemon 的应答。`RuntimeStatus` �
 
 | 字段 | 含义 |
 |---|---|
-| `established_cb` | 经过 `skyline_policy` 的新建连接数（`ssctl flows` 里的 *connections seen*）。为 0 说明没有进程在 `/sys/fs/cgroup/skyline-speeder` 里——判断 cgroup 是否生效就看它 |
+| `established_cb` | 经过 `skyline_policy` 的新建连接数（`ssctl flows` 里的 *connections seen*），自 daemon 启动起累计；动态 RTO 关闭时同样计数。为 0 说明还没有进程在 `runtime.cgroup_path`（默认 `/sys/fs/cgroup/skyline-speeder`）里建立过连接——判断 cgroup 是否生效就看它。0.5.2 起 `ssctl flows` 总是显示这一行：动态 RTO 关闭时在 `CGROUP POLICY (skyline_policy)` 段落，打开时在 `DYNAMIC RTO (skyline_policy)` 段落；之前只在动态 RTO 打开后才显示，而 0.5.1 起 daemon 每次启动动态 RTO 都是关闭的 |
 | `subscribe_ok` / `subscribe_err` | 动态 RTO 打开时，为新连接订阅 RTT 回调成功 / 失败的次数；关闭时两者都不动 |
 | `rtt_callbacks` | 动态 RTO 打开时收到的 RTT 回调次数；关闭时不动（daemon 每次启动后都是关闭，第 2.4 节） |
 | `skipped_warmup` | 每条连接前 `warmup_samples` 个 RTT 样本只观察不下发，跳过的次数 |
@@ -291,20 +303,24 @@ BPF 侧的四段配置各自独立维护自己的 ABI 版本号，互不联动�
 
 各段配置的版本校验行为并不完全一致：
 
-- M2/M3/M4（`SKYLINE_ABI_VERSION`）：每条连接复制配置时（`skyline_adopt_config()`）校验
-  版本号，不匹配就不复制，这条连接就没有配置：`skyline_cong_control` 在每个 ACK 上直接返回。
-  这不是交还给内核——`cong_control` 已经取代了内核自己的增长逻辑——所以 cwnd 停在内核的初始
-  窗口（RTO 之后停在 `tcp_enter_loss()` 留下的大小），也没有谁设 pacing；没有对应的计数器记录
-  这件事（`active_flows` 在涨、`metrics.ack_events` 不动）。`struct skyline_config` 大小变了的
-  话，daemon 写配置槽时就会报错。`metrics` 按布局读取，大小对不上的每 CPU 值被跳过，计数器全是 0。
-  加载时没有谁拒绝不匹配的一对。
+- M2/M3/M4（`SKYLINE_ABI_VERSION`）：0.5.2 起 `skyline-speederd` 加载 `skyline_cc.bpf.o`
+  之前先读对象自己记下的版本（`.rodata.abi` 段里的 `skyline_abi_version`），与自己的不同、或者
+  对象里没有这一段（0.5.1 及更早构建的对象），就拒绝加载并说明原因——`ssctl enable`、
+  `--validate-only --verify-bpf` 与安装器的验证步骤都会报这个错。对象一侧，每条连接复制配置时
+  （`skyline_adopt_config()`）仍然校验版本号，不匹配就不复制，这条连接就没有配置——只有不做
+  上述检查的旧 daemon 加载了新对象时才会出现。这不是交还给内核：`cong_control` 已经取代了内核
+  自己的增长逻辑。0.5.2 起这样的连接按内核 Reno 的方式增长窗口（之前一直停在内核的初始窗口，
+  RTO 之后停在 `tcp_enter_loss()` 留下的大小），没有谁设 pacing，也没有对应的计数器记录这件事
+  （`active_flows` 在涨、`metrics.ack_events` 不动）。`struct skyline_config` 大小变了的话，
+  daemon 写配置槽时就会报错。`metrics` 按布局读取，大小对不上的每 CPU 值被跳过，计数器全是 0。
 - DSCP 标记（`SKYLINE_RETRANSMIT_DSCP_ABI_VERSION`）：版本不匹配时跳过标记逻辑
   （相当于功能关闭），并递增 `retransmit_dscp.stats` 里的 `abi_mismatch`
   计数器。
 - 首轮冗余（`SKYLINE_REDUNDANCY_ABI_VERSION`）：与 DSCP 标记相同——不匹配时不复制，
   递增 `redundancy.stats` 里的 `abi_mismatch`。
-- M1 tier-2 动态 RTO（`SKYLINE_RTO_TUNING_ABI_VERSION`）：BPF 侧当前不校验这个
-  版本号。
+- M1 tier-2 动态 RTO（`SKYLINE_RTO_TUNING_ABI_VERSION`）：0.5.2 起 `skyline_policy` 校验它，
+  不匹配时当作没有配置——新连接不订阅 RTT 回调，已订阅的在下一个 RTT 样本上退订，与功能关闭
+  时一样；没有对应的计数器。0.5.1 及更早不校验，不匹配就按错位的结构读取。
 
 这只会发生在 `skyline-speederd` 与它加载的 `.bpf.o` 不是同一次构建产物时，正常部署
 （`skyline-speederd`/`ssctl`/BPF 对象来自同一次 `make`）不会遇到。
@@ -330,7 +346,9 @@ BPF 侧的四段配置各自独立维护自己的 ABI 版本号，互不联动�
 
 **不认识的键会被拒绝（0.5.0 起）。** 文件里有 daemon 不认识的键时，`--validate-only` 与 daemon 启动都失败，
 报错逐个列出这些键（`guardrail_gain at the top level (it is a key of [adaptive_cwnd])`、
-`table [gaurd]`），键名属于别的段落时指明是哪一段。写错段落、拼错名字的键因此不会再被静默忽略。0.4.x 及更早的
+`table [gaurd]`），键名属于别的段落时指明是哪一段，属于几个段落时全部列出（`enabled in [guard] (it is a key
+of [rack_rto], [redundancy] or [retransmit_dscp])`；0.5.1 及更早只说第一个，`tc_interface` 这类可选键写错位置时
+不提示）。写错段落、拼错名字的键因此不会再被静默忽略。0.4.x 及更早的
 daemon 静默忽略它们；降级到这些版本时文件里多出的键没有影响，降级到 0.5.0 或更新的版本时要先删掉报错列出的键。
 
 ### 6.1 顶层字段
@@ -341,26 +359,30 @@ daemon 静默忽略它们；降级到这些版本时文件里多出的键没有�
 | `enabled_modules` | string[] | 启动时启用的 M1-M4 模块子集，取值 `early-loss`/`adaptive-cwnd`/`loss-classifier`/`pacing` | 是（`ssctl enable`） |
 | `prr_pacing_enabled` | bool | 框架级 PRR 重实现开关，独立于上面四个模块——即使 `enabled_modules` 为空也默认生效（修正的是"绕开内核 PRR 后基线不对等"这个问题，不是可选特性）。M2 开启时该路径不会被执行 | 是（`set-module-config`） |
 | `auto_pacing_enabled` | bool | M4 关闭时使用的、等价于内核默认行为的 pacing 速率上限，独立开关，语义同上 | 是（`set-module-config`） |
-| `fallback_cc` | string | 未启用/摘除 `skyline_cc` 时新连接使用的拥塞控制算法名（每次 enable 挂载前、`ssctl drain`、enable unit 的 ExecStop 都写它），必须是内核已注册的算法，或可由内核自动加载的模块 `tcp_<名字>`。模板值 `cubic`；`install.sh` 新建配置时换成开机 sysctl 配置选定的算法（见 `DEPLOY.md` 第 2.4 节） | 否 |
+| `fallback_cc` | string | 未启用/摘除 `skyline_cc` 时新连接使用的拥塞控制算法名（每次 enable 挂载前、`ssctl drain`、enable unit 的 ExecStop 都写它），必须是内核已注册的算法，或可由内核自动加载的模块 `tcp_<名字>`，且不能是 `skyline_cc`（drain 先写它、再注销 skyline_cc，0.5.2 起拒绝）。模板值 `cubic`；`install.sh` 新建配置时换成开机 sysctl 配置选定的算法（见 `DEPLOY.md` 第 2.4 节） | 否 |
 | `max_pacing_mbps` | u64 | pacing 速率硬上限（Mbps），`pacing` 模块启用时不可为 0 | 是 |
 | `max_cwnd_packets` | u32 | cwnd 硬上限（包），最小值 4 | 是 |
 | `max_queue_delay_ms` | u32 | 队列时延护栏的固定基准值（毫秒） | 是 |
-| `max_queue_delay_ratio` | f64 | 按基准 RTT 折算的护栏增量比例，实际护栏 = `max(max_queue_delay_ms, 基准RTT × 该比例)`，让护栏在高 RTT 路径上自动放宽而不是卡在固定毫秒数；`0.0` = 不放宽，恒等于 `max_queue_delay_ms` | 是 |
-| `initial_cwnd_packets` | u32 | 连接建立时的初始 cwnd（包），`0` = 不覆盖、使用内核自身的初始窗口 | 是 |
+| `max_queue_delay_ratio` | f64 | 按基准 RTT 折算的护栏增量比例，实际护栏 = `max(max_queue_delay_ms, 基准RTT × 该比例)`，让护栏在高 RTT 路径上自动放宽而不是卡在固定毫秒数；`0.0` = 不放宽，恒等于 `max_queue_delay_ms`。必须是非负的有限数（0.5.2 起拒绝 `nan`/`inf`） | 是 |
+| `initial_cwnd_packets` | u32 | 连接建立时的初始 cwnd（包），`0` = 不覆盖、使用内核自身的初始窗口；不得超过 `max_cwnd_packets`（0.5.2 起：初始窗口在任何 ACK 经过上限之前就写下） | 是 |
 | `min_cwnd_packets` | u32 | M2 的 cwnd 目标下限（包），取值范围 `4`–`max_cwnd_packets`，随附模板为 `32`，省略 = `4`（历史行为）。也是还没有带宽估计的流在 RTO 之后的 cwnd 下限——整个响应在第一轮就发完的短流通常一直没有估计，内核在 RTO 后只给它留 1 个包。只在 `adaptive-cwnd` 开启时生效；M2 关闭的中性基线路径始终使用固定的 4 包下限，不受此字段影响。发送速率仍由 pacing 决定，见 `docs/03-design.md` 第 6 节 | 是 |
 
 ### 6.2 `[adaptive_cwnd]`（M2 系数）
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `min_rtt_window_s` | u32 | 最小 RTT 滑动窗口长度（秒） |
-| `bw_window_rtts` | u32 | 带宽估计窗口长度（RTT 个数），取值范围 1-10 |
+| `min_rtt_window_s` | u32 | 最小 RTT 滑动窗口长度（秒），取值范围 1-4294（0.5.2 起：`0` 让基准 RTT 恒等于当前 RTT，队列时延护栏永远看不到排队；内核侧以 32 位微秒保存） |
+| `bw_window_rtts` | u32 | 带宽估计窗口长度：有样本进入滤波器的轮数（一轮约两个 RTT，`docs/03-design.md` 第 3 节），取值范围 1-10 |
 | `startup_plateau_rtts` | u32 | 判定"带宽增长平台期"所需的连续轮数，用于触发 STARTUP→CRUISE 切换；只数有样本进入带宽滤波器的轮次，整轮受应用限速的不算（0.5.1 起） |
 | `startup_growth_ratio` | f64 | 低于此增长比例视为平台期，取值范围 0.0-1.0 |
-| `startup_gain` | f64 | STARTUP 态单一增益，同时作用于 cwnd 目标和 pacing 速率，必须 ≥1.0 |
-| `cruise_inflight_gain` | f64 | CRUISE 态 cwnd 目标增益，必须 ≥1.0——刻意比 `cruise_pacing_gain` 更宽松，cwnd 只需不成为限制因素，真正的限速器是 pacing |
-| `cruise_pacing_gain` | f64 | CRUISE 态 pacing 速率增益（M4 开启时真正生效的限速值），必须 ≥1.0 |
+| `startup_gain` | f64 | STARTUP 态单一增益，同时作用于 cwnd 目标和 pacing 速率，取值范围 1.0-1000 |
+| `cruise_inflight_gain` | f64 | CRUISE 态 cwnd 目标增益，取值范围 1.0-1000——刻意比 `cruise_pacing_gain` 更宽松，cwnd 只需不成为限制因素，真正的限速器是 pacing |
+| `cruise_pacing_gain` | f64 | CRUISE 态 pacing 速率增益（M4 开启时真正生效的限速值），取值范围 1.0-1000 |
 | `guardrail_gain` | f64 | 队列时延/ECN 护栏触发时对 cwnd 目标和 pacing 速率共同生效的增益，取值范围 0.0-1.0。`0.0` = 未启用护栏降速（护栏只取消加速，增益回到中性 1.0）；`(0.0, 1.0)` = 主动降速到测得带宽的该比例 |
+
+本节与下一节的浮点字段都必须是有限数：TOML 能写 `nan` 和 `inf`，它们到 BPF 侧分别变成 0 和 u32 上限，
+在状态 JSON 里变成没有任何读者能解码的 `null`，0.5.2 起一律拒绝。三个模式增益的上限 1000 是因为 pacing
+路径在 32 位里把增益乘上 M3 的丢包补偿（最多 2 倍），约 2147 以上会回绕成一个很小的增益。
 
 ### 6.3 `[loss_classifier]`（M3 系数）
 
@@ -409,7 +431,7 @@ daemon 静默忽略它们；降级到这些版本时文件里多出的键没有�
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `bpf_dir` | path | BPF 对象文件所在目录 |
-| `pin_dir` | path | 必填，但当前版本不读它，也不 pin 任何对象（模板值 `/sys/fs/bpf/skyline-speeder`） |
+| `pin_dir` | path | 当前版本不读它，也不 pin 任何对象（模板值 `/sys/fs/bpf/skyline-speeder`）。0.5.2 起可以省略；0.5.1 及更早必填，降级前要留着这一行 |
 | `cgroup_path` | path | M1 tier-2 cgroup sockops 挂载的 cgroup 路径 |
 | `socket_path` | path | 控制面 Unix socket 路径 |
 | `state_path` | path | 运行期状态落盘路径（不是配置输入）。只在 daemon 启动时和每次**成功**处理请求后改写（失败的请求，例如超时的 drain，不更新它），不是实时状态：监控请调用 `ssctl status --json` |

@@ -206,7 +206,7 @@ sudo ssctl reset-redundancy                             # 回到配置文件里�
 
 配置文件里对应 `[redundancy]` 段的 `enabled`、`first_kib`（1-1024）和 `delay_ms`（0-100，0 表示紧跟原包）。复制只在 skyline_cc 挂载期间进行：`ssctl enable` 启动它，`ssctl drain` 停掉它。它需要 `skyline_tc` 挂在以太网的 `tc_interface` 上；根 qdisc 不是 `fq` 时，副本会立即发出。
 
-`ssctl flows` 里有两处显示它。*PARAMETERS IN FORCE* 里的 `first-flight copies` 说明它是否在运行：`handshake + first 64 KiB of each connection sent twice, the copy +10 ms`（运行中）、`configured, not running`（TC 程序没有加载），或 `off`。*TC EGRESS* 里的 `first-flight copies` 说明 daemon 启动以来它花了多少：`52,113 sent, 58.2 MiB (9,870 handshakes)` 依次是副本个数（一个 GSO 包算一个）、这些副本的字节数，以及其中 SYN 和 SYN-ACK 的个数。末尾出现 `N could not be made` 表示有副本没做成，正常情况下不会出现。
+`ssctl flows` 里有两处显示它。*PARAMETERS IN FORCE* 里的 `first-flight copies` 说明它是否在运行：`handshake + first 64 KiB of each connection sent twice, the copy +10 ms`（运行中）、`configured, not running`（应该运行而没有：TC 程序没有加载，或者最近一次 `ssctl enable` 说明了原因）、`stopped by the drain`（drain 正在等 skyline_cc 的最后几条连接），或 `off`。*TC EGRESS* 里的 `first-flight copies` 说明 daemon 启动以来它花了多少：`52,113 sent, 58.2 MiB (9,870 handshakes)` 依次是副本个数（一个 GSO 包算一个）、这些副本的字节数，以及其中 SYN 和 SYN-ACK 的个数。末尾出现 `N could not be made` 表示有副本没做成，正常情况下不会出现。
 
 ### 拥塞控制与 qdisc 守护
 
@@ -239,11 +239,11 @@ sudo ssctl set-rack-rto --disable
 
 用之前要知道三件事：
 
-- 只有 `/sys/fs/cgroup/skyline-speeder` 里的进程建立的连接才会经过 `skyline_policy`；进程不在其中**不会报任何错误**，只是 `ssctl flows` 里 *connections seen* 一直是 0。用 `sudo /opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <你的服务启动命令...>` 在该 cgroup 里启动服务；systemd 服务的做法见 [DEPLOY.md](DEPLOY.md) 第 7 节。`skyline_cc` 本身是全局的，不需要 cgroup。
+- 只有 `/sys/fs/cgroup/skyline-speeder`（`runtime.cgroup_path`）里的进程建立的连接才会经过 `skyline_policy`；进程不在其中**不会报任何错误**，只是 `ssctl flows` 里 *connections seen* 一直是 0——不论动态 RTO 开没开，这一行都在。用 `sudo /opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <你的服务启动命令...>` 在该 cgroup 里启动服务；systemd 服务的做法见 [DEPLOY.md](DEPLOY.md) 第 7 节。`skyline_cc` 本身是全局的，不需要 cgroup。
 - **daemon 每次启动时它都是关闭的**，不管配置里的 `[rack_rto]` 怎么写。每次启动之后都要执行 `ssctl reset-rack-rto`（下发配置文件里的 `[rack_rto]`）或 `ssctl set-rack-rto`。
 - 它在任何拥塞控制下都起作用，`ssctl drain` 也不会停掉它。
 
-`ssctl flows` 的 *PARAMETERS IN FORCE* 里显示 `dynamic RTO floor` 和 `dynamic RTO ceiling`，另有 *DYNAMIC RTO* 段落：`applied` 是设下下限的次数（后面依次是被内核拒绝、等待预热、与已设的值相同而跳过的次数），`connections seen` 是经过 `skyline_policy` 的连接数。`applied` 在增长（连接短到过不了预热期时是 `warmup` 在增长），才说明它真的在运行。
+`ssctl flows` 的 *PARAMETERS IN FORCE* 里显示 `dynamic RTO floor` 和 `dynamic RTO ceiling`，另有 *DYNAMIC RTO* 段落（关闭时是 *CGROUP POLICY*，只有 `connections seen` 一行）：`applied` 是设下下限的次数（后面依次是被内核拒绝、等待预热、与已设的值相同而跳过的次数），`connections seen` 是经过 `skyline_policy` 的连接数。`applied` 在增长（连接短到过不了预热期时是 `warmup` 在增长），才说明它真的在运行。
 
 ### 重传包 DSCP 标记
 
@@ -254,6 +254,7 @@ sudo ssctl set-rack-rto --disable
 
 ```bash
 sudo ssctl set-retransmit-dscp --dscp-value <值>   # 1-63，向网络方要；这条命令同时打开标记
+sudo ssctl set-retransmit-dscp --disable           # 关闭，不管配置文件怎么写
 sudo ssctl reset-retransmit-dscp                   # 回到配置文件里的 [retransmit_dscp]：没有显式开启就是关闭
 ```
 
@@ -284,7 +285,7 @@ sudo systemctl restart skyline-speederd    # 挂载服务随之重新挂载 skyl
 
 | 行 | 含义 |
 |---|---|
-| 首行 | 正在运行的 daemon 的版本（升级后、daemon 重启之前，`ssctl --version` 可能与它不同）和结论：`ACCELERATING`，已挂载且是全机默认；`ATTACHED, NOT DEFAULT`，之后有东西改了默认算法，新连接绕开了 skyline_cc，执行 `ssctl enable`；`STANDBY`，没有挂载，执行 `ssctl enable` |
+| 首行 | 正在运行的 daemon 的版本（升级后、daemon 重启之前，`ssctl --version` 可能与它不同）和结论：`ACCELERATING`，已挂载且是全机默认；`ATTACHED, NOT DEFAULT`，之后有东西改了默认算法，新连接绕开了 skyline_cc，执行 `ssctl enable`；`DRAINING`，一次 drain 已经把新连接交给 `fallback_cc`，skyline_cc 只服务它还剩的连接（通过 SSH 执行的 drain 总是停在这里；`ssctl enable` 把主机接管回来）；`STANDBY`，没有挂载，执行 `ssctl enable` |
 | skyline_cc struct_ops | 是否已挂载，挂载了多久 |
 | host default cc | `net.ipv4.tcp_congestion_control`：新连接用什么算法 |
 | fallback on drain | `fallback_cc`：`ssctl drain` 之后新连接用什么算法；全新安装时，如果主机的 sysctl 文件在开机时指定了一个本内核有的算法，就设为它 |
@@ -300,7 +301,7 @@ sudo systemctl restart skyline-speederd    # 挂载服务随之重新挂载 skyl
 
 | 行 | 含义 |
 |---|---|
-| 首行 | `ACCELERATING`；`IDLE`，已挂载但还没有连接跑在 skyline_cc 上；`BYPASSED`，已挂载但不是全机默认；`NOT ACCELERATING`，没有挂载 |
+| 首行 | `ACCELERATING`；`IDLE`，已挂载但还没有连接跑在 skyline_cc 上；`DRAINING`，drain 正在等下面列出的连接结束；`BYPASSED`，已挂载但不是全机默认；`NOT ACCELERATING`，没有挂载 |
 | coverage | 这台机器的 TCP 连接里跑在 skyline_cc 上的比例 |
 | volume | 列出的连接已发送和重传的字节数，取自内核自己的计数器 |
 | 连接表 | 逐条连接：RTT、窗口（包数）、skyline_cc 设定的 pacing 速率、内核估计的交付速率、已发字节及其中的重传占比 |
@@ -315,10 +316,10 @@ sudo systemctl restart skyline-speederd    # 挂载服务随之重新挂载 skyl
 | pacing updates | pacing 速率重新计算的次数 |
 | delivery samples | 相互重叠的速率样本之和，用于比较两次测试；不是包数 |
 | PRR adjustments | 只在不为 0 时出现；`adaptive-cwnd` 开着时出现它，就是值得报告的缺陷 |
-| TC EGRESS | daemon 启动以来从 `tc_interface` 发出的全部流量，不论拥塞控制：`seen` 是包数、字节数和 GSO 包数；`drops` 恒为 0，这个程序从不丢包；然后是 [`retransmits marked`](#重传包-dscp-标记) 和 [`first-flight copies`](#首轮冗余) |
-| DYNAMIC RTO | 见[动态 RTO 上下限](#动态-rto-上下限) |
+| TC EGRESS | daemon 启动以来从 `tc_interface` 发出的全部流量，不论拥塞控制：`seen` 是包数、字节数和 GSO 包数；然后是 [`retransmits marked`](#重传包-dscp-标记) 和 [`first-flight copies`](#首轮冗余) |
+| DYNAMIC RTO，关闭时是 CGROUP POLICY | 见[动态 RTO 上下限](#动态-rto-上下限)；`connections seen` 用来判断 cgroup 里有没有进程 |
 
-要给脚本解析就加 `--json`，打印 daemon 的原始应答。`ssctl snapshot <文件>` 让 daemon 把其中的 `status` 部分写进文件（systemd 下写到 `/run/skyline-speeder/` 最稳妥），`ssctl validate` 对照内核校验 daemon 内存里的配置。
+要给脚本解析就加 `--json`，打印 daemon 的原始应答。`ssctl snapshot <文件>` 让 daemon 把其中的 `status` 部分写进一个普通文件（systemd 下写到 `/run/skyline-speeder/` 最稳妥），`ssctl validate` 对照内核校验 daemon 内存里的配置。
 
 ## 仓库结构
 

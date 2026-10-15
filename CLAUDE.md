@@ -52,7 +52,7 @@ skyline-speederd --config config/speeder.toml --validate-only --verify-bpf
 | 标识符 | 位置 | 约束 | 细则 |
 |---|---|---|---|
 | 算法名 `"skyline_cc"` | `bpf/` 的三个程序、`crates/skyline-common` 的 `SKYLINE_CC_NAME`，以及 `infra/` 三个脚本与 `install.sh` 里的字面量 | 算法注册名，**≤ 15 字符**（`TCP_CA_NAME_MAX` 为 16 含 NUL），各处一字不差；policy 与 tc 两处对不上时静默失效 | `bpf/CLAUDE.md` |
-| `SKYLINE_ABI_VERSION` 及另外三个 ABI 版本号 | `bpf/include/skyline_abi.h` 与 `crates/skyline-common/src/lib.rs` | 布局变更必须递增管这段结构的版本号，两侧一起改。加载时**没有**谁拒绝不匹配的一对，不一致时静默停摆、不报错 | `bpf/CLAUDE.md` |
+| `SKYLINE_ABI_VERSION` 及另外三个 ABI 版本号 | `bpf/include/skyline_abi.h` 与 `crates/skyline-common/src/lib.rs` | 布局变更必须递增管这段结构的版本号，两侧一起改。0.5.2 起 daemon 拒绝加载 ABI 不同的 `skyline_cc.bpf.o`；不做这项检查的旧 daemon 配新对象时不报错，连接拿不到配置 | `bpf/CLAUDE.md` |
 | `cong_control` 4 参数签名 | `bpf/skyline_cc.bpf.c` | `(sk, ack, flag, rs)`，内核 >= 6.10 才有 | `bpf/CLAUDE.md` |
 | struct_ops 双变体 `skyline_cc` / `skyline_cc_txs` | `bpf/skyline_cc.bpf.c` | 两张 map 挂**同一组回调**：**给一张加回调，另一张也要加**，否则行为随内核版本悄悄不同 | `bpf/CLAUDE.md` |
 | 安装路径 `/opt|/etc|/run/skyline-speeder` | 配置、unit（含 `packaging/openrc/` 的两个 OpenRC 脚本）、脚本 | 三处必须一致 | `packaging/CLAUDE.md` |

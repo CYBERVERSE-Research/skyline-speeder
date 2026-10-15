@@ -15,8 +15,8 @@
 # fixed against this kernel's BTF at load time, and a prebuilt control plane,
 # with no build toolchain on this host -- on Alpine, the release's musl build.
 # A host that cannot run the published binaries (not x86_64, a glibc older
-# than 2.38) is told why and builds from source instead. Forwarding --source builds from source
-# unconditionally; --release <tag> pins the artifact. Either way the
+# than 2.38, a musl older than 1.2.5) is told why and builds this tree from
+# source instead. Forwarding --source builds from source unconditionally; --release <tag> pins the artifact. Either way the
 # install.sh that runs comes from --ref, which defaults to main, while the
 # artifact comes from the latest release (or --release): --ref picks the
 # installer, not the version installed.
@@ -41,7 +41,8 @@
 #   ... | sudo bash -s -- --source      # build from source on this host instead
 #   ... | sudo bash -s -- --release v0.4.0
 #                                       # install that release, not the latest
-#   ... | sudo bash -s -- --check       # preflight only
+#   ... | sudo bash -s -- --check       # preflight only: installs only what the
+#                                       #   download needs, places no tree
 #   ... | sudo bash -s -- --no-enable   # install without attaching skyline_cc
 #   ... | sudo bash -s -- --verbose     # show every build command's output
 #   ... | sudo bash -s -- --uninstall   # remove, put the host on bbr + fq, and
@@ -89,7 +90,14 @@ main() {
                 shift 2; n=$((n - 2)) ;;
             # The header comment, to its end, rather than a hand-counted line
             # range that truncates the moment a flag is documented above.
-            -h|--help) awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
+            # Piped into a shell -- the way this script is meant to run --
+            # $0 is that shell, not a file to read.
+            -h|--help)
+                case "$0" in
+                    *bootstrap.sh) awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0" ;;
+                    *) echo "Usage: the comment at the top of https://github.com/$REPO/blob/main/scripts/bootstrap.sh" ;;
+                esac
+                exit 0 ;;
             *)         set -- "$@" "$1"; shift; n=$((n - 1)) ;;
         esac
     done
@@ -142,7 +150,7 @@ main() {
                 cat "$TMP/pkg.log" >&2
                 die "failed to install $NEED
    An interrupted dpkg run blocks every install until it is finished:
-   'sudo dpkg --configure -a', then run this again. install.sh repairs that
+   '${SUDO}dpkg --configure -a', then run this again. install.sh repairs that
    itself at its package step; this bootstrap deliberately stays small."
             fi
         elif command -v dnf >/dev/null 2>&1; then
@@ -190,6 +198,20 @@ main() {
         die "unexpected tarball layout: no executable install.sh at the top level"
     fi
 
+    # A preflight changes nothing, and an uninstall has nothing to keep a tree
+    # for: both run the installer straight from the download. Placing it as an
+    # install does moved an operator's tree aside and then advertised "upgrade
+    # or remove from there" -- after --check on a host with nothing installed,
+    # after --uninstall of the very installation it pointed at. bash rather
+    # than the file itself: /tmp may be mounted noexec.
+    case " $* " in *" --check "*) CHECKING=1 ;; *) CHECKING=0 ;; esac
+    if [ "$CHECKING" -eq 1 ] || [ "$UNINSTALLING" -eq 1 ]; then
+        info "handing off to install.sh (nothing is placed in $SRC_DIR)"
+        echo
+        bash "$UNPACKED/install.sh" "$@"
+        exit 0
+    fi
+
     # --- place the tree -----------------------------------------------------
     # A previous tree is moved aside, never deleted: it may carry local edits,
     # and an installer that silently destroys an operator's working copy is not
@@ -198,6 +220,12 @@ main() {
         BACKUP="${SRC_DIR}.bak-$(date +%Y%m%d%H%M%S)"
         mv "$SRC_DIR" "$BACKUP"
         warn "existing tree moved to $BACKUP"
+        # One more on every upgrade, each with a source build's target/ and
+        # build/ when there was one. Never removed here (see above): counted.
+        KEPT=0
+        for b in "${SRC_DIR}".bak-*; do [ -e "$b" ] && KEPT=$((KEPT + 1)); done
+        [ "$KEPT" -le 1 ] \
+            || warn "$KEPT earlier trees are kept as ${SRC_DIR}.bak-*; remove the ones you no longer need"
     fi
     mkdir -p "$(dirname "$SRC_DIR")"
     mv "$UNPACKED" "$SRC_DIR"
