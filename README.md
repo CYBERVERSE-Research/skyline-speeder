@@ -165,7 +165,7 @@ ssctl disable --module loss-classifier        # one module off, the others as th
 
 ### Coefficients
 
-Seventeen parameters change online with `ssctl set-module-config`, no restart. Each open connection picks the new values up at its next round trip and starts its estimate over with them. `ssctl flows` shows them under *PARAMETERS IN FORCE*, one line per group:
+Seventeen parameters change online with `ssctl set-module-config`, no restart. Each open connection picks the new values up at its next round (about two round trips) and starts its estimate over with them. `ssctl flows` shows them under *PARAMETERS IN FORCE*, one line per group:
 
 | `ssctl flows` line | Flags, with defaults | What they set |
 |---|---|---|
@@ -360,7 +360,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 make bpf                          # generate vmlinux.h, compile the three CO-RE objects
 cargo build --workspace --release
-make check PYTHON="$(command -v python3)"   # formatting, static checks, unit tests (the harness tests need Python 3.11+)
+make check PYTHON="$(command -v python3)"   # script syntax, the harness tests (Python 3.11+), formatting, cargo check; cargo test is `make test`
 
 # Run every object through the kernel verifier, attaching nothing
 skyline-speederd --config config/speeder.toml --validate-only --verify-bpf

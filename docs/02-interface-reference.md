@@ -536,7 +536,9 @@ qdisc：网卡的根 qdisc 往往在这个 sysctl 生效前就建好了（一台
 **所有权。** 从一次成功的 `enable` 到下一次 `drain`，下面几项只有 `skyline-speederd` 一个
 写入者：
 
-- `net.ipv4.tcp_congestion_control` = `skyline_cc`（它本来就是这个 sysctl 的唯一所有者）；
+- `net.ipv4.tcp_congestion_control` = `skyline_cc`（daemon 对这个 sysctl 的每次写入都经过同一个函数；
+  `enable` 之前与 `drain` 之后，`infra/boot-disable.sh` 的兜底、实验矩阵的 `apply-guest-profile.sh` 与
+  `install.sh --uninstall` 也会写它）；
 - `net.core.default_qdisc` = `fq`，以及受管网卡（通常就是 `runtime.tc_interface`，见下文
   "受管网卡"）的根 qdisc = `fq`（多队列网卡上是每个子队列都为 `fq` 的 `mq`）——仅当
   `[guard] qdisc = true`。`infra/boot-enable.sh` 过去在开机时写一次 `default_qdisc=fq`，

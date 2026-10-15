@@ -466,7 +466,8 @@ daemon 会留下 socket 文件，OpenRC 也不像 systemd 的 `RuntimeDirectory=
 4. 武装 guard 并立即做一遍完整检查（§9）：`[guard] qdisc = true`（默认）时把 `net.core.default_qdisc` 写成
    `fq`，并把出口网卡的根 qdisc 换成 `fq`（多队列网卡上是子队列全为 `fq` 的 `mq`；VLAN、bond、网桥则换它下面的
    物理网卡）；
-5. 打开首轮冗余：每条 `skyline_cc` 连接的握手包与前 64 KiB 各发两份，第二份晚 10 ms（§8.1）。
+5. 打开首轮冗余：本机发出的每个带套接字的 SYN-ACK（不论它的连接将来跑哪种拥塞控制：发出时还没有选定），
+   以及 `skyline_cc` 连接的 SYN 与前 64 KiB（含其中的重传）各发两份，第二份晚 10 ms（§8.1）。
 
 不带 `--modules` 的 `ssctl enable` 沿用 daemon 当前的模块集合：执行过 `ssctl enable --all-off` 之后，要用
 `--modules early-loss,adaptive-cwnd,loss-classifier,pacing` 才能回到全开（或重启 daemon）。
@@ -989,11 +990,12 @@ tmpfs）里，大小受 `runtime.events_max_mib` 限制（默认 8 MiB，满了�
 
 | 文档 | 内容 |
 |---|---|
-| [README.md](README.md) / [README.zh.md](README.zh.md) | 项目简介、实测性能、快速开始 |
+| [README.md](README.md) / [README.zh.md](README.zh.md) | 按上手顺序：这是什么、内核版本要求、快速开始、原理、配置（每个功能，以及 `ssctl status` / `ssctl flows` 的每一行）、实测性能 |
 | [docs/usage.md](docs/usage.md) | 新手向：每个开关和参数、四档配方、动态 RTO、DSCP、卡顿排查 |
 | [docs/02-interface-reference.md](docs/02-interface-reference.md) | `ssctl` 命令、线协议、状态字段、配置字段、事件码、guard 规则 |
 | [docs/03-design.md](docs/03-design.md) | 各模块的设计与取舍 |
 | [docs/04-performance-report.md](docs/04-performance-report.md) | 测试床数据、有效性边界与局限（第 8 节） |
 | [research/experiments/README.md](research/experiments/README.md) | 在自己的环境里复现性能测试 |
+| [research/experiments/single-ended/](research/experiments/single-ended/) | README「实测性能」引用的单条公网链路现场对比：方法、逐轮数据、原始记录与脚本（不是测试床数据） |
 | [CHANGELOG.md](CHANGELOG.md) | 每个版本的变化与 *Upgrading from ...* 升级注意事项 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 构建、验证器、硬性不变量、发版流程 |

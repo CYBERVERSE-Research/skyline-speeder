@@ -124,7 +124,8 @@ BDP ≈ 1.78 MB ≈ 1225 包。测试时段为晚高峰：首轮 19:59–21:29�
 | `setalgo.sh` | 服务端算法切换；`DST` 必填，下一跳沿用内核原本的选择 |
 | `analyze.py` | 生成 `RESULTS.md` |
 | `plot_comparison.py` | 从 `head-to-head.jsonl` 直接计算并生成两张 README 图；不硬编码任何数字，换了数据图就跟着变（纯标准库，不需要 matplotlib） |
-| `first-pass-*.jsonl` | 首轮探索性数据（含 cubic，n=3，丢包 3–10%），**方法较弱，仅作参考** |
+| `first-pass-with-cubic.jsonl` | 首轮探索性数据：游戏、网页、视频、大文件四个场景 × cubic / bbr / tcp-brutal（100、200、400 Mbps）/ skyline_cc，71 条，n=3，丢包 3–10%，不含服务端计数器；**方法较弱，仅作参考** |
+| `first-pass-retransmission.jsonl` | 首轮之后的单流大文件补测：同样六种配置各 3 次，18 条，带服务端的计数器增量（重传）；**方法较弱，仅作参考** |
 
 ```bash
 # 重新分析
@@ -162,9 +163,11 @@ sudo ./server-setup.sh stop
   `ssctl set-rack-rto`。源码安装和 `--prebuilt` 装的都是同一份生产模板 `speeder-guest.toml`，
   它刻意不写 `[rack_rto]`，因为实验矩阵依赖 `reset-rack-rto` 等于"关闭"。所以本次测试用
   `setalgo.sh` 显式下发取值。
-  另外，从代码看，`ssctl status` 的 `rack_rto.config` 报告的是配置文件里的值而不是内核侧的实际
-  状态；配置文件写了 `enabled = true` 时，状态会显示已开启、实际却没有生效。本次测试的配置
-  文件没有 `[rack_rto]`，没有触发这种情况，也未在测试中复现。
+  另外，0.5.0 及更早的 `ssctl status` 里 `rack_rto.config` 报告的是配置文件里的值而不是内核侧的
+  实际状态：配置文件写了 `enabled = true` 时，会显示已开启、实际却没有生效。0.5.1 起它是内核实际
+  运行的值（daemon 启动后为 `enabled: false`，直到 `set-`/`reset-` 命令），文件里的值在新字段
+  `declared` 里，ATTENTION 会给出要执行的命令。本次测试的配置文件没有 `[rack_rto]`，没有触发这种
+  情况。
 
 - **`rto_max` 在 6.12 内核上全部被拒**。`TCP_RTO_MAX_MS` 需要 Linux 6.15+，本次内核 6.12.63，
   `rto_max_rejected: 59 / rto_max_applied: 0`。计数器如实记录，不属于静默失效，但测试时已关闭该半个功能。

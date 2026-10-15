@@ -18,22 +18,28 @@ If that is acceptable to you, read on.
 ```bash
 make bpf                          # generate vmlinux.h, compile three CO-RE objects
 cargo build --workspace --release
-make check                        # cargo fmt --check + cargo check + unit tests
-make test                         # includes cargo test
+make check                        # bash -n on the scripts, the experiment-harness Python tests,
+                                  # cargo fmt --check, cargo check -- no cargo test
+make test                         # the experiment-harness Python tests, then cargo test --workspace
 ```
 
 `make bpf` reads type information from **this machine's** `/sys/kernel/btf/vmlinux`
 by default. Point it at another kernel's BTF with `make VMLINUX_BTF=<path> bpf`, or
 hand it a ready-made header with `make PREBUILT_VMLINUX_H=<path> bpf` -- that path
 needs neither bpftool nor this machine's BTF, and it is how releases are built.
-The header only has to define the types the code uses, not come from the kernel
-the objects will run on: it is generated with `preserve_access_index`, so every
-field access carries a CO-RE relocation that libbpf fixes against the running
-kernel's BTF at load time (built on 6.12.63 and loaded on 6.19.14, and the other
-way round; `infra/kernel/core-portability.sh` reproduces it). CO-RE cannot fix a
-field that was renamed or removed, so after a data-plane change, rerun that script
-before relying on it. `bpf/include/vmlinux.h` is a build artefact and is never
-committed.
+The header only has to define the types the code uses. It need not come from the
+kernel the objects will run on, but it must not be newer than that kernel: it is
+generated with `preserve_access_index`, so every field access carries a CO-RE
+relocation that libbpf fixes against the running kernel's BTF at load time, and
+CO-RE cannot supply a field the running kernel lacks -- objects built against a
+newer kernel's header can fail to load on 6.12, which is why releases build
+against the 6.12 reference header. What has been verified is a 6.12 header:
+objects built against it under 6.12.63 load on 6.19.14, and built against it
+under 6.19.14 load on 6.12.63 (CHANGELOG 0.1.0, *Verified*);
+`infra/kernel/core-portability.sh` reproduces this. CO-RE cannot fix a field
+that was renamed or removed either, so after a data-plane change, rerun that
+script before relying on it. `bpf/include/vmlinux.h` is a build artefact and is
+never committed.
 
 A vmlinux.h generated this way is compiled with `-DBPF_NO_KFUNC_PROTOTYPES`: from
 7.5 on, bpftool writes a prototype for every kfunc the running kernel exports, and
@@ -44,14 +50,15 @@ declares four). So **declare every kfunc a BPF source calls in that source**, as
 `PREBUILT_VMLINUX_H` path a release builds with does not set the macro, and the
 released objects stay byte for byte the same.
 
-`make check` and `make test` drive a Python venv for the experiment-harness unit
-tests, which need **Python 3.11 or newer** (`research/experiments/matrix_lib.py`
-imports `tomllib`; on 3.10 and earlier the tests fail at import). Either run
-`make venv` once (it creates the venv through pyenv), or point them at any
-suitable interpreter:
+`make check` and `make test` run the experiment-harness unit tests with
+`$(PYTHON)` (default `.venv/bin/python`). They need **Python 3.11 or newer**
+(`research/experiments/matrix_lib.py` imports `tomllib`; on 3.10 and earlier the
+tests fail at import) and nothing outside the standard library. `make venv`
+builds `.venv` through pyenv from the *system* `python3`, so it only helps where
+that is 3.11 or newer. Anywhere else, point the targets at a 3.11+ interpreter:
 
 ```bash
-make check PYTHON=$(command -v python3)
+make check PYTHON=/path/to/python3.11
 ```
 
 ### Required before every commit
@@ -73,32 +80,42 @@ Breaking any of these is a defect regardless of what else the change does.
 
 | Identifier | Location | Constraint |
 |---|---|---|
-| `.name = "skyline_cc"` | `bpf/skyline_cc.bpf.c` | Registration name, **≤ 15 characters** (`TCP_CA_NAME_MAX` is 16 including NUL) |
-| `SKYLINE_ABI_VERSION` | `bpf/include/skyline_abi.h` | Must be incremented on any layout change. Nothing refuses a mismatched pair at load time: each flow compares it with the version userspace writes into the config slot it copies and adopts nothing that does not match, so `skyline_cc` stops adjusting cwnd and pacing on every connection -- without an error. It covers `struct skyline_metrics` too: userspace reads the counters by layout, and a size mismatch leaves them all at 0. The bump is what makes a half-updated pair stop instead of misreading the struct |
+| The algorithm name `"skyline_cc"` | `.name` of both struct_ops maps in `bpf/skyline_cc.bpf.c`; the `TCP_CONGESTION` setsockopt in `bpf/skyline_policy.bpf.c`; `skyline_runs_skyline_cc()` in `bpf/skyline_tc.bpf.c`; `SKYLINE_CC_NAME` in `crates/skyline-common`; the literals in `infra/boot-enable.sh`, `infra/boot-disable.sh`, `infra/apply-guest-profile.sh` and `install.sh` | Registration name, **≤ 15 characters** (`TCP_CA_NAME_MAX` is 16 including NUL), byte-identical everywhere. The daemon's sysctl write fails loudly on a mismatch; the policy and TC programs do not -- the setsockopt's error is ignored, and first-flight redundancy is left copying SYN-ACKs only. The struct_ops map names are a separate namespace |
+| `SKYLINE_ABI_VERSION` and the three other ABI versions | `bpf/include/skyline_abi.h` and `crates/skyline-common/src/lib.rs` | A layout change bumps the version that covers the struct, on both sides: `SKYLINE_ABI_VERSION` for `struct skyline_config`, `skyline_flow_state` and `skyline_metrics`; `SKYLINE_RTO_TUNING_ABI_VERSION`, `SKYLINE_RETRANSMIT_DSCP_ABI_VERSION` and `SKYLINE_REDUNDANCY_ABI_VERSION` for their own structs (`docs/02-interface-reference.md` section 5). Since 0.5.2 `skyline-speederd` reads the version a `skyline_cc.bpf.o` was built for (`skyline_abi_version` in its `.rodata.abi` section) before loading it, and refuses an object of another version, or one without the section, with both versions in the error (`ssctl enable`, `--validate-only --verify-bpf` and the installer's verifier step). An older daemon that does not check can still load a newer object: then no flow can adopt a configuration, each grows its window as `tcp_reno_cong_avoid()` does (before 0.5.2 it stayed at the kernel's initial window, after an RTO at what `tcp_enter_loss()` left) and nothing sets its pacing. `cong_control` has replaced the kernel's own growth, so this is not a fallback to the kernel. There is no error and no counter: `active_flows` grows while `metrics.ack_events` does not. A `struct skyline_config` of another size fails loudly instead, when the daemon writes the slot. A size mismatch also leaves the `struct skyline_metrics` counters at 0. On a mismatch of their own versions, DSCP marking and first-flight redundancy skip their work and count `abi_mismatch`, and since 0.5.2 `skyline_policy` treats a dynamic-RTO slot as no configuration. The bump is what makes a half-updated pair stop instead of misreading the struct |
 | `cong_control` 4-argument signature | `bpf/skyline_cc.bpf.c` | `(sk, ack, flag, rs)` — exists only on kernel >= 6.10 |
 | Two struct_ops maps, `skyline_cc` / `skyline_cc_txs` | `bpf/skyline_cc.bpf.c` | Both set **the same callbacks** and differ only in where CA_EVENT_TX_START arrives (`cwnd_event`, or `cwnd_event_tx_start` from Linux 7.1); the daemon creates one of them, by the kernel's BTF. **A callback added to one goes into the other too**, or the behaviour silently depends on the kernel version |
 | Install paths `/opt`, `/etc`, `/run/skyline-speeder` | config, units (the two OpenRC scripts in `packaging/openrc/` included), scripts | All three must agree |
-| `RuntimeDirectory=skyline-speeder` | `packaging/skyline-speederd.service` | **Must match the parent directory of `socket_path`** |
+| `RuntimeDirectory=skyline-speeder` | `packaging/skyline-speederd.service` | **Must be the parent directory of `socket_path`** (and of `events_path`, `state_path`): the unit sets `ProtectSystem=strict`, under which this is the one directory in `/run` the daemon can write |
 | `checkpath -d /run/skyline-speeder` | `packaging/openrc/skyline-speederd` | OpenRC's `RuntimeDirectory=`: **must be the parent directory of `socket_path`** (and of `events_path`, `state_path`), where the daemon opens its event log first |
 
 > The `RuntimeDirectory` / `socket_path` coupling is a hole this project has
 > already fallen into once: a bulk rename changed `RuntimeDirectory` to
 > `skyline` while the config still said `/run/skyline-speeder/`. The daemon
-> started fine and the control socket simply never appeared. If you touch either
-> side, check the other.
+> started fine then and the control socket simply never appeared. Today's daemon
+> creates those directories itself and runs under `ProtectSystem=strict`, so, by
+> the unit and the code, the same mismatch now makes it fail at start and be
+> restarted over and over: the invariant stands, the symptom changed. If you
+> touch either side, check the other.
 
 ### Configuration-plane semantics
 
-- `set-module-config` and `set-rack-rto` are **absolute overwrite**: every call
-  carries the complete field set, never a delta. The matching `reset-*` commands
-  restore config-file defaults.
+- `set-module-config`, `set-rack-rto`, `set-retransmit-dscp` and
+  `set-redundancy` are **absolute overwrite**: every call carries the complete
+  field set, never a delta. The matching `reset-*` commands restore config-file
+  defaults.
 - Configuration switching uses **double slots, a sequence number and a per-flow
   copy**. The daemon writes configuration N into `config_slots[N & 1]` and only
-  then sets `config_seq` to N; each flow copies the slot `config_seq` names into
-  its own state when it starts and at RTT boundaries, discards the copy if
-  `config_seq` moved while it copied, and reads only its own copy on every ACK.
-  So no flow reads a mix of old and new values within a round, however quickly
-  updates follow each other. **Any change to the config delivery path must keep
+  then sets `config_seq` to N. A flow copies the slot `config_seq` names when it
+  starts: the ACK that completes the handshake reaches `cong_control` before
+  `init`, and `init` copies again and starts over. A flow that has no copy yet
+  tries again on every ACK; one that has a copy copies again only when a new
+  round starts and `config_seq` has moved. A round is not one RTT:
+  `skyline_new_round()` ends it when `prior_delivered` reaches the round's
+  `delivered + packets_out`, about two RTTs for a flow that keeps its window
+  full (about one right after a start or a switch). A copy taken while
+  `config_seq` moved is discarded, and every ACK reads only the flow's own
+  copy. So no flow reads a mix of old and new values within a round, however
+  quickly updates follow each other. **Any change to the config delivery path must keep
   both halves** -- slot first, sequence number second; BPF reads only the copy --
   or you get torn reads (0.4.x had neither, and two updates within one RTT
   rewrote a slot live flows were reading).
@@ -123,13 +140,20 @@ careful around the code that touches them.
    it writes `net.ipv4.tcp_congestion_control = skyline_cc`. **The order of the
    sysctl writes is an invariant**: `enable` writes after the attach (the kernel
    rejects a name that is not registered), and `drain` writes `fallback_cc`
-   back before it unregisters. skyline-speederd is that sysctl's single owner
-   (every write goes through `set_default_congestion_control` in
-   `crates/skyline-speederd/src/main.rs`); `infra/boot-enable.sh` writes no
-   sysctl, and `infra/boot-disable.sh` drains first and writes the sysctl only
-   if the default is still `skyline_cc` afterwards -- the fallback for when the
-   daemon is already gone (written before the drain, the still-armed guard would
-   put `skyline_cc` back).
+   back before it unregisters (otherwise a struct_ops would be unregistered
+   while it is still the default algorithm). Inside skyline-speederd every write
+   of that sysctl goes through `set_default_congestion_control` in
+   `crates/skyline-speederd/src/main.rs` (`BpfRuntime::load`, `enable`, the
+   guard, `drain`), and from `enable` to `drain` the daemon is its only writer.
+   Outside that window three others write it, each for a reason:
+   `infra/boot-disable.sh` drains first and writes the sysctl only if the
+   default is still `skyline_cc` afterwards -- the fallback for when the daemon
+   is already gone (written before the drain, the still-armed guard would put
+   `skyline_cc` back); the experiment harness's `infra/apply-guest-profile.sh`
+   writes the algorithm it wants after `drain --timeout 0`; and
+   `install.sh --uninstall` writes bbr (or, with `--restore-pre-install`, the
+   pre-install value) after draining and removing the daemon.
+   `infra/boot-enable.sh` writes no sysctl.
 
    **Being switched back after the attach is just as silent.** A "one-click
    BBR" script's `bbr` line in `/etc/sysctl.d`, re-applied by
@@ -141,15 +165,21 @@ careful around the code that touches them.
    root qdisc of `runtime.tc_interface` (`fq`, or `mq` over `fq` on a
    multi-queue NIC; when that is a VLAN, bond or bridge whose root is
    `noqueue`, the NICs with a `device` link under it instead, never a tap or
-   veth). The daemon is the only writer of all three:
-   `boot-enable.sh` used to write `default_qdisc=fq` once at boot and no longer
-   does -- do not add it back. Related invariants:
+   veth). From `enable` to `drain` the daemon is the only writer of all three
+   (after a drain, `apply-guest-profile.sh` and `install.sh --uninstall` set
+   qdiscs of their own). `boot-enable.sh` used to write `default_qdisc=fq` once
+   at boot and no longer does -- do not add it back: it cannot change a NIC's
+   existing root qdisc, and two writers of one setting drift apart. Related
+   invariants:
    - `enable` arms the guard only after it has written `skyline_cc`. `drain`
      disarms it first and writes `fallback_cc` **while still holding the
      guard's lock**; otherwise a periodic check could write `skyline_cc` back
-     after the drain. A drain that times out leaves it disarmed too.
+     after the drain. A drain that times out leaves it disarmed too: the
+     experiment matrix drains with `--timeout 0` and then installs its own
+     qdisc, which the guard must not fight.
    - On stop, the guard thread is stopped and joined before `BpfRuntime` drops
-     and unregisters the struct_ops (`impl Drop for Daemon`).
+     and unregisters the struct_ops (`impl Drop for Daemon`); otherwise an armed
+     pass would write a `skyline_cc` the kernel no longer knows.
    - **Stopping the daemon writes no sysctl.** The maintainer explicitly does
      not want `fallback_cc` written on stop; `drain` and the enable unit's
      `ExecStop` do that.
@@ -160,12 +190,14 @@ careful around the code that touches them.
      are left alone: replacing them would silently destroy an operator's
      shaping.
 3. **`tc_interface` pointing at the wrong NIC.** The default in
-   `config/speeder-guest.toml` is the test bed's interface name and will almost
-   never match a real host. `install.sh` rewrites it with the first Ethernet
-   device a default route (IPv4, then IPv6) leaves through, but only on first
-   install — it never overwrites an operator-edited config. When the default
-   route only goes through a tunnel (WireGuard, tun, ...) it keeps the
-   placeholder and warns: skyline_tc is only attached to an Ethernet device. The guard keeps the root qdisc of that same NIC on
+   `config/speeder-guest.toml`, `data0`, is the test bed's interface name and
+   will almost never match a real host. `install.sh` rewrites it on every run,
+   install or upgrade, while the file still holds the template line
+   `tc_interface = "data0"`: the first Ethernet device a default route (IPv4,
+   then IPv6) leaves through takes its place. A value an operator has changed
+   is never touched. When the default route only goes through a tunnel
+   (WireGuard, tun, ...) it keeps the placeholder and warns: skyline_tc is only
+   attached to an Ethernet device. The guard keeps the root qdisc of that same NIC on
    `fq`: pointed at the wrong one, the real egress NIC keeps whatever qdisc it
    had, and the other NIC gets `fq` instead.
 
@@ -190,27 +222,49 @@ test guarding this. **Do not weaken or delete it to make a case pass.**
 ## Performance-claim discipline
 
 **Do not put a performance number in the documentation without test data behind
-it.** Formal performance conclusions may only come from a two-VM test bed meeting
-the resource thresholds in `research/experiments/README.md`. A machine below
+it.** Formal performance conclusions may only come from a two-VM test bed that
+passes `infra/preflight.sh formal` (by default ≥ 16 logical CPUs, ≥ 32 GiB RAM,
+≥ 120 GiB free disk, a writable `/dev/kvm` and vmx/svm; setting one up is in
+`research/experiments/README.md`). A machine below
 those thresholds is good for code review, verifier checks and short smoke runs,
 and **must not be used to draw performance conclusions**.
+
+## Where things are documented
+
+| Document | Reader and content |
+|---|---|
+| `README.md` / `README.zh.md` | Users, in the order a newcomer needs it: what it is, the kernel requirement, quick start, how it works and how the three algorithms differ, configuration (what a default install runs, a subsection per feature, and what every line of `ssctl status` and `ssctl flows` means), layout, building, documentation, measured performance, contributing, license. The two say the same thing |
+| `DEPLOY.md` | The one deployment and operations manual (Chinese), written for automation agents and followed by people: prerequisites, every installer step, verification gates, the cgroup, the guard, upgrades, removal, troubleshooting |
+| `docs/usage.md` | Newcomers (Chinese): every switch and parameter, four presets, dynamic RTO, DSCP, finding the cause of a stalled connection |
+| `docs/02-interface-reference.md` | `ssctl` commands, the wire protocol, status fields and counters, ABI versions, configuration fields, event codes, guard rules |
+| `docs/03-design.md` | How each module works, the trade-offs, open questions |
+| `docs/04-performance-report.md` | The two-VM test bed's data, what it does and does not show |
+| `research/experiments/README.md` | The experiment harness and how to reproduce a run |
+| `research/experiments/single-ended/` | The one-path field comparison of bbr, tcp-brutal and skyline_cc the README's performance section cites; not test-bed data |
+| `CHANGELOG.md` | Every release and its *Upgrading from ...* notes |
+| `CLAUDE.md` and the `CLAUDE.md` in `bpf/`, `crates/`, `config/`, `packaging/`, `infra/` and `docs/` | These conventions in Chinese, for AI coding agents. The root file is loaded in every session and holds the repository-wide rules and an index; each directory's file is loaded when an agent reads or edits a file there and holds that directory's details |
 
 ## Documentation you must update with your change
 
 | Change | Also update |
 |---|---|
-| ABI struct | `skyline_abi.h` + `crates/skyline-common` + `SKYLINE_ABI_VERSION` |
+| ABI struct | `skyline_abi.h` + `crates/skyline-common` + the version that covers it (`SKYLINE_ABI_VERSION`, `SKYLINE_RTO_TUNING_ABI_VERSION`, `SKYLINE_RETRANSMIT_DSCP_ABI_VERSION` or `SKYLINE_REDUNDANCY_ABI_VERSION`) + `docs/02-interface-reference.md` section 5 |
 | `ssctl` command or field | `docs/02-interface-reference.md` |
 | Config field | `config/*.toml` + `docs/02-interface-reference.md` section 6 |
 | Install flow | `DEPLOY.md` + `install.sh` + `scripts/bootstrap.sh` (and both READMEs and `docs/usage.md` where they describe it) |
 | Algorithm behaviour | `docs/03-design.md`; performance claims need data in `docs/04-performance-report.md` |
 | Anything user-facing in the README | Both `README.md` and `README.zh.md` |
+| A new feature, a changed default, or report wording in `crates/ssctl/src/view.rs` | Both READMEs' table of what a default install runs, the feature's subsection, and the line-by-line key to `ssctl status` and `ssctl flows` (`cargo test -p ssctl -- --nocapture renders_for_review` prints both reports) |
+| A hard invariant or the contribution process | This file, the `CLAUDE.md` of the directory the invariant lives in (the same conventions in Chinese; the root `CLAUDE.md` keeps a one-line summary of each) and the Invariants list in `.github/PULL_REQUEST_TEMPLATE.md` |
+| A release (`v*` tag) | `[workspace.package] version` in `Cargo.toml`, the three workspace crates in `Cargo.lock`, and a `## [<version>] - <date>` section in `CHANGELOG.md` with its compare link at the bottom; `release.yml` refuses a tag that is not exactly `v<version>` or has no such section |
 
 ## Style
 
 - **Rust:** `cargo fmt` is mandatory; `make check` enforces it.
 - **BPF C:** four-space indentation.
-- **Shell:** `set -euo pipefail`.
+- **Shell:** `set -euo pipefail`; the POSIX sh scripts (`scripts/bootstrap.sh`,
+  `infra/boot-enable.sh`) use `set -eu`, and `infra/boot-disable.sh`
+  deliberately only `set -u`, so that a stop never fails half way.
 - **Comments explain *why*.** A large share of the comments in this repository
   record verifier limitations, kernel behaviour and holes already fallen into.
   Those comments are worth more than the code around them. Do not delete them
@@ -225,8 +279,11 @@ container by `infra/build-musl.sh`, which needs docker and which CI runs on
 every pull request too), carrying the same BPF objects. Before building anything it checks that the tag is exactly `v`
 followed by the workspace version in `Cargo.toml`, and that `CHANGELOG.md` has a
 `## [<version>]` heading for it; otherwise it stops. So bump
-`[workspace.package] version` and turn `## [Unreleased]` into the release's
-section before tagging: the version is what `--version`, `ssctl status` and the
+`[workspace.package] version` in `Cargo.toml` and the three workspace crates'
+entries in `Cargo.lock` (every build runs with `--locked`), and add a
+`## [<version>] - <YYYY-MM-DD>` section with an *Upgrading from ...* subsection
+at the top of `CHANGELOG.md` (there is no `[Unreleased]` section), plus its
+compare link at the bottom, before tagging: the version is what `--version`, `ssctl status` and the
 installer's upgrade summary report. The build uses `--locked`, as CI does. It
 compiles the BPF objects against a **pinned reference header**
 generated from the oldest supported kernel, not against whatever the runner
@@ -251,14 +308,20 @@ built against a newer kernel, and the failure would land on a 6.12 user's
 machine rather than in CI.
 
 A release that changes the data plane is checked before it is tagged: build the
-objects the way `release.yml` does, freeze them on one kernel and verify that they
-load on another. The same script checks an unpacked artifact after the release:
+objects the way `release.yml` does, in a fresh checkout (the Makefile copies a
+`PREBUILT_VMLINUX_H` by mtime and keeps a `vmlinux.h` that is already there),
+freeze them on one kernel and verify that they load on another. The same script
+checks an unpacked artifact after the release, with the artifact's own daemon:
 
 ```bash
 SKYLINE_BPF_DIR=<unpacked artifact>/bpf infra/kernel/core-portability.sh freeze
 # get to the other kernel
-infra/kernel/core-portability.sh verify
+SKYLINE_SPEEDERD=<unpacked artifact>/bin/skyline-speederd infra/kernel/core-portability.sh verify
 ```
+
+For an artifact, the artifact's `MANIFEST` (`reference_vmlinux_sha256`, the
+digest of the `.h.gz` release.yml fetched) is what says which header the objects
+were built against.
 
 ## Never commit
 
@@ -275,14 +338,16 @@ See `.gitignore`. In particular:
 
 - Say whether the change needs a new prebuilt release, and why (the "Prebuilt
   release" section of the PR template). The one-line install installs the
-  latest release's prebuilt artifact, not `main`, so a change that lives in the
-  artifact reaches those users only with the next release -- and nothing fails
-  in the meantime; it just is not there:
+  latest release's prebuilt artifact, not `main` (a host that cannot run the
+  published binaries -- not x86_64, glibc older than 2.38, musl older than
+  1.2.5 -- builds the fetched tree, `main` by default, from source), so a change
+  that lives in the artifact reaches those users only with the next release --
+  and nothing fails in the meantime; it just is not there:
 
   | The change touches | Release needed? | Why |
   |---|---|---|
   | `bpf/`, `crates/`, `config/speeder-guest.toml`, `packaging/` (the systemd units and the OpenRC scripts), the `infra/*.sh` that `release.yml` ships | **yes** | it is in the artifact (the OpenRC scripts from v0.4.1 on: Alpine installs the musl artifact, and the installer prefers the two scripts in it) |
-  | `install.sh`, `scripts/bootstrap.sh` | usually not | the one-line install always runs the installer from `main`; unless the new installer needs something the released artifact does not have yet -- then release first |
+  | `install.sh`, `scripts/bootstrap.sh` | usually not | the one-line install always runs the installer from `main`; but `bootstrap.sh --uninstall`, and an upgrade run from the tree an install keeps, use the installer kept in `/usr/local/src/skyline-speeder`, not `main`'s. Release first when the new installer needs something the released artifact does not have yet |
   | docs, the experiment harness, CI, anything only a source build uses | no | not in the artifact |
 
   A release can wait and bundle several PRs, but the PR has to say that it goes

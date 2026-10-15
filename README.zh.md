@@ -167,7 +167,7 @@ ssctl disable --module loss-classifier        # 只关一个，其余不变
 
 ### 系数
 
-十七个参数可以用 `ssctl set-module-config` 在线调整，无需重启。已建立的连接各自在下一轮换用新值，并用新值从头估计。`ssctl flows` 的 *PARAMETERS IN FORCE* 段落按用途分行显示它们：
+十七个参数可以用 `ssctl set-module-config` 在线调整，无需重启。已建立的连接各自在下一轮（约两个 RTT）换用新值，并用新值从头估计。`ssctl flows` 的 *PARAMETERS IN FORCE* 段落按用途分行显示它们：
 
 | `ssctl flows` 里的行 | 参数及默认值 | 管什么 |
 |---|---|---|
@@ -362,7 +362,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
 make bpf                          # 生成 vmlinux.h 并编译三个 CO-RE 对象
 cargo build --workspace --release
-make check PYTHON="$(command -v python3)"   # 格式、静态检查与单元测试（实验框架的测试要 Python 3.11+）
+make check PYTHON="$(command -v python3)"   # 脚本语法、实验框架的测试（Python 3.11+）、格式、cargo check；cargo test 用 `make test`
 
 # 让每个对象过一遍内核验证器，不挂载任何东西
 skyline-speederd --config config/speeder.toml --validate-only --verify-bpf

@@ -42,8 +42,9 @@ user-data
 # ---------------------------------------------------------------------------
 # Build artifacts
 #
-# vmlinux.h is generated from the *running kernel's* BTF and is therefore
-# machine-specific -- regenerate with `make bpf`, never commit it.
+# vmlinux.h is a build product: `make bpf` generates it from this machine's
+# kernel BTF by default (or from VMLINUX_BTF=<path>), or copies the header
+# PREBUILT_VMLINUX_H names -- machine-specific either way, never commit it.
 # ---------------------------------------------------------------------------
 /build/
 /target/
@@ -93,6 +94,10 @@ venv/
 
 # ---------------------------------------------------------------------------
 # Editor / OS / agent session state
+#
+# The CLAUDE.md files (the repository root and bpf/, crates/, config/, docs/,
+# infra/, packaging/) are public and committed. What an agent keeps for one
+# machine or one person -- .claude/ and CLAUDE.local.md at any level -- is not.
 # ---------------------------------------------------------------------------
 .vscode/
 .idea/
@@ -101,3 +106,4 @@ venv/
 .DS_Store
 Thumbs.db
 .claude/
+CLAUDE.local.md
