@@ -1,24 +1,25 @@
 # config/CLAUDE.md
 
-配置模板的细则。Claude Code 读写本目录下的文件时自动加载本文件；全仓库的约定在仓库根目录的 `CLAUDE.md`
-（配置字段的同步要求在那里的"文档同步要求"表：`config/*.toml` + `docs/02-interface-reference.md` §6）。
+Details for the configuration templates. Claude Code loads this file once it reads or edits a file in this directory;
+the repository-wide conventions are in the root `CLAUDE.md` (a config field change also updates `config/*.toml` and
+`docs/02-interface-reference.md` section 6, per its documentation sync table).
 
-## guest 配置的强约束
+## The guest config constraint
 
-`config/speeder-guest.toml` 中 `[rack_tuning]` **必须整段保持注释**。该配置由实验
-矩阵（`infra/apply-guest-profile.sh`）逐 case 精确控制 `tcp_recovery` /
-`tcp_reordering` / `tcp_early_retrans`；若 `skyline-speederd` 在此接管这几个全局 sysctl，
-daemon 重启会把 per-case 精确值悄悄覆盖回默认值。
+`[rack_tuning]` in `config/speeder-guest.toml` **must stay commented out in its entirety**. That config is driven
+per-case by the experiment matrix (`infra/apply-guest-profile.sh`), which controls `tcp_recovery`, `tcp_reordering`
+and `tcp_early_retrans` exactly. If `skyline-speederd` takes ownership of those global sysctls here, a daemon restart
+silently overwrites the per-case values with defaults.
 
-`crates/skyline-common/src/lib.rs` 有 `guest_config_never_owns_global_sysctls`
-测试守护这条约束——**不要为了让某个用例通过而删改它**。
+`crates/skyline-common/src/lib.rs` has a `guest_config_never_owns_global_sysctls` test guarding this. **Do not weaken
+or delete it to make a case pass.**
 
-## `tc_interface` 指向错误网卡（静默失效点 3 的细则）
+## `tc_interface` pointing at the wrong NIC (details of silent failure point 3)
 
-`config/speeder-guest.toml` 的默认值 `data0` 是测试床的
-接口名，真实主机上几乎必然不匹配。`install.sh` 每次运行（安装与升级都算），只要配置里还是
-`tc_interface = "data0"` 这一行，就改写成默认路由（先 IPv4、再 IPv6）上的第一块以太网网卡；
-已经是别的值（运维改过）就不动。默认路由只走 WireGuard/tun 这类隧道时不改写，保留模板值并
-告警——`skyline_tc` 只挂在以太网设备上。
-guard 维护的也是这块网卡的根 qdisc：指错了，真正的出口网卡保持原来的 qdisc，而被指到
-的那块网卡被换成 `fq`。
+The default in `config/speeder-guest.toml`, `data0`, is the test bed's interface name and will almost never match a
+real host. `install.sh` rewrites it on every run, install or upgrade, while the file still holds the template line
+`tc_interface = "data0"`: the first Ethernet device a default route (IPv4, then IPv6) leaves through takes its place.
+A value an operator has changed is never touched. When the default route only goes through a tunnel (WireGuard, tun,
+...), it keeps the placeholder and warns: `skyline_tc` is only attached to an Ethernet device. The guard keeps the root
+qdisc of that same NIC on `fq`: pointed at the wrong one, the real egress NIC keeps whatever qdisc it had, and the
+other NIC gets `fq` instead.

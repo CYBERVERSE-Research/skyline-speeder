@@ -1,17 +1,21 @@
 # infra/CLAUDE.md
 
-`infra/` 脚本的细则。Claude Code 读写本目录下的文件时自动加载本文件；全仓库的约定在仓库根目录的 `CLAUDE.md`。
+Details for the scripts in `infra/`. Claude Code loads this file once it reads or edits a file in this directory; the
+repository-wide conventions are in the root `CLAUDE.md`.
 
-- **全局 sysctl 与 qdisc**：谁、在什么前提下写 `net.ipv4.tcp_congestion_control`、`net.core.default_qdisc` 和出口
-  网卡的根 qdisc 是不变量，完整规则在 `crates/CLAUDE.md`「全局 sysctl」，改下面几个脚本里的这类写入之前先读它。
-  - `boot-enable.sh` 刻意不写任何 sysctl；它过去写的 `default_qdisc=fq` **不要加回去**。
-  - `boot-disable.sh` 先 drain，之后只在默认仍是 `skyline_cc` 时兜底写回，是 daemon 已死时的兜底，不是重复。
-  - `apply-guest-profile.sh` 在 `drain --timeout 0` 之后才写自己要的算法与 qdisc；它逐 case 精确控制
-    `tcp_recovery` / `tcp_reordering` / `tcp_early_retrans`，所以 guest 配置不能接管这几个 sysctl（`config/CLAUDE.md`）。
-- **随产物发布的脚本**：`release.yml` 把 `boot-enable.sh`、`boot-disable.sh`、`run-in-skyline-cgroup.sh`、
-  `apply-guest-profile.sh`、`collect-guest-metrics.sh`、`snapshot-skyline-events.sh` 打进产物，改了它们就要发版
-  （根目录 `CLAUDE.md`「预编译版本」）。
-- **`kernel/core-portability.sh`**：改动数据面后若要依赖 CO-RE 可移植性，必须重跑（`bpf/CLAUDE.md`「CO-RE 可移植性」）；
-  改过数据面的版本发版前也要跑。
-- **Shell 风格**：`set -euo pipefail`；`boot-enable.sh` 是 POSIX sh 的 `set -eu`，`boot-disable.sh` 刻意只用
-  `set -u`（根目录 `CLAUDE.md`「风格」）。
+- **Global sysctls and qdiscs.** Who writes `net.ipv4.tcp_congestion_control`, `net.core.default_qdisc` and the egress
+  NIC's root qdisc, and under what preconditions, is an invariant; the full rules are in `crates/CLAUDE.md`, "Global
+  sysctls". Read them before changing such a write in any of these scripts.
+  - `boot-enable.sh` deliberately writes no sysctl; **do not add back** the `default_qdisc=fq` it used to write.
+  - `boot-disable.sh` drains first and writes the default back only if it is still `skyline_cc` afterwards -- the
+    fallback for when the daemon is already gone, not a duplicate.
+  - `apply-guest-profile.sh` writes the algorithm and qdisc it wants only after `drain --timeout 0`. It sets
+    `tcp_recovery`, `tcp_reordering` and `tcp_early_retrans` per case, which is why the guest config must not take
+    those sysctls over (`config/CLAUDE.md`).
+- **Scripts a release ships.** `release.yml` packs `boot-enable.sh`, `boot-disable.sh`, `run-in-skyline-cgroup.sh`,
+  `apply-guest-profile.sh`, `collect-guest-metrics.sh` and `snapshot-skyline-events.sh` into the artifact, so a change
+  to them needs a release (root `CLAUDE.md`, "Prebuilt releases").
+- **`kernel/core-portability.sh`.** After a data-plane change, rerun it before relying on CO-RE portability
+  (`bpf/CLAUDE.md`, "CO-RE portability"), and before tagging a release that changed the data plane.
+- **Shell style.** `set -euo pipefail`; `boot-enable.sh` is POSIX sh with `set -eu`, and `boot-disable.sh`
+  deliberately uses only `set -u` (root `CLAUDE.md`, "Style").

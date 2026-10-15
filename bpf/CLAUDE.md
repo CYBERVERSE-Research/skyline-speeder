@@ -1,44 +1,49 @@
 # bpf/CLAUDE.md
 
-`bpf/` 三个 eBPF 程序的细则。Claude Code 读写本目录下的文件时自动加载本文件；全仓库的约定（不变量一览、静默
-失效点、文档同步、发版）在仓库根目录的 `CLAUDE.md`。配置下发（双槽 + 配置序号 + 每连接副本）的完整规则在
-`crates/CLAUDE.md`「控制面语义」：BPF 侧只读每条连接自己的副本。
+Details for the three eBPF programs in `bpf/`. Claude Code loads this file once it reads or edits a file in this
+directory; the repository-wide conventions (the invariant overview, silent failure points, documentation sync,
+releases) are in the root `CLAUDE.md`. The full rules for configuration delivery (double slots, a sequence number and
+a per-flow copy) are in `crates/CLAUDE.md`, "Configuration-plane semantics": on the BPF side, every ACK reads only the
+flow's own copy.
 
-## vmlinux.h 与 kfunc 声明
+## vmlinux.h and kfunc declarations
 
-`make bpf` 默认从**本机** `/sys/kernel/btf/vmlinux` 读取类型信息；也可以用
-`make VMLINUX_BTF=<路径> bpf` 指定另一份 BTF，或用
-`make PREBUILT_VMLINUX_H=<路径> bpf` 直接提供已生成好的头（这条路径**不需要
-bpftool，也不需要 /sys/kernel/btf/vmlinux**，供容器/发布流水线使用）。
-`bpf/include/vmlinux.h` 是构建产物，**不提交**。
+`make bpf` reads type information from **this machine's** `/sys/kernel/btf/vmlinux` by default. Point it at another
+kernel's BTF with `make VMLINUX_BTF=<path> bpf`, or hand it a ready-made header with
+`make PREBUILT_VMLINUX_H=<path> bpf` -- that path needs **neither bpftool nor this machine's
+`/sys/kernel/btf/vmlinux`**, and it is what containers and the release workflow use. `bpf/include/vmlinux.h` is a
+build product and is **never committed**.
 
-本机生成的 vmlinux.h 编译时带 `-DBPF_NO_KFUNC_PROTOTYPES`：bpftool 7.5 起把运行内核导出的每个
-kfunc 原型都写进头里，其中一个与发行版 libbpf 的 `bpf_helpers.h` 对不上就编不过（Fedora 43：
-6.17 内核的 `bpf_stream_vprintk` 五个参数，libbpf 1.6.1 声明四个）。所以 **BPF 源码调用的 kfunc
-必须自己声明**（见 `skyline_cc.bpf.c` 顶部），不能靠 vmlinux.h。`PREBUILT_VMLINUX_H` 路径不带
-这个宏，发布产物逐字节不变。
+A vmlinux.h generated on this machine is compiled with `-DBPF_NO_KFUNC_PROTOTYPES`: from 7.5 on, bpftool writes a
+prototype for every kfunc the running kernel exports, and one of them can disagree with the distribution's
+`bpf_helpers.h` (on Fedora 43, kernel 6.17 exports `bpf_stream_vprintk` with five arguments and libbpf 1.6.1 declares
+four). So **every kfunc a BPF source calls is declared in that source** (see the top of `skyline_cc.bpf.c`), never
+taken from vmlinux.h. The `PREBUILT_VMLINUX_H` path does not set the macro, and the released objects stay byte for
+byte the same.
 
-## CO-RE 可移植性
+## CO-RE portability
 
-vmlinux.h 只需要**定义**代码用到的类型，不必来自最终运行的那个内核，但**不能比它新**：bpftool
-生成的头带 `preserve_access_index`，每处字段访问都生成 CO-RE 重定位记录，偏移由 libbpf 在
-加载时按运行内核的 BTF 修正；运行内核没有的字段，CO-RE 补不出来，用较新内核的头编出的对象可能
-在 6.12 上加载失败——发布因此固定用 6.12 参考头编译（`release.yml`）。实测过的是 6.12 的头：
-在 6.12.63 上编、在 6.19.14 上加载，以及在 6.19.14 上用 6.12 的头编、在 6.12.63 上加载
-（`CHANGELOG.md` 0.1.0 的 *Verified*）。复现脚本见 `infra/kernel/core-portability.sh`。
-**改动数据面后若要依赖这条性质，必须重跑该脚本**——CO-RE 能修偏移，修不了字段改名或删除。
+The header only has to **define** the types the code uses. It need not come from the kernel the objects will run on,
+but it **must not be newer** than that kernel: bpftool generates it with `preserve_access_index`, so every field access
+carries a CO-RE relocation that libbpf fixes against the running kernel's BTF at load time, and CO-RE cannot supply a
+field the running kernel lacks -- objects built against a newer kernel's header can fail to load on 6.12, which is why
+releases build against the 6.12 reference header (`release.yml`). What has been verified is a 6.12 header: objects
+built against it under 6.12.63 load on 6.19.14, and built against it under 6.19.14 load on 6.12.63 (`CHANGELOG.md`
+0.1.0, *Verified*). `infra/kernel/core-portability.sh` reproduces this. **After a data-plane change, rerun that script
+before relying on this property** -- CO-RE fixes offsets, not a field that was renamed or removed.
 
-## 硬性不变量（完整约束）
+## Hard invariants (full constraints)
 
-根目录 `CLAUDE.md` 的不变量表里，落在本目录的四项的完整约束：
+The four rows of the root `CLAUDE.md`'s invariant table that live in this directory, in full:
 
-| 标识符 | 位置 | 约束 |
+| Identifier | Location | Constraint |
 |---|---|---|
-| 算法名 `"skyline_cc"` | `bpf/skyline_cc.bpf.c`（两张 struct_ops map 的 `.name`）、`bpf/skyline_policy.bpf.c`（`TCP_CONGESTION` setsockopt）、`bpf/skyline_tc.bpf.c`（`skyline_runs_skyline_cc()`）、`crates/skyline-common` 的 `SKYLINE_CC_NAME`，以及 `infra/boot-enable.sh`、`infra/boot-disable.sh`、`infra/apply-guest-profile.sh`、`install.sh` 里的字面量 | 算法注册名，**≤ 15 字符**（`TCP_CA_NAME_MAX` 为 16 含 NUL），各处一字不差。daemon 写 sysctl 时对不上会报错；policy 与 tc 两处对不上则静默失效（setsockopt 的返回值被忽略；首轮冗余只剩 SYN-ACK）。struct_ops 的 map 名是另一个命名空间 |
-| `SKYLINE_ABI_VERSION` 及另外三个 ABI 版本号 | `bpf/include/skyline_abi.h` 与 `crates/skyline-common/src/lib.rs` | 布局变更必须递增管这段结构的版本号，两侧一起改：`SKYLINE_ABI_VERSION` 管 `struct skyline_config`、`skyline_flow_state`、`skyline_metrics`，`SKYLINE_RTO_TUNING_ABI_VERSION`、`SKYLINE_RETRANSMIT_DSCP_ABI_VERSION`、`SKYLINE_REDUNDANCY_ABI_VERSION` 各管自己那段（`docs/02-interface-reference.md` 第 5 节）。0.5.2 起 `skyline-speederd` 加载 `skyline_cc.bpf.o` 之前先读对象自己记下的版本（`.rodata.abi` 段里的 `skyline_abi_version`），与自己的不同、或者对象里没有这一段，就拒绝加载并在错误里给出两个版本（`ssctl enable`、`--validate-only --verify-bpf` 与安装器的验证步骤）。不做这项检查的旧 daemon 加载了新对象时，每条连接复制配置（`skyline_adopt_config()`）都失败：这样的连接按内核 Reno 的方式增长窗口（0.5.1 及更早一直停在内核的初始窗口，RTO 之后停在 `tcp_enter_loss()` 留下的大小），没有谁设 pacing；`cong_control` 已经取代了内核自己的增长逻辑，所以这不是交还给内核。这种情况不报错，也没有计数器：`ssctl status --json` 里 `active_flows` 在涨、`metrics.ack_events` 不动。`struct skyline_config` 大小变了的话，daemon 写配置槽时就会报错。它也管 `struct skyline_metrics`：Rust 侧按布局读计数器，大小不符时计数器全是 0。DSCP 标记与首轮冗余的版本不符时跳过并递增各自的 `abi_mismatch`；0.5.2 起 `skyline_policy` 把版本不符的动态 RTO 配置当作没有配置。递增版本号，是让半新半旧的组合停摆，而不是误读结构体 |
-| `cong_control` 4 参数签名 | `bpf/skyline_cc.bpf.c` | `(sk, ack, flag, rs)`，内核 >= 6.10 才有 |
-| struct_ops 双变体 `skyline_cc` / `skyline_cc_txs` | `bpf/skyline_cc.bpf.c` | 两张 map 挂**同一组回调**，只有 TX_START 的入口不同（`cwnd_event` / 7.1 起的 `cwnd_event_tx_start`）；daemon 按内核 BTF 只创建其中一张。**给一张加回调，另一张也要加**，否则行为随内核版本悄悄不同 |
+| The algorithm name `"skyline_cc"` | `.name` of both struct_ops maps in `bpf/skyline_cc.bpf.c`; the `TCP_CONGESTION` setsockopt in `bpf/skyline_policy.bpf.c`; `skyline_runs_skyline_cc()` in `bpf/skyline_tc.bpf.c`; `SKYLINE_CC_NAME` in `crates/skyline-common`; the literals in `infra/boot-enable.sh`, `infra/boot-disable.sh`, `infra/apply-guest-profile.sh` and `install.sh` | Registration name, **≤ 15 characters** (`TCP_CA_NAME_MAX` is 16 including NUL), byte-identical everywhere. The daemon's sysctl write fails loudly on a mismatch; the policy and TC programs do not -- the setsockopt's error is ignored, and first-flight redundancy is left copying SYN-ACKs only. The struct_ops map names are a separate namespace |
+| `SKYLINE_ABI_VERSION` and the three other ABI versions | `bpf/include/skyline_abi.h` and `crates/skyline-common/src/lib.rs` | A layout change bumps the version that covers the struct, on both sides: `SKYLINE_ABI_VERSION` for `struct skyline_config`, `skyline_flow_state` and `skyline_metrics`; `SKYLINE_RTO_TUNING_ABI_VERSION`, `SKYLINE_RETRANSMIT_DSCP_ABI_VERSION` and `SKYLINE_REDUNDANCY_ABI_VERSION` for their own structs (`docs/02-interface-reference.md` section 5). Since 0.5.2 `skyline-speederd` reads the version a `skyline_cc.bpf.o` was built for (`skyline_abi_version` in its `.rodata.abi` section) before loading it, and refuses an object of another version, or one without the section, with both versions in the error (`ssctl enable`, `--validate-only --verify-bpf` and the installer's verifier step). An older daemon that does not check can still load a newer object: then every flow's configuration copy (`skyline_adopt_config()`) fails, each flow grows its window as the kernel's Reno does (before 0.5.2 it stayed at the kernel's initial window, after an RTO at what `tcp_enter_loss()` left) and nothing sets its pacing. `cong_control` has replaced the kernel's own growth, so this is not a fallback to the kernel. There is no error and no counter: in `ssctl status --json`, `active_flows` grows while `metrics.ack_events` does not. A `struct skyline_config` of another size fails loudly instead, when the daemon writes the slot. The version also covers `struct skyline_metrics`: the Rust side reads the counters by layout, and a size mismatch leaves them all at 0. On a mismatch of their own versions, DSCP marking and first-flight redundancy skip their work and count `abi_mismatch`, and since 0.5.2 `skyline_policy` treats a dynamic-RTO slot as no configuration. The bump is what makes a half-updated pair stop instead of misreading the struct |
+| `cong_control` 4-argument signature | `bpf/skyline_cc.bpf.c` | `(sk, ack, flag, rs)`, which exists only on kernel >= 6.10 |
+| Two struct_ops maps, `skyline_cc` / `skyline_cc_txs` | `bpf/skyline_cc.bpf.c` | Both set **the same callbacks** and differ only in where CA_EVENT_TX_START arrives (`cwnd_event`, or `cwnd_event_tx_start` from Linux 7.1); the daemon creates one of them, by the kernel's BTF. **A callback added to one goes into the other too**, or behaviour silently depends on the kernel version |
 
-`skyline_cc.bpf.c` 里的 `PRR-SSRB` 是 RFC 6937 的术语，不要改名（根目录 `CLAUDE.md`「命名雷区」）。
+`PRR-SSRB` in `skyline_cc.bpf.c` is RFC 6937 terminology; do not rename it (root `CLAUDE.md`, "Naming landmine").
 
-改了本目录的源码或头文件（注释也算：`-g` 的行号信息会变，对象字节随之改变）就要发版，见根目录 `CLAUDE.md`「预编译版本」。
+A change to a source or header in this directory (a comment included: `-g` line information changes and the object
+bytes with it) needs a release; see "Prebuilt releases" in the root `CLAUDE.md`.
