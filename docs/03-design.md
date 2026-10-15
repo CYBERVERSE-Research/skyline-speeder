@@ -1,701 +1,753 @@
-# Skyline Speeder 模块设计说明
+# Skyline Speeder Module Design
 
-本篇面向需要维护或改进 Skyline Speeder 的技术人员，完整描述当前设计：整体架构、每个
-模块的机制、模块之间的数据流，以及控制面的实现方式。
+This document is for engineers who maintain or improve Skyline Speeder. It describes the current design in full: the
+overall architecture, the mechanism of each module, the data flow between modules, and how the control plane is
+implemented.
 
-## 1. 设计目标与取向
+## 1. Design goals and orientation
 
-Skyline Speeder 只在 TCP **发送端**部署，不需要改动客户端、不需要改协议头，对标准
-客户端完全透明。设计面向的部署环境：丢包率 10%-20%（逐包独立随机丢包，
-不是排队拥塞导致的丢包）、RTT 100-300ms、带宽数十到数百 Mbps。
+Skyline Speeder is deployed only on the TCP **sender**. It needs no change to the client and no change to protocol
+headers, and it is fully transparent to standard clients. The deployment environment it is designed for: a loss rate
+of 10%-20% (independent random per-packet loss, not loss caused by queueing congestion), an RTT of 100-300ms, and
+bandwidth from tens to hundreds of Mbps.
 
-**优化取向**：目标是单流自身的吞吐/完成时间，不追求与其他流的公平共享
-带宽。这与标准 CUBIC 的设计初衷（通用互联网、隐含公平性假设）方向相反——
-CUBIC 把任何丢包都当作拥塞信号处理，在高随机丢包环境下会把带宽利用率压
-到接近于零。
+**Optimization target**: the goal is the single flow's own throughput/completion time; it does not aim to share
+bandwidth fairly with other flows. This runs opposite to what standard CUBIC was designed for (the general Internet,
+with an implicit fairness assumption) -- CUBIC treats any loss as a congestion signal, and in a high-random-loss
+environment it pushes bandwidth utilization close to zero.
 
-**丢包语义**：Skyline Speeder 只承认两个真实拥塞信号——排队时延增长和 ECN 标记。丢包
-本身默认被假设为不携带拥塞信息，不触发任何降窗。
+**Loss semantics**: Skyline Speeder recognizes only two real congestion signals -- growing queueing delay and ECN
+marks. Loss itself is assumed by default to carry no congestion information, and it triggers no window cut at all.
 
-**保留的不变量**：如果把全部四个可选模块关闭，Skyline Speeder 的行为需要约等于内核
-原生 CUBIC——这是一条**正确性**不变量（用来验证"模块关闭"这条路径没有
-意外副作用），不是公平性要求，两者不冲突。
+**The invariant kept**: with all four optional modules turned off, Skyline Speeder must behave approximately like the
+kernel's native CUBIC -- this is a **correctness** invariant (it verifies that the "modules off" path has no
+unintended side effects), not a fairness requirement, and the two do not conflict.
 
-## 2. 总体架构
+## 2. Overall architecture
 
-Skyline Speeder 由 3 个独立的 BPF 对象 + 1 份共享的每连接状态 + 1 个 Rust 用户态控制
-面构成：
+Skyline Speeder consists of 3 independent BPF objects + 1 piece of shared per-connection state + 1 Rust user-space
+control plane:
 
 ```mermaid
 flowchart TB
-    subgraph CC["skyline_cc.bpf.o —— struct_ops 拥塞控制（每次 ACK 都执行）"]
+    subgraph CC["skyline_cc.bpf.o — struct_ops congestion control (runs on every ACK)"]
         direction TB
-        UM["skyline_update_model<br/>更新带宽/RTT 估计 + 丢包率 EMA(M3) + STARTUP→CRUISE 判定(M2)"]
-        PACE["skyline_apply_pacing (M4)<br/>写 sk_pacing_rate"]
-        TARGET["skyline_set_cwnd_target (M2)<br/>M2 开启时：直接对 cwnd 赋值<br/>绕开 PRR，所有 CA 状态下都执行"]
+        UM["skyline_update_model<br/>updates the bandwidth/RTT estimates + loss-rate EMA (M3) + STARTUP→CRUISE decision (M2)"]
+        PACE["skyline_apply_pacing (M4)<br/>writes sk_pacing_rate"]
+        TARGET["skyline_set_cwnd_target (M2)<br/>with M2 on: assigns cwnd directly<br/>bypasses PRR, runs in every CA state"]
         UM --> PACE --> TARGET
     end
-    FLOW["skyline_flow_state<br/>（每条连接一份，存在 BPF_MAP_TYPE_SK_STORAGE 里）"]
-    UM <-.读写.-> FLOW
-    PACE <-.读写.-> FLOW
-    TARGET <-.读写.-> FLOW
+    FLOW["skyline_flow_state<br/>(one per connection, kept in BPF_MAP_TYPE_SK_STORAGE)"]
+    UM <-.reads and writes.-> FLOW
+    PACE <-.reads and writes.-> FLOW
+    TARGET <-.reads and writes.-> FLOW
 
-    POLICY["skyline_policy.bpf.o<br/>enable 期间把 cgroup 内的新连接切到 skyline_cc<br/>+ M1 tier-2：per-flow 动态 RTO"]
-    TC["skyline_tc.bpf.o<br/>egress 统计 + 重传包 DSCP 标记（IPv4/IPv6）<br/>+ 首轮冗余"]
+    POLICY["skyline_policy.bpf.o<br/>while enabled, switches new connections in the cgroup to skyline_cc<br/>+ M1 tier-2: per-flow dynamic RTO"]
+    TC["skyline_tc.bpf.o<br/>egress statistics + DSCP marking of retransmitted packets (IPv4/IPv6)<br/>+ first-flight redundancy"]
 
-    CFG["config_slots[0/1] + config_seq<br/>双缓冲配置（Rust 写入）"]
-    CFG -.连接开始时与轮边界上复制一份.-> FLOW
+    CFG["config_slots[0/1] + config_seq<br/>double-buffered configuration (written by Rust)"]
+    CFG -.copied at connection start and on round boundaries.-> FLOW
 
-    RUST["skyline-speederd（守护进程）+ ssctl（CLI）<br/>加载/卸载 BPF、探测内核能力、管理配置<br/>+ M1 tier-1 sysctl、guard"]
-    RUST -.管理.-> CC
-    RUST -.管理.-> POLICY
-    RUST -.管理.-> TC
+    RUST["skyline-speederd (daemon) + ssctl (CLI)<br/>loads/unloads BPF, probes kernel capabilities, manages configuration<br/>+ M1 tier-1 sysctl, guard"]
+    RUST -.manages.-> CC
+    RUST -.manages.-> POLICY
+    RUST -.manages.-> TC
 ```
 
-要点：
+Key points:
 
-- M2（自适应 cwnd）/M3（丢包率补偿）/M4（pacing）是同一个 struct_ops 回调
-  （`skyline_cong_control`，每次 ACK 触发）里顺序执行的几段代码，靠读写同一份
-  `skyline_flow_state` 配合，不是三个互相调用的独立程序。
-- M1（早期丢包感知）在 `skyline_policy.bpf.c` 里，跟"选择拥塞控制算法"共享同一
-  个 cgroup sockops 挂载点，但逻辑完全独立。
-- 每个模块能否生效由配置里的一个位掩码 `feature_mask` 控制——不是四份不同
-  的代码，而是同一份代码里的条件分支（见 `docs/02-interface-reference.md`
-  第 7 节的位定义）。
+- M2 (adaptive cwnd)/M3 (loss-rate compensation)/M4 (pacing) are sections of code run in sequence inside the same
+  struct_ops callback (`skyline_cong_control`, triggered on every ACK). They cooperate by reading and writing the same
+  `skyline_flow_state`; they are not three independent programs that call each other.
+- M1 (early loss awareness) lives in `skyline_policy.bpf.c`. It shares the same cgroup sockops attach point with
+  "choosing the congestion control algorithm", but its logic is entirely separate.
+- Whether each module takes effect is controlled by one bit mask in the configuration, `feature_mask` -- not four
+  different pieces of code but conditional branches in the same code (see the bit definitions in
+  `docs/02-interface-reference.md` section 7).
 
-`bpf/`/`crates/`/`infra/`/`config/` 各目录的职责划分见 README 的"仓库结构"一节和
-源码顶部注释；接口见 `docs/02-interface-reference.md`；本文档只讲机制本身。
+What each of the `bpf/`/`crates/`/`infra/`/`config/` directories is responsible for is in the README's "Repository
+layout" section and in the comments at the top of the sources; the interfaces are in
+`docs/02-interface-reference.md`; this document covers only the mechanisms themselves.
 
-IPv4/IPv6 双栈：控制面（Rust 侧）完全不涉及地址概念，只认接口名/Unix
-socket/系统 sysctl 路径，双栈不需要任何改动；`skyline_cc`（M2/M3/M4）只碰
-`tcp_sock`/`sock` 的地址族无关字段，同样不需要改动。改动集中在两处：
-`skyline_tc.bpf.c` 的重传检测新增 IPv6 扩展头遍历分支（有界展开，遇到分片/
-认证头/未知扩展头一律放行不处理），`skyline_policy.bpf.c` 的 family 判断同时
-接受 `AF_INET`/`AF_INET6`（含 IPv4-mapped 地址，见 `DEPLOY.md` 第 13.5 节的
-双栈监听陷阱）。
+IPv4/IPv6 dual stack: the control plane (the Rust side) has no notion of addresses at all -- it knows only interface
+names, Unix sockets and system sysctl paths -- so dual stack needs no change there; `skyline_cc` (M2/M3/M4) touches
+only the address-family-independent fields of `tcp_sock`/`sock`, and needs no change either. The changes are in two
+places: retransmission detection in `skyline_tc.bpf.c` gained a branch that walks IPv6 extension headers (a bounded
+unroll; a fragment header, an authentication header or an unknown extension header is always passed through
+untouched), and the family check in `skyline_policy.bpf.c` accepts both `AF_INET`/`AF_INET6` (including IPv4-mapped
+addresses; see the dual-stack listening pitfall in `DEPLOY.md` section 13.5).
 
-## 3. 共享状态：`skyline_flow_state`
+## 3. Shared state: `skyline_flow_state`
 
-定义在 `bpf/include/skyline_abi.h`，存在一个 `BPF_MAP_TYPE_SK_STORAGE` 类型的
-map 里——这是**逐 socket**存储，随连接创建自动分配、随连接销毁自动释放。
-"共享"指的是"同一条连接内部，M2/M3/M4 之间共享"，不是"所有连接共享同一份
-数据"。
+Defined in `bpf/include/skyline_abi.h` and kept in a map of type `BPF_MAP_TYPE_SK_STORAGE` -- this is **per-socket**
+storage, allocated automatically when a connection is created and freed automatically when it is destroyed. "Shared"
+means "shared among M2/M3/M4 within the same connection", not "one piece of data shared by all connections".
 
-字段分六类：
+The fields fall into six categories:
 
-| 类别 | 代表字段 | 消费者 |
+| Category | Representative fields | Consumers |
 |---|---|---|
-| 拥塞/带宽估计 | `min_rtt_us`/`min_srtt_us`/`bw_bps`/`bw_samples[10]`/`next_round_delivered` | 所有模块共享的底层估计器 |
-| 模式机状态 | `mode`（STARTUP/CRUISE）、`plateau_rounds`、`queue_clamped` | M2 |
-| 丢包率信号 | `loss_rate_permille`、`last_lost`、`last_loss_rate_delivered` | M3 消费，计算本身独立于 `feature_mask` |
-| CUBIC 增长核心状态（仅 M2 关闭路径） | `w_max`、`epoch_start_ns`、`epoch_k_ms`、`tcp_cwnd`、`ack_cnt` | 框架层的 CUBIC 增长核心 + M2 关闭时的降窗 |
-| PRR 状态（仅 M2 关闭路径） | `prior_cwnd`、`prr_delivered`、`recovery_active`（已发出的量读内核的 `tp->prr_out`） | 框架层的 PRR 实现，M2 开启时完全绕开 |
-| 配置副本 | `config`、`config_seq` | 这条连接读的全部系数都来自这份副本，只在连接开始时与轮边界上更新（第 11 节） |
+| Congestion/bandwidth estimates | `min_rtt_us`/`min_srtt_us`/`bw_bps`/`bw_samples[10]`/`next_round_delivered` | The underlying estimators shared by all modules |
+| State machine state | `mode` (STARTUP/CRUISE), `plateau_rounds`, `queue_clamped` | M2 |
+| Loss-rate signal | `loss_rate_permille`, `last_lost`, `last_loss_rate_delivered` | Consumed by M3; the computation itself is independent of `feature_mask` |
+| CUBIC growth core state (M2-off path only) | `w_max`, `epoch_start_ns`, `epoch_k_ms`, `tcp_cwnd`, `ack_cnt` | The framework layer's CUBIC growth core + the window cut when M2 is off |
+| PRR state (M2-off path only) | `prior_cwnd`, `prr_delivered`, `recovery_active` (the amount already sent is read from the kernel's `tp->prr_out`) | The framework layer's PRR implementation; bypassed entirely when M2 is on |
+| Configuration copy | `config`, `config_seq` | Every coefficient this connection reads comes from this copy, which is updated only at connection start and on round boundaries (section 11) |
 
-无论模块开关如何，持续更新的底层估计器：`min_rtt_us`（历史最低 RTT，超过
-`min_rtt_window_s` 未刷新过允许接受更大新值，防止路径变化后死守旧值）、
-`bw_bps`（最近 `bw_window_rtts` 个有样本进入滤波器的轮里的峰值投递速率，只用未被
-应用层限速的样本；"应用受限"除了内核在应用写入时标记，`skyline_cc` 在每个 ACK 上也会
-补标，见第 6 节"带宽估计"）、`next_round_delivered`（一轮在这样的 ACK 处结束：它确认的包是在本轮
-开始时的 `delivered + packets_out` 都已交付之后才发出的——先等当时在途的数据交付，再等
-那之后发出的包被确认，所以窗口打满的流一轮约两个 RTT，有 SACK 空洞时更长；开始或配置
-切换后的第一轮约一个 RTT；BBR 的一轮约一个 RTT）、
-`loss_rate_permille`（这条流自己测得的丢包率，指数滑动平均，alpha=1/4）。
+The underlying estimators, updated continuously whatever the module switches: `min_rtt_us` (the lowest RTT seen; once
+it has gone `min_rtt_window_s` without being refreshed, a larger new value may be accepted, so it does not cling to an
+old value after the path changes), `bw_bps` (the peak delivery rate over the most recent `bw_window_rtts` rounds in
+which a sample entered the filter, using only samples not limited by the application; besides the kernel marking
+"application-limited" when the application writes, `skyline_cc` also adds the mark on every ACK, see "Bandwidth
+estimate" in section 6), `next_round_delivered` (a round ends at the ACK that acknowledges a packet sent only after the
+`delivered + packets_out` at the round's start had all been delivered -- first the data in flight at that moment is
+delivered, then a packet sent after that is acknowledged, so for a flow with a full window a round is about two RTTs,
+longer with SACK holes; the first round after the start or after a configuration switch is about one RTT; a BBR round
+is about one RTT), `loss_rate_permille` (the flow's own measured loss rate, an exponential moving average,
+alpha=1/4).
 
-## 4. 中性基线：模块全关时的框架层
+## 4. The neutral baseline: the framework layer with all modules off
 
-如果把 M1-M4 全部关闭（`enabled_modules=[]`），Skyline Speeder 的目标是表现约等于内核
-原生 CUBIC，而不是"随便跑"。这条基线是后续"打开某个模块提升多少"这个问题
-有意义的前提。
+With M1-M4 all turned off (`enabled_modules=[]`), Skyline Speeder aims to behave approximately like the kernel's native
+CUBIC, not to "run any old way". This baseline is what makes the later question "how much does turning on a given
+module gain" meaningful.
 
-M2 开启时，`skyline_cong_control()` 直接掌管 cwnd，完全不经过这里的 PRR/CUBIC
-增长核心。下面三块框架级实现只在对应的模块关闭时执行：PRR 重实现与 CUBIC 增长核心
-在 M2 关闭时，auto-pacing 在 M4 关闭时（与 M2 开不开无关）：
+With M2 on, `skyline_cong_control()` takes direct charge of cwnd and never goes through the PRR/CUBIC growth core
+here. The three framework-level implementations below run only when the corresponding module is off: the PRR
+reimplementation and the CUBIC growth core when M2 is off, auto-pacing when M4 is off (whether or not M2 is on):
 
-**PRR 重实现**（`prr_pacing_enabled`，默认开启）：Skyline Speeder 使用 `cong_control`
-struct_ops 回调，内核会因此把自己的 PRR 恢复期限速逻辑整段跳过。Skyline Speeder 自己
-重新实现一份等价的逐 ACK 限速（`skyline_apply_prr()`），在整个恢复期内每次
-ACK 都限制发送量，而不是只在恢复开始时降一次窗——否则 cwnd 降低了，但发
-送节奏不受控，一个 RTT 内就能把降低后的 cwnd 打满。和内核一样只在 CWR 与 Recovery
-里执行，已发出的量取内核自己记的 `tp->prr_out`（内核对任何拥塞控制都维护它），
-PRR-SSRB 多放的那一个包也只在这个 ACK 推进了 `snd_una` 时给；Loss 里由下面的增长路径
-从 `tcp_enter_loss()` 留下的窗口慢启动回去（0.5.2 之前 Loss 里也走 PRR，计数沿用上一次
-恢复的）。
+**PRR reimplementation** (`prr_pacing_enabled`, on by default): Skyline Speeder uses the `cong_control` struct_ops
+callback, so the kernel skips its own PRR recovery-period rate limiting entirely. Skyline Speeder reimplements an
+equivalent per-ACK limit itself (`skyline_apply_prr()`), which limits how much is sent on every ACK throughout the
+recovery period instead of cutting the window once at the start of recovery -- otherwise cwnd would drop but the
+sending pace would be uncontrolled, and the reduced cwnd could be filled within one RTT. As in the kernel, it runs
+only in CWR and Recovery; the amount already sent is taken from the kernel's own `tp->prr_out` (the kernel maintains it
+for every congestion control), and the one extra packet PRR-SSRB allows is given only when this ACK advanced
+`snd_una`. In Loss, the growth path below slow-starts back up from the window `tcp_enter_loss()` left (before 0.5.2,
+Loss also went through PRR, with the counts carried over from the previous recovery).
 
-**Auto-pacing**（`auto_pacing_enabled`，默认开启）：M4 关闭时，pacing 速率
-按内核自身公式（慢启动阶段/拥塞避免阶段两档比例）计算一个等价的封顶速率，
-保证"M4 关闭"和"内核原生 pacing 行为"一致。auto-pacing 也关掉时不设 pacing 速率：
-每个 ACK 把它放回 socket 自己的上限（`sk_max_pacing_rate`，应用没设 `SO_MAX_PACING_RATE`
-时就是不限速）。内核不为带 `cong_control` 的算法更新 pacing 速率（跳过
-`tcp_update_pacing_rate()`），握手完成时按初始窗口 10 算出的那个值会一直留着；0.5.2
-之前每个 ACK 放回的正是这个值，`fq` 下整条连接都被它卡住（实验网 40 ms 时约 5.7 Mbit/s）。
+**Auto-pacing** (`auto_pacing_enabled`, on by default): with M4 off, the pacing rate is an equivalent capped rate
+computed by the kernel's own formula (two ratios, one for the slow-start phase and one for the congestion-avoidance
+phase), so that "M4 off" matches "the kernel's native pacing behaviour". With auto-pacing off as well, no pacing rate
+is set: every ACK puts it back to the socket's own ceiling (`sk_max_pacing_rate`, which means unlimited when the
+application has not set `SO_MAX_PACING_RATE`). The kernel does not update the pacing rate for an algorithm with
+`cong_control` (it skips `tcp_update_pacing_rate()`), so the value computed from an initial window of 10 when the
+handshake completes stays in place; before 0.5.2 that is exactly the value every ACK put back, and under `fq` it held
+back the whole connection (about 5.7 Mbit/s at 40 ms on the lab network).
 
-**CUBIC 增长核心**（M2 关闭时的 cwnd 增长路径）：完整复刻内核 CUBIC 的三次
-函数增长公式（`K` 在每个增长周期开始时算一次并冻结）、"曲线还没追上当前
-cwnd"时的近似冻结分支，以及一个独立维护的 Reno 风格增长下限（TCP-
-friendliness 地板，防止极短拥塞周期下增长长期趋近于 0）。和 `bictcp_cong_avoid()`
-一样，窗口不是限制因素时不增长（`tcp_is_cwnd_limited()`），每确认两个段至多加一个
-（0.5.2 起；之前应用受限的流也照样涨，Reno 地板领先很多时每个确认都能加一个）。
+**CUBIC growth core** (the cwnd growth path when M2 is off): a full replica of kernel CUBIC's cubic growth formula
+(`K` is computed once at the start of each growth epoch and frozen), the near-freeze branch for when "the curve has
+not yet caught up with the current cwnd", and a separately maintained Reno-style growth floor (the TCP-friendliness
+floor, which keeps growth from tending to 0 for long stretches under very short congestion epochs). As in
+`bictcp_cong_avoid()`, the window does not grow when it is not the limiting factor (`tcp_is_cwnd_limited()`), and it
+grows by at most one for every two segments acknowledged (since 0.5.2; before that, application-limited flows grew all
+the same, and when the Reno floor was far ahead every acknowledgement could add one).
 
-这三块合起来保证：无论 M1-M4 开关如何组合，只要 M2/M4 关闭，cwnd 增长和
-pacing 行为都精确对齐内核原生实现。
+Together these three guarantee that, whatever the combination of M1-M4 switches, as long as M2/M4 are off, cwnd
+growth and pacing behaviour match the kernel's native implementation exactly.
 
-**空闲后重新发送（`CA_EVENT_TX_START`）**：连接空闲（没有在途包）之后第一次
-发送时，CUBIC 增长核心把增长周期的起点 `epoch_start_ns` 设为当前时刻。这个
-事件原先经 `cwnd_event` 送达；Linux 7.1 起内核把它交给 `tcp_congestion_ops`
-新加的 `cwnd_event_tx_start`，`cwnd_event` 不再看到它。`skyline_cc.bpf.o`
-因此带两张 struct_ops map：`skyline_cc`（没有这个成员的布局）和
-`skyline_cc_txs`（有），挂的是同一组回调，只是 TX_START 的入口不同。一张
-map 设了内核不认识的成员，libbpf 会拒绝整张 map，所以两者不能合成一张；
-daemon 按运行内核的 BTF 只创建其中一张（`load_cc_object()`），注册的算法名
-都是 `skyline_cc`。
+**Sending again after idle (`CA_EVENT_TX_START`)**: on the first send after a connection has been idle (no packets in
+flight), the CUBIC growth core sets the start of the growth epoch, `epoch_start_ns`, to the current time. This event
+used to arrive through `cwnd_event`; from Linux 7.1 the kernel hands it to `cwnd_event_tx_start`, newly added to
+`tcp_congestion_ops`, and `cwnd_event` no longer sees it. `skyline_cc.bpf.o` therefore carries two struct_ops maps:
+`skyline_cc` (the layout without this member) and `skyline_cc_txs` (with it). Both set the same callbacks and differ
+only in where TX_START arrives. If a map sets a member the kernel does not know, libbpf rejects the whole map, so the
+two cannot be merged into one; the daemon creates only one of them, by the running kernel's BTF
+(`load_cc_object()`), and both register the algorithm name `skyline_cc`.
 
-**验证**（双 VM 测试床，`research/experiments/manifests/neutrality.toml`，
-`n=2`，中位数，单位 Mbit/s；与 `docs/04-performance-report.md` 的主数据是同
-一次构建——内核 6.18.40，`skyline_cc.bpf.o` SHA-256 前 12 位
-`1cb1d581c4f7`，见该报告附录 A）：
+**Verification** (two-VM test bed, `research/experiments/manifests/neutrality.toml`, `n=2`, medians, in Mbit/s; the
+same build as the main data in `docs/04-performance-report.md` -- kernel 6.18.40, first 12 hex digits of the
+`skyline_cc.bpf.o` SHA-256 `1cb1d581c4f7`, see that report's Appendix A):
 
-| 场景 | `b1-controlled-cubic`（内核 CUBIC + `fq`） | `b2-skyline-base`（模块全关） | `skyline-best`（模块全开） |
+| Scenario | `b1-controlled-cubic` (kernel CUBIC + `fq`) | `b2-skyline-base` (all modules off) | `skyline-best` (all modules on) |
 |---|---:|---:|---:|
-| `dc-lowrtt`（RTT 2ms、1000 Mbit/s、0% 丢包） | 956.41 | 956.39 | 956.41 |
-| `line-rate`（RTT 20ms、1000 Mbit/s、0% 丢包） | 956.41 | 956.41 | 956.40 |
+| `dc-lowrtt` (RTT 2ms, 1000 Mbit/s, 0% loss) | 956.41 | 956.39 | 956.41 |
+| `line-rate` (RTT 20ms, 1000 Mbit/s, 0% loss) | 956.41 | 956.41 | 956.40 |
 
-两个零丢包场景下三者差异全部 <0.01%：模块全关这条路径没有引入可测的系统
-性偏差。BPF 代码注释里的 "B1/B2 neutrality" 指的就是 `b1`/`b2` 这两个
-profile 在这里的对等。这是一条正确性检查，不是性能对比，门槛只看零丢包场景：
-同一 manifest 里另有两个轻丢包场景（`light-loss`/`primary`），`b1`/`b2` 在那
-个区间本身高度不稳定、`n=2` 下方差偏大，不用于这条门槛。表中 `skyline-best`
-用的是第 12 节所说的第一代系数。
+In both zero-loss scenarios the three differ by <0.01% throughout: the all-modules-off path introduces no measurable
+systematic bias. "B1/B2 neutrality" in the BPF code comments refers to exactly this parity between the `b1`/`b2`
+profiles. This is a correctness check, not a performance comparison, and the gate looks only at the zero-loss
+scenarios: the same manifest also has two light-loss scenarios (`light-loss`/`primary`), where `b1`/`b2` are
+themselves highly unstable and the variance at `n=2` is large, so they are not used for this gate. `skyline-best` in
+the table uses the first-generation coefficients described in section 12.
 
-## 5. M1：早期丢包感知
+## 5. M1: early loss awareness
 
-Linux 内核自带的 RACK（Recent Acknowledgment）+ TLP（Tail Loss Probe）用
-"发送时间域"而非序列号/重复确认计数判断丢失置信度，已经完整覆盖了丢包检
-测这个问题空间。M1 不重新发明这套判丢逻辑，而是定位成**参数的观测驱动动
-态调节层**：内核提供了判丢机制本身，但很多关键参数默认是全局静态值，M1
-按每条连接的实时观测去调节这些参数。
+The Linux kernel's built-in RACK (Recent Acknowledgment) + TLP (Tail Loss Probe) judge how confident a loss is in the
+"send-time domain" rather than by sequence numbers/duplicate-ACK counts, and already fully cover the problem space of
+loss detection. M1 does not reinvent this loss-detection logic; it is positioned as an **observation-driven dynamic
+tuning layer for parameters**: the kernel provides the loss-detection mechanism itself, but many key parameters are
+global static values by default, and M1 tunes them from each connection's live observations.
 
-**两个互不相关的部分**：`enabled_modules` 里的 `early-loss` 位（M1 在
-`skyline_cc.bpf.c` 里的部分）目前只是一个观测计数器（`metrics.
-hypothetical_early_loss`），不驱动任何决策，也不控制本节剩余部分描述的
-行为（详见第 13 节）。本节实际讲的 tier-1 全局 sysctl 与 tier-2 per-flow
-动态 RTO，由 `[rack_tuning]`/`[rack_rto]` 两段独立配置驱动，跟
-`enabled_modules`/`ssctl enable`/`ssctl disable --module early-loss`
-完全无关——即便 `early-loss` 从未出现在 `enabled_modules` 里，只要用
-`ssctl set-rack-rto`（或下发配置文件 `[rack_rto]` 的 `ssctl reset-rack-rto`）打开了
-tier-2，RTO 调节依然生效。daemon 每次启动都把 tier-2 初始化为关闭，配置文件里的
-`enabled = true` 不会自动下发（`docs/02-interface-reference.md` 第 2.4 节）。
+**Two unrelated parts**: the `early-loss` bit in `enabled_modules` (M1's part in `skyline_cc.bpf.c`) is for now only
+an observation counter (`metrics.hypothetical_early_loss`); it drives no decision and does not control the behaviour
+described in the rest of this section (see section 13). What this section actually covers -- the tier-1 global
+sysctls and the tier-2 per-flow dynamic RTO -- is driven by two separate configuration sections,
+`[rack_tuning]`/`[rack_rto]`, and has nothing to do with `enabled_modules`/`ssctl enable`/
+`ssctl disable --module early-loss`: even if `early-loss` has never appeared in `enabled_modules`, once tier-2 has
+been turned on with `ssctl set-rack-rto` (or with `ssctl reset-rack-rto`, which sends the configuration file's
+`[rack_rto]`), RTO tuning still takes effect. The daemon initializes tier-2 to off on every start; `enabled = true` in the configuration file is not
+sent automatically (`docs/02-interface-reference.md` section 2.4).
 
-**内核暴露的调节接口按暴露程度分三档**：
+**The tuning interfaces the kernel exposes fall into three tiers by how much they expose**:
 
-| 档次 | 内容 | 能否调节 |
+| Tier | Contents | Tunable? |
 |---|---|---|
-| 第一档：全局 sysctl | `tcp_recovery`（位掩码）/`tcp_reordering`/`tcp_early_retrans` | 可写，但粒度是整个网络命名空间，不能按连接区分 |
-| 第二档：逐连接自适应、但不对外暴露写接口 | `tp->reordering`、`tp->rack.reo_wnd_steps` | 只能改初始值，改不了自适应逻辑本身；但 `TCP_BPF_RTO_MIN`/`TCP_RTO_MAX_MS` 这两个相关的 RTO 参数可以通过 `bpf_setsockopt` 从 sockops 程序按连接单独设置 |
-| 第三档：完全硬编码 | `reo_wnd` 基础量子、`reo_wnd_steps` 上限、恢复阈值等 | 没有任何暴露接口（sysctl/setsockopt/bpf_setsockopt 均无），需要内核补丁才能按连接动态调整 |
+| Tier 1: global sysctls | `tcp_recovery` (bit mask)/`tcp_reordering`/`tcp_early_retrans` | Writable, but per whole network namespace; cannot differ per connection |
+| Tier 2: adaptive per connection, but with no exposed write interface | `tp->reordering`, `tp->rack.reo_wnd_steps` | Only the initial value can be changed, not the adaptive logic itself; but the two related RTO parameters `TCP_BPF_RTO_MIN`/`TCP_RTO_MAX_MS` can be set per connection from a sockops program through `bpf_setsockopt` |
+| Tier 3: fully hard-coded | the `reo_wnd` base quantum, the `reo_wnd_steps` ceiling, the recovery thresholds, etc. | No exposed interface at all (no sysctl/setsockopt/bpf_setsockopt); adjusting them dynamically per connection needs a kernel patch |
 
-M1 当前只做第一档 + 第二档里 RTO 相关的部分，不涉及需要内核补丁的第三档：
+M1 currently does only tier 1 + the RTO-related part of tier 2, and does not touch tier 3, which needs a kernel patch:
 
-**tier-1（全局 sysctl）**：`skyline-speederd` 启动时把配置里 `[rack_tuning]` 声明的
-`tcp_recovery`/`tcp_reordering`/`tcp_early_retrans` 一次性写入
-`/proc/sys/net/ipv4/*`，写入失败即致命退出。
+**tier-1 (global sysctls)**: when `skyline-speederd` starts, it writes the `tcp_recovery`/`tcp_reordering`/
+`tcp_early_retrans` declared in the configuration's `[rack_tuning]` to `/proc/sys/net/ipv4/*` once; a failed write is
+fatal and it exits.
 
-**tier-2（per-flow 动态 RTO 下限 + 上限）**：`skyline_policy.bpf.c` 订阅
-`BPF_SOCK_OPS_RTT_CB`（每次有新 RTT 样本时触发），两个独立可开关的半部分
-共享这一个订阅：
+**tier-2 (per-flow dynamic RTO floor + ceiling)**: `skyline_policy.bpf.c` subscribes to `BPF_SOCK_OPS_RTT_CB` (fired
+whenever there is a new RTT sample), and two halves, each switchable on its own, share this one subscription:
 
-- **下限**：`target = max(实测srtt, min_rtt) × 可调系数`，夹在配置好的绝
-  对上下限之间（不超过内核 `TCP_RTO_MIN` 200ms），跳过前 N 个样本，目标值
-  不变则跳过写入，通过 `bpf_setsockopt(TCP_BPF_RTO_MIN)` 应用。
-- **上限**：内核的 RTO 真正上限（`TCP_RTO_MAX`，约 120 秒）和失败重传后的
-  指数退避会把下一次 RTO 顶到接近这个量级——而随机独立丢包场景下，一次丢
-  包和下一次互相独立，等更久不会提高"下次重传就成功"的概率。这一半用同一
-  个 RTT_CB 读到的 `srtt`/`min_rtt` 算出 `base_rtt = max(srtt, min_rtt)`
-  （跟下限用同一个抗乱序基线——单独用 `min_rtt` 在重排序场景下可能塌陷到
-  0），乘一个倍数 `k` 算出 `ceiling = clamp(k × base_rtt, 1000ms, 120000ms)`，
-  通过 `bpf_setsockopt(TCP_RTO_MAX_MS)` 应用。`k` 分两档：无拥塞证据时用
-  `rto_max_normal_permille`（实验配置与 `config/speeder.toml` 用 3000，即 3 倍），
-  检测到真实拥塞证据（`delivered_ce` 前进，或 `srtt` 相对 `min_rtt` 涨超阈值）后换成
-  `rto_max_congested_permille`（同上用 6000，即 6 倍）——刻意不设计"拥塞证据
-  出现就回退到内核 120 秒默认值"这条分支，公式始终挂在 `base_rtt` 上，拥塞
-  只是换一个更大的倍数。`rto_max_normal_permille` 为 0 时整个上限半部分就不生效，
-  不论 congested 设成多少；代码与随附模板里两者的默认值都是 0，即上限关闭。
-  `TCP_RTO_MAX_MS` 是 Linux 6.15 才加的选项：6.12 上内核拒绝它（只有
-  `rto_max_rejected` 增长），下限这一半不受影响。
+- **Floor**: `target = max(measured srtt, min_rtt) × tunable factor`, clamped between the configured absolute floor and
+  ceiling (no higher than the kernel's `TCP_RTO_MIN`, 200ms); the first N samples are skipped, the write is skipped
+  when the target is unchanged, and it is applied through `bpf_setsockopt(TCP_BPF_RTO_MIN)`.
+- **Ceiling**: the kernel's real RTO ceiling (`TCP_RTO_MAX`, about 120 seconds) and the exponential backoff after
+  failed retransmissions push the next RTO close to that magnitude -- yet with independent random loss, one loss and
+  the next are independent, and waiting longer does not raise the probability that "the next retransmission
+  succeeds". This half takes the `srtt`/`min_rtt` read in the same RTT_CB, computes `base_rtt = max(srtt, min_rtt)`
+  (the same reordering-resistant baseline as the floor -- `min_rtt` alone can collapse to 0 under reordering),
+  multiplies it by a factor `k` to get `ceiling = clamp(k × base_rtt, 1000ms, 120000ms)`, and applies it through
+  `bpf_setsockopt(TCP_RTO_MAX_MS)`. `k` has two levels: with no evidence of congestion it is
+  `rto_max_normal_permille` (3000, i.e. 3 times, in the experiment configurations and `config/speeder.toml`); once
+  real evidence of congestion is detected (`delivered_ce` advances, or `srtt` rises above `min_rtt` by more than a
+  threshold) it switches to `rto_max_congested_permille` (6000, i.e. 6 times, in the same files) -- there is
+  deliberately no branch that "falls back to the kernel's 120-second default once congestion evidence appears"; the
+  formula always hangs off `base_rtt`, and congestion only swaps in a larger factor. When `rto_max_normal_permille` is
+  0 the whole ceiling half has no effect, whatever congested is set to; in the code and the shipped templates both
+  default to 0, i.e. the ceiling is off. `TCP_RTO_MAX_MS` is an option added only in Linux 6.15: on 6.12 the kernel
+  rejects it (only `rto_max_rejected` grows), and the floor half is unaffected.
 
-**与其他模块的交互**：M1 不读写 `skyline_flow_state`，跟 M2/M3/M4 没有数据交
-换。tier-2 不受"Skyline Speeder CC 是否启用"这个全局开关影响——即便拥塞控制算法一直
-是内核原生 CUBIC（从未 `enable` 过，或 `drain` 之后），只要 tier-2 已被打开
-（`set-rack-rto` / `reset-rack-rto`），RTO 调节依然独立生效，这正是"受控 cubic"
-对照条件需要的语义。
+**Interaction with other modules**: M1 neither reads nor writes `skyline_flow_state` and exchanges no data with
+M2/M3/M4. tier-2 is not affected by the global switch "is the Skyline Speeder CC enabled" -- even if the congestion
+control algorithm has always been the kernel's native CUBIC (never `enable`d, or after a `drain`), as long as tier-2
+has been turned on (`set-rack-rto` / `reset-rack-rto`), RTO tuning still takes effect on its own, which is exactly the
+semantics the "controlled cubic" control condition needs.
 
-**排障要点**见 `DEPLOY.md` 第 7 节的诊断表；两个使用前提（cgroup 迁移、
-双栈监听地址族判断）见 `DEPLOY.md` 第 7 节和第 13.5 节。
+**Troubleshooting points** are in the diagnostic table in `DEPLOY.md` section 7; the two preconditions for use
+(moving processes into the cgroup, and the address-family check for dual-stack listeners) are in `DEPLOY.md` sections
+7 and 13.5.
 
-## 6. M2：自适应 cwnd
+## 6. M2: adaptive cwnd
 
-`skyline_cong_control()` 按 `feature_mask` 分派：M2 开启时，`skyline_set_cwnd_target()`
-在每次 ACK、每一种 TCP 拥塞状态（`Open`/`Recovery`/`CWR` 都一样）下都直接
-给 `tp->snd_cwnd` 赋值，完全绕开内核自身的 PRR 恢复期限速逻辑；M2 关闭，
-才走第 4 节的 CUBIC 对等路径 + PRR。
+`skyline_cong_control()` dispatches on `feature_mask`: with M2 on, `skyline_set_cwnd_target()` assigns
+`tp->snd_cwnd` directly on every ACK and in every TCP congestion state (`Open`/`Recovery`/`CWR` alike), bypassing the
+kernel's own PRR recovery-period rate limiting entirely; only with M2 off does it take section 4's CUBIC-parity path +
+PRR.
 
-**两态状态机**：
+**Two-state state machine**:
 
 ```mermaid
 stateDiagram-v2
     [*] --> STARTUP
-    STARTUP --> CRUISE: 连续几个测到带宽的轮次不再明显增长<br/>或队列时延/ECN 护栏触发
+    STARTUP --> CRUISE: bandwidth stops growing noticeably over several consecutive rounds that measured it<br/>or the queue-delay/ECN guardrail fires
 ```
 
-- **STARTUP**：cwnd 目标和 pacing 速率共用同一个增益 `startup_gain`，目标
-  是尽快摸到这条路的带宽上限。退出条件：连续几轮带宽涨幅低于阈值，或护栏
-  触发。"几轮"只数有样本进入带宽滤波器的轮次：整轮都受应用限速的轮次带宽估计
-  原样不动，不算"没涨"（0.5.1 起；之前算，长连接上几个小响应就能把流带着第一次
-  突发测到的偏低估计送进 CRUISE，见下文"带宽估计"）。退出后直接进入 CRUISE，
-  不主动排空队列（排空队列是一种队列卫生/公平行为，跟"不追求公平性"的取向
-  相反）。
-- **CRUISE**：cwnd 目标增益 `cruise_inflight_gain`、pacing 增益
-  `cruise_pacing_gain`，两者都必须 ≥1.0。没有周期性探测阶段——CRUISE 的增
-  益恒大于 1.0（本来就在过量发送），带宽估计随发送量自然刷新，不需要额外
-  周期性探测。CRUISE 是终态，进入之后除非清零重来（配置切换/新连接），不
-  会再离开。
+- **STARTUP**: the cwnd target and the pacing rate share one gain, `startup_gain`; the aim is to find this path's
+  bandwidth ceiling as fast as possible. Exit condition: bandwidth growth below a threshold for several consecutive
+  rounds, or the guardrail fires. The "several rounds" count only rounds in which a sample entered the bandwidth
+  filter: in a round that is application-limited throughout, the bandwidth estimate stays as it was, and that does not
+  count as "no growth" (since 0.5.1; before that it did count, and a few small responses on a long-lived connection
+  could send the flow into CRUISE carrying the low estimate measured from its first burst, see "Bandwidth estimate"
+  below). After exiting it goes straight into CRUISE without actively draining the queue (draining the queue is a
+  queue-hygiene/fairness behaviour, which runs against the "no fairness goal" orientation).
+- **CRUISE**: cwnd target gain `cruise_inflight_gain`, pacing gain `cruise_pacing_gain`, both of which must be ≥1.0.
+  There is no periodic probing phase -- CRUISE's gain is always above 1.0 (it is already over-sending), so the
+  bandwidth estimate refreshes naturally with what is sent and needs no extra periodic probing. CRUISE is the end
+  state: once entered, it is never left unless everything is reset (a configuration switch/a new connection).
 
-**cwnd 目标计算**：
-
-```
-目标字节数 = 带宽估计(bw_bps) × 基准RTT × 增益系数(gain) × 丢包补偿系数(M3)
-目标包数 = 目标字节数 / 每包大小(MSS)
-```
-
-算出目标值后直接赋值给 `tp->snd_cwnd`，不经过加性增长逐步逼近（与 BBR 的
-设计一致）。cwnd 只需不成为限制因素（`cruise_inflight_gain` 刻意比
-`cruise_pacing_gain` 更宽松），真正的限速器是 M4 的 pacing 速率。超过
-`max_cwnd_packets` 硬上限直接砍到该值。还没有带宽估计、走标准慢启动的分支（见下文）
-同样受这个上限约束——0.5.0 起；之前那条分支不检查上限，而 `tcp_slow_start()` 每个
-ACK 都把确认的包数加到 cwnd 上，不管 cwnd 是不是限制因素，一直受应用限速、因而一直
-没有估计的流 cwnd 会一路涨过上限（第 13 节）。
-
-**cwnd 下限**：目标值低于 `min_cwnd_packets` 时取该下限（随附模板为 32；省略 = 4，
-即历史上写死的 `SKYLINE_MIN_CWND`）。细流或长期受应用限速的流，`带宽估计 × 基准RTT`
-算出来只有几个包；这么小的窗口丢一个包之后，后面没有足够的包产生 SACK 反馈，
-只能靠尾丢探测或 RTO 恢复。下限在硬上限和护栏钳位**之后**应用（与原先固定下限
-的次序一致），配置校验保证它不超过 `max_cwnd_packets`。它不改变发送速率——
-速率仍由 pacing 决定——只是不让 cwnd 成为重传的瓶颈。BPF 侧实际取
-`max(min_cwnd_packets, 4)`；M2 关闭的中性基线路径不读这个字段，始终用固定的
-4 包下限，因此 B1/B2 中性性不受影响。
-
-**还没有带宽估计时的 RTO**：同一个下限也用在"还没有带宽估计"的分支上，但只在
-RTO 之后（`TCP_CA_Loss`）。`skyline_update_model()` 只采信非应用受限的样本，而
-整个响应在第一轮就发完的短流（常见的 15–35 KB 网页响应）是在窗口没用满、数据
-已经发完的情况下发出去的，内核把它的速率样本标成应用受限；丢包时响应末尾的重传
-也算应用受限（0.5.1 起，见下文"带宽估计"），所以它通常从头到尾都没有带宽估计，
-一直走这个分支的标准慢启动。内核的
-`tcp_enter_loss()` 在 RTO 时把 cwnd 压到"在途包数 + 1"，没有这个下限，这样的流会
-从 1 个包重新慢启动剩下的响应——这是"永不因丢包降窗"唯一没有兑现的地方。限定在
-Loss 状态，是为了不改动连接开始时的初始窗口（包括有意设小的 `initial_cwnd_packets`）；
-Loss 之外内核不会为带 `cong_control` 的算法降窗（不走 PRR，恢复结束不回落到
-ssthresh，也没有空闲衰减），没有别的需要补。这个下限在 Loss 结束之后也保住：
-`tcp_slow_start()` 遇到高于 ssthresh 的窗口会把它压回 ssthresh，所以 0.5.2 起这个
-分支只在窗口低于 ssthresh 时才调用它（之前，`initial_cwnd_packets` 小于下限的流
-在 Loss 结束后的第一个 ACK 上就被压回 ssthresh）。
-
-**永不因丢包降窗**：`skyline_ssthresh()` 在 M2 开启时直接返回当前 cwnd 不变，
-不计算任何降幅——这是"丢包默认不携带拥塞信息"这条设计原则最直接的体现。
-唯一还能限制流的是下面的护栏。
-
-**队列时延/ECN 护栏——一次性钳位，不是粘性模式**：每轮重新计算
-`flow->queue_clamped`（队列时延超过护栏，或出现新鲜 ECN CE 标记，两者任一
-即真），真则把这一轮的增益钳位到 `guardrail_gain`。pacing 上护栏永远赢：护栏增益
-直接替换掉"模式增益 × 丢包补偿系数"，pacing 速率 = 测得带宽 × `guardrail_gain`。
-cwnd 目标上护栏只替换模式增益，丢包补偿系数仍乘在后面，钳位时的目标是
-`BDP × guardrail_gain × 1/(1-p)`——cwnd 只需要不成为限制，真正压住发送速度的是
-pacing。`guardrail_gain` 取值 `(0.0, 1.0)` 时是真正的主动降速（pacing 降到测得带宽的
-该比例）；`0.0` 表示只取消加速、不主动降速（增益回到中性 1.0）。护栏只在 M2 开启时
-每轮判定。每轮从零重新判定，没有"进入/
-退出"的状态转换，触发条件消失的下一轮立刻恢复原增益。
-
-护栏阈值 = `max(max_queue_delay_ms, 基准RTT × max_queue_delay_ratio)`，让
-阈值在高 RTT 链路上自动放宽（同样的排队延迟占基准 RTT 的比例更小）；
-`max_queue_delay_ratio=0` 时退化为只用固定绝对值。
-
-**基准 RTT 的估计**：取 `min_rtt_us` 和 `srtt` 窗口最小值（`min_srtt_us`）
-两者中的较大值，而不是单纯用 `min_rtt_us`——在网络重排序场景下，部分包会
-绕过实际排队/传输延迟提前到达，逐包 RTT 样本会真实地趋近 0，把
-`min_rtt_us` 压得远低于真实基准；`srtt` 作为平滑值不会这样塌陷。取较大值
-只会让算出的排队时延更保守，不会引入高估风险；极低 RTT 下按比例算出的阈值过小、
-容易被调度噪声误触发的问题，由阈值公式里的固定下界 `max_queue_delay_ms` 兜住。
-
-**带宽估计**：每轮结束时把峰值投递速率存入长度为 10 的滑动窗口，取窗口内
-（`bw_window_rtts` 个最近槛位）最大值，只用未被应用层限速的样本。这个估
-计器天生系统性低估 `1-p`（`p` 为丢包率），见第 7 节 M3 的补偿。
-
-样本的区间（`rate_sample.interval_us`）超过 `2 × srtt` 的也不采信：这样的样本
-跨过了一次计时器等待——尾丢探测（TLP）的 SACK 是"PTO + 一个 RTT 里交付了 1 个
-包"，RTO 发出的重传被确认时是"退避后的 RTO + 一个 RTT 里交付了 1 个包"，而正常
-ACK 时钟驱动的样本只覆盖约一个 RTT。把它当带宽读出来只有几 kbit/s。连接刚开始
-时窗口里没有更好的样本，最大值滤波会直接采用它（窗口里连续 `bw_window_rtts`
-轮都只有这种样本时也一样），M4 再按增益乘上它去 pacing——每一两秒放出两个
-包，而每一轮能测到的也只有这个节奏放出去的量，估计值自己回不来，几十 KB 的
-响应会因此拖上十几秒。丢掉这种样本后，滤波器要么保持为空（M2 走慢启动，M4 不碰 pacing），要么保留
-上一个真实的估计。Recovery/Loss 状态下 ACK 驱动的样本照常采信，它们和其他
-样本一样只覆盖约一个 RTT。
-
-**响应末尾的重传不是带宽测量**：内核只在应用写入时（`tcp_sendmsg_locked()` 里的
-`tcp_rate_check_app_limited()`）判断"应用受限"——要发的数据不足一个包、qdisc 和
-网卡里没有排着的包、窗口没用满、丢的包都已重传——成立就打一个标记，标记被交付之前
-发出的包，速率样本都带 `is_app_limited`。重传不是写入：响应末尾丢了一个段，RACK 补发
-它（或者尾丢探测）时，这次响应自己那个标记早已交付，补发的样本于是被当成路径测量，
-而它只覆盖响应结束时还在途的那几个包，长 RTT 下读出来几百 kbit/s。有丢包的链路上，
-这往往是一个短响应产生的第一个样本；滤波器原本为空，它就成了估计值：M2 把 cwnd 从
-初始窗口砍到 `min_cwnd_packets`，M4 按 pacing 下限发——同一条连接上的下一个响应
-（keep-alive、HTTP/2、代理的复用隧道）就从这里起步。0.5.1 起 `skyline_cc` 在每个
-ACK 的末尾（M2、M4 都已定好这一 ACK 的窗口和速率之后）再做一遍内核的这个判断，成立就
-同样打上标记，这个 ACK 放出去的重传（`tcp_xmit_recovery()` 在 `cong_control` 之后
-执行）以及在途数据交付之前的探测都算应用受限。内核的条件里刻意少了"丢的包都已重传"
-这一条：没有新数据要发时，重传同样填不满管道。socket 里还有数据排着的流永远不会被
-标记，一直喂满 socket 的传输测得的样本和以前完全一样。只在 M2 或 M4 开启时做——只有
-它们读带宽滤波器，两者都关时流走内核 CUBIC 那条路，速率样本保持内核原样。
-
-**空的滤波器不用重传的样本起头**（0.5.1 起）：一轮丢掉大半之后，第一个补发的包被确认
-时，这段时间里交付的往往只有它自己——每 RTT 一个包。滤波器原本为空，它就直接成为估计
-值，M2、M4 跟着把窗口和速率压下去，直到更大的样本到来；而同一批发出的新数据片刻之后就
-被确认，它的样本覆盖整轮的交付。所以第一个估计必须来自只发过一次的包；有了估计之后，
-重传的样本照常采信——持续丢包时正是靠它们让估计跟上。响应末尾没有新数据可发的情形，由
-上一段的应用受限标记处理。
-
-**STARTUP 的平台期只数测到带宽的轮次**：整轮都受应用限速的轮次没有样本进入滤波器，
-`bw_bps` 原样不动；0.5.1 之前这样的轮次也算"涨幅低于 `startup_growth_ratio`"。一条
-承载小响应、中间有空闲的长连接（keep-alive、HTTP/2、代理的复用隧道）每个响应都有一两
-轮这样的轮次，几个小响应就凑满 `startup_plateau_rtts`，流带着第一次突发测到的估计
-进入 CRUISE——那次突发往往还受客户端没长大的接收窗口所限，估计偏低——之后每次突发都
-按 `cruise_pacing_gain` 倍的这个估计发——CRUISE 每轮最多也只能按这个倍数（默认 1.25）
-往上爬，而短于一个 RTT 的突发从头到尾都是应用受限，刷新不了估计。现在这些轮次不计数，流留在 STARTUP，直到连续
-`startup_plateau_rtts` 个测到带宽的轮次涨不动、或者护栏触发；内核的 BBR 在同一个判断里
-也跳过应用受限的轮次（`bbr_check_full_bw_reached()`）。
-
-**激进初始窗口**：`initial_cwnd_packets` 支持覆盖内核自身的初始窗口（标准
-IW10 在高 RTT 场景下需要多个 RTT 才能涨到较大 cwnd）；`0` 表示不覆盖。
-
-**M2 关闭时**：走框架层的 CUBIC 对等路径（第 4 节）：CWR 与 Recovery 里走 PRR，
-其余状态（Loss 在内）增长。
-
-## 7. M3：丢包率补偿
-
-不区分"这次丢包是不是拥塞"——目标环境下丢包默认被假设为不携带拥塞信息
-（第 1 节）。M3 只做一件事：估计这条流自己的丢包率，并把 `bw_bps` 系统性
-低估的部分补偿回来。`bw_bps` 是投递速率的滤波，在丢包率为 `p` 的链路上，
-维持投递速率 `B` 实际需要维持约 `B/(1-p)` 的在途字节——每一处从 `bw_bps`
-派生 cwnd 目标或 pacing 速率的地方都天然低估了 `(1-p)`。
-
-**丢包率信号**：每轮更新一次 `flow->loss_rate_permille`（`tp->lost` 增量
-除以 `tp->lost+tp->delivered` 增量，指数滑动平均，alpha=1/4）——这个计算
-独立于 `feature_mask`，即使 M3 关闭也照常计算，只是没人读它。
-
-**补偿系数**：
+**cwnd target computation**:
 
 ```
-p = min(测得loss_rate_permille, loss_inflation_max_ratio换算成permille, 500‰上限)
-补偿系数 = 1000 × 1000 / (1000 - p)   # 即 1/(1-p)
+target bytes = bandwidth estimate (bw_bps) × base RTT × gain × loss compensation factor (M3)
+target packets = target bytes / packet size (MSS)
 ```
 
-M3 关闭或 `loss_inflation_max_ratio=0.0` 时补偿系数恒为 1.0（完全不生效）。
-上限 500‰（最多补偿到 2.0 倍）是防止极端测得丢包率下补偿过头的安全阀。
-这个系数被 M2 的 cwnd 目标计算和 M4 的 pacing 计算共同消费。pacing 上它在护栏钳位
-之前应用，护栏触发时被整个替换掉（护栏有最后否决权）；cwnd 目标上它乘在护栏增益
-之后，护栏触发时照样放大（见第 6 节）。
+The computed target is assigned to `tp->snd_cwnd` directly, without approaching it step by step through additive
+increase (consistent with BBR's design). cwnd only needs not to be the limiting factor (`cruise_inflight_gain` is
+deliberately looser than `cruise_pacing_gain`); the real rate limiter is M4's pacing rate. Anything above the hard
+ceiling `max_cwnd_packets` is cut straight to that value. The branch that has no bandwidth estimate yet and runs
+standard slow start (see below) is bound by this ceiling too -- since 0.5.0; before that the branch did not check the
+ceiling, and since `tcp_slow_start()` adds the number of acknowledged packets to cwnd on every ACK whether or not cwnd
+is the limiting factor, the cwnd of a flow that was always application-limited, and so never had an estimate, would
+climb right past the ceiling (section 13).
 
-## 8. M4：Pacing
+**cwnd floor**: when the target is below `min_cwnd_packets`, the floor is used (32 in the shipped templates; omitted =
+4, the historically hard-coded `SKYLINE_MIN_CWND`). For a thin flow or one that is application-limited for long
+periods, `bandwidth estimate × base RTT` comes to only a few packets; with a window that small, after one packet is
+lost there are not enough packets behind it to produce SACK feedback, and recovery can come only from a tail loss
+probe or an RTO. The floor is applied **after** the hard ceiling and the guardrail clamp (the same order as the old
+fixed floor), and configuration validation ensures it does not exceed `max_cwnd_packets`. It does not change the
+sending rate -- the rate is still set by pacing -- it only keeps cwnd from becoming the bottleneck for retransmission.
+The BPF side actually uses `max(min_cwnd_packets, 4)`; the neutral-baseline path with M2 off does not read this field
+and always uses the fixed 4-packet floor, so B1/B2 neutrality is unaffected.
 
-普通 TCP 只关心 cwnd（一次能发多少），不关心这些数据具体在什么时间点发出
-去，容易出现"cwnd 一下子全部倾泻出去"这种一惊一乍的模式。M4 通过设置
-`sk_pacing_rate`，让内核的 `fq` 队列调度器把数据匀速吐出去。
+**RTO with no bandwidth estimate yet**: the same floor also applies to the "no bandwidth estimate yet" branch, but only
+after an RTO (`TCP_CA_Loss`). `skyline_update_model()` accepts only samples that are not application-limited, and a
+short flow whose whole response goes out in the first round (a typical 15–35 KB web response) is sent with the window
+not full and the data already all sent, so the kernel marks its rate samples application-limited; on loss, the
+retransmissions at the end of the response count as application-limited too (since 0.5.1, see "Bandwidth estimate"
+below), so such a flow usually has no bandwidth estimate from start to finish and runs this branch's standard slow
+start throughout. On an RTO the kernel's `tcp_enter_loss()` presses cwnd down to "packets in flight + 1"; without this
+floor, such a flow would slow-start the rest of the response again from 1 packet -- the one place where "never cut the
+window because of loss" is not honoured. It is limited to the Loss state so as not to change the initial window at
+connection start (including a deliberately small `initial_cwnd_packets`); outside Loss the kernel does not cut the
+window for an algorithm with `cong_control` (no PRR, no fall back to ssthresh at the end of recovery, no idle decay),
+so there is nothing else to make up for. The floor also holds after Loss ends: `tcp_slow_start()` presses a window
+above ssthresh back down to ssthresh, so since 0.5.2 this branch calls it only when the window is below ssthresh
+(before that, a flow whose `initial_cwnd_packets` was below the floor was pressed back to ssthresh on the first ACK
+after Loss ended).
 
-pacing 速率 = 带宽估计 × 增益 × M3 的丢包补偿系数，并被 `max_pacing_mbps`
-硬性封顶；M4 关闭时退化为第 4 节的 auto-pacing 或完全交还内核默认行为。
+**Never cut the window because of loss**: with M2 on, `skyline_ssthresh()` simply returns the current cwnd unchanged
+and computes no reduction at all -- the most direct expression of the design principle "loss carries no congestion
+information by default". The only thing that can still restrain a flow is the guardrail below.
 
-出口网卡上的根 qdisc 是 `fq`，这件事由控制面负责（第 11 节的 guard），而不是假定
-主机本来就这样：`net.core.default_qdisc` 只影响之后新建的 qdisc，网卡的根 qdisc
-常在它生效之前就已建好，很多 VPS 上还被"一键加速"脚本换成了 `cake`/`fq_pie`。
+**Queue-delay/ECN guardrail -- a one-shot clamp, not a sticky mode**: `flow->queue_clamped` is recomputed every round
+(true if either the queue delay exceeds the guardrail or a fresh ECN CE mark appears), and when it is true the round's
+gain is clamped to `guardrail_gain`. On pacing the guardrail always wins: the guardrail gain replaces "mode gain × loss
+compensation factor" outright, and pacing rate = measured bandwidth × `guardrail_gain`. On the cwnd target the
+guardrail replaces only the mode gain, and the loss compensation factor still multiplies after it, so the clamped
+target is `BDP × guardrail_gain × 1/(1-p)` -- cwnd only needs not to be the limit; what actually holds the sending
+speed down is pacing. A `guardrail_gain` in `(0.0, 1.0)` is a real active slowdown (pacing drops to that fraction of
+the measured bandwidth); `0.0` means only cancelling the speed-up without actively slowing down (the gain returns to a
+neutral 1.0). The guardrail is evaluated every round only when M2 is on. It is re-evaluated from scratch every round,
+with no "enter/exit" state transition: the round after the trigger condition disappears, the original gain is restored
+immediately.
 
-**增益选择**：M2 开启且处于 STARTUP 用 `startup_gain`；其余情况（M2 开启
-且 CRUISE，或 M2 关闭）用 `cruise_pacing_gain`。护栏触发时不管前面算出多
-少，强制钳位到 `guardrail_gain`——这是唯一还存在的"低于正常值"的增益路
-径，且是一次性的、每轮重新判定，不是粘性状态。护栏的判定（`queue_clamped`）只在 M2
-开启时进行：M2 关闭、M4 开启的组合里 pacing 没有护栏。
+Guardrail threshold = `max(max_queue_delay_ms, base RTT × max_queue_delay_ratio)`, so the threshold loosens
+automatically on high-RTT links (the same queueing delay is a smaller fraction of the base RTT); with
+`max_queue_delay_ratio=0` it reduces to the fixed absolute value alone.
 
-**pacing 下限**：pacing 速率不低于"每个基准 RTT 发一个最小窗口"，即
-`最小窗口 × MSS / 基准RTT`；最小窗口在 M2 开启时是 `min_cwnd_packets`，关闭时是
-固定的 4 包。这是 cwnd 下限在 pacing 上的对应物：第 6 节已经把会让估计值塌到
-几 kbit/s 的已知样本挡在滤波器外，这个下限是兜底——不管还有什么让估计值远低于
-窗口本身允许的速率，M2 定为 `min_cwnd_packets` 包的一轮都不会被 pacing 摊到
-好几秒。它在护栏钳位**之后**应用，与 cwnd 下限的次序一致；`max_pacing_mbps` 和
-套接字的 `SO_MAX_PACING_RATE` 仍然最后生效。32 包、1448 字节、85 ms 时是
-4.4 Mbit/s，在本项目针对的链路上只有估计值坏掉时才会起作用。
+**Estimating the base RTT**: take the larger of `min_rtt_us` and the windowed minimum of `srtt` (`min_srtt_us`), rather
+than `min_rtt_us` alone -- under network reordering some packets bypass the actual queueing/transmission delay and
+arrive early, per-packet RTT samples genuinely approach 0, and `min_rtt_us` is pressed far below the true baseline;
+`srtt`, being a smoothed value, does not collapse like that. Taking the larger value only makes the computed queueing
+delay more conservative and introduces no risk of overestimation; the problem that at very low RTT the proportionally
+computed threshold is too small and easily triggered by scheduling noise is covered by the fixed lower bound
+`max_queue_delay_ms` in the threshold formula.
 
-**为什么不会形成正反馈死循环**：CRUISE/STARTUP 的增益恒 ≥1.0（配置校验强
-制这一点），唯一低于 1.0 的情形（护栏触发）是一次性钳位、每轮重新判定，
-不会连续维持，因此不存在"低增益→低估带宽→更低增益"这种没有下界的正反馈。
+**Bandwidth estimate**: at the end of each round the peak delivery rate is stored in a sliding window of length 10,
+and the estimate is the maximum within the window (the `bw_window_rtts` most recent slots), using only samples not
+limited by the application. This estimator inherently and systematically underestimates by a factor of `1-p` (`p`
+being the loss rate); see M3's compensation in section 7.
 
-## 9. cgroup 策略与 TC 程序
+Samples whose interval (`rate_sample.interval_us`) exceeds `2 × srtt` are not accepted either: such a sample spans a
+timer wait -- the SACK for a tail loss probe (TLP) is "1 packet delivered in PTO + one RTT", the acknowledgement of a
+retransmission sent by an RTO is "1 packet delivered in the backed-off RTO + one RTT", whereas a sample driven by the
+normal ACK clock covers only about one RTT. Read as bandwidth, it comes to only a few kbit/s. At the very start of a
+connection the window has no better sample, so the max filter takes it as is (as it also does when the window has
+held only such samples for `bw_window_rtts` consecutive rounds), and M4 multiplies it by the gain and paces at that --
+two packets let out every second or two, and each round can measure only what that pace lets out, so the estimate
+cannot recover by itself and a response of a few tens of KB drags on for over ten seconds. With such samples dropped,
+the filter either stays empty (M2 runs slow start, M4 leaves pacing alone) or keeps the last real estimate.
+ACK-driven samples in the Recovery/Loss states are accepted as usual; like other samples, they cover only about one
+RTT.
 
-**cgroup 策略**（`skyline_policy.bpf.c` 的 CC 选择那一半）：新连接建立时检查
-一个全局开关（`enable` 时打开、`drain` 时关闭），是则把这条连接的拥塞控制算法设成
-`skyline_cc`，不是则什么都不做，连接沿用主机的默认算法。这段逻辑跟 M1 tier-2 的动态
-RTO 调节共用同一个 sockops 挂载点，但两段代码互相独立、互不门控——即便 CC 选择从未
-启用过，RTO 调节（若已用 `set-rack-rto` / `reset-rack-rto` 打开）依然生效。
+**Retransmissions at the end of a response are not a bandwidth measurement**: the kernel judges "application-limited"
+only when the application writes (`tcp_rate_check_app_limited()` in `tcp_sendmsg_locked()`) -- less than a packet of
+data to send, no packets queued in the qdisc or the NIC, the window not full, all lost packets already retransmitted
+-- and if that holds it sets a mark, and the rate samples of packets sent before the mark is delivered all carry
+`is_app_limited`. A retransmission is not a write: when a segment at the end of a response is lost and RACK
+retransmits it (or a tail loss probe does), this response's own mark has long been delivered, so the retransmission's
+sample is taken as a path measurement, yet it covers only the few packets still in flight when the response ended, and
+at long RTTs it reads as a few hundred kbit/s. On a lossy link this is often the first sample a short response
+produces; the filter was empty, so it becomes the estimate: M2 cuts cwnd from the initial window to
+`min_cwnd_packets`, M4 sends at the pacing floor -- and the next response on the same connection (keep-alive, HTTP/2,
+a proxy's multiplexed tunnel) starts from there. Since 0.5.1, `skyline_cc` repeats this kernel check at the end of
+every ACK (after M2 and M4 have both settled this ACK's window and rate), and if it holds sets the same mark, so the
+retransmissions this ACK lets out (`tcp_xmit_recovery()` runs after `cong_control`) and the probes sent before the
+in-flight data is delivered all count as application-limited. The kernel's condition "all lost packets already
+retransmitted" is deliberately left out: when there is no new data to send, retransmissions cannot fill the pipe
+either. A flow with data still queued in the socket is never marked, and a transfer that keeps the socket full
+measures exactly the same samples as before. This is done only when M2 or M4 is on -- only they read the bandwidth
+filter; with both off the flow takes the kernel CUBIC path and the rate samples stay as the kernel left them.
 
-**TC 程序**（`skyline_tc.bpf.c`）：挂在发送网卡出方向，做三件互相独立的事：
+**An empty filter does not start from a retransmission's sample** (since 0.5.1): after most of a round is lost, when
+the first retransmitted packet is acknowledged, often it alone has been delivered in that time -- one packet per RTT.
+The filter was empty, so it becomes the estimate directly, and M2 and M4 press the window and rate down with it until
+a larger sample arrives; yet the new data sent in the same batch is acknowledged moments later, and its sample covers
+the whole round's deliveries. So the first estimate must come from a packet sent only once; once there is an estimate,
+retransmissions' samples are accepted as usual -- under sustained loss they are exactly what keeps the estimate up to
+date. The case where there is no new data to send at the end of a response is handled by the application-limited mark
+of the previous paragraph.
 
-- **统计**：包数/字节数/GSO 包数（`gso_segs > 1` 的 skb，不是段数），供 `ssctl status`
-  展示，不参与任何决策
-  （TC 程序始终 fail open，从不丢包）。
-- **重传包 DSCP 标记**：检测到重传的 TCP 段（比较包自己的序列号和
-  `bpf_tcp_sock(sk)->snd_nxt`）时打上配置好的 DSCP 编码，供上游网络设备按
-  DSCP 分流。接口级挂载，不分 cgroup，对该接口上全部 TCP 流一致生效，不
-  区分用的是哪种拥塞控制。IPv4 直接改写 ToS 字节高 6 位并修正 IPv4 头校验
-  和；IPv6 没有头部校验和，改写 Traffic Class 字段后不需要额外修正——两者
-  是独立实现的函数，不共用同一段校验和修正逻辑。IPv6 路径遇到分片/认证头/
-  未知扩展头/超过扩展头层数上限一律放行不处理（fail-open）。
-- **首轮冗余**（`[redundancy]`，默认开）：skyline_cc 启用期间，本机发出的每个
-  SYN-ACK、skyline_cc 套接字发出的每个 SYN，以及 skyline_cc 连接里起点落在前
-  `first_kib` KiB 内的每个数据段，都发两份——原包立即发出，副本晚 `delay_ms`
-  （默认 10 ms）。原因：高丢包的长距离链路上，一个短响应的大部分时间花在等丢包
-  恢复上而不是在传输上。15–35 KB 的响应在初始窗口里一个 RTT 就能发完，丢一个段
-  至少再多一个 RTT（快速重传），丢的是尾部就是两三个 RTT（约 2 个 RTT 后的 TLP、
-  约 3 个 RTT 后的 RTO），丢了 SYN-ACK 则要等内核固定的 1 秒初始超时——这些计时器
-  都不归拥塞控制管，cwnd 再大也缩短不了。第二份副本把"丢了"变成"晚到了一点"，
-  除非两份都丢。副本之所以要晚发：紧挨着的两个包往往被同一段成片丢包一起丢掉，
-  隔几毫秒的两个包一起丢的概率低得多。
-  实现：用 `bpf_clone_redirect()` 把包克隆回同一块网卡；克隆出来的副本没有套接字，
-  会带着写在 `skb->cb[0]` 里的标记再次经过同一个出方向挂载点，在那里被打上 EDT
-  时间戳（`bpf_skb_set_tstamp()`），由 `fq` 把它扣到时间再发——根 qdisc 不是 `fq`
-  时副本立即发出。有套接字的包永远不会被当成副本，副本也不会被再次复制。
-  判断"是不是 skyline_cc 连接"看的是拥塞控制注册的名字（`icsk_ca_ops->name`），
-  不是指针——struct_ops 的注册地址事先无从得知，daemon 重启还会换一个。数据段在
-  连接发送流里的位置用 `seq - (snd_una - bytes_acked)` 算，不需要每条连接的额外
-  状态，这段范围内的重传也照样复制。SYN-ACK 属于请求套接字，还没有拥塞控制，
-  所以按主机状态判断：daemon 只在 `ssctl enable` 成功之后才把开关写成 1，
-  `ssctl drain` 一开始就写回 0，daemon 启动时也清零。代价：没有丢包时每条连接多发
-  约 `first_kib` KiB 外加一个 SYN/SYN-ACK——判断看的是每个 skb 的起点，起点落在范围内
-  的最后一个 GSO 包整个复制，所以最多超出一个 GSO 包；整个落在 `first_kib` 以内的响应
-  发了两遍，大文件只为开头的 `first_kib` 付费；TC 程序不记每条连接的状态，这段范围内的每次
-  重传、每个重传的 SYN/SYN-ACK 也各复制一份，所以丢包越多多发得越多，没有"每条连接
-  最多多少"的硬上限。实验矩阵在每个 case 里显式关闭它，
-  `docs/04-performance-report.md` 的数据都是在没有副本的情况下测的。
+**STARTUP's plateau counts only rounds that measured bandwidth**: a round that is application-limited throughout puts
+no sample into the filter, and `bw_bps` stays as it was; before 0.5.1 such a round also counted as "growth below
+`startup_growth_ratio`". A long-lived connection carrying small responses with idle time in between (keep-alive,
+HTTP/2, a proxy's multiplexed tunnel) has one or two such rounds per response, so a few small responses were enough
+to fill `startup_plateau_rtts`, and the flow entered CRUISE with the estimate measured from its first burst -- that
+burst was often still limited by the client's not-yet-grown receive window, so the estimate was low -- and from then
+on every burst was sent at `cruise_pacing_gain` times that estimate -- CRUISE can climb by at most that factor (1.25
+by default) per round, and a burst shorter than one RTT is application-limited from start to finish and cannot refresh
+the estimate. Now these rounds do not count: the flow stays in STARTUP until `startup_plateau_rtts` consecutive rounds
+that measured bandwidth stop growing, or the guardrail fires; the kernel's BBR also skips application-limited rounds
+in the same check (`bbr_check_full_bw_reached()`).
 
-DSCP 标记与首轮冗余都从报文偏移 0 处的以太网帧头开始解析（统计不解析报文，在哪里
-都照数），所以 TC 程序只挂在以太网设备上（`/sys/class/net/<网卡>/type` 为 1；VLAN、
-bond、网桥也是）。WireGuard/WARP、tun、gre、ppp 这类三层隧道上没有这个帧头：首轮冗余
-会认错报文，启用的 DSCP 标记则会按以太网偏移写进 IP 头内部。`tc_interface` 是这类设备时，控制面直接拒绝挂载 TC 程序并在
-状态里说明原因，而不是带着告警挂上去。
+**Aggressive initial window**: `initial_cwnd_packets` can override the kernel's own initial window (the standard IW10
+needs several RTTs to grow to a large cwnd at high RTT); `0` means no override.
 
-## 10. 模块间数据流小结
+**With M2 off**: the framework layer's CUBIC-parity path (section 4) is used: PRR in CWR and Recovery, growth in the
+other states (Loss included).
 
-M2 开启时直接掌管 cwnd（每次 ACK、每种 CA 状态都赋值），绕开 PRR；M3 只提
-供一个丢包率信号和由此派生的补偿系数，供 M2/M4 消费；M4 = pacing 速率；
-框架层的 PRR 与 CUBIC 增长核心只在 M2 关闭时执行、auto-pacing 只在 M4 关闭时执行，
-维持中性基线；M1 是跟 CC 选择共存但逻辑独立的主动调节层（tier-1 sysctl + tier-2
-动态 RTO）。M2/M3/M4 与框架层由配置里的位掩码 `feature_mask` 控制启停（六位，见
-`docs/02-interface-reference.md` 第 7 节）；M1 tier-2、首轮冗余与 guard 各由自己的
-配置段和命令控制，不在这个位掩码里。
+## 7. M3: loss-rate compensation
 
-四个模块开关对应的配置字段速查见 `docs/02-interface-reference.md` 第 6
-节；每个字段在 C 代码里的具体作用见本文档对应模块的小节。
+M3 does not distinguish "is this loss congestion or not" -- in the target environment loss is assumed by default to
+carry no congestion information (section 1). M3 does one thing: it estimates the flow's own loss rate and compensates
+for the part that `bw_bps` systematically underestimates. `bw_bps` is a filter of the delivery rate; on a link with
+loss rate `p`, sustaining a delivery rate `B` actually requires sustaining about `B/(1-p)` worth of bytes in flight --
+every place that derives a cwnd target or pacing rate from `bw_bps` naturally underestimates by a factor of `(1-p)`.
 
-## 11. 控制面设计
+**Loss-rate signal**: `flow->loss_rate_permille` is updated once per round (the increase in `tp->lost` divided by the
+increase in `tp->lost+tp->delivered`, exponential moving average, alpha=1/4) -- this computation is independent of
+`feature_mask` and runs even with M3 off; nobody reads it then.
 
-**启动流程**：`skyline-speederd` 启动时不会立刻把 Skyline Speeder 挂到内核里——先探测一遍内核能
-力（见 `docs/02-interface-reference.md` 第 4 节"能力探测"），然后开始监
-听管理命令。真正"注册进内核"发生在收到 `enable` 命令之后：启动=待命，
-enable=生效。`enable` 里的顺序：第一次挂载前先把全机默认算法写成 `fallback_cc`
-作基线（挂载失败时主机停在一个确定可用的算法上），挂载成功之后才写成 `skyline_cc`
-（内核拒绝还没注册的算法名），然后武装 guard、打开首轮冗余。`--validate-only --verify-bpf` 是一次性健康检查：把 BPF 对
-象提交给内核验证器过一遍，验证完立刻释放，不做任何挂载/生效操作。
+**Compensation factor**:
 
-**双配置槽、配置序号与每连接副本**：daemon 把第 N 份配置写进 `config_slots[N & 1]`，
-写完再把 `config_seq` 改成 N。序号指向的槽永远不是正在写的那个：写第 N 份时序号还是
-N-1，下一份 N+1 又写进另一个槽。每条连接在开始时、之后只在自己进入一个新 round 的那
-一刻看序号有没有变，变了就把序号指向的那个槽整份复制进自己的 `skyline_flow_state`；
-复制前后各读一次序号，期间序号变了（复制的槽可能正被改写）就丢掉这份副本，下一轮再试。
-连接的第一次复制其实发生在 `init` 之前：握手最后那个 ACK 先经过 `tcp_ack()`（其中会调
-`cong_control`），`tcp_init_transfer()` 之后才调 `init`，两端都是这样（6.12 与 7.2 上实测）。那一次
-还没有配置，就地复制一份；`init` 随后再复制一次并从头开始。
-复制成功后把该连接的整个状态机（当前模式、带宽窗口、round 计数等）清零重新开始——
-因为 M2 状态机的很多判断以整轮为单位累积，允许轮中途切换参数会出现"这轮的窗口用旧
-参数算的，退出阈值却已是新参数"的自相矛盾。
+```
+p = min(measured loss_rate_permille, loss_inflation_max_ratio converted to permille, 500‰ cap)
+compensation factor = 1000 × 1000 / (1000 - p)   # i.e. 1/(1-p)
+```
 
-之后每个 ACK 只读自己的副本，所以 daemon 下发得多快（脚本里紧挨着的 `enable` 与
-`set-module-config`）、连接空闲了多久，一轮之内读到的都是同一份完整配置；一轮里下发
-了几次的，下一个轮边界直接换成最新那份（type 11 事件的新旧代际因此可能跳号）。两次
-读序号之间的复制靠 x86 的内存序成立（读与读之间不重排，BPF 对象就是按 x86 编译的），
-编译器层面由 volatile 读与编译屏障保证次序。
+With M3 off or `loss_inflation_max_ratio=0.0` the compensation factor is always 1.0 (no effect at all). The 500‰ cap
+(compensation up to at most 2.0 times) is a safety valve against over-compensating at extreme measured loss rates.
+The factor is consumed by both M2's cwnd target computation and M4's pacing computation. On pacing it is applied
+before the guardrail clamp and is replaced entirely when the guardrail fires (the guardrail has the final veto); on
+the cwnd target it multiplies after the guardrail gain and still inflates the target when the guardrail fires (see
+section 6).
 
-0.4.x 只有双槽，没有副本和序号：连接每个 ACK 都去读自己所在的槽，daemon 总是写
-`(当前槽 + 1) & 1` 而不检查还有没有连接在读它。一个 RTT 之内连续两次更新时，第二次会
-改写仍有连接在读的槽，这个槽又随即成了活跃槽，这些连接既读到正在写入的值，也不会
-清零重来。
+## 8. M4: Pacing
 
-**Drain**：按顺序执行——先解除 guard（见下），再关闭"给新连接分配 Skyline Speeder"的
-开关（全局默认算法写回 `fallback_cc`，然后是 cgroup 派发），之后新建立的连接沿用
-`fallback_cc`；然后轮询等待现有 Skyline Speeder 连接数归零（默认超时 300 秒，超
-时报错退出，不强制摘除）；确认归零后才真正注销 struct_ops。只影响 M2/M3/
-M4，M1 的两层（若已启用）不受影响。
+Plain TCP cares only about cwnd (how much can be sent at once), not about exactly when that data goes out, which
+easily leads to a jerky pattern where "the whole cwnd pours out at once". M4 sets `sk_pacing_rate` so that the
+kernel's `fq` queue scheduler releases the data at an even pace.
 
-**Guard（拥塞控制与 qdisc 守护）**：`enable` 把全机默认算法写成 `skyline_cc`，但这只是
-一次写入，主机上别的东西随时可能把它改掉——典型是"一键 BBR"脚本留在 `/etc/sysctl.d`
-里的 `bbr` 被下一次 `sysctl --system` 重新应用。改掉之后每条新连接都悄悄绕开
-`skyline_cc`，没有任何报错，属于本项目最怕的那类静默失效。所以从 `enable` 到 `drain`，
-控制面独占三项设置并周期性（`[guard] interval_s`，默认 5 秒）核对：默认拥塞控制、
-`net.core.default_qdisc`、出口网卡的根 qdisc（后两项可用 `[guard] qdisc = false`
-放手）。设计上的几个取舍：
+pacing rate = bandwidth estimate × gain × M3's loss compensation factor, hard-capped by `max_pacing_mbps`; with M4 off
+it falls back to section 4's auto-pacing or hands everything back to the kernel's default behaviour.
 
-- **只有一个写入者。** 这三项此前分散在 daemon（拥塞控制）与开机脚本
-  `boot-enable.sh`（`default_qdisc`，开机时写一次）两处；两处写同一个设置就会各说各话，
-  所以 qdisc 也收归 daemon，开机脚本不再写任何 sysctl。
-- **替换根 qdisc，而不只是改 sysctl。** `default_qdisc` 只决定之后新建的 qdisc；一台
-  全新的 Debian 13 主机上实测，`/etc/sysctl.d` 写着 `fq`，`eth0` 仍是 `fq_codel`。
-  多队列网卡换成 `mq`（子队列按刚设好的默认 `fq` 创建），不换成单个 `fq`——那会把
-  所有发送队列压到一把锁上。新 `mq` 的子队列只看 `default_qdisc`，所以它读回来不是
-  `fq` 时就不建：从 `cake` 的默认值建出来的新 `mq`，装上的恰恰是要去掉的东西。
-- **尽量只让网卡停发一次。** 逐个替换 `mq` 的子队列，每换一个都让整块网卡停发一次
-  （`mq_graft`），64 队列就是连续 64 次；而对 `tc` 建的 `mq` 执行 `replace root mq` 是内核接受却不改任何
-  东西的空操作。所以要换多个子队列时，用一个没被占用的句柄新建整棵 `mq`（`root handle
-  <M>: mq`），一次嫁接完成；只有一个子队列要换、或 `default_qdisc` 不是 `fq`（新 `mq`
-  会按它建子队列）时才逐个替换。
-- **找真正排队的那块网卡。** VLAN、bond、网桥的根是内核默认的 `noqueue`，它们自己不排队，
-  一键脚本的 `cake` 装在下面的物理网卡上。所以 `tc_interface` 的根是 `noqueue` 时，guard
-  顺着 `lower_*` 链接往下找有 `device` 链接的物理/virtio 网卡去管；tap、veth 这类端口
-  一律不碰——网桥上虚拟机和容器的端口不是本机的出口。下面找不到网卡的隧道设备
-  （例如内核 WireGuard）只说明，不当成"有人刻意设的 `noqueue`"；tun、PPP 设备有自己的
-  qdisc，当作 `tc_interface` 时 guard 管它自己的根。
-- **刻意搭建的东西不碰。** 只替换"没有值得保留的配置"的种类（内核默认的 `pfifo_fast`、
-  `fq_codel`，以及一键脚本常装的 `cake`/`fq_pie` 等 AQM）；`htb`/`tbf`/`netem`/`mqprio`
-  这类分类、整形、硬件卸载 qdisc，设了带宽（或 `autorate-ingress`）的 `cake`——那是有人
-  设的限速器，和 `tbf` 一样——以及物理网卡上被人设成的 `noqueue`，一律保留并在状态里
-  说明：替换它们会悄悄毁掉运维的整形配置，代价远大于没有 `fq`。不认识的种类同样保留。
-- **失败后退避，而不是放弃或死磕。** 每次替换都会让网卡短暂停发，不能每个周期都试；但多数
-  失败是暂时的（一次 netlink 内存不足、一个超时被杀的 `tc`），就此不再重试会让网卡一直
-  留在 `cake` 上，直到有人想起来执行 `enable`。所以同一块网卡替换失败后按 30 秒（或
-  `interval_s`，取大者）起步、每次翻倍、最长 5 分钟（或一个 `interval_s`，取大者）重试，并取整到
-  `interval_s` 的整数倍；根 qdisc 变样、`enable` 都立即重试。
-- **卡住的 `tc` 不能卡住 drain。** 每次调用 `tc` 有 10 秒上限；卡在 rtnl 锁上的 `tc`
-  处于不可中断睡眠，SIGKILL 要等锁释放才生效，阻塞地等它退出就会一直占着 guard 的锁——
-  而 `drain` 写回 `fallback_cc` 之前要拿的正是这把锁。所以超时的 `tc` 杀掉后交给后台
-  线程回收，在它退出之前后续的 `tc` 一律立即失败，一次卡住的 rtnl 最多让一次检查（和排在
-  它后面的 `drain`、`status`）多等约 10 秒。
-- **与 drain 无竞态。** 周期检查、`enable` 的武装和 `drain` 的解除共用一把锁，`drain`
-  在持锁状态下写回 `fallback_cc`，因此不存在"drain 刚写回、检查又把 `skyline_cc` 写回去"
-  的交错；drain 超时报错时 guard 同样保持解除，不和随后接手的人（例如实验矩阵）抢设置。
-- **停止时不写 sysctl。** daemon 退出时先停掉并等待 guard 线程结束，再注销 struct_ops
-  （否则一次已武装的检查可能去写一个内核已不认识的 `skyline_cc`）；它不把 `fallback_cc`
-  写回去——这是刻意的决定，写回由 `drain` 和 enable unit 的 `ExecStop` 负责。`ExecStop`
-  （`boot-disable.sh`）先执行 `drain`，之后只在默认仍是 `skyline_cc` 时（daemon 已经不在）
-  才自己写一次：先写 sysctl 再 drain 的话，仍处于武装状态的 guard 会把它改回
-  `skyline_cc`，还在日志里记成"主机上有别的东西改了它"。
+That the root qdisc on the egress NIC is `fq` is the control plane's job (the guard in section 11), not something
+assumed of the host: `net.core.default_qdisc` affects only qdiscs created afterwards, the NIC's root qdisc has often
+been created before it takes effect, and on many VPSes a "one-click speed-up" script has replaced it with
+`cake`/`fq_pie`.
 
-每次改动都记一行 `guard: ...` 到 journald，这是运维发现"主机上有东西在跟我抢设置"的唯一
-线索；刻意没动的东西只在内容变化时记一次。字段与规则见
-`docs/02-interface-reference.md` 第 4、6.8、9 节。
+**Gain selection**: with M2 on and in STARTUP, `startup_gain`; in all other cases (M2 on and in CRUISE, or M2 off),
+`cruise_pacing_gain`. When the guardrail fires, whatever was computed before is forcibly clamped to `guardrail_gain`
+-- this is the only remaining "below normal" gain path, and it is one-shot, re-evaluated every round, not a sticky
+state. The guardrail evaluation (`queue_clamped`) happens only with M2 on: in the M2-off, M4-on combination, pacing
+has no guardrail.
 
-**计数器**：`metrics` 是所有连接共用的每 CPU 计数器，自挂载起累计。护栏触发按轮计
-（`guardrail_hits`，分母 `guardrail_rounds`），cwnd 顶到上限按 ACK 计（`cwnd_cap_hits`，
-分母 `ack_events`）：前者是拥塞信号起了作用，后者只是上限在起作用。0.4.x 把两者合在
-`guardrail_hits` 一个计数器里、都除以 ACK 数，看不出是哪一个，而两者的量级可以差得很远。
-按算术：RTT 200 ms、1 Gbit/s 的流，BDP 约 17,000 个 1448 字节的包，乘上 `cruise_inflight_gain`
-3.0 就超过默认上限 50,000；每两个包一个 ACK 的话每秒约 4 万个 ACK，每个都记一次上限命中，
-几秒钟就是十几万次，而这条流的护栏每秒只检查约 2.5 轮（一轮约两个 RTT，第 3 节）。
-挂载期间 daemon 每 5 秒读一次计数器，status 里的 `metrics_recent` 是最近约一分钟的增量，
-用来区分"现在仍在发生"和"挂载以来某个时候发生过"。
+**pacing floor**: the pacing rate is no lower than "one minimum window per base RTT", i.e.
+`minimum window × MSS / base RTT`; the minimum window is `min_cwnd_packets` with M2 on and a fixed 4 packets with it off. This is the pacing
+counterpart of the cwnd floor: section 6 already keeps the known samples that would collapse the estimate to a few
+kbit/s out of the filter, and this floor is the backstop -- whatever else drives the estimate far below the rate the
+window itself allows, a round M2 has set at `min_cwnd_packets` packets is never spread over several seconds by
+pacing. It is applied **after** the guardrail clamp, in the same order as the cwnd floor; `max_pacing_mbps` and the
+socket's `SO_MAX_PACING_RATE` still apply last. At 32 packets, 1448 bytes and 85 ms it is 4.4 Mbit/s, which on the
+links this project targets comes into play only when the estimate is broken.
 
-**事件日志**：`skyline_cc` 把状态切换、丢包、护栏触发、配置代际切换等事件写进一个
-BPF ring buffer，daemon 的读线程把它落盘成 `runtime.events_path` 指向的 JSON Lines
-文件；文件超过 `runtime.events_max_mib` 就轮转成 `.1`，最多占约两倍，设为 0 则既不
-读 ring buffer 也不写文件（事件码与轮转细节见 `docs/02-interface-reference.md`
-第 8 节）。
+**Why no positive-feedback death spiral forms**: the CRUISE/STARTUP gains are always ≥1.0 (configuration validation
+enforces this), and the only case below 1.0 (the guardrail firing) is a one-shot clamp, re-evaluated every round and
+never sustained continuously, so there is no unbounded positive feedback of the form "low gain → underestimated
+bandwidth → even lower gain".
 
-**TOML 配置 → BPF 二进制格式**：配置文件里的值是给人看的（比如 0.25 这种
-小数），BPF 程序里不能用浮点数（内核验证器不允许），Rust 侧统一做换算：
-比例类参数乘以 1000 变成"千分数"整数，时间类参数换算成微秒，速率类参数
-从 Mbit/s 换算成 bit/s，换算全部使用饱和运算（溢出钳到最大值，不是绕回一
-个很小的数）。
+## 9. The cgroup policy and the TC program
 
-**已知的设计空白**：配置里的 `pin_dir` 字段（本意是把 BPF 对象"钉"在文件
-系统上，重启进程后复用）目前未被实际使用。`skyline_flow_state` 存在 socket storage
-里，用户态无法遍历，所以 `ssctl flows` 的逐条连接（0.3.0 起，含对端与本端地址）读的是
-`ss -tin`：cwnd、pacing、RTT 恰好是 `skyline_cc` 写进套接字的那几项；模式、带宽估计、
-护栏状态这些只存在 socket storage 里的量，仍只有聚合计数。
+**cgroup policy** (the CC-selection half of `skyline_policy.bpf.c`): when a new connection is established it checks a
+global switch (turned on by `enable`, off by `drain`); if it is on, it sets the connection's congestion control
+algorithm to `skyline_cc`, and if not it does nothing and the connection keeps the host's default algorithm. This
+logic shares the same sockops attach point with M1 tier-2's dynamic RTO tuning, but the two pieces of code are
+independent and do not gate each other -- even if CC selection has never been enabled, RTO tuning (if turned on with
+`set-rack-rto` / `reset-rack-rto`) still takes effect.
 
-## 12. 系数选择依据
+**TC program** (`skyline_tc.bpf.c`): attached to the egress direction of the sending NIC, it does three independent
+things:
 
-**出厂默认值有两代，证据来源不同，不要混读。**
+- **Statistics**: packet count/byte count/GSO packet count (skbs with `gso_segs > 1`, not the number of segments),
+  shown by `ssctl status` and not used in any decision
+  (the TC program always fails open and never drops a packet).
+- **DSCP marking of retransmitted packets**: when it detects a retransmitted TCP segment (by comparing the packet's
+  own sequence number with `bpf_tcp_sock(sk)->snd_nxt`), it sets the configured DSCP code point so that upstream
+  network devices can steer traffic by DSCP. It is attached per interface, not per cgroup, and applies equally to
+  every TCP flow on that interface, whatever congestion control it uses. For IPv4 it rewrites the upper 6 bits of the
+  ToS byte directly and fixes up the IPv4 header checksum; IPv6 has no header checksum, so rewriting the Traffic Class
+  field needs no further fix-up -- the two are separately implemented functions and do not share checksum fix-up
+  logic. On the IPv6 path, a fragment header, an authentication header, an unknown extension header, or exceeding the
+  limit on the number of extension headers always means the packet is passed through untouched (fail-open).
+- **First-flight redundancy** (`[redundancy]`, on by default): while skyline_cc is enabled, every SYN-ACK this host
+  sends, every SYN a skyline_cc socket sends, and every data segment in a skyline_cc connection that starts within the
+  first `first_kib` KiB, is sent twice -- the original goes out immediately and the copy `delay_ms` later (10 ms by
+  default). Why: on a high-loss long-distance link, a short response spends most of its time waiting for loss
+  recovery rather than transmitting. A 15–35 KB response fits in the initial window and is sent in one RTT; losing
+  one segment costs at least one more RTT (fast retransmit), losing the tail costs two or three RTTs (a TLP after
+  about 2 RTTs, an RTO after about 3), and losing the SYN-ACK means waiting for the kernel's fixed 1-second initial
+  timeout -- none of these timers is under congestion control, and no cwnd, however large, shortens them. The second
+  copy turns "lost" into "arrived a little late", unless both copies are lost. Why the copy is sent late: two
+  back-to-back packets are often lost together in the same burst of loss, while two packets a few milliseconds apart
+  are much less likely to be lost together.
+  Implementation: `bpf_clone_redirect()` clones the packet back to the same NIC; the clone has no socket and passes
+  the same egress attach point again carrying a mark written in `skb->cb[0]`, where it gets an EDT timestamp
+  (`bpf_skb_set_tstamp()`) and `fq` holds it until that time before sending it -- when the root qdisc is not `fq`, the
+  copy goes out immediately. A packet with a socket is never taken for a copy, and a copy is never copied again.
+  Whether something "is a skyline_cc connection" is decided by the congestion control's registered name
+  (`icsk_ca_ops->name`), not a pointer -- the struct_ops registration address cannot be known in advance, and a daemon
+  restart changes it. A data segment's position in the connection's send stream is computed as
+  `seq - (snd_una - bytes_acked)`, which needs no extra per-connection state, and retransmissions within this range
+  are copied as well.
+  A SYN-ACK belongs to a request socket, which has no congestion control yet, so it is judged by host state: the
+  daemon writes the switch to 1 only after `ssctl enable` succeeds, `ssctl drain` writes it back to 0 at its very
+  start, and the daemon also clears it when it starts. Cost: with no loss, each connection sends about `first_kib` KiB
+  extra plus one SYN/SYN-ACK -- the check looks at each skb's start, and the last GSO packet whose start falls within
+  the range is copied whole, so the overshoot is at most one GSO packet; a response that lies entirely within
+  `first_kib` is sent twice, and a large file pays only for its first `first_kib`; the TC program keeps no
+  per-connection state, so every retransmission within this range and every retransmitted SYN/SYN-ACK is copied once
+  too, so the more loss, the more extra is sent, with no hard ceiling of "at most this much per connection". The
+  experiment matrix turns it off explicitly in every case, and the data in `docs/04-performance-report.md` were all
+  measured without copies.
 
-第一代（`docs/04-performance-report.md` 测的 `skyline-best`，现在是
-`docs/usage.md` 的「高随机丢包档」）在测试台的目标环境网格上选定：
-`cruise_inflight_gain` 2.0 / `cruise_pacing_gain` 1.1 按吞吐与自伤风险权衡，
-`loss_inflation_max_ratio` 0.5（最多 2.0 倍补偿）覆盖 10%-20% 随机丢包上界
-并留出重传开销的余量，护栏 100ms / 1.0 倍基准 RTT。它的前提是第 1 节那条
-"丢包不携带拥塞信息"。
+DSCP marking and first-flight redundancy both parse from an Ethernet header at packet offset 0 (statistics do not
+parse the packet and count wherever they are), so the TC program is attached only to Ethernet devices
+(`/sys/class/net/<nic>/type` is 1; VLANs, bonds and bridges are too). Layer-3 tunnels such as WireGuard/WARP, tun, gre
+and ppp have no such header: first-flight redundancy would misread packets, and DSCP marking, when enabled, would
+write inside the IP header at the Ethernet offset. When `tc_interface` is such a device, the control plane refuses
+outright to attach the TC program and states why in the status, rather than attaching it with a warning.
 
-第二代（当前默认值）来自一台生产部署上的交替对照调参：大量并发连接、基准
-RTT 约 100-150ms，丢包主要来自瓶颈被挤满而不是随机丢包——第一代的前提在
-那里不成立。改动分成互相配合的两组：
+## 10. Summary of data flow between modules
 
-- **收紧"刹车"**：`loss_inflation_max_ratio` 0.5 → 0.10、护栏
-  100ms / 1.0 → 70ms / 0.6、`min_rtt_window_s` 10 → 30、`bw_window_rtts`
-  10 → 6。机制上的理由各自写在 `config/speeder.toml` 对应字段的注释里；
-  核心是 M3 的补偿在拥塞型瓶颈上是一条正反馈（丢得越多补得越多），而原
-  护栏阈值恰好落在这类链路实际能堆出的排队时延之上，几乎不触发。
-- **放开"油门"**：`cruise_pacing_gain` 1.1 → 1.25、`cruise_inflight_gain`
-  2.0 → 3.0、STARTUP 退出判定 3 轮 / 25% → 5 轮 / 20%。CRUISE 是终态且没
-  有周期性探测，带宽估计只能靠 > 1.0 的 pacing 增益往上刷新。
+M2, when on, takes direct charge of cwnd (assigning it on every ACK, in every CA state), bypassing PRR; M3 provides
+only a loss-rate signal and the compensation factor derived from it, consumed by M2/M4; M4 = the pacing rate; the
+framework layer's PRR and CUBIC growth core run only with M2 off and auto-pacing only with M4 off, keeping the neutral
+baseline; M1 is an active tuning layer that coexists with CC selection but is logically independent (tier-1 sysctl +
+tier-2 dynamic RTO). M2/M3/M4 and the framework layer are switched on and off by the bit mask `feature_mask` in the
+configuration (six bits, see `docs/02-interface-reference.md` section 7); M1 tier-2, first-flight redundancy and the
+guard are each controlled by their own configuration section and commands, and are not in this bit mask.
 
-此后的默认值又有两处变化，不属于这次调参：`min_cwnd_packets` 4 → 32（0.4.0，同一个
-下限也用在 RTO 之后还没有带宽估计的分支上，第 6 节），以及默认开启的首轮冗余
-（0.4.0，`first_kib` 64、`delay_ms` 10，第 9 节）。
+A quick reference of the configuration fields behind the four module switches is in `docs/02-interface-reference.md`
+section 6; what each field does in the C code is in this document's section for the corresponding module.
 
-两组必须一起用：只放开油门、不收紧刹车的组合，重传增多而速度没有换来；
-`cruise_pacing_gain` 再往上（1.4）同样如此；`cruise_inflight_gain` 退回 2.0
-时 RTO 超时明显增多。围绕当前默认值逐个参数再调，没有找到稳定更优的取值。
+## 11. Control-plane design
 
-这一代**没有**在测试台矩阵上重跑过，`docs/04-performance-report.md` 里的
-数字不适用于它；按本仓库的性能声明纪律，这里不给出生产环境上的具体数字。
-cwnd 增益刻意比 pacing 增益更宽松这一点两代相同——cwnd 只需要不成为限制
-因素，真正的限速器是 pacing，跟 BBR 把 cwnd 当作上限而非主要速率控制手段
-是同一个思路。
+**Startup**: when `skyline-speederd` starts it does not attach Skyline Speeder to the kernel right away -- it first
+probes the kernel's capabilities (see "Capability probes" in `docs/02-interface-reference.md` section 4) and then
+starts listening for management commands. The real "registration with the kernel" happens after an `enable` command
+arrives: start = standby, enable = in effect. The order inside `enable`: before the first attach it writes
+`fallback_cc` as the machine-wide default algorithm, as a baseline (so if the attach fails the host is left on an
+algorithm known to work), writes `skyline_cc` only after the attach succeeds (the kernel rejects an algorithm name that
+is not yet registered), then arms the guard and turns on first-flight redundancy. `--validate-only --verify-bpf` is a
+one-off health check: it submits the BPF objects to the kernel verifier, releases them as soon as they pass, and
+performs no attach or activation.
 
-`guardrail_gain`（0.8）：护栏触发时 pacing 降到测得带宽的 80%（cwnd 目标见第 6 节），
-是工程选定的初始值，尚未做多候选值的专门对比实验。
+**Double configuration slots, a configuration sequence number and a per-connection copy**: the daemon writes the Nth
+configuration into `config_slots[N & 1]` and only after that changes `config_seq` to N. The slot the sequence number
+points to is never the one being written: while the Nth is written the sequence number is still N-1, and the next
+one, N+1, goes into the other slot. Each connection checks whether the sequence number has changed at its start, and
+afterwards only at the moment it enters a new round; if it has, it copies the whole slot the sequence number points to
+into its own `skyline_flow_state`. It reads the sequence number once before and once after the copy, and if it changed
+in between (the slot being copied may have been rewritten meanwhile) it drops this copy and tries again next round. A
+connection's first copy actually happens before `init`: the handshake's last ACK goes through `tcp_ack()` first (which
+calls `cong_control`), and `init` is called only after `tcp_init_transfer()`, on both ends (measured on 6.12 and 7.2).
+At that point there is no configuration yet, so it copies one on the spot; `init` then copies again and starts from
+scratch.
+After a successful copy the connection's whole state machine (current mode, bandwidth window, round count and so on)
+is reset to zero and starts over -- because many of the M2 state machine's decisions accumulate over whole rounds, and
+allowing parameters to switch mid-round would produce contradictions such as "this round's window was computed with
+the old parameters, but the exit threshold is already the new one".
 
-`rto_max_normal_permille`/`rto_max_congested_permille`（实验配置与
-`config/speeder.toml` 里的 3000/6000，即 3 倍/6 倍基准 RTT；代码与随附模板的默认值是
-0，即上限关闭）：直接按"随机独立丢包场景下等更久不提高重传成功率"这条设计原则
-拍定，未做专门的候选对比矩阵，后续如有真实数据显示需要调整可以直接改。
+After that every ACK reads only its own copy, so however fast the daemon sends configurations (an `enable` and a
+`set-module-config` back to back in a script) and however long a connection has been idle, everything read within a
+round is the same complete configuration; if several were sent within one round, the next round boundary switches
+straight to the latest one (so the old and new generations in type 11 events may skip numbers). The copy between the
+two reads of the sequence number relies on x86 memory ordering (reads are not reordered with other reads, and the BPF
+objects are compiled for x86); at the compiler level the order is guaranteed by volatile reads and compiler barriers.
 
-## 13. 设计取舍与开放问题
+0.4.x had only the double slots, with no copy and no sequence number: a connection read its slot on every ACK, and
+the daemon always wrote `(current slot + 1) & 1` without checking whether any connection was still reading it. With
+two updates in a row within one RTT, the second rewrote a slot that connections were still reading, and that slot then
+immediately became the active slot, so those connections both read values that were being written and never reset.
 
-- M1 目前只覆盖内核已经暴露调节接口的两档（全局 sysctl、RTO 相关的按连
-  接 setsockopt）；如果需要让排序容忍窗口（`reo_wnd`）这类完全硬编码在内
-  核里的参数也按连接动态调整，现有内核没有暴露任何接口，需要内核补丁
-  （见第 5 节的三档分类）。
-- `early-loss`（M1 在 `skyline_cc.bpf.c` 里的部分）目前只是一个观测计数器，
-  不驱动任何决策——如果未来需要让它真正影响拥塞控制行为，需要先确认这个
-  提前量信号本身的可靠性。
-- `ssctl` 的线协议没有加密或身份验证，完全依赖 Unix socket 文件的文件
-  系统权限——多租户环境下需要额外的访问控制。0.5.2 起 socket 固定为 `0600`（之前
-  取决于 daemon 启动时的 umask），每个客户端读写各有 5 秒期限：一次只处理一个请求，
-  一个连上不发完的客户端曾经能卡住其后所有请求，包括 SIGTERM 触发的退出。
-- M2 关闭路径对 `CA_EVENT_TX_START` 的处理与内核 CUBIC 不完全一致：这里把
-  增长周期的起点重置为当前时刻（起点还没设定时也照设，于是下一次增长不会重算
-  `K`），内核 CUBIC 则把起点后移空闲的时长
-  （`now - lsndtime`，以 jiffies 计），让增长接着空闲前的曲线走。照搬需要在
-  BPF 里把 jiffies 换算成纳秒（要知道 `HZ`），目前没有做。只影响 M2 关闭、
-  且中途空闲过的连接；第 4 节的中性性门槛（零丢包大流量）不受影响。
-- 还没有带宽估计的分支用 `tcp_slow_start()` 增长 cwnd，不像内核自己的慢启动那样只在
-  cwnd 确实是限制因素时才增长：一直受应用限速的流（它们也正是一直没有估计、一直走这个
-  分支的流）每个 ACK 都在加 cwnd。它增长的上限其实是 ssthresh：`tcp_slow_start()` 不会
-  越过它，而 M2 的 `skyline_ssthresh()` 把它定在第一次丢包事件那一刻的 cwnd，所以第一次
-  CWR、恢复或 RTO 之后，这样的流不再增长（撤销时内核恢复旧的 ssthresh，上限随之抬回）。
-  还没丢过包时，它停在 `max_cwnd_packets`（0.5.0 起，第 6 节），而这个上限默认是 50,000
-  个包；这样的流哪天一次写入大量数据，M4 又因为没有估计而不设 pacing 速率，这个窗口只受
-  cwnd 本身限制，会成批发出去。要不要改成只在受 cwnd 限制时增长、越过 ssthresh 之后是否
-  继续增长（例如改用内核的 `tcp_reno_cong_avoid()`），需要测试台数据来定。
+**Drain**: runs in order -- first it disarms the guard (see below), then turns off the switch that "assigns Skyline
+Speeder to new connections" (the global default algorithm is written back to `fallback_cc`, then the cgroup dispatch
+is turned off), after which newly established connections use `fallback_cc`; then it polls until the number of
+existing Skyline Speeder connections reaches zero (default timeout 300 seconds; on timeout it exits with an error and
+does not force a detach); only once zero is confirmed does it actually unregister the struct_ops. It affects only
+M2/M3/M4; M1's two tiers (if enabled) are unaffected.
+
+**Guard (the congestion control and qdisc guard)**: `enable` writes `skyline_cc` as the machine-wide default
+algorithm, but that is a single write, and something else on the host can change it at any time -- typically the `bbr`
+that a "one-click BBR" script left in `/etc/sysctl.d`, reapplied by the next `sysctl --system`. Once it is changed,
+every new connection silently bypasses `skyline_cc` with no error at all -- the kind of silent failure this project
+fears most. So from `enable` to `drain` the control plane owns three settings exclusively and checks them periodically
+(`[guard] interval_s`, default 5 seconds): the default congestion control, `net.core.default_qdisc`, and the egress
+NIC's root qdisc (the last two can be released with `[guard] qdisc = false`). A few design trade-offs:
+
+- **Only one writer.** These three used to be split between the daemon (congestion control) and the boot script
+  `boot-enable.sh` (`default_qdisc`, written once at boot); two places writing the same setting contradict each other,
+  so the qdisc was brought under the daemon too, and the boot script no longer writes any sysctl.
+- **Replace the root qdisc, not just the sysctl.** `default_qdisc` decides only qdiscs created afterwards; measured on
+  a fresh Debian 13 host, `/etc/sysctl.d` said `fq` and `eth0` was still `fq_codel`. A multi-queue NIC gets an `mq`
+  (with child queues created from the default `fq` just set), not a single `fq` -- that would squeeze all transmit
+  queues onto one lock. A new `mq`'s child queues look only at `default_qdisc`, so when it reads back as something
+  other than `fq` none is built: a new `mq` built from a `cake` default would install exactly what is being removed.
+- **Pause the NIC's transmission only once where possible.** Replacing an `mq`'s child queues one by one pauses
+  transmission on the whole NIC once per replacement (`mq_graft`), so 64 queues means 64 pauses in a row; and running
+  `replace root mq` on an `mq` that `tc` created is a no-op the kernel accepts without changing anything. So when
+  several child queues need replacing, a whole new `mq` tree is created under an unused handle (`root handle <M>: mq`)
+  and grafted in at once; child queues are replaced one by one only when just one needs replacing, or when
+  `default_qdisc` is not `fq` (the new `mq` would build its child queues from it).
+- **Find the NIC that actually queues.** The root of a VLAN, bond or bridge is the kernel's default `noqueue`; they do
+  not queue themselves, and a one-click script's `cake` is installed on the physical NIC underneath. So when the root
+  of `tc_interface` is `noqueue`, the guard follows the `lower_*` links down to the physical/virtio NICs that have a
+  `device` link and looks after those; ports such as tap and veth are never touched -- on a bridge, the ports of
+  virtual machines and containers are not this host's egress. A tunnel device with no NIC underneath (for example
+  kernel WireGuard) is only reported, not treated as "a `noqueue` someone set deliberately"; tun and PPP devices have
+  their own qdisc, and when one is the `tc_interface` the guard looks after its own root.
+- **Leave deliberate setups alone.** Only kinds with "no configuration worth keeping" are replaced (the kernel defaults
+  `pfifo_fast` and `fq_codel`, and AQMs such as `cake`/`fq_pie` that one-click scripts commonly install); classful,
+  shaping and hardware-offload qdiscs such as `htb`/`tbf`/`netem`/`mqprio`, a `cake` with a bandwidth (or
+  `autorate-ingress`) set -- that is a rate limiter someone set, just like `tbf` -- and a `noqueue` someone set on a
+  physical NIC are all kept and reported in the status: replacing them would silently wreck the operator's shaping
+  configuration, a far higher cost than not having `fq`. Kinds it does not recognize are kept too.
+- **Back off after a failure, rather than giving up or hammering away.** Every replacement briefly pauses the NIC's
+  transmission, so it cannot be tried every cycle; but most failures are temporary (a netlink out-of-memory, a `tc`
+  killed on timeout), and never retrying would leave the NIC on `cake` until someone remembers to run `enable`. So
+  after a failed replacement on a given NIC it retries starting at 30 seconds (or `interval_s`, whichever is larger),
+  doubling each time, up to at most 5 minutes (or one `interval_s`, whichever is larger), rounded to a whole multiple
+  of `interval_s`; a change in the root qdisc, or an `enable`, triggers an immediate retry.
+- **A stuck `tc` must not stall a drain.** Each `tc` invocation has a 10-second limit; a `tc` stuck on the rtnl lock is
+  in uninterruptible sleep, and SIGKILL takes effect only once the lock is released, so blocking until it exits would
+  hold the guard's lock all along -- and that is exactly the lock `drain` must take before writing `fallback_cc` back.
+  So a `tc` that timed out is killed and handed to a background thread to reap, and until it exits every later `tc`
+  fails immediately; one stuck rtnl makes at most one check (and the `drain` and `status` queued behind it) wait about
+  10 seconds longer.
+- **No race with drain.** The periodic check, `enable`'s arming and `drain`'s disarming share one lock, and `drain`
+  writes `fallback_cc` back while holding it, so there is no interleaving of "drain has just written it back, and a
+  check writes `skyline_cc` back again"; when a drain times out with an error the guard stays disarmed as well, and
+  does not fight whoever takes over afterwards (for example the experiment matrix) for the settings.
+- **No sysctl writes on stop.** When the daemon exits, it first stops the guard thread and waits for it to finish, then
+  unregisters the struct_ops (otherwise an armed check could go and write a `skyline_cc` the kernel no longer knows);
+  it does not write `fallback_cc` back -- a deliberate decision; writing it back is the job of `drain` and the enable
+  unit's `ExecStop`. `ExecStop` (`boot-disable.sh`) runs `drain` first, and afterwards writes the sysctl itself only
+  if the default is still `skyline_cc` (the daemon is already gone): if it wrote the sysctl first and drained
+  afterwards, the still-armed guard would change it back to `skyline_cc` and also log that as "something else on the
+  host changed it".
+
+Every change is logged as a `guard: ...` line to journald -- the operator's only clue that "something on the host is
+fighting me for the settings"; things deliberately left alone are logged once, only when they change. The fields and
+rules are in `docs/02-interface-reference.md` sections 4, 6.8 and 9.
+
+**Counters**: `metrics` are per-CPU counters shared by all connections, accumulated since the attach. Guardrail
+triggers are counted per round (`guardrail_hits`, denominator `guardrail_rounds`), and cwnd hitting the ceiling per
+ACK (`cwnd_cap_hits`, denominator `ack_events`): the former means a congestion signal took effect, the latter only
+that the ceiling is in effect. 0.4.x combined both into one counter, `guardrail_hits`, both divided by the number of
+ACKs, so there was no telling which it was, and the magnitudes of the two can be very far apart. By arithmetic: for a
+flow at 200 ms RTT and 1 Gbit/s, the BDP is about 17,000 packets of 1448 bytes, which times a `cruise_inflight_gain`
+of 3.0 exceeds the default ceiling of 50,000; with one ACK every two packets that is about 40,000 ACKs per second,
+each counting a ceiling hit, over a hundred thousand within a few seconds, while this flow's guardrail is checked only
+about 2.5 rounds per second (a round is about two RTTs, section 3). While attached, the daemon reads the counters
+every 5 seconds, and `metrics_recent` in status is the increase over roughly the last minute, used to tell "still
+happening now" from "happened at some point since the attach".
+
+**Event log**: `skyline_cc` writes events such as state transitions, losses, guardrail triggers and
+configuration-generation switches into a BPF ring buffer, and the daemon's reader thread persists it to the JSON Lines
+file that `runtime.events_path` points to; when the file exceeds `runtime.events_max_mib` it is rotated to `.1`, so it
+takes up at most about twice that, and setting it to 0 means neither reading the ring buffer nor writing the file
+(event codes and rotation details are in `docs/02-interface-reference.md` section 8).
+
+**TOML configuration → BPF binary format**: the values in the configuration file are meant for people (decimals such
+as 0.25), while BPF programs cannot use floating point (the kernel verifier does not allow it), so the Rust side does
+all the conversion: ratio parameters are multiplied by 1000 into "per-mille" integers, time parameters are converted
+to microseconds, rate parameters from Mbit/s to bit/s, and every conversion uses saturating arithmetic (an overflow
+clamps to the maximum value rather than wrapping around to a very small number).
+
+**Known design gaps**: the `pin_dir` field in the configuration (meant to "pin" BPF objects to the file system for
+reuse after a process restart) is not actually used yet. `skyline_flow_state` lives in socket storage, which user
+space cannot iterate, so the per-connection lines of `ssctl flows` (since 0.3.0, including the peer and local
+addresses) are read from `ss -tin`: cwnd, pacing and RTT are exactly the items `skyline_cc` writes into the socket;
+quantities that exist only in socket storage -- mode, bandwidth estimate, guardrail state -- are still available only
+as aggregate counts.
+
+## 12. Rationale for the coefficient choices
+
+**There are two generations of factory defaults, backed by different evidence; do not read them together.**
+
+The first generation (the `skyline-best` measured in `docs/04-performance-report.md`, now the "high random loss"
+preset in `docs/usage.md`) was chosen on the test bed's target-environment grid: `cruise_inflight_gain` 2.0 /
+`cruise_pacing_gain` 1.1 trade throughput against the risk of self-harm, `loss_inflation_max_ratio` 0.5 (compensation
+of at most 2.0 times) covers the upper bound of 10%-20% random loss with headroom for retransmission overhead, and the
+guardrail is 100ms / 1.0 times the base RTT. Its premise is section 1's "loss carries no congestion information".
+
+The second generation (the current defaults) comes from tuning by alternating controlled comparisons on a production
+deployment: many concurrent connections, a base RTT of about 100-150ms, and loss coming mainly from a saturated
+bottleneck rather than random loss -- the first generation's premise does not hold there. The changes fall into two
+groups that work together:
+
+- **Tighten the "brakes"**: `loss_inflation_max_ratio` 0.5 → 0.10, guardrail 100ms / 1.0 → 70ms / 0.6,
+  `min_rtt_window_s` 10 → 30, `bw_window_rtts` 10 → 6. The mechanistic reason for each is in the comment on the
+  corresponding field in `config/speeder.toml`; the core of it is that on a congestion-type bottleneck M3's
+  compensation is a positive feedback loop (the more is lost, the more is compensated), and the old guardrail
+  threshold sat just above the queueing delay such links can actually build up, so it almost never fired.
+- **Open up the "throttle"**: `cruise_pacing_gain` 1.1 → 1.25, `cruise_inflight_gain` 2.0 → 3.0, STARTUP exit
+  criterion 3 rounds / 25% → 5 rounds / 20%. CRUISE is the end state and has no periodic probing, so the bandwidth
+  estimate can be refreshed upward only by a pacing gain > 1.0.
+
+The defaults have changed in two more places since then, outside this tuning: `min_cwnd_packets` 4 → 32 (0.4.0; the
+same floor also applies to the branch with no bandwidth estimate yet after an RTO, section 6), and first-flight
+redundancy on by default (0.4.0, `first_kib` 64, `delay_ms` 10, section 9).
+
+The two groups must be used together: opening up the throttle without tightening the brakes increased retransmissions
+without buying any speed; raising `cruise_pacing_gain` further (1.4) did the same; returning `cruise_inflight_gain` to
+2.0 noticeably increased RTO timeouts. Further tuning one parameter at a time around the current defaults found no
+value that was consistently better.
+
+This generation has **not** been rerun on the test-bed matrix, and the numbers in `docs/04-performance-report.md` do
+not apply to it; under this repository's performance-claim discipline, no specific production numbers are given here.
+Both generations share the cwnd gain being deliberately looser than the pacing gain -- cwnd only needs not to be the
+limiting factor, the real rate limiter is pacing, the same idea as BBR treating cwnd as a ceiling rather than the main
+means of rate control.
+
+`guardrail_gain` (0.8): when the guardrail fires, pacing drops to 80% of the measured bandwidth (for the cwnd target
+see section 6); this is an engineering choice of initial value, and no dedicated experiment comparing several
+candidate values has been done yet.
+
+`rto_max_normal_permille`/`rto_max_congested_permille` (3000/6000 in the experiment configurations and
+`config/speeder.toml`, i.e. 3 times/6 times the base RTT; the default in the code and the shipped templates is 0, i.e.
+the ceiling is off): set directly from the design principle "with independent random loss, waiting longer does not
+raise the retransmission success rate", with no dedicated matrix comparing candidates; if real data later shows they
+need adjusting, they can simply be changed.
+
+## 13. Design trade-offs and open questions
+
+- M1 currently covers only the two tiers for which the kernel already exposes tuning interfaces (global sysctls, and
+  RTO-related per-connection setsockopt); to have parameters fully hard-coded in the kernel, such as the reordering
+  tolerance window (`reo_wnd`), also adjusted dynamically per connection, there is no interface at all in current
+  kernels and a kernel patch is needed (see the three-tier classification in section 5).
+- `early-loss` (M1's part in `skyline_cc.bpf.c`) is for now only an observation counter that drives no decision -- if
+  it is ever to actually influence congestion control behaviour, the reliability of this early-warning signal itself
+  must be established first.
+- The `ssctl` wire protocol has no encryption or authentication and relies entirely on the file-system permissions of
+  the Unix socket file -- multi-tenant environments need additional access control. Since 0.5.2 the socket is always
+  `0600` (before, it depended on the daemon's umask at startup), and each client's reads and writes have a 5-second
+  deadline each: requests are handled one at a time, and a client that connected without finishing its request used
+  to be able to stall every request behind it, including the exit triggered by SIGTERM.
+- The M2-off path's handling of `CA_EVENT_TX_START` does not fully match kernel CUBIC: here the start of the growth
+  epoch is reset to the current time (it is set even when no start had been set yet, so the next growth does not
+  recompute `K`), whereas kernel CUBIC moves the start later by the idle duration
+  (`now - lsndtime`, in jiffies), so growth continues along the pre-idle curve. Copying that would require converting
+  jiffies to nanoseconds in BPF (which needs `HZ`), and it has not been done. It affects only connections with M2 off
+  that went idle partway through; section 4's neutrality gate (zero-loss bulk traffic) is unaffected.
+- The branch with no bandwidth estimate yet grows cwnd with `tcp_slow_start()`, and unlike the kernel's own slow start
+  it does not restrict growth to when cwnd really is the limiting factor: a flow that is always application-limited
+  (exactly the flows that never have an estimate and always take this branch) adds to cwnd on every ACK. Its growth is
+  in fact capped by ssthresh: `tcp_slow_start()` does not go past it, and M2's `skyline_ssthresh()` sets it to the
+  cwnd at the moment of the first loss event, so after the first CWR, recovery or RTO such a flow stops growing (on an
+  undo the kernel restores the old ssthresh, and the cap is raised back with it). Before any loss, it stops at
+  `max_cwnd_packets` (since 0.5.0, section 6), and that ceiling is 50,000 packets by default; if such a flow one day
+  writes a large amount of data at once, and M4 sets no pacing rate because there is no estimate, this window is
+  limited only by cwnd itself and goes out in bulk. Whether to change it to grow only when cwnd-limited, and whether to
+  keep growing past ssthresh (for example by switching to the kernel's `tcp_reno_cong_avoid()`), needs test-bed data
+  to decide.

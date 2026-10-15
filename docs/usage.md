@@ -1,66 +1,66 @@
-# 使用与调参指南（新手向）
+# Usage and tuning guide (for newcomers)
 
-这份文档假设你**不懂 eBPF、不懂拥塞控制算法**，只想把服务器调快。全程复制粘贴即可。
+This guide assumes you **know nothing about eBPF or congestion control algorithms** and just want a faster server. You can copy and paste your way through all of it.
 
-术语只需要知道三个：
+You only need to know three terms:
 
-- **丢包**：数据包在路上弄丢了。线路噪声造成的叫**随机丢包**；发太快把设备缓冲撑爆
-  造成的叫**拥塞丢包**。本项目只对**随机丢包**有效。
-- **RTT**：数据包一来一回的时间，单位毫秒。国内到国外一般 100–300ms。
-- **发送端加速**：只装在**发数据的那一头**（你的服务器）。客户端什么都不用装、不用改。
+- **Loss**: packets lost on the way. Loss caused by noise on the line is **random loss**; loss caused by sending so fast
+  that a device's buffer overflows is **congestion loss**. This project only helps with **random loss**.
+- **RTT**: the time a packet takes to get there and back, in milliseconds. From inside China to servers abroad it is typically 100–300ms.
+- **Sender-side acceleration**: installed only on **the end that sends the data** (your server). Nothing needs to be installed or changed on the client.
 
-> 所以：用户**下载**会变快，用户**上传**不会。这是设计如此，不是没生效。
+> So: your users' **downloads** get faster, their **uploads** do not. That is by design, not a sign that it is not working.
 
 ---
 
-## 一、先确认你该不该用
+## 1. First, check whether you should use it
 
-用错场景会**更慢**。花两分钟测一下：
+In the wrong situation it makes things **slower**. Spend two minutes testing:
 
 ```bash
 sudo apt-get install -y iperf3
-# 对端跑 iperf3 -s，然后从你的服务器发固定速率 UDP
-iperf3 -c <对端IP> -u -b 100M -t 10
-iperf3 -c <对端IP> -u -b 400M -t 10
+# Run iperf3 -s on the other end, then send fixed-rate UDP from your server
+iperf3 -c <peer-IP> -u -b 100M -t 10
+iperf3 -c <peer-IP> -u -b 400M -t 10
 ```
 
-看 `Lost/Total Datagrams` 那一列：
+Look at the `Lost/Total Datagrams` column:
 
-| 测试结果 | 说明 | 建议 |
+| Result | What it means | Recommendation |
 |---|---|---|
-| 各速率**都稳定丢包**（5% 以上） | 线路噪声，随机丢包 | **适合**，效果明显 |
-| 低速不丢，速率一高才丢 | 你把线路撑满了，拥塞丢包 | **不适合**，可能更糟 |
-| 各速率**都不丢** | 线路干净 | 差别不大 |
+| **Steady loss at every rate** (5% or more) | Line noise: random loss | **A good fit**; the effect is clear |
+| No loss at low rates, loss only once the rate goes up | You are filling the line: congestion loss | **Not a fit**; it may make things worse |
+| **No loss at any rate** | A clean line | Little difference |
 
 > [!WARNING]
-> **别用 `ping` 的丢包率判断。** 绝大多数网络对 ping 限速，它显示的丢包和真实数据传输
-> 无关。我们实测过一条线路 ping 显示丢 6%，实际 UDP 打到 1.1Gbps 都零丢包。
+> **Do not judge by `ping`'s loss rate.** Most networks rate-limit ping, so the loss it shows has nothing to do with
+> real data transfer. We measured one line where ping showed 6% loss, while real UDP pushed all the way to 1.1Gbps lost nothing.
 
 ---
 
-## 二、装完就能用，默认是什么样
+## 2. Ready to use once installed: what the defaults are
 
-一键安装后默认状态：
+The default state after a one-line install:
 
-| 项目 | 默认 | 说明 |
+| Item | Default | Notes |
 |---|---|---|
-| 四个加速模块 | **全开** | 见下一节 |
-| 动态 RTO 调节 | **关闭** | 需要手动开，见第五节 |
-| 重传包 DSCP 标记 | **关闭，且值为 0** | ⚠️ 见第六节，**开之前必须先问网络管理员** |
-| 首轮冗余 | **开**：握手包 + 每条连接前 64 KiB 发两份，第二份晚 10 ms | 丢包多的线路上短请求（网页、API）不用干等丢包恢复；代价是每条连接约多发 64 KiB，丢包重传时会更多。关掉：`sudo ssctl set-redundancy --disable`，恢复配置文件的值：`sudo ssctl reset-redundancy`；要重启后也关着，在配置文件里写 `[redundancy]` `enabled = false` |
-| 摘除后回落算法（`fallback_cc`） | 这台机器开机时的默认算法（安装时自动选，通常是 `bbr`；选不出来时是 `cubic`） | `drain` 摘除之后新连接用它 |
-| 拥塞控制与 qdisc 守护（guard） | **开**，每 5 秒检查一次 | 被别的脚本改回 bbr / cake 会自动改回来，见第七节 |
+| The four acceleration modules | **All on** | See the next section |
+| Dynamic RTO adjustment | **Off** | Turn it on by hand; see section 5 |
+| DSCP marking of retransmitted packets | **Off, and the value is 0** | ⚠️ See section 6; **you must ask your network administrator before turning it on** |
+| First-flight redundancy | **On**: the handshake packets and the first 64 KiB of each connection are sent twice, the second copy 10 ms later | On a lossy line, short requests (web pages, APIs) do not sit waiting for loss recovery; the cost is about 64 KiB extra per connection, more when lost packets are retransmitted. To turn it off: `sudo ssctl set-redundancy --disable`; to go back to the config file's value: `sudo ssctl reset-redundancy`; to keep it off across restarts, write `[redundancy]` `enabled = false` in the config file |
+| Fallback algorithm after detaching (`fallback_cc`) | The machine's default algorithm at boot (picked automatically at install, usually `bbr`; `cubic` when none can be picked) | New connections use it after `drain` detaches |
+| Congestion control and qdisc guard | **On**, checking every 5 seconds | If another script switches things back to bbr / cake, they are switched back automatically; see section 7 |
 
-安装脚本结束时会打印一份摘要：拥塞控制和 qdisc 改之前、之后各是什么，常用命令，以及
-几个最常用参数的当前值。装的过程中所有命令的输出都在 `/var/log/skyline-speeder-install.log`，
-出错时先看它。
+When the installer finishes it prints a summary: the congestion control and qdisc before and after the change, the
+common commands, and the current values of the most commonly used parameters. The output of every command run during the install is in `/var/log/skyline-speeder-install.log`;
+when something goes wrong, look there first.
 
-> Alpine 用的是 OpenRC：下文的 `sudo systemctl restart skyline-speederd` 在那里是
-> `rc-service skyline-speederd restart`，`journalctl -u skyline-speederd` 换成
-> `grep skyline-speederd /var/log/messages`（Alpine 默认没有 sudo，以 root 执行即可）。
-> 安装脚本最后打印的命令已经按本机写好。
+> Alpine uses OpenRC: there, the `sudo systemctl restart skyline-speederd` used below is
+> `rc-service skyline-speederd restart`, and `journalctl -u skyline-speederd` becomes
+> `grep skyline-speederd /var/log/messages` (Alpine has no sudo by default; run the commands as root).
+> The commands the installer prints at the end are already written for the host it ran on.
 
-检查当前状态：
+Check the current state:
 
 ```bash
 sudo ssctl status
@@ -68,98 +68,98 @@ sudo ssctl status
 
 ---
 
-## 三、四个加速模块，分别是干嘛的
+## 3. The four acceleration modules and what each one does
 
-| 模块 | 大白话 | 建议 |
+| Module | In plain words | Recommendation |
 |---|---|---|
-| `adaptive-cwnd` | **自动调节一次能发多少**。核心模块，加速主要靠它 | 保持开 |
-| `loss-classifier` | **按测得的丢包率多发一点**，补上路上丢掉的那部分（有封顶，见 `--loss-inflation-max-ratio`） | 保持开 |
-| `pacing` | **把数据均匀发出去**，而不是一股脑挤出去 | 保持开 |
-| `early-loss` | **更早发现丢包**。当前内核上只做观测，不影响决策 | 保持开（开了也不会有副作用）|
+| `adaptive-cwnd` | **Automatically adjusts how much can be sent at once.** The core module; most of the speedup comes from it | Keep on |
+| `loss-classifier` | **Sends a little more, in line with the measured loss rate**, to make up for what is lost on the way (capped; see `--loss-inflation-max-ratio`) | Keep on |
+| `pacing` | **Sends data out evenly** instead of pushing it all out at once | Keep on |
+| `early-loss` | **Detects loss earlier.** On current kernels it only observes and does not affect decisions | Keep on (leaving it on has no side effects) |
 
-全开（默认）：
+All on (the default):
 
 ```bash
 sudo ssctl enable --modules early-loss,adaptive-cwnd,loss-classifier,pacing
 ```
 
-> 不带 `--modules` 的 `sudo ssctl enable` 沿用 daemon 当前的模块集合：刚装好时就是全开，但执行过下面的
-> `--modules` 或 `--all-off` 之后，要像上面这样把四个都写上才回到全开（或者重启 daemon）。
+> `sudo ssctl enable` without `--modules` keeps the daemon's current set of modules: right after install that is all on, but after you have run
+> `--modules` or `--all-off` below, you need to name all four as above to get back to all on (or restart the daemon).
 
 > [!IMPORTANT]
-> `ssctl enable` 执行成功后，**这台机器上所有新建 TCP 连接**都会默认走 `skyline_cc`
-> （它会把 `net.ipv4.tcp_congestion_control` 改成 `skyline_cc`）。不是只影响某个进程、
-> 也不是只影响 cgroup 里的进程。想退回去用 `sudo ssctl drain`。
+> Once `ssctl enable` succeeds, **every new TCP connection on this machine** uses `skyline_cc` by default
+> (it sets `net.ipv4.tcp_congestion_control` to `skyline_cc`). It does not affect only one process,
+> nor only the processes in the cgroup. To go back, use `sudo ssctl drain`.
 
-只开其中几个（用来定位是哪个模块起作用）：
+Turn on only some of them (to find out which module is making the difference):
 
 ```bash
 sudo ssctl enable --modules adaptive-cwnd,pacing
 ```
 
-全部关掉（变成一个"什么都不做"的基准，用来做对比测试）：
+Turn them all off (a "does nothing" baseline for comparison tests):
 
 ```bash
 sudo ssctl enable --all-off
 ```
 
-> 全关时它不做任何加速，是一个中性基准，可以放心当作对照组（验证数据见
-> [docs/03-design.md](03-design.md) 第 4 节）。
+> With everything off it does no acceleration at all: a neutral baseline you can safely use as the control group (for the data that shows this, see
+> section 4 of [docs/03-design.md](03-design.md)).
 
 ---
 
-## 四、参数调整：先看这个致命陷阱
+## 4. Tuning parameters: read about this critical trap first
 
 > [!CAUTION]
-> **`ssctl set-module-config` 是"全量覆盖"，不是"只改你写的那个"。**
+> **`ssctl set-module-config` is an "absolute overwrite", not "change only what you wrote".**
 >
-> 每个参数在命令行里都有内置默认值。你只写一个参数时，**其余 16 个会被静默重置成
-> 内置默认值**，而不是保持你配置文件里的自定义值。
+> Every parameter has a built-in default on the command line. If you pass only one parameter, **the other 16 are silently reset to
+> their built-in defaults**, instead of keeping the custom values in your config file.
 >
 > ```bash
-> # 危险：你以为只改了护栏，实际上其他 16 个参数全被重置了
+> # Dangerous: you think you changed only the guardrail, but all 16 other parameters were reset
 > sudo ssctl set-module-config --guardrail-gain 0.5
 > ```
 >
-> **正确做法**：先 `ssctl flows` 看当前值（PARAMETERS IN FORCE 段落），然后把**所有**你想保留的参数一起写全。
-> 如果你从没改过配置文件，内置默认值恰好和出厂值一致，那么单独写一个是安全的。
+> **The right way**: first check the current values with `ssctl flows` (the PARAMETERS IN FORCE section), then pass **every** parameter you want to keep, all together.
+> If you have never changed the config file, the built-in defaults happen to match the shipped values, so passing just one is safe.
 >
-> 例外：从 0.3.x 及更早版本升级、保留了原配置文件的主机。安装脚本不会覆盖已有的
-> `/etc/skyline-speeder/speeder.toml`，里面仍是当时的默认值（0.1.0 装的是下面的「④ 高随机丢包档」，
-> 0.2.0 与 0.3.x 装的 `min_cwnd_packets` 是 4），和新版 `ssctl` 的内置默认值不同。在这类主机上单独写
-> 一个参数，会把其余参数一起换成新默认值；而 `reset-module-config` 回到的是配置文件里的旧值。
+> The exception: a host upgraded from 0.3.x or earlier that kept its original config file. The installer does not overwrite an existing
+> `/etc/skyline-speeder/speeder.toml`, so it still holds the defaults of that time (0.1.0 installed the ④ high random loss preset below,
+> and 0.2.0 and 0.3.x installed a `min_cwnd_packets` of 4), which differ from the newer `ssctl`'s built-in defaults. On such a host, passing a single
+> parameter replaces all the others with the new defaults as well, while `reset-module-config` goes back to the old values in the config file.
 
-想回到配置文件里的设置（全新安装的主机上就是出厂设置），随时可以：
+To go back to the settings in the config file (on a freshly installed host, the shipped settings), at any time:
 
 ```bash
 sudo ssctl reset-module-config
 ```
 
-### 常用参数，用大白话讲
+### The common parameters, in plain words
 
-**99% 的人不需要碰这些。** 装完默认就是调好的。
+**99% of people never need to touch these.** The defaults are already tuned when you install.
 
-| 参数 | 它管什么 | 调大会怎样 | 调小会怎样 | 默认 |
+| Parameter | What it controls | Raising it | Lowering it | Default |
 |---|---|---|---|---:|
-| `--cruise-inflight-gain` | **稳定期最多能比理论值多发多少** | 高丢包时更能顶住 | 高丢包下发不出去 | `3.0` |
-| `--cruise-pacing-gain` | **稳定期发送速率是估算带宽的多少倍** | 更激进，可能堆队列 | 更保守，吞吐低 | `1.25` |
-| `--guardrail-gain` | **发现真拥塞时降到原来的几成**（自我保护） | 降得少，更激进 | 降得狠，更安全 | `0.8` |
-| `--loss-inflation-max-ratio` | **最多按多高的丢包率做补偿**（按 `1/(1-p)` 多发：0.10 ≈ 多发 11%，0.5 = 多发一倍） | 随机丢包链路上补偿更足；拥塞型瓶颈上会越丢越发 | 补偿更弱，更不容易自己把链路挤爆 | `0.10` |
-| `--max-queue-delay-ms` | **排队延迟超过多少毫秒就认为堵了** | 更晚才减速，延迟更高 | 更早减速，延迟更低 | `70` |
-| `--startup-gain` | **刚开始连接时冲多猛** | 起速快，可能过冲 | 起速慢更稳 | `3.0` |
-| `--initial-cwnd-packets` | **一开始就发多少个包**（不用慢慢试探） | 小文件传输更快 | 更保守 | `100` |
-| `--max-pacing-mbps` | **速率硬上限**，单位 Mbps | 允许跑更快 | 限速 | `1200` |
-| `--max-cwnd-packets` | **未确认数据的硬上限**，单位包数 | 允许更多在途数据 | 省内存但限吞吐 | `50000` |
-| `--min-cwnd-packets` | **窗口的下限**，单位包数（只在 `adaptive-cwnd` 开启时生效） | 小流量连接丢包后窗口里还有足够的包触发快速恢复，不必干等超时；短响应超时之后也从这个窗口重新发，不必从 1 个包爬起；发送速率仍由 pacing 决定，不会因此发得更快 | 回到历史行为（4） | `32` |
+| `--cruise-inflight-gain` | **The most it may send beyond the theoretical value in the steady phase** | Holds up better under heavy loss | Cannot get data out under heavy loss | `3.0` |
+| `--cruise-pacing-gain` | **The steady-phase sending rate as a multiple of the estimated bandwidth** | More aggressive; may build a queue | More conservative; lower throughput | `1.25` |
+| `--guardrail-gain` | **What fraction of the rate to drop to when real congestion is detected** (self-protection) | Cuts less; more aggressive | Cuts harder; safer | `0.8` |
+| `--loss-inflation-max-ratio` | **The highest loss rate it compensates for** (it sends `1/(1-p)` as much: 0.10 ≈ 11% more, 0.5 = twice as much) | More compensation on random-loss links; on a congested bottleneck, the more it loses the more it sends | Less compensation; less likely to overload the link by itself | `0.10` |
+| `--max-queue-delay-ms` | **How many milliseconds of queueing delay count as congestion** | Slows down later; higher latency | Slows down sooner; lower latency | `70` |
+| `--startup-gain` | **How hard a new connection ramps up at the start** | Faster ramp-up; may overshoot | Slower ramp-up, steadier | `3.0` |
+| `--initial-cwnd-packets` | **How many packets to send right from the start** (without probing slowly) | Faster small-file transfers | More conservative | `100` |
+| `--max-pacing-mbps` | **Hard rate cap**, in Mbps | Allows higher speeds | Limits the speed | `1200` |
+| `--max-cwnd-packets` | **Hard cap on unacknowledged data**, in packets | Allows more data in flight | Saves memory but limits throughput | `50000` |
+| `--min-cwnd-packets` | **The window's floor**, in packets (takes effect only while `adaptive-cwnd` is on) | A low-traffic connection that loses a packet still has enough packets in its window to trigger fast recovery, instead of sitting and waiting for a timeout; a short response that times out also resends from this window instead of climbing up from 1 packet; the sending rate is still set by pacing, so this does not make it send faster | Back to the historical behaviour (4) | `32` |
 
-**改完立刻生效，不用重启**，而且是在每条连接的下一个轮边界（约两个 RTT）上平滑切换，不会传到一半出乱子。
+**Changes take effect immediately, with no restart**, and each connection switches over smoothly at its next round boundary (about two RTTs), so nothing goes wrong halfway through a transfer.
 
-### 四档现成配方（复制即用）
+### Four ready-made presets (copy and use)
 
-Skyline Speeder 没有 BBR 那样的内置档位，只有裸参数。下面四档是我们整理的等价档位，
-**直接复制粘贴**即可，不需要理解每个参数。
+Skyline Speeder has no built-in presets the way BBR does, only raw parameters. The four below are equivalent presets we put together;
+just **copy and paste** them, with no need to understand each parameter.
 
-**① 保守档 —— 低延迟优先**（游戏、语音、SSH 交互）
+**① The conservative preset — low latency first** (games, voice, interactive SSH)
 
 ```bash
 sudo ssctl set-module-config \
@@ -172,13 +172,13 @@ sudo ssctl set-module-config \
   --guardrail-gain 0.7 --loss-inflation-max-ratio 0.10
 ```
 
-**② 默认档 —— 出厂设置**（等价于 `ssctl reset-module-config`；从 0.3.x 及更早升级、保留了原配置文件的主机上，它回到的是那份旧配置，0.1.0 即 ④。要切到新默认档，执行不带任何参数的 `sudo ssctl set-module-config`，它发送的正是新版内置默认值；想重启后依然生效，再改配置文件，见「让档位重启后依然生效」）
+**② The default preset — the shipped settings** (equivalent to `ssctl reset-module-config`; on a host upgraded from 0.3.x or earlier that kept its original config file, that goes back to the old configuration, which for 0.1.0 is ④. To switch to the new default preset, run `sudo ssctl set-module-config` with no parameters at all, which sends exactly the newer built-in defaults; to keep it across restarts, also edit the config file, see "Keeping a preset across restarts")
 
 ```bash
 sudo ssctl reset-module-config
 ```
 
-**③ 激进档 —— 吞吐优先**（大文件下载、视频分发、确认线路有随机丢包）
+**③ The aggressive preset — throughput first** (large file downloads, video distribution, lines confirmed to have random loss)
 
 ```bash
 sudo ssctl set-module-config \
@@ -191,43 +191,43 @@ sudo ssctl set-module-config \
   --guardrail-gain 1.0 --loss-inflation-max-ratio 0.5
 ```
 
-激进档相对默认档改了什么：
+What the aggressive preset changes relative to the default preset:
 
-| 参数 | 默认 | 激进 | 效果 |
+| Parameter | Default | Aggressive | Effect |
 |---|---:|---:|---|
-| `cruise-pacing-gain` | 1.25 | **1.3** | 稳定期按带宽估计的 1.3 倍发 |
-| `cruise-inflight-gain` | 3.0 | 3.0 | 与默认档相同 |
-| `startup-gain` | 3.0 | **4.0** | 起步冲得更猛 |
-| `startup-growth-ratio` | 0.20 | **0.15** | 带宽每轮增长不到 15% 才算到顶，更晚退出 STARTUP |
-| `guardrail-gain` | 0.8 | **1.0** | 检测到拥塞时**不再降速**（1.0 = 中性） |
-| `max-queue-delay-ms` / `max-queue-delay-ratio` | 70 / 0.6 | **200 / 2.0** | 排队延迟高得多才认为"堵了" |
-| `loss-inflation-max-ratio` | 0.10 | **0.5** | 丢包补偿放开到最多多发一倍 |
-| `bw-window-rtts` | 6 | **10** | 带宽估计记住更久以前的峰值 |
-| `initial-cwnd-packets` | 100 | **200** | 连接一建立就发 200 个包 |
-| `max-cwnd-packets` / `max-pacing-mbps` | 50000 / 1200 | **100000 / 2000** | 抬高两个硬上限 |
+| `cruise-pacing-gain` | 1.25 | **1.3** | Sends at 1.3 × the bandwidth estimate in the steady phase |
+| `cruise-inflight-gain` | 3.0 | 3.0 | Same as the default preset |
+| `startup-gain` | 3.0 | **4.0** | Ramps up harder at the start |
+| `startup-growth-ratio` | 0.20 | **0.15** | Bandwidth counts as having peaked only when it grows less than 15% per round, so STARTUP ends later |
+| `guardrail-gain` | 0.8 | **1.0** | **No longer slows down** when congestion is detected (1.0 = neutral) |
+| `max-queue-delay-ms` / `max-queue-delay-ratio` | 70 / 0.6 | **200 / 2.0** | Queueing delay must be much higher before it counts as "congested" |
+| `loss-inflation-max-ratio` | 0.10 | **0.5** | Loss compensation opened up to sending at most twice as much |
+| `bw-window-rtts` | 6 | **10** | The bandwidth estimate remembers peaks from further back |
+| `initial-cwnd-packets` | 100 | **200** | Sends 200 packets as soon as a connection is established |
+| `max-cwnd-packets` / `max-pacing-mbps` | 50000 / 1200 | **100000 / 2000** | Raises both hard caps |
 
-**实测效果**（单台服务器 → 客户端，RTT ≈ 18ms 的干净链路，下载 50MB，5 轮交错对比）。
-这组数据测于默认系数调整**之前**：表里的「默认档」是当时的默认值，也就是下面的
-「④ 高随机丢包档」；现在的默认档没有在这条链路上重测过。
+**Measured effect** (one server → client, a clean link with RTT ≈ 18ms, a 50MB download, 5 interleaved rounds).
+These numbers were measured **before** the default coefficients changed: the "default preset" in the table is the default of that time, that is, the
+④ high random loss preset below; the current default preset has not been measured again on this link.
 
-| | 默认档 | 激进档 |
+| | Default preset | Aggressive preset |
 |---|---:|---:|
-| 吞吐中位数 | 85.6 MB/s | **143.6 MB/s** |
-| 逐轮配对提升 | 基准 | **+54%（中位）** |
-| 胜出轮次 | — | **5 / 5** |
-| 空载延迟 | 18.4 ms | 18.4 ms |
-| 满载延迟 | 18.0 ms | 18.1 ms |
+| Median throughput | 85.6 MB/s | **143.6 MB/s** |
+| Per-round paired gain | Baseline | **+54% (median)** |
+| Rounds won | — | **5 / 5** |
+| Idle latency | 18.4 ms | 18.4 ms |
+| Latency under load | 18.0 ms | 18.1 ms |
 
-这条链路上激进档**没有测出延迟代价**——因为带宽充裕，没把队列堆起来。
-但这不代表在你的链路上也如此：带宽紧张或存在瓶颈缓冲时，`guardrail-gain=1.0`
-会让它一路挤到丢包为止。**换档后请自己测一遍满载延迟再决定是否长期使用。**
+On this link the aggressive preset **showed no measurable latency cost**, because bandwidth was plentiful and no queue built up.
+That does not mean the same holds on your link: where bandwidth is tight or there is a bottleneck buffer, `guardrail-gain=1.0`
+makes it push all the way until packets are lost. **After switching presets, measure the latency under load yourself before deciding whether to keep it.**
 
 > [!WARNING]
-> 激进档把 `guardrail-gain` 设成 1.0，等于**关掉了自我保护降速**。在真正拥塞的链路上
-> 它会持续挤占缓冲、推高延迟，也会挤压同链路上的其他流量。
-> **只在"线路带宽充足"时使用。**
+> The aggressive preset sets `guardrail-gain` to 1.0, which amounts to **turning off the self-protective slowdown**. On a truly congested link
+> it keeps filling buffers and pushing latency up, and it also squeezes other traffic on the same link.
+> **Use it only when "the line has plenty of bandwidth".**
 
-**④ 高随机丢包档 —— 原默认值**（链路确实是 10%-20% 的**随机**丢包、不是被挤爆的丢包）
+**④ The high random loss preset — the former defaults** (for links that really do have 10%-20% **random** loss, not loss from being overloaded)
 
 ```bash
 sudo ssctl set-module-config \
@@ -240,67 +240,67 @@ sudo ssctl set-module-config \
   --guardrail-gain 0.8 --loss-inflation-max-ratio 0.5
 ```
 
-这是 [性能验证报告](04-performance-report.md) 里 `skyline-best` 测的那组系数，针对的是
-"丢包不代表拥塞"的链路：丢包补偿放到最多多发一倍，护栏放得很宽。默认档后来改掉它，
-是因为在并发连接很多、丢包主要来自瓶颈被挤满的生产环境里，这组系数会越丢越发——
-重传明显增多，速度却没有换来。**判断方法**：换档后看重传占比和 RTO 超时数（做法见
-文末「附：视频卡顿 / 大文件传输中断怎么查」），重传涨了而吞吐没涨，就说明你的丢包是
-挤出来的，回默认档。
+These are the coefficients measured as `skyline-best` in the [performance validation report](04-performance-report.md), aimed at links where
+"loss does not mean congestion": loss compensation goes up to sending at most twice as much, and the guardrail is set very loose. The default preset later moved away from them
+because, in a production environment with many concurrent connections where loss came mostly from a full bottleneck, these coefficients sent more the more they lost —
+retransmissions rose markedly and bought no speed. **How to tell**: after switching presets, look at the retransmission share and the number of RTO timeouts (for how, see
+"Appendix: how to investigate video stalls / interrupted large-file transfers" at the end); if retransmissions went up while throughput did not, your loss is
+self-inflicted by overloading the path: go back to the default preset.
 
-### 让档位重启后依然生效
+### Keeping a preset across restarts
 
-`ssctl set-module-config` 改的是**内存态，重启会丢**。要长期生效，改配置文件：
+`ssctl set-module-config` changes the **in-memory state, which is lost on restart**. To make a change permanent, edit the config file:
 
 ```bash
 sudo cp /etc/skyline-speeder/speeder.toml /etc/skyline-speeder/speeder.toml.bak
 sudo nano /etc/skyline-speeder/speeder.toml
 ```
 
-命令行参数与配置文件的对应（参数名里的 `-` 换成 `_`）：`--max-pacing-mbps`、`--max-cwnd-packets`、
-`--max-queue-delay-ms`、`--max-queue-delay-ratio`、`--initial-cwnd-packets`、`--min-cwnd-packets` 是顶层字段；
-`--loss-inflation-max-ratio` 在 `[loss_classifier]` 段；其余的（各种 gain、`--min-rtt-window-s`、
-`--bw-window-rtts`、`--startup-plateau-rtts`、`--startup-growth-ratio`）在 `[adaptive_cwnd]` 段。
+How command-line parameters map to the config file (replace `-` with `_` in the parameter name): `--max-pacing-mbps`, `--max-cwnd-packets`,
+`--max-queue-delay-ms`, `--max-queue-delay-ratio`, `--initial-cwnd-packets` and `--min-cwnd-packets` are top-level fields;
+`--loss-inflation-max-ratio` is in the `[loss_classifier]` section; the rest (the gains, `--min-rtt-window-s`,
+`--bw-window-rtts`, `--startup-plateau-rtts`, `--startup-growth-ratio`) are in the `[adaptive_cwnd]` section.
 
 > [!CAUTION]
-> 0.5.0 起，写错段落或拼错的键会让下面的 `--validate-only` 直接报错，并指出它该放在哪一段；0.4.x 及更早的
-> 版本会**静默忽略**它们，`--validate-only` 照样通过。无论哪个版本，重启之后都用 `sudo ssctl flows` 的
-> PARAMETERS IN FORCE 段落核对一遍。
+> From 0.5.0, a key in the wrong section, or a misspelt key, makes the `--validate-only` below fail outright, naming the section it belongs in; 0.4.x and earlier
+> **silently ignore** such keys, and `--validate-only` still passes. Whatever the version, after the restart check the values against the
+> PARAMETERS IN FORCE section of `sudo ssctl flows`.
 
-改完：
+When you are done editing:
 
 ```bash
-# 先校验，不通过就别重启
+# Validate first; if it fails, do not restart
 sudo skyline-speederd --config /etc/skyline-speeder/speeder.toml --validate-only
 
-sudo systemctl restart skyline-speederd.service    # 挂载单元会随之重启并重新挂载
+sudo systemctl restart skyline-speederd.service    # the attach unit restarts along with it and attaches again
 ```
 
-### 有硬上限的参数（填超了整组命令会被拒绝）
+### Parameters with hard limits (go past one and the whole command is rejected)
 
-| 参数 | 允许范围 | 备注 |
+| Parameter | Allowed range | Notes |
 |---|---|---|
-| `--bw-window-rtts` | **1 – 10** | 默认 6；10 是硬上限 |
-| `--loss-inflation-max-ratio` | **0 – 0.5** | 默认 0.10；0.5 是 BPF 侧硬编码的上限（500‰） |
-| `--guardrail-gain` | 0 – 1.0 | 1.0 = 只取消加速、不降速；0 的效果和 1.0 一样（不是关掉护栏） |
+| `--bw-window-rtts` | **1 – 10** | Default 6; 10 is a hard cap |
+| `--loss-inflation-max-ratio` | **0 – 0.5** | Default 0.10; 0.5 is the cap hard-coded on the BPF side (500‰) |
+| `--guardrail-gain` | 0 – 1.0 | 1.0 = only cancels the boost, never slows down; 0 has the same effect as 1.0 (it does not turn the guardrail off) |
 | `--startup-growth-ratio` | 0 – 1.0 | |
-| `--startup-gain` / `--cruise-*-gain` | **1.0 – 1000** | 越大越容易堆队列。上限是 0.5.2 加的：再大，内核侧把增益和丢包补偿在 32 位里相乘会回绕成一个很小的值 |
+| `--startup-gain` / `--cruise-*-gain` | **1.0 – 1000** | The larger it is, the more easily a queue builds. The cap was added in 0.5.2: beyond it, the kernel side's 32-bit multiplication of the gain by the loss compensation wraps around to a very small value |
 | `--max-cwnd-packets` | ≥ 4 | |
-| `--min-cwnd-packets` | **4 – `--max-cwnd-packets`** | 低于 4 会被拒绝（BPF 侧本来就不会让窗口低于 4） |
-| `--initial-cwnd-packets` | **0 – `--max-cwnd-packets`** | 0 = 用内核自己的初始窗口（0.5.2 起不能超过上限） |
-| `--min-rtt-window-s` | **1 – 4294** | 0 会让基准 RTT 恒等于当前 RTT，护栏永远看不到排队（0.5.2 起拒绝） |
+| `--min-cwnd-packets` | **4 – `--max-cwnd-packets`** | Below 4 is rejected (the BPF side never lets the window go below 4 anyway) |
+| `--initial-cwnd-packets` | **0 – `--max-cwnd-packets`** | 0 = use the kernel's own initial window (from 0.5.2 it cannot exceed the cap) |
+| `--min-rtt-window-s` | **1 – 4294** | 0 would make the base RTT always equal the current RTT, so the guardrail never sees any queueing (rejected from 0.5.2) |
 
-所有小数参数都必须是普通的数：`nan`、`inf` 这类写法，`ssctl` 和配置文件都会拒绝（0.5.2 起）。
+Every fractional parameter must be an ordinary number: values such as `nan` and `inf` are rejected by both `ssctl` and the config file (from 0.5.2).
 
-> 命令是**全量覆盖**的：只要有**任何一个**参数越界，**整条命令都会被拒绝**，
-> 已生效的配置保持不变。返回里写明被拒绝的原因（多数会点名参数和允许范围）。
+> The command is an **absolute overwrite**: if **any single** parameter is out of range, **the whole command is rejected**,
+> and the configuration in force stays as it was. The reply states why it was rejected (usually naming the parameter and its allowed range).
 
-### 改参数的正确姿势
+### The right way to change parameters
 
 ```bash
-# 1. 先看现在是什么（PARAMETERS IN FORCE 段落）
+# 1. First see what is in force now (the PARAMETERS IN FORCE section)
 sudo ssctl flows
 
-# 2. 把所有要保留的值一起写全（这里示范：只想把护栏放松到 0.9）
+# 2. Pass every value you want to keep, all together (this example only wants to loosen the guardrail to 0.9)
 sudo ssctl set-module-config \
   --max-pacing-mbps 1200 --max-cwnd-packets 50000 \
   --max-queue-delay-ms 70 --max-queue-delay-ratio 0.6 \
@@ -311,54 +311,54 @@ sudo ssctl set-module-config \
   --guardrail-gain 0.9 \
   --loss-inflation-max-ratio 0.10
 
-# 3. 不满意就一键还原
+# 3. Not happy with it? Restore with one command
 sudo ssctl reset-module-config
 ```
 
-> 在线改的参数**重启后会丢失**。要长期生效，请改 `/etc/skyline-speeder/speeder.toml`
-> 里对应的字段，然后 `sudo systemctl restart skyline-speederd`。
+> Parameters changed online **are lost on restart**. To make them permanent, edit the matching fields in `/etc/skyline-speeder/speeder.toml`,
+> then `sudo systemctl restart skyline-speederd`.
 
 ---
 
-## 五、动态 RTO 调节（默认关闭）
+## 5. Dynamic RTO adjustment (off by default)
 
-**RTO** = 等多久没收到回应就重发。内核默认最长能退到 **120 秒**——线路抖一下，
-连接就可能卡死两分钟。这个功能给它加个上限。
+**RTO** = how long to wait without a response before resending. By default the kernel can back off as far as **120 seconds** — one hiccup on the line
+and a connection can be stuck for two minutes. This feature puts a ceiling on it.
 
-我们实测过：没有上限的对照组里，RTO 被顶到过 **101 秒**。
+We measured it: in the control group without a ceiling, the RTO was pushed as high as **101 seconds**.
 
 > [!CAUTION]
-> **RTO「上限」需要内核 ≥ 6.15，在 6.12 上无法生效。**
+> **The RTO "ceiling" needs kernel ≥ 6.15; it cannot take effect on 6.12.**
 >
-> 这个功能靠 `TCP_RTO_MAX_MS`（socket 选项编号 **44**）下发。该编号在 Linux 6.12 里
-> **尚未分配**（该内核最大只到 43 = `TCP_IS_MPTCP`），内核会返回 `ENOPROTOOPT`。
+> This feature sends its value with `TCP_RTO_MAX_MS` (socket option number **44**). That number is
+> **not yet assigned** in Linux 6.12 (that kernel only goes up to 43 = `TCP_IS_MPTCP`), so the kernel returns `ENOPROTOOPT`.
 >
-> 表现是：命令能成功下发、配置也显示已生效，但 `ssctl flows --json` 里
-> **`rack_rto.stats.rto_max_rejected` 持续增长而 `rto_max_applied` 恒为 0**。
-> 我们在 Debian 6.12.101 上实测确认了这一点。
+> What you see: the command is sent successfully and the configuration shows as in force, but in `ssctl flows --json`
+> **`rack_rto.stats.rto_max_rejected` keeps growing while `rto_max_applied` stays at 0**.
+> We confirmed this by measurement on Debian 6.12.101.
 >
-> **RTO「下限」（`floor_us` / `srtt_permille` / `ceiling_us`）不受影响，在 6.12 上正常工作**
-> ——它走的是另一个选项 `TCP_BPF_RTO_MIN`（1004），该内核支持。
+> **The RTO "floor" (`floor_us` / `srtt_permille` / `ceiling_us`) is not affected and works normally on 6.12**
+> — it uses a different option, `TCP_BPF_RTO_MIN` (1004), which that kernel supports.
 >
-> 检查你的内核支不支持：
+> Check whether your kernel supports it:
 > ```bash
 > grep -c "TCP_RTO_MAX_MS" /usr/src/linux-headers-$(uname -r)*/include/uapi/linux/tcp.h
-> # 输出 0 = 不支持上限调节；非 0 = 支持
+> # Output 0 = ceiling adjustment not supported; non-zero = supported
 > ```
-> 配置留着不会有副作用（只是被内核忽略），升级到 6.15+ 后会自动开始生效。
+> Leaving the configuration in place has no side effects (the kernel just ignores it), and it starts taking effect by itself once you upgrade to 6.15+.
 
 > [!CAUTION]
-> **只在配置文件里写 `[rack_rto] enabled = true` 是不够的。** daemon 每次启动都把这项功能清零，
-> 不会把配置文件里的这一段推进 BPF map。要真正打开，执行一次 `sudo ssctl reset-rack-rto`（下发配置文件里
-> 的值），或 `sudo ssctl set-rack-rto ...`（下发命令行给的值，见下）。
-> 实测：仅靠配置文件时 `established_cb` 有 2169，但 `subscribe_ok` / `rtt_callbacks`
-> / `applied` 全是 0；执行命令后才开始增长。
+> **Writing `[rack_rto] enabled = true` in the config file alone is not enough.** Every time the daemon starts it clears this feature,
+> and it does not push this section of the config file into the BPF map. To actually turn it on, run `sudo ssctl reset-rack-rto` once (sends the values in
+> the config file), or `sudo ssctl set-rack-rto ...` (sends the values given on the command line; see below).
+> Measured: with only the config file, `established_cb` was 2169, but `subscribe_ok` / `rtt_callbacks`
+> / `applied` were all 0; they started growing only after the command was run.
 >
-> 因此**每次 daemon 重启后都要重跑一次**，或把它加进开机脚本。0.5.1 起，配置文件开启而实际没开时，
-> `sudo ssctl status` 的 ATTENTION 段落会提示执行 `reset-rack-rto`，`ssctl flows` 里这一行也如实显示 `off`；
-> 0.5.0 及更早的两份报告照着文件把它显示为已开启。
+> So **run it again after every daemon restart**, or add it to a boot script. From 0.5.1, when the config file turns it on but it is not actually on,
+> the ATTENTION section of `sudo ssctl status` tells you to run `reset-rack-rto`, and this line in `ssctl flows` honestly shows `off`;
+> in 0.5.0 and earlier, both reports followed the file and showed it as on.
 
-开启：
+To turn it on:
 
 ```bash
 sudo ssctl set-rack-rto \
@@ -368,29 +368,29 @@ sudo ssctl set-rack-rto \
   --warmup-samples 4
 ```
 
-| 参数 | 大白话 | 建议值 |
+| Parameter | In plain words | Suggested value |
 |---|---|---|
-| `--srtt-permille` | 目标 RTO = 实测延迟 × 这个数 ÷ 1000。1100 = 1.1 倍 | `1100` |
-| `--floor-us` | **最小**等待时间（微秒）。太小会误判成丢包乱重发 | `20000`（20ms） |
-| `--ceiling-us` | RTO **下限**的上界（微秒）。**不是退避上限**，且内核硬卡在 200000 | `200000`（200ms） |
-| `--warmup-samples` | 前几次只观察不干预，等延迟测准了再动手 | `4` |
+| `--srtt-permille` | Target RTO = measured latency × this number ÷ 1000. 1100 = 1.1 × | `1100` |
+| `--floor-us` | The **minimum** wait (microseconds). Too small and it mistakes delay for loss and retransmits spuriously | `20000` (20ms) |
+| `--ceiling-us` | The upper bound of the RTO **floor** (microseconds). **Not the backoff ceiling**, and the kernel hard-limits it to 200000 | `200000` (200ms) |
+| `--warmup-samples` | For the first few samples it only observes and does not intervene, acting only once the latency is measured accurately | `4` |
 
-**真正的「退避上限」是另外两个参数**（就是防卡死的关键，需内核 ≥ 6.15）：
+**The real "backoff ceiling" is two other parameters** (the key to keeping connections from getting stuck; needs kernel ≥ 6.15):
 
 ```
-退避上限 = clamp(permille × RTT ÷ 1000,  1000ms,  120000ms)
-                                          ↑ 夹住下限，所以 1 秒是能设到的最小值
+backoff ceiling = clamp(permille × RTT ÷ 1000,  1000ms,  120000ms)
+                                                 ↑ clamped from below, so 1 second is the smallest value you can set
 ```
 
-RTT 取这条连接的平滑 RTT 与最小 RTT 中较大的那个；每来一个 RTT 样本都重新算一次。
+RTT is the larger of the connection's smoothed RTT and its minimum RTT; it is worked out again at every RTT sample.
 
-| 参数 | 大白话 | 说明 |
+| Parameter | In plain words | Notes |
 |---|---|---|
-| `--rto-max-normal-permille` | 平时的退避上限倍数 | `0` = 关闭本功能，保持内核 120 秒默认 |
-| `--rto-max-congested-permille` | 显示出拥塞的样本改用的倍数（每个样本重新判断，拥塞迹象消失就换回 normal） | 必须 ≥ normal |
-| `--rto-max-congestion-ratio-permille` | 延迟涨到几倍算「真拥塞」 | `0` = 用内置默认 2000（2 倍） |
+| `--rto-max-normal-permille` | The backoff ceiling multiplier in normal times | `0` = this feature off, keeping the kernel's 120-second default |
+| `--rto-max-congested-permille` | The multiplier used instead for samples that show congestion (judged afresh at every sample; once the signs of congestion are gone it switches back to normal) | Must be ≥ normal |
+| `--rto-max-congestion-ratio-permille` | How many times higher the latency must rise to count as "real congestion" | `0` = use the built-in default of 2000 (2 ×) |
 
-以一条 RTT 为 120ms 的连接为例：
+Take a connection with an RTT of 120ms as an example:
 
 ```bash
 sudo ssctl set-rack-rto \
@@ -399,172 +399,172 @@ sudo ssctl set-rack-rto \
   --rto-max-congested-permille 6000
 ```
 
-算法：平时 `3000` → 3.0 × 120ms = 360ms，低于 1000ms 下限 → 夹到 **1 秒**。
-拥塞有两种判据，算出来不一样：平滑 RTT 超过最小 RTT 的 2 倍时，乘的是那时已经变大的 RTT，
-比如 250ms → 6.0 × 250ms = **1.5 秒**；RTT 没涨、只是来了新的 ECN 标记时，6.0 × 120ms = 720ms → 夹到 **1 秒**。
+The arithmetic: normally `3000` → 3.0 × 120ms = 360ms, below the 1000ms lower bound → clamped to **1 second**.
+Congestion has two criteria, and they work out differently: when the smoothed RTT is over twice the minimum RTT, the multiplier applies to the RTT that has grown by then,
+say 250ms → 6.0 × 250ms = **1.5 seconds**; when the RTT has not risen and only a new ECN mark has arrived, 6.0 × 120ms = 720ms → clamped to **1 second**.
 
-> 注意公式挂在**每条连接各自的 RTT** 上，不是绝对值。RTT 更大的连接，同样的倍数会
-> 算出更大的上限；按 RTT 判定拥塞时 RTT 已经翻倍，上限也跟着翻倍以上，所以 congested 倍数不必
-> 定得比 normal 大很多。想要"任意 RTT 都是 1 秒"，把 normal 设小即可（夹住下限就是 1 秒）。
+> Note that the formula is tied to **each connection's own RTT**, not to an absolute value. On a connection with a larger RTT, the same multiplier
+> works out to a higher ceiling; when congestion is judged by RTT, the RTT has already doubled, so the ceiling more than doubles with it, and the congested multiplier need not
+> be set much larger than the normal one. If you want "1 second whatever the RTT", just set normal small (clamped at the lower bound, that is 1 second).
 
-关闭：
+To turn it off:
 
 ```bash
 sudo ssctl set-rack-rto --disable
 ```
 
-（`sudo ssctl reset-rack-rto` 是回到配置文件里 `[rack_rto]` 的设置：出厂配置没有这一段，就是关闭；
-配置文件里写了 `enabled = true` 的，它反而会把功能打开。）
+(`sudo ssctl reset-rack-rto` goes back to the `[rack_rto]` settings in the config file: the shipped configuration has no such section, so that means off;
+where the config file says `enabled = true`, it turns the feature on instead.)
 
 > [!IMPORTANT]
-> **这个功能有个前提：进程必须在指定的 cgroup 里，否则完全不生效，而且不报错。**
+> **This feature has a precondition: the process must be in the designated cgroup; otherwise it has no effect at all, and no error is reported.**
 >
-> 检查：`sudo ssctl flows` 的 DYNAMIC RTO 段落（动态 RTO 关闭时叫 CGROUP POLICY，这一行一直都在）里，
-> 如果 *connections seen* 一直是 0，就是没生效（它下面会直接写明这不是错误，而是没有进程在那个 cgroup 里）。
+> To check: in the DYNAMIC RTO section of `sudo ssctl flows` (called CGROUP POLICY while dynamic RTO is off; this line is always there),
+> if *connections seen* stays at 0, it is not taking effect (the text below it says outright that this is not an error, but that no process is in that cgroup).
 >
-> 让你的服务进入 cgroup：
+> To put your service in the cgroup:
 > ```bash
-> sudo /opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <你的服务启动命令>
+> sudo /opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <your service's start command>
 > ```
-> systemd 服务的做法见 [DEPLOY.md 第 7 节](../DEPLOY.md)。
+> For a systemd service, see [DEPLOY.md section 7](../DEPLOY.md).
 >
-> 加速主体（`skyline_cc`）**不受这个限制**，永远全局生效。
+> The main acceleration (`skyline_cc`) is **not subject to this restriction**; it always applies globally.
 
 ---
 
-## 六、⚠️ 重传包 DSCP 标记：默认关闭，且默认值是 0
+## 6. ⚠️ DSCP marking of retransmitted packets: off by default, and the default value is 0
 
-**这是最容易配错的功能，请完整读完再动手。**
+**This is the easiest feature to misconfigure. Read all of this before you do anything.**
 
-它的作用：给**重传的数据包**打一个 DSCP 标记（IP 头里的优先级字段），
-让上游的路由器/运营商设备能识别出"这是重传包"，从而单独做分流或优先处理。
+What it does: it puts a DSCP mark (the priority field in the IP header) on **retransmitted packets**,
+so that upstream routers / carrier equipment can recognise "this is a retransmission" and route it separately or give it priority.
 
-### 为什么默认是 0
+### Why the default is 0
 
 ```toml
 [retransmit_dscp]
 enabled = false
-dscp_value = 0      # <- 占位符，不是可用值
+dscp_value = 0      # <- a placeholder, not a usable value
 ```
 
-`dscp_value = 0` 是**占位符**，代表"未配置"。DSCP 0 在标准里是"尽力而为"（默认等级），
-**打上去等于没打**。
+`dscp_value = 0` is a **placeholder** meaning "not configured". In the standard, DSCP 0 is "best effort" (the default class),
+so **marking with it is the same as not marking at all**.
 
 > [!CAUTION]
-> **DSCP 的具体数值必须由你的网络方（运营商 / 机房 / 上游网络管理员）指定。**
+> **The actual DSCP value must be specified by whoever runs your network (the carrier / data centre / upstream network administrator).**
 >
-> 这个值不是你自己拍脑袋定的——它必须和上游设备的策略对上，否则：
-> - 填错了：上游不认识，标记被忽略（白做）；
-> - 填成别人在用的值：你的流量可能被误分到别的策略里，**可能更慢甚至被限速**。
+> This is not a value you make up yourself — it must match the policy of the upstream equipment; otherwise:
+> - Fill in the wrong value: upstream does not recognise it and the mark is ignored (wasted effort);
+> - Fill in a value someone else is using: your traffic may be misclassified into another policy and **may get slower or even be rate-limited**.
 >
-> **开启前请先联系网络方，问清楚"重传流量应该打哪个 DSCP 值"。**
+> **Before turning it on, contact whoever runs your network and ask exactly "which DSCP value should retransmitted traffic be marked with".**
 
-### 确认拿到值之后怎么开
+### How to turn it on once you have the value
 
 ```bash
-# 把 <值> 换成网络方给你的数字（0-63）
-sudo ssctl set-retransmit-dscp --dscp-value <值>
+# Replace <value> with the number your network operator gave you (0-63)
+sudo ssctl set-retransmit-dscp --dscp-value <value>
 ```
 
-> 注意：这条命令**同时就把功能打开了**（`enabled` 会被自动设为 true），
-> 不需要另外再执行开启命令。
+> Note: this command **also turns the feature on** (`enabled` is set to true automatically);
+> there is no separate command to run to turn it on.
 >
-> 写进配置文件（`[retransmit_dscp]` 段写 `enabled = true` 和 `dscp_value = <值>`）同样**不会在 daemon
-> 启动时生效**：每次启动之后都要执行一次 `sudo ssctl reset-retransmit-dscp`，下发文件里的值。0.5.1 起
-> `sudo ssctl status` 的 ATTENTION 段落会提示这件事。
+> Writing it into the config file (`enabled = true` and `dscp_value = <value>` in the `[retransmit_dscp]` section) likewise **does not take effect when the daemon
+> starts**: after every start, run `sudo ssctl reset-retransmit-dscp` once to send the values in the file. From 0.5.1,
+> the ATTENTION section of `sudo ssctl status` reminds you of this.
 
-关闭：
+To turn it off:
 
 ```bash
-sudo ssctl set-retransmit-dscp --disable    # 不管配置文件怎么写，都关闭（0.5.2 起）
+sudo ssctl set-retransmit-dscp --disable    # off, whatever the config file says (from 0.5.2)
 ```
 
-（`sudo ssctl reset-retransmit-dscp` 是回到配置文件里的设置：出厂配置是关闭；文件里打开了的，它反而会打开。
-0.5.1 及更早没有 `--disable`，只能用它，或者重启 daemon。）
+(`sudo ssctl reset-retransmit-dscp` goes back to the settings in the config file: the shipped configuration is off; where the file turns it on, it turns it on instead.
+0.5.1 and earlier have no `--disable`, so there you can only use this, or restart the daemon.)
 
-### 补充说明
+### Further notes
 
-- 它挂在网卡出方向上，对该网卡**所有 TCP 流量**一致生效，不区分用的是哪种拥塞控制算法。
-- 它只挂在以太网网卡上。配置里的 `runtime.tc_interface` 是 WireGuard / WARP、tun 这类隧道时
-  不会挂载，上面这条开启命令会报错（原因写在 `ssctl status` 的 ATTENTION 段落里）：
-  把 `tc_interface` 改成承载隧道流量的那块物理网卡，再重启 `skyline-speederd`。
-- 它**不受** `ssctl drain` 影响。摘除加速功能时，这个标记仍然在工作，要单独关。
-- IPv4 和 IPv6 都支持，我们实测零误标记。
+- It is attached to the NIC's egress and applies equally to **all TCP traffic** on that NIC, whichever congestion control algorithm it uses.
+- It is attached only to Ethernet NICs. When `runtime.tc_interface` in the configuration is a tunnel such as WireGuard / WARP or tun,
+  it is not attached, and the command above to turn it on fails (the reason is given in the ATTENTION section of `ssctl status`):
+  change `tc_interface` to the physical NIC that carries the tunnel's traffic, then restart `skyline-speederd`.
+- It is **not affected** by `ssctl drain`. When the acceleration is detached, this marking keeps working; turn it off separately.
+- Both IPv4 and IPv6 are supported; in our measurements nothing was marked by mistake.
 
 ---
 
-## 七、确认真的生效了
+## 7. Confirm that it really is working
 
 ```bash
 sudo ssctl status
 ```
 
-标题右上角直接给结论，只看这一处就够了：
+The top right of the title line gives the verdict directly; that one spot is all you need to look at:
 
 ```
-● ACCELERATING            <- 已挂载，而且是全机默认，新连接都走它
-○ ATTACHED, NOT DEFAULT   <- 挂载了但新连接绕开了它，等于没生效（见下）
-○ DRAINING                <- 执行过 drain：新连接已回到 fallback_cc，skyline_cc 只服务剩下的连接
-                             （SSH 里执行的 drain 总会停在这里；想恢复加速，跑 sudo ssctl enable）
-○ STANDBY                 <- 没挂载，跑 sudo ssctl enable
+● ACCELERATING            <- attached and the host-wide default; new connections all use it
+○ ATTACHED, NOT DEFAULT   <- attached, but new connections bypass it, so it is as good as not working (see below)
+○ DRAINING                <- drain was run: new connections are back on fallback_cc, skyline_cc only serves the remaining connections
+                             (a drain run over SSH always stops here; to resume acceleration, run sudo ssctl enable)
+○ STANDBY                 <- not attached; run sudo ssctl enable
 ```
 
-`ATTACHED, NOT DEFAULT` 和 `STANDBY`，报告最下面的 **ATTENTION** 段落会逐条写明问题和对应的处理
-动作；`DRAINING` 是你自己执行 drain 的结果，不算问题。四个关键行也各自带标记：
+For `ATTACHED, NOT DEFAULT` and `STANDBY`, the **ATTENTION** section at the bottom of the report lists each problem and the action
+to take for it; `DRAINING` is the result of a drain you ran yourself and is not a problem. The four key lines each carry a mark too:
 
 ```
-✔ skyline_cc struct_ops   attached, 3h 12m ago     <- 加速已挂载
-✔ host default cc         skyline_cc               <- 新连接确实走它
-✔ 状态 ARMED（DRIFT GUARD 段落）                    <- 拥塞控制和 qdisc 正被守着
-✔ KERNEL 段落 required 那行全是 ✔                   <- 环境满足要求
+✔ skyline_cc struct_ops   attached, 3h 12m ago     <- acceleration attached
+✔ host default cc         skyline_cc               <- new connections really do use it
+✔ state ARMED (DRIFT GUARD section)                <- congestion control and qdisc are being guarded
+✔ KERNEL section: all ✔ on the required line       <- the environment meets the requirements
 ```
 
-再确认真实连接确实在用它（服务器有流量时执行）：
+Then confirm that real connections really are using it (run this while the server has traffic):
 
 ```bash
 sudo ssctl flows
 ```
 
-CONNECTIONS 段落的 coverage 那行会写「多少条 TCP 连接里有多少条跑在 skyline_cc 上」，
-下面逐条列出这些连接。是 0 的话，可能是已建立的老连接不会中途切换，等新连接即可。
+The coverage line in the CONNECTIONS section says "how many of the TCP connections run on skyline_cc",
+and the connections are listed one by one below it. If it is 0, it may be that old connections already established do not switch partway through; just wait for new connections.
 
-> KERNEL 段落 optional 那行里 `RACK reorder hook` 是灰点（未命中）是**正常的**，不影响使用。
-> 要原始 JSON（脚本解析、贴报告）就加 `--json`。
+> A grey dot (not found) for `RACK reorder hook` on the optional line of the KERNEL section is **normal** and does not affect anything.
+> For the raw JSON (for scripts to parse, or to paste into a report), add `--json`.
 
-### 之前装过「一键 BBR」、改过 qdisc 的机器
+### Machines that previously had "one-click BBR" installed or their qdisc changed
 
-不用先卸载它们，也不用手动改回来。`ssctl enable`（安装脚本会自动执行）会：
+You do not need to uninstall those first, or change anything back by hand. `ssctl enable` (which the installer runs automatically):
 
-- 把拥塞控制改成 `skyline_cc`；
-- 把默认 qdisc（`net.core.default_qdisc`）改成 `fq`；
-- 把出口网卡上的 qdisc（`cake`、`fq_pie`、`fq_codel` 等）换成 `fq`——`skyline_cc` 靠 `fq`
-  把数据均匀发出去。出口是 VLAN、bond 或网桥时，换的是它下面的物理网卡（网桥上虚拟机、
-  容器的端口不碰）。
+- switches the congestion control to `skyline_cc`;
+- sets the default qdisc (`net.core.default_qdisc`) to `fq`;
+- replaces the qdisc on the egress NIC (`cake`, `fq_pie`, `fq_codel` and so on) with `fq` — `skyline_cc` relies on `fq`
+  to send data out evenly. When the egress is a VLAN, bond or bridge, it replaces the qdisc of the physical NICs under it (the ports of virtual machines
+  and containers on the bridge are left alone).
 
-之后 `skyline-speederd` 每 5 秒检查一次，谁改回去就再改过来（比如有脚本又执行了
-`sysctl --system`），并在日志里记一笔：
+After that, `skyline-speederd` checks every 5 seconds and changes back whatever anything else changes (for instance, a script running
+`sysctl --system` again), and records it in the log:
 
 ```bash
 journalctl -u skyline-speederd | grep 'guard:'
 ```
 
-带 `something else on this host changed it` 的行反复出现，说明机器上有东西一直在改。
-不影响加速；想根除，就去 `/etc/sysctl.conf`、`/etc/sysctl.d/` 里找写着 `bbr`、`cake` 的
-那一行删掉（安装结束时的摘要会列出这些文件）。
+If lines with `something else on this host changed it` keep appearing, something on the machine keeps changing them.
+That does not affect acceleration; to stop it for good, find the line that says `bbr` or `cake` in `/etc/sysctl.conf` or `/etc/sysctl.d/`
+and delete it (the summary at the end of the install lists these files).
 
-以下情况它**不会动**：
+It **leaves things alone** in these cases:
 
-- 网卡上是你自己搭的限速 / 整形 qdisc（`htb`、`tbf`、`netem` 等，以及设了带宽的 `cake`，
-  比如 `cake bandwidth 90Mbit`）——替换会把你的限速配置弄没。`ssctl status` 的 DRIFT GUARD
-  段落里会以 `note` 写明它没动；
-- 出口是内核 WireGuard 这类根为 `noqueue`、下面又找不到物理网卡的设备时——`notes` 里会写
-  `is a virtual device ... no qdisc checked`。想让它管，就把配置里的 `runtime.tc_interface`
-  改成真正的物理网卡（tun 类隧道——WARP 客户端、wireguard-go、OpenVPN——有自己的 qdisc，
-  被设成 `tc_interface` 时照样会被换成 `fq`）；
-- 执行过 `ssctl drain` 之后——摘除即停止守护，qdisc 保持现状（仍是 `fq`）。
+- The NIC has a rate-limiting / shaping qdisc you set up yourself (`htb`, `tbf`, `netem` and so on, and a `cake` with a bandwidth set,
+  such as `cake bandwidth 90Mbit`) — replacing it would wipe out your rate-limiting setup. The DRIFT GUARD
+  section of `ssctl status` says in a `note` that it left it alone;
+- The egress is a device such as in-kernel WireGuard whose root is `noqueue` and under which no physical NIC can be found — `notes` will say
+  `is a virtual device ... no qdisc checked`. If you want it managed, change `runtime.tc_interface` in the configuration
+  to the real physical NIC (tun-type tunnels — the WARP client, wireguard-go, OpenVPN — have their own qdisc,
+  and when set as `tc_interface` it is replaced with `fq` all the same);
+- After `ssctl drain` has run — detaching stops the guard, and the qdisc stays as it is (still `fq`).
 
-不想让它管 qdisc：把 `/etc/skyline-speeder/speeder.toml` 里 `[guard]` 段的 `qdisc` 改成
-`false`，然后：
+If you do not want it to manage qdiscs: set `qdisc` in the `[guard]` section of `/etc/skyline-speeder/speeder.toml` to
+`false`, then:
 
 ```bash
 sudo skyline-speederd --config /etc/skyline-speeder/speeder.toml --validate-only
@@ -573,30 +573,30 @@ sudo systemctl restart skyline-speederd.service
 
 ---
 
-## 八、常见场景配方
+## 8. Recipes for common scenarios
 
-### 场景 1：普通跨境服务器，不确定线路情况
+### Scenario 1: an ordinary cross-border server, line conditions unknown
 
-**什么都别改。** 安装完就是调好的。
+**Change nothing.** It is already tuned once installed.
 
-### 场景 2：想验证到底有没有效果
+### Scenario 2: you want to verify whether it actually helps
 
 ```bash
-# 基准：把模块全关（不做任何加速的中性基准）
+# Baseline: all modules off (a neutral baseline with no acceleration at all)
 sudo ssctl enable --all-off
-# ... 测速 ...
+# ... measure speed ...
 
-# 全开（要把四个模块写全：不带 --modules 的 enable 会沿用刚才的全关）
+# All on (name all four modules: enable without --modules keeps the all-off set from before)
 sudo ssctl enable --modules early-loss,adaptive-cwnd,loss-classifier,pacing
-# ... 同样条件再测一次 ...
+# ... measure again under the same conditions ...
 ```
 
-> 线路本身波动很大，**单次测试不可信**。同一时段交替测 3 轮以上取中位数。
+> The line itself fluctuates a lot, so **a single test cannot be trusted**. Alternate at least 3 rounds in the same time window and take the median.
 
-### 场景 3：延迟敏感业务（游戏、语音），想更保守
+### Scenario 3: latency-sensitive services (games, voice), you want it more conservative
 
 ```bash
-# 更早减速、降得更狠
+# Slow down sooner, cut harder
 sudo ssctl set-module-config \
   --max-pacing-mbps 1200 --max-cwnd-packets 50000 \
   --max-queue-delay-ms 50 --max-queue-delay-ratio 0.5 \
@@ -608,37 +608,37 @@ sudo ssctl set-module-config \
   --loss-inflation-max-ratio 0.10
 ```
 
-### 场景 4：连接经常莫名卡死几十秒
+### Scenario 4: connections often freeze for tens of seconds for no apparent reason
 
-开启第五节的动态 RTO 调节，并确认进程在 cgroup 里。
+Turn on the dynamic RTO adjustment from section 5, and make sure the process is in the cgroup.
 
 ---
 
-## 附：视频卡顿 / 大文件传输中断怎么查
+## Appendix: how to investigate video stalls / interrupted large-file transfers
 
-典型症状：**4K 卡死但 2K 正常**、大文件下到一半不动、SSH 卡几十秒又恢复。
+Typical symptoms: **4K freezes while 2K plays normally**, a large download stops moving halfway, SSH freezes for tens of seconds and then recovers.
 
-### 第一步：看有没有连接陷入 RTO 退避
+### Step 1: check whether any connection is stuck in RTO backoff
 
 ```bash
-# 有输出就说明有连接在指数退避，数字越大退避越深
+# Any output means some connection is in exponential backoff; the bigger the number, the deeper the backoff
 ss -tin | grep -oE 'backoff:[0-9]+' | sort | uniq -c
 
-# RTO 分布，正常应集中在几百毫秒
+# RTO distribution; normally it should cluster at a few hundred milliseconds
 ss -tin | grep -oE 'rto:[0-9]+' | sed 's/rto://' | sort -n | tail -5
 ```
 
-一旦看到 `backoff:10` 以上、`rto` 上万毫秒，就是它。我们实测遇到过
-**RTT 仅 101ms 而 rto=120000ms（120 秒）** 的连接——这条连接实际已经死了。
+As soon as you see `backoff:10` or more and an `rto` in the tens of thousands of milliseconds, that is the cause. We have actually seen
+a connection with **an RTT of only 101ms but rto=120000ms (120 seconds)** — that connection was in effect already dead.
 
-> **为什么 4K 先崩、2K 没事**：AnyTLS / VLESS 这类协议做会话复用，多条流跑在同一条
-> TCP 上。这条 TCP 一旦卡住，其上所有流一起卡。4K 码率高、播放器缓冲余量小，最先
-> 表现出来；2K 码率低，能靠缓冲扛过短暂停顿。
+> **Why 4K breaks first while 2K is fine**: protocols such as AnyTLS / VLESS multiplex sessions, running many streams over the same
+> TCP connection. Once that TCP connection stalls, every stream on it stalls together. 4K has a high bitrate and the player has little buffer headroom, so it
+> shows the problem first; 2K has a low bitrate and can ride out a short pause on its buffer.
 
-### 第二步：看是不是参数开太猛
+### Step 2: check whether the parameters are set too aggressively
 
 ```bash
-# 40 秒内的重传率与 RTO 超时次数
+# Retransmission share and number of RTO timeouts over 40 seconds
 python3 - <<'EOF'
 import time
 def snmp():
@@ -651,42 +651,42 @@ def snmp():
     return d
 a=snmp(); time.sleep(40); b=snmp()
 o=b["Tcp:OutSegs"]-a["Tcp:OutSegs"]; r=b["Tcp:RetransSegs"]-a["Tcp:RetransSegs"]
-# OutSegs 不含重传的报文段，重传占比是 r/(o+r)
-print(f"重传占比 {r*100/(o+r):.2f}%  RTO超时 {b['TcpExt:TCPTimeouts']-a['TcpExt:TCPTimeouts']} 次")
+# OutSegs does not include retransmitted segments, so the retransmission share is r/(o+r)
+print(f"retransmission share {r*100/(o+r):.2f}%  RTO timeouts {b['TcpExt:TCPTimeouts']-a['TcpExt:TCPTimeouts']}")
 EOF
 ```
 
-我们在同一台机器上实测三档（每档 40 秒真实业务流量，中位数）。这组数据测于默认系数调整
-**之前**：「默认档」是当时的默认值，也就是上面的「④ 高随机丢包档」；「保守档」也是调整前的
-版本。现在的默认档和保守档没有用这个方法重测过，下面「2.7 倍」的结论只适用于激进档与 ④ 的对比。
+We measured three presets on the same machine (40 seconds of real production traffic per preset, medians). These numbers were measured **before** the default coefficients
+changed: the "default preset" is the default of that time, that is, the ④ high random loss preset above; the "conservative preset" is also the
+version from before the change. The current default and conservative presets have not been measured again this way, and the "2.7 times" conclusion below applies only to the comparison of the aggressive preset with ④.
 
-| 档位 | 重传占比 | **RTO 超时 / 40 秒** |
+| Preset | Retransmission share | **RTO timeouts / 40 s** |
 |---|---:|---:|
-| 激进档 | 9.2% | **93** |
-| 默认档 | 8.1% | **35** |
-| 保守档 | 5.7% | **25** |
+| Aggressive preset | 9.2% | **93** |
+| Default preset | 8.1% | **35** |
+| Conservative preset | 5.7% | **25** |
 
-（重传占比由当时按 `重传 ÷ 新发` 记下的 10.1% / 8.8% / 6.0% 换算成 `重传 ÷ 全部发出`，换算不改变排序。）
+(The retransmission shares were converted from the 10.1% / 8.8% / 6.0% recorded at the time as `retransmitted ÷ newly sent` into `retransmitted ÷ everything sent`; the conversion does not change the order.)
 
-**激进档的 RTO 超时是默认档的 2.7 倍**，三轮测试全部最高。RTO 超时就是卡顿的直接来源。
+**The aggressive preset had 2.7 times the RTO timeouts of the default preset**, the highest in all three rounds of testing. RTO timeouts are the direct source of stalls.
 
-**处置：先回默认档**（从 0.3.x 及更早升级、保留了原配置文件的主机上，`reset-module-config` 回到的是那份旧配置；
-要回新默认档，改用不带任何参数的 `sudo ssctl set-module-config`，见 ②）
+**What to do: go back to the default preset first** (on a host upgraded from 0.3.x or earlier that kept its original config file, `reset-module-config` goes back to that old configuration;
+to get the new default preset, use `sudo ssctl set-module-config` with no parameters at all instead; see ②)
 
 ```bash
 sudo ssctl reset-module-config
 ```
 
-如果还想要速度，**不要动 `guardrail-gain`**（那是自我保护开关），
-只小幅提 `cruise-pacing-gain`（1.25 → 1.3 → 1.35），每档跑上面的脚本看 RTO 超时数，
-涨得明显就退回去。
+If you still want more speed, **leave `guardrail-gain` alone** (that is the self-protection switch),
+and only raise `cruise-pacing-gain` in small steps (1.25 → 1.3 → 1.35), running the script above at each step to watch the number of RTO timeouts;
+if it rises noticeably, step back.
 
-### 第三步：限制死连接的挂起时长
+### Step 3: limit how long a dead connection hangs
 
-内核默认 `tcp_retries2 = 15`，连接进入退避后最长会挂**约 15 分钟**才被放弃。
+The kernel default is `tcp_retries2 = 15`: once a connection is in backoff it can hang for up to **about 15 minutes** before it is given up.
 
-理论上应该用 `rto_max_*_permille` 把退避上限压到 1–2 秒，
-但**那需要内核 ≥ 6.15**（见第五节）。6.12 上的替代方案是缩短放弃阈值：
+In principle you would use `rto_max_*_permille` to push the backoff ceiling down to 1–2 seconds,
+but **that needs kernel ≥ 6.15** (see section 5). The alternative on 6.12 is to shorten the give-up threshold:
 
 ```bash
 sudo tee /etc/sysctl.d/99-zz-skyline-speeder-retries.conf >/dev/null <<'EOF'
@@ -695,55 +695,55 @@ EOF
 sudo sysctl -p /etc/sysctl.d/99-zz-skyline-speeder-retries.conf
 ```
 
-让死连接**快速失败、客户端重连**，而不是长时间悬挂。
-值越小失败越快（8 ≈ 100 秒量级，6 ≈ 25 秒量级）；太小会误杀网络短暂抖动中
-本可恢复的连接，移动端用户多时不建议低于 6。
+This makes dead connections **fail fast so the client reconnects**, instead of hanging for a long time.
+The smaller the value, the faster they fail (8 ≈ on the order of 100 seconds, 6 ≈ on the order of 25 seconds); too small, and it kills connections that could have recovered
+from a brief network hiccup; with many mobile users, going below 6 is not recommended.
 
-## 九、出问题了怎么退回
+## 9. How to back out when something goes wrong
 
 ```bash
-# 1. 参数改乱了 -> 还原成配置文件里的参数（从 0.3.x 及更早升级、保留了原配置的主机上是当时的默认值）
+# 1. Parameters in a mess -> restore the parameters from the config file (on a host upgraded from 0.3.x or earlier that kept its original config, these are the defaults of that time)
 sudo ssctl reset-module-config
 
-# 2. 想暂时不用加速（等现有连接自然结束，不断线）
+# 2. Stop accelerating for now (existing connections finish on their own; nothing is cut off)
 sudo ssctl drain --timeout 60
 
-# 3. 完全停掉
+# 3. Stop it completely
 sudo systemctl stop skyline-speeder-enable.service skyline-speederd.service
 
-# 4. 彻底卸载：切回 bbr + fq，并卸掉安装时装上的编译工具链（配置文件会保留）
+# 4. Uninstall completely: switch back to bbr + fq and remove the build toolchain the install added (the config files are kept)
 sudo ./install.sh --uninstall
 
-# 4b. 想回到安装前那台机器用的拥塞控制和 qdisc，而不是 bbr + fq
+# 4b. Go back to the congestion control and qdisc the machine used before the install, instead of bbr + fq
 sudo ./install.sh --uninstall --restore-pre-install
 ```
 
-卸载做的事：断开前先 drain 掉存量连接，删掉两个 systemd 单元、二进制和 BPF 对象，把机器切到
-**bbr + fq**，再卸掉安装时装上的包（`clang`、`llvm`、`bpftool`、rustup 等）。只卸安装时记录在
-`/etc/skyline-speeder/added-packages` 里的那些，**不会**碰 `iproute2`、`curl`、
-`ca-certificates`、`tar`，不会碰这几个包仍然依赖的库，也不会碰系统标为必需的包；如果 apt 的
-计划显示会连带删掉清单之外的东西，就把造成这件事的那个包单独留下（并告警说明是谁需要它），
-其余照卸；实在凑不出一个不越界的方案时，才一个都不卸、改为把命令打给你自己决定。`/etc/skyline-speeder` 会保留，重装时你调过的
-参数还在。
+What the uninstall does: before detaching, it drains the existing connections, removes the two systemd units, the binaries and the BPF objects, switches the machine to
+**bbr + fq**, then removes the packages the install added (`clang`, `llvm`, `bpftool`, rustup and so on). It removes only the ones recorded at install time in
+`/etc/skyline-speeder/added-packages`, **never** touches `iproute2`, `curl`,
+`ca-certificates` or `tar`, never touches the libraries those packages still depend on, and never touches packages the system marks as essential; if apt's
+plan shows that something outside the list would be removed along with them, it keeps the one package that causes this (and warns, saying what needs it),
+and removes the rest; only when it really cannot put together a plan that stays inside the list does it remove nothing at all, printing the commands for you to decide on instead. `/etc/skyline-speeder` is kept, so the parameters you tuned
+are still there when you reinstall.
 
 > [!NOTE]
-> `bbr` 和 `fq` 是**本次运行时**设置的。本项目从不改 `/etc/sysctl.d` 下的文件，所以重启后
-> 由那里的文件决定用什么。想让 bbr + fq 一直生效，自己写一个文件即可：
+> `bbr` and `fq` are set **for the current boot**. This project never changes the files under `/etc/sysctl.d`, so after a reboot
+> those files decide what is used. To keep bbr + fq in effect permanently, just write a file yourself:
 > ```bash
 > printf 'net.ipv4.tcp_congestion_control = bbr\nnet.core.default_qdisc = fq\n' \
 >   | sudo tee /etc/sysctl.d/99-zz-skyline-bbr.conf
 > sudo sysctl --system
 > ```
 >
-> 名字要能排在最后：`/etc/sysctl.d` 是按文件名顺序应用的，同名键后写的赢。写完用
-> `sudo ./install.sh --check` 核对一下到底是哪个文件在开机时设这两个键。
+> The name has to sort last: `/etc/sysctl.d` is applied in file-name order, and for the same key the one written later wins. Afterwards, use
+> `sudo ./install.sh --check` to check which file actually sets these two keys at boot.
 
 > [!NOTE]
-> 卸载后 `bpftool struct_ops show` 可能还能看到 `skyline_cc`（7.1 及以上内核上叫
-> `skyline_cc_txs`）。**这不是失败**——
-> 只要还有连接在用它，内核就不释放。这些连接断开后或重启后会自动消失。
+> After uninstalling, `bpftool struct_ops show` may still show `skyline_cc` (called
+> `skyline_cc_txs` on kernels 7.1 and later). **This is not a failure** —
+> as long as any connection still uses it, the kernel does not release it. It disappears by itself once those connections close, or after a reboot.
 
-**DSCP 标记和 RTO 调节不受 `drain` 影响**，要单独关：
+**DSCP marking and RTO adjustment are not affected by `drain`**; turn them off separately:
 
 ```bash
 sudo ssctl set-retransmit-dscp --disable
@@ -752,9 +752,9 @@ sudo ssctl set-rack-rto --disable
 
 ---
 
-## 十、还想深入
+## 10. Going deeper
 
-- [docs/02-interface-reference.md](02-interface-reference.md) —— 每个命令、每个字段的精确定义
-- [docs/03-design.md](03-design.md) —— 算法原理、为什么这么设计
-- [docs/04-performance-report.md](04-performance-report.md) —— 完整测试数据与局限性
-- [DEPLOY.md](../DEPLOY.md) —— 部署与运维手册：安装、验证、升级、排障、卸载
+- [docs/02-interface-reference.md](02-interface-reference.md) — the exact definition of every command and every field
+- [docs/03-design.md](03-design.md) — how the algorithm works and why it is designed this way
+- [docs/04-performance-report.md](04-performance-report.md) — the full test data and its limitations
+- [DEPLOY.md](../DEPLOY.md) — the deployment and operations manual: installing, verifying, upgrading, troubleshooting, uninstalling

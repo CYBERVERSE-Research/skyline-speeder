@@ -1,14 +1,14 @@
-# 最小正确性冒烟——不看性能。见 bpf/include/skyline_abi.h 顶部注释：
-# M2 是STARTUP/CRUISE两态状态机，开启时直接掌管全部CA状态下的cwnd
-# （绕开PRR），ssthresh对M2永不降窗，M3是单一丢包率补偿系数。
+# Minimal correctness smoke test: not about performance. See the comment at the top of bpf/include/skyline_abi.h:
+# M2 is a two-state STARTUP/CRUISE state machine that, when on, directly owns cwnd in every CA state
+# (bypassing PRR); ssthresh never reduces the window for M2; M3 is a single loss-rate compensation coefficient.
 #
-# 验收点（跑完后人工核对，不在这个manifest里断言）：
-# - ssctl status 显示当前 abi_version 与系数字段（cruise_inflight_gain等）
-# - skyline-events.jsonl 里 SKYLINE_EVENT_STATE 的 state 只出现 0/1（STARTUP/CRUISE）
-# - metrics.prr_adjustments == 0（证明 M2 路径确实绕开了 PRR）
-# - metrics.guardrail_hits 远小于 metrics.guardrail_rounds（护栏不是每轮都触发）
+# Acceptance points (checked by hand after the run, not asserted in this manifest):
+# - ssctl status shows the current abi_version and the coefficient fields (cruise_inflight_gain etc.)
+# - the state of SKYLINE_EVENT_STATE in skyline-events.jsonl only ever shows 0/1 (STARTUP/CRUISE)
+# - metrics.prr_adjustments == 0 (proving that the M2 path really bypasses PRR)
+# - metrics.guardrail_hits is far below metrics.guardrail_rounds (the guardrail does not fire every round)
 #
-# rtt200-loss15（目标box中心点）× {b1, skyline-best} × runs=1，2 case，~10分钟。
+# rtt200-loss15 (the target box's centre point) × {b1, skyline-best} × runs=1, 2 cases, ~10 minutes.
 name = "smoke"
 execution_class = "formal-kvm"
 performance_valid = true

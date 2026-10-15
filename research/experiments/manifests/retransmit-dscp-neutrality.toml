@@ -1,20 +1,20 @@
-# 重传包 DSCP 标记——中性性/开销对比。跟
-# retransmit-dscp-mechanism.toml 是同一需求的另一半：那份验证"标记对不
-# 对"，这份验证"打开标记会不会拖累吞吐/CPU"。
+# Retransmitted-packet DSCP marking: neutrality/overhead comparison. The other half of the same
+# requirement as retransmit-dscp-mechanism.toml: that one verifies "whether the marking is
+# right", this one verifies "whether turning the marking on drags down throughput/CPU".
 #
-# A/B 只有一个变量：retransmit_dscp.enabled（b1-controlled-cubic 完全一
-# 致，其它字段不动）。两个场景：
-#   - retransmit-neutrality-baseline：中等丢包，标准时长/样本数（不是机
-#     制验证的短样本），标准中性性对比。
-#   - retransmit-neutrality-highloss：更高丢包率——`bpf_skb_store_bytes`
-#     触发的 skb_ensure_writable/pskb_expand_head 只发生在真正被标记的
-#     包上，低丢包场景测不出这份成本，需要专门覆盖一次高丢包场景确认没
-#     有意外开销回归。
+# The A/B has only one variable: retransmit_dscp.enabled (identical to b1-controlled-cubic,
+# no other field touched). Two scenarios:
+#   - retransmit-neutrality-baseline: moderate loss, standard duration/sample count (not the short
+#     samples of a mechanism validation), a standard neutrality comparison.
+#   - retransmit-neutrality-highloss: a higher loss rate. The skb_ensure_writable/pskb_expand_head
+#     triggered by `bpf_skb_store_bytes` only happen on packets that are actually
+#     marked, so a low-loss scenario cannot measure this cost; a high-loss scenario needs to be covered once specifically to confirm there is
+#     no unexpected overhead regression.
 #
-# 抓包在这份 manifest 里全程关闭（capture_retransmits 默认 false）——
-# tcpdump 在发送端消耗真实 CPU，会直接污染这里要对比的
-# mean_sender_cpu_pct/perf stat 计数器，机制正确性已经在
-# retransmit-dscp-mechanism.toml 里验证过，这里只看性能。
+# Packet capture is off throughout this manifest (capture_retransmits defaults to false):
+# tcpdump consumes real CPU on the sender and would directly pollute the
+# mean_sender_cpu_pct/perf stat counters compared here; mechanism correctness has already been verified in
+# retransmit-dscp-mechanism.toml, so this looks only at performance.
 name = "retransmit-dscp-neutrality"
 execution_class = "formal-kvm"
 performance_valid = true

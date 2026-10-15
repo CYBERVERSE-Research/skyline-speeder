@@ -182,7 +182,7 @@ ssctl disable --module loss-classifier        # 只关一个，其余不变
 > [!CAUTION]
 > `set-module-config` 是**全量覆盖**，不是增量修改：没写的参数都会被重置为命令行的内置默认值，而不是保持你配置文件里的值。先在 *PARAMETERS IN FORCE* 里看清当前值，把要保留的全部写上；`ssctl reset-module-config` 回到配置文件里的值。
 
-[使用与调参指南](docs/usage.md) 给出每个参数的允许范围和四档现成配方，其中「高随机丢包档」适用于确实有 10%-20% 随机丢包的链路。
+[使用与调参指南](docs/usage.md) 给出每个参数的允许范围和四档现成配方，其中「高随机丢包档」（文中名为 high random loss）适用于确实有 10%-20% 随机丢包的链路。
 
 ### 首轮冗余
 
@@ -373,6 +373,8 @@ Debian 12 上跑 `bookworm-backports` 的 6.12 内核时，`libelf-dev` 也要�
 `make bpf` 默认从本机 `/sys/kernel/btf/vmlinux` 读取类型信息；要用别的内核的 BTF，用 `make VMLINUX_BTF=<路径> bpf`；已有生成好的头，用 `make PREBUILT_VMLINUX_H=<路径> bpf`。
 
 ## 文档
+
+下面的文档都是英文的，只有 README 有中文版（本文件）。
 
 | 文档 | 内容 |
 |---|---|

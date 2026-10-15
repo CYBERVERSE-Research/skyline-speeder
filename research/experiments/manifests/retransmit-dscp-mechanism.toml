@@ -1,49 +1,49 @@
-# 重传包 DSCP 标记——机制验证（网络侧按 DSCP 走不同 upstream，Skyline Speeder 这一侧
-# 只负责正确、可配置地把"这是重传包"这件事标在 IP 头上；网络侧是否真的
-# 按 DSCP 分流不在这次测试范围内）。
+# Retransmitted-packet DSCP marking: mechanism validation (the network side sends traffic to different upstreams by DSCP; the Skyline Speeder side
+# is only responsible for marking "this is a retransmitted packet" in the IP header correctly and configurably; whether the network side really
+# splits traffic by DSCP is outside the scope of this test).
 #
-# 检测机制在 bpf/skyline_tc.bpf.c 内自成一体完成（比较包自己的 TCP end_seq 和
-# bpf_tcp_sock(sk)->snd_nxt），接口级挂载、不分 cgroup、不看跑的是哪种拥
-# 塞控制——这份 manifest 的核心验证点就是"标记机制对 b0/b1/bbr/skyline 四种
-# CC 一致生效"，不是又一轮 CC 性能对比，所以 runs=1（跟
-# rto-max-smoke.toml 一样，是机制冒烟验证，不追求统计置信）。
+# The detection mechanism is self-contained in bpf/skyline_tc.bpf.c (it compares the packet's own TCP end_seq with
+# bpf_tcp_sock(sk)->snd_nxt), attached at the interface level, not per cgroup, and regardless of which congestion
+# control is running. The core validation point of this manifest is "the marking mechanism works consistently for all four
+# CCs b0/b1/bbr/skyline", not yet another round of CC performance comparison, so runs=1 (like
+# rto-max-smoke.toml, it is a mechanism smoke validation and does not seek statistical confidence).
 #
-# 四组 case：
-#   (a) 机制验证：4 个 profile 在同一个真实丢包场景下开启标记，抓包核对
-#       标记的都是真重传（sender 侧抓包精度门槛）+ BPF 自带计数器（主
-#       oracle）。
-#   (b) 零丢包负控制：同一批 profile 换到 netem 0% 丢包场景，开着标记。
-#       实测这里的"标记数"**不是** 0——HTB 限速器（queue_bdp=1.0，浅队列）
-#       在可达吞吐超过 rate_mbit 时会尾部丢包，这是跟 netem 独立的另一个
-#       真实丢包源，一样会触发真实重传。这个场景测的不是"零重传"，而是
-#       "在没有 netem 主动丢包时，精度门槛（sender 侧抓包重建）依然
-#       false_positives=0"——反而是比预想更硬的负控制：真实重传量比预期
-#       大得多的情况下，标记逻辑仍然没有误标。
-#   (c) 功能关闭对照：跟 (a) 相同丢包场景，只有 retransmit_dscp.enabled
-#       换成 false——证明开关真的在控制行为（用 BPF 自带计数器跨 case 比
-#       对 (a) 和 (c)：(a) 里 retransmits_detected/marked 都非零，(c) 里
-#       两者都应该是 0——检测发生在 config map 查询之后，disabled 时提前
-#       返回，不解析包）。
-#   (d) DSCP 数值跟踪对照：同一丢包场景，两个不同的 dscp_value（10 和
-#       46）——证明"占位参数"真的是可配置的，不是看起来能配但其实硬编码。
+# Four case groups:
+#   (a) Mechanism validation: 4 profiles turn on marking in the same real-loss scenario; packet capture checks
+#       that everything marked is a real retransmission (the sender-side capture precision threshold) + the BPF built-in counters (the main
+#       oracle).
+#   (b) Zero-loss negative control: the same profiles moved to a netem 0% loss scenario, with marking on.
+#       Measured, the "marked count" here is **not** 0: the HTB rate limiter (queue_bdp=1.0, a shallow queue)
+#       tail-drops when achievable throughput exceeds rate_mbit, which is another real loss source independent of netem,
+#       and it triggers real retransmissions just the same. What this scenario tests is not "zero retransmissions" but
+#       "without active netem loss, the precision threshold (sender-side capture reconstruction) still gives
+#       false_positives=0", which makes it a harder negative control than expected: with far more real retransmissions than
+#       expected, the marking logic still marked nothing wrongly.
+#   (c) Feature-off control: the same loss scenario as (a), with only retransmit_dscp.enabled
+#       switched to false, proving that the switch really controls the behaviour (compare (a) and (c) across cases
+#       using the BPF built-in counters: in (a) retransmits_detected/marked are both non-zero, in (c)
+#       both should be 0; detection happens after the config map lookup, and when disabled it returns early
+#       without parsing the packet).
+#   (d) DSCP value tracking control: the same loss scenario, two different dscp_values (10 and
+#       46), proving that the "placeholder parameter" really is configurable, not something that looks configurable but is actually hard-coded.
 #
-# 全部四组共用同一个丢包场景（rtt_ms=100/rate_mbit=50/loss_pct=5%，
-# offload=off 保证逐包独立随机丢包、抓包不被 GSO 超帧干扰），只有 (b) 换
-# 成零丢包场景。
+# All four groups share the same loss scenario (rtt_ms=100/rate_mbit=50/loss_pct=5%,
+# offload=off ensures independent random per-packet loss and captures undisturbed by GSO superframes); only (b) switches
+# to the zero-loss scenario.
 #
-# 已知的口径差异（不是标记错误）：analyze_results.py 里 retransmit_marked
-# （BPF 侧，按 skb 计数一次）和 retransmit_capture_marked（发送端抓包，按
-# wire 上的实际包计数）在高吞吐 case（尤其 skyline-best）下不相等，前者明显偏
-# 小。即使 offload=off 且确认 tso/gso/gro 全部关闭，tc_stats.gso_packets
-# 仍有非零 delta，而抓包里的包长度全部是 MTU（1500B）。原因已查明：TCP 不管
-# 网卡 offload 怎么设都先组 GSO 大帧（sk_setup_caps() 给每个 TCP socket 加
-# NETIF_F_GSO），离开 qdisc 交给网卡时才由软件分段（validate_xmit_skb()），
-# 而 TC 钩子在分段之前——BPF 按 skb 计一次的地方，wire 上确实是不止一个包，
-# retransmit_marked 因此系统性小于 retransmit_capture_marked（分出来的每个
-# 包都带着已改写的 DSCP）。**retransmit_capture_marked 才是标记正确性的
-# 权威依据**（发送端抓包直接看 wire）；这五组 case 里 false_positives 全部
-# 是 0，标记机制本身没有问题。路由器上的 NetEm 拿到的是分段后的包，所以
-# offload=off 时丢包确实逐包独立，见 docs/04-performance-report.md 第 2.3 节。
+# A known difference in what is counted (not a marking error): in analyze_results.py, retransmit_marked
+# (BPF side, counted once per skb) and retransmit_capture_marked (sender-side capture, counting the actual packets
+# on the wire) are not equal in high-throughput cases (especially skyline-best); the former is clearly
+# smaller. Even with offload=off and tso/gso/gro confirmed all off, tc_stats.gso_packets
+# still has a non-zero delta, while the packet lengths in the capture are all MTU (1500B). The cause has been found: TCP builds
+# large GSO frames first no matter how the NIC offloads are set (sk_setup_caps() adds NETIF_F_GSO to every TCP socket),
+# and they are segmented in software only when they leave the qdisc for the NIC (validate_xmit_skb()),
+# while the TC hook runs before segmentation; where BPF counts one skb, there really is more than one packet on the wire,
+# so retransmit_marked is systematically smaller than retransmit_capture_marked (every segmented
+# packet carries the rewritten DSCP). **retransmit_capture_marked is the authoritative basis for
+# marking correctness** (the sender-side capture looks directly at the wire); false_positives is 0 in all
+# of these five case groups, and the marking mechanism itself has no problem. NetEm on the router receives the segmented packets, so
+# with offload=off the loss really is independent per packet; see section 2.3 of docs/04-performance-report.md.
 name = "retransmit-dscp-mechanism"
 execution_class = "formal-kvm"
 performance_valid = true
@@ -123,10 +123,10 @@ rto_max_congestion_ratio_permille = 0
 enabled = true
 dscp_value = 10
 
-# 用于 (c)：功能关闭对照。跟 bbr-fq 完全一致，只有 retransmit_dscp.enabled
-# 换成 false。不需要对全部 4 个 CC 都重复关闭对照——检测逻辑完全在
-# skyline_tc.bpf.c 里，跟哪种 CC 在跑无关，(a) 已经证明了"对 4 种 CC 一致生
-# 效"，这里只需要证明一次"关掉开关确实不再标记"。
+# Used for (c): the feature-off control. Identical to bbr-fq; only retransmit_dscp.enabled
+# is switched to false. There is no need to repeat the off control for all 4 CCs: the detection logic lives entirely in
+# skyline_tc.bpf.c and does not depend on which CC is running; (a) already proved "works consistently for the 4
+# CCs", so here it only needs to be proved once that "turning the switch off really stops the marking".
 [[profiles]]
 id = "bbr-fq-dscp-off"
 kind = "bbr"
@@ -137,8 +137,8 @@ modules = []
 enabled = false
 dscp_value = 0
 
-# 用于 (d)：DSCP 数值跟踪对照的第二个取值（跟上面 bbr-fq 的 dscp_value=10
-# 对比）。
+# Used for (d): the second value of the DSCP value tracking control (compared with the dscp_value=10 of bbr-fq
+# above).
 [[profiles]]
 id = "bbr-fq-dscp46"
 kind = "bbr"
@@ -149,8 +149,8 @@ modules = []
 enabled = true
 dscp_value = 46
 
-# (a)(c)(d) 共用：中等丢包，offload=off 保证逐包独立随机丢包+抓包不被
-# GSO 超帧干扰，warmup/duration 短——机制验证不是统计实验。
+# Shared by (a)(c)(d): moderate loss; offload=off ensures independent random per-packet loss + captures undisturbed by
+# GSO superframes; short warmup/duration: a mechanism validation is not a statistical experiment.
 [[scenarios]]
 id = "retransmit-mechanism"
 rtt_ms = 100
@@ -164,8 +164,8 @@ parallel = 1
 offload = "off"
 capture_retransmits = true
 
-# (b)：零丢包（netem 层面）负控制——见上方 header 注释，HTB 尾部丢包仍会
-# 产生真实重传，这个场景验证的是"精度门槛在非 netem 丢包源下依然成立"。
+# (b): zero-loss (at the netem level) negative control. See the header comment above: HTB tail drops still
+# produce real retransmissions; what this scenario validates is that "the precision threshold still holds with a non-netem loss source".
 [[scenarios]]
 id = "retransmit-zero-loss"
 rtt_ms = 20

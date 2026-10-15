@@ -1,12 +1,12 @@
-# 带宽敏感性——4 profile（b0-stock-cubic/b1-controlled-cubic/bbr-fq/
-# skyline-best，skyline-best 同 target-box.toml 带 rack_rto+guardrail_gain）×
-# rtt200-loss15 下 rate_mbit ∈ {10,20,30,60,100} × runs=2 = 40 case，
-# ~40 分钟。低带宽端点（10/20 Mbit）覆盖 initial_cwnd_packets=100 可能
-# 直接超过 BDP 的边界——IW 与护栏交互的一个现实约束。
+# Bandwidth sensitivity: 4 profiles (b0-stock-cubic/b1-controlled-cubic/bbr-fq/
+# skyline-best, where skyline-best carries rack_rto+guardrail_gain as in target-box.toml) ×
+# rate_mbit ∈ {10,20,30,60,100} at rtt200-loss15 × runs=2 = 40 cases,
+# ~40 minutes. The low-bandwidth end points (10/20 Mbit) cover the boundary where initial_cwnd_packets=100 may
+# directly exceed the BDP: a real-world constraint on how IW interacts with the guardrail.
 #
-# 不设通过/不通过的数值门槛，只要求诚实报告 4 个 profile 在 5 个带宽点上的
-# 趋势——"数百 Mbps"仍是外推，这里也只覆盖到 100Mbit（offload=off 测试台
-# 结构性上限）。
+# No numeric pass/fail threshold is set; the only requirement is to report honestly the trends of the 4 profiles over the 5 bandwidth
+# points. "Hundreds of Mbps" is still an extrapolation, and this only covers up to 100Mbit (the structural ceiling of the offload=off
+# test bed).
 name = "bandwidth-sweep"
 execution_class = "formal-kvm"
 performance_valid = true

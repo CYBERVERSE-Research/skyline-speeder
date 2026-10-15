@@ -1,22 +1,22 @@
-# M1 tier-2 TCP_RTO_MAX_MS 上限调节——机制 + 方向性烟雾测试。
+# M1 tier-2 TCP_RTO_MAX_MS cap adjustment: mechanism + directional smoke test.
 #
-# 倍数（没有拥塞证据 3x、出现证据 6x base_rtt）是直接拍定的，不再跑矩阵
-# 实验去比较候选值——这份 manifest 只验证机制端到端跑得通、方向对，不追
-# 求统计置信的"最优值"结论，所以 runs=1 让 CV 门槛自动失效。
+# The multipliers (3x base_rtt without congestion evidence, 6x with it) were set directly; no more matrix
+# experiments are run to compare candidate values. This manifest only verifies that the mechanism works end to end and points the right way; it does not
+# seek a statistically confident "optimal value" conclusion, so runs=1 makes the CV threshold drop out automatically.
 #
-# 场景设计的关键约束：真实的 RTO 超时要求一整个飞行窗口内的包全部丢失
-# （否则 RACK 的乱序窗口推断会先把它们当成快速重传处理掉，根本轮不到 RTO
-# 计时器），所以常规的独立同分布随机丢包在飞行窗口有上百个包的场景里很难
-# 可靠触发——这也是为什么 forced-rto-burst 场景故意用低带宽（压小飞行
-# 窗口）+ Gilbert-Elliott 突发丢包模型（burst_length 故意设得比满窗口飞行
-# 量还大，保证坏状态持续时间稳定超过一整个 RTT）而不是调大随机丢包比例。
-# offload=off 是必需的：GSO 打开时 netem 一次丢弃会砍掉一整个 GSO 超帧，
-# "连续 220 个包"的语义会被破坏。
+# The key constraint of the scenario design: a real RTO timeout requires every packet in a whole flight window to be lost
+# (otherwise RACK's reordering-window inference handles them first as fast retransmissions, and the RTO
+# timer never gets a turn), so ordinary i.i.d. random loss can hardly trigger it reliably in scenarios with
+# hundreds of packets in flight. That is also why the forced-rto-burst scenario deliberately uses low bandwidth (to shrink the flight
+# window) + the Gilbert-Elliott burst loss model (burst_length deliberately set larger than a full window's
+# flight, so the bad state reliably lasts longer than a whole RTT) instead of raising the random loss rate.
+# offload=off is required: with GSO on, a single netem drop cuts a whole GSO superframe,
+# breaking the meaning of "220 consecutive packets".
 #
-# rtt200-loss15 是从 target-box.toml 原样复制的一个点（独立同分布
-# 随机丢包，不是突发），作为"没把正常场景的恢复行为搞坏"的回归检查——
-# 这类场景里真实 RTO 事件本就该很少，rtomax-off/rtomax-on 在这里应该基本
-# 没有可观测差异。
+# rtt200-loss15 is a point copied verbatim from target-box.toml (i.i.d.
+# random loss, not bursts), as a regression check that "the recovery behaviour of normal scenarios was not broken";
+# real RTO events should be rare in this kind of scenario anyway, so rtomax-off/rtomax-on should show essentially
+# no observable difference here.
 name = "rto-max-smoke"
 execution_class = "formal-kvm"
 performance_valid = true

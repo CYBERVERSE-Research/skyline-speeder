@@ -28,16 +28,16 @@ METRICS = [
     ("game",  "RTT p50",        "rtt_ms_p50",       "ms",   True,  1),
     ("game",  "RTT p95",        "rtt_ms_p95",       "ms",   True,  1),
     ("game",  "RTT p99",        "rtt_ms_p99",       "ms",   True,  1),
-    ("game",  "卡顿 >150ms",    "stall_150ms",      "次",   True,  0),
-    ("game",  "抖动",           "jitter_ms",        "ms",   True,  1),
-    ("web",   "页面加载",       "pageload_ms_p50",  "ms",   True,  0),
+    ("game",  "stalls >150ms",  "stall_150ms",      "count", True, 0),
+    ("game",  "jitter",         "jitter_ms",        "ms",   True,  1),
+    ("web",   "page load",      "pageload_ms_p50",  "ms",   True,  0),
     ("web",   "TTFB p95",       "ttfb_ms_p95",      "ms",   True,  1),
-    ("video", "分块 p50",       "chunk_ms_p50",     "ms",   True,  0),
-    ("video", "分块 p95",       "chunk_ms_p95",     "ms",   True,  0),
-    ("video", "启动延迟",       "startup_ms",       "ms",   True,  0),
-    ("video", "卡顿次数",       "rebuffer_events",  "次",   True,  0),
-    ("bulk1", "吞吐",           "goodput_mbps",     "Mbps", False, 1),
-    ("bulk4", "吞吐",           "goodput_mbps",     "Mbps", False, 1),
+    ("video", "chunk p50",      "chunk_ms_p50",     "ms",   True,  0),
+    ("video", "chunk p95",      "chunk_ms_p95",     "ms",   True,  0),
+    ("video", "startup delay",  "startup_ms",       "ms",   True,  0),
+    ("video", "rebuffer events", "rebuffer_events", "count", True, 0),
+    ("bulk1", "throughput",     "goodput_mbps",     "Mbps", False, 1),
+    ("bulk4", "throughput",     "goodput_mbps",     "Mbps", False, 1),
 ]
 
 
@@ -73,25 +73,25 @@ def main(path, probe_path=None):
     if probe_path:
         try:
             probes = [json.loads(l) for l in open(probe_path) if l.strip()]
-            print("## 链路状态（每轮开始时实测）\n")
-            print("| 轮次 | " + " | ".join(str(p["rot"]) for p in probes) + " |")
+            print("## Path conditions (measured at the start of each rotation)\n")
+            print("| Rotation | " + " | ".join(str(p["rot"]) for p in probes) + " |")
             print("|---|" + "---|" * len(probes))
             print("| RTT avg ms | " + " | ".join(
                 f'{p["rtt_avg_ms"]:.1f}' if p.get("rtt_avg_ms") is not None else "-"
                 for p in probes) + " |")
-            print("| 丢包 % | " + " | ".join(
+            print("| Loss % | " + " | ".join(
                 f'{p["loss_pct"]:.0f}' if p.get("loss_pct") is not None else "-"
                 for p in probes) + " |")
             print()
         except (OSError, ValueError, KeyError):
             pass
 
-    print("## 逐轮原始数据\n")
+    print("## Raw data per rotation\n")
     for scen, name, field, unit, lower, nd in METRICS:
         if scen not in by:
             continue
-        print(f"**{scen} · {name} ({unit})** — {'越低越好' if lower else '越高越好'}\n")
-        print("| 算法 | " + " | ".join(f"第{r}轮" for r in rots) + " | 中位数 | IQR |")
+        print(f"**{scen} · {name} ({unit})** — {'lower is better' if lower else 'higher is better'}\n")
+        print("| Algorithm | " + " | ".join(f"Rotation {r}" for r in rots) + " | Median | IQR |")
         print("|---|" + "---|" * (len(rots) + 2))
         for a in ALGOS:
             cells, vals = [], []
@@ -111,9 +111,10 @@ def main(path, probe_path=None):
             print(f"| {LABEL[a]} | " + " | ".join(cells) + f" | **{med}** | {iqr} |")
         print()
 
-    print("## 轮内胜率（不受链路漂移影响）\n")
-    print("在每一轮里，三者面对的是同一时段的链路。统计每轮谁排第一。\n")
-    print("| 指标 | " + " | ".join(LABEL[a] for a in ALGOS) + " | 有效轮次 |")
+    print("## Within-rotation win rate (unaffected by path drift)\n")
+    print("Within each rotation, the three face the path during the same period. "
+          "The table counts who ranked first in each rotation.\n")
+    print("| Metric | " + " | ".join(LABEL[a] for a in ALGOS) + " | Valid rotations |")
     print("|---|---|---|---|---|")
     for scen, name, field, unit, lower, nd in METRICS:
         if scen not in by:
@@ -139,8 +140,8 @@ def main(path, probe_path=None):
                   " | ".join(f"{wins[a]}" for a in ALGOS) + f" | {valid} |")
     print()
 
-    print("## 服务端代价（全部场景累计）\n")
-    print("| 指标 | " + " | ".join(LABEL[a] for a in ALGOS) + " |")
+    print("## Server-side cost (all scenarios combined)\n")
+    print("| Metric | " + " | ".join(LABEL[a] for a in ALGOS) + " |")
     print("|---|---|---|---|")
     agg = {a: defaultdict(int) for a in ALGOS}
     for scen in by:
@@ -148,12 +149,13 @@ def main(path, probe_path=None):
             for rec in by[scen].get(a, {}).values():
                 for k, v in (rec.get("server") or {}).items():
                     agg[a][k] += v
-    rows = [("重传占比 %（重传 ÷ 全部发出）", retrans_share, 2),
-            ("新数据报文段（TcpOutSegs，不含重传）", lambda d: d.get("TcpOutSegs"), 0),
-            ("重传报文段", lambda d: d.get("TcpRetransSegs"), 0),
-            ("RTO 超时", lambda d: d.get("TcpExtTCPTimeouts"), 0),
-            ("快速重传", lambda d: d.get("TcpExtTCPFastRetrans"), 0),
-            ("白重传 DSACK", lambda d: d.get("TcpExtTCPDSACKRecv"), 0)]
+    rows = [("Retransmission share % (retransmitted ÷ all sent)", retrans_share, 2),
+            ("New-data segments (TcpOutSegs, excluding retransmissions)",
+             lambda d: d.get("TcpOutSegs"), 0),
+            ("Retransmitted segments", lambda d: d.get("TcpRetransSegs"), 0),
+            ("RTO timeouts", lambda d: d.get("TcpExtTCPTimeouts"), 0),
+            ("Fast retransmits", lambda d: d.get("TcpExtTCPFastRetrans"), 0),
+            ("Spurious retransmissions (DSACK)", lambda d: d.get("TcpExtTCPDSACKRecv"), 0)]
     for label, fn, nd in rows:
         cells = []
         for a in ALGOS:

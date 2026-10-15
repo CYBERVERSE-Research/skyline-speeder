@@ -129,7 +129,7 @@ def _footnotes_for_version(version_entry):
 
 
 def render_main_table(versions):
-    header = ["版本"] + STAGE_ORDER
+    header = ["Version"] + STAGE_ORDER
     lines = [
         "| " + " | ".join(header) + " |",
         "|" + "---|" * len(header),
@@ -145,7 +145,7 @@ def render_main_table(versions):
 
 
 def render_capabilities_table(versions):
-    header = ["版本"] + CAPABILITY_KEYS + ["notes"]
+    header = ["Version"] + CAPABILITY_KEYS + ["notes"]
     lines = [
         "| " + " | ".join(header) + " |",
         "|" + "---|" * len(header),
@@ -163,7 +163,7 @@ def render_capabilities_table(versions):
 
 
 def render_artifacts_table(versions):
-    header = ["版本", "config sha256", "vmlinux sha256", "vmlinux.h sha256", "build_seconds"]
+    header = ["Version", "config sha256", "vmlinux sha256", "vmlinux.h sha256", "build_seconds"]
     lines = [
         "| " + " | ".join(header) + " |",
         "|" + "---|" * len(header),
@@ -226,19 +226,22 @@ def render_report(summary):
         )
 
     sections = [
-        "# 多内核版本适配性验证报告",
+        "# Multi-kernel-version compatibility validation report",
         "",
-        "**本轮为适配性冒烟验证，不是性能验证。** `performance_valid=true` "
-        "（如果某个 case 的 manifest 这样标）只是 `formal-kvm` execution_class "
-        "的 schema 约束，本报告任何数字都不得解释为算法收益结论——不做吞吐/"
-        "goodput 对比、不做 CV 门槛、不做 B1/B2 中性性、不做多 CC 性能矩阵、"
-        "不做超参 sweep，也不是目标环境网格级别的验证。",
+        "**This round is a compatibility smoke validation, not a performance validation.** "
+        "`performance_valid=true` (if a case's manifest is marked that way) is only a schema "
+        "constraint of the `formal-kvm` execution_class; no number in this report may be "
+        "interpreted as a conclusion about algorithm gains: no throughput/goodput comparison, "
+        "no CV threshold, no B1/B2 neutrality, no multi-CC performance matrix, no "
+        "hyperparameter sweep, and not a validation at the level of the target environment "
+        "grid either.",
         "",
-        f"版本总数: {len(versions)}　通过: {passed}　失败: {failed}　进行中: {running}",
+        f"Total versions: {len(versions)}, passed: {passed}, failed: {failed}, "
+        f"in progress: {running}",
         stale_header_warning,
-        "## 环境冻结",
+        "## Frozen environment",
         "",
-        "| 字段 | 值 |",
+        "| Field | Value |",
         "|---|---|",
     ]
     env_fields = [
@@ -256,34 +259,38 @@ def render_report(summary):
 
     sections += [
         "",
-        "## 版本 × 检查项",
+        "## Version × checks",
         "",
         main_table,
         "",
     ]
     if footnotes:
-        sections.append("### 失败详情")
+        sections.append("### Failure details")
         sections.append("")
         sections += [f"- {note}" for note in footnotes]
         sections.append("")
 
     sections += [
-        "## 版本 × capabilities",
+        "## Version × capabilities",
         "",
         render_capabilities_table(versions),
         "",
-        "## 构建产物",
+        "## Build artifacts",
         "",
         render_artifacts_table(versions),
         "",
-        "## 已知限制",
+        "## Known limitations",
         "",
-        "- 不做吞吐/goodput 对比、CV 门槛、B1/B2 中性性、多 CC 性能矩阵、超参 "
-        "sweep，也不是目标环境网格级别的验证。",
-        "- `rack_reo_hook` 预期恒为 false（探测的是自定义内核补丁，上游内核本"
-        "就没有）——只记录、不作为失败判据；跨版本取值若变化才值得留意。",
-        "- IPv6 冒烟分两级：L1（连通性 + 不崩溃）恒跑；L2（标记正确性）取决于"
-        "当时 IPv6 支持是否已落地，落地前记 skip，不是 fail。",
+        "- No throughput/goodput comparison, CV threshold, B1/B2 neutrality, multi-CC "
+        "performance matrix or hyperparameter sweep, and not a validation at the level of "
+        "the target environment grid either.",
+        "- `rack_reo_hook` is expected to always be false (it probes for a custom kernel "
+        "patch that upstream kernels do not have in the first place): it is only recorded, "
+        "not used as a failure criterion; only a change in its value across versions is "
+        "worth noticing.",
+        "- The IPv6 smoke test has two levels: L1 (connectivity + no crash) always runs; "
+        "L2 (marking correctness) depends on whether IPv6 support had landed at the time; "
+        "before it lands it is recorded as skip, not fail.",
     ]
     return "\n".join(sections) + "\n"
 

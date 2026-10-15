@@ -1,21 +1,21 @@
-# 目标box全9点网格——覆盖 b0-stock-cubic（真正未改动的内核默认：
-# fq_codel + 默认 sysctl）与真正激活的 M1 tier-2 rack_rto。
+# The full 9-point target box grid: covers b0-stock-cubic (the truly unmodified kernel default:
+# fq_codel + default sysctls) and a truly activated M1 tier-2 rack_rto.
 #
-# skyline-best 显式带上 [profiles.rack_rto]（enabled=true，与
-# config/speeder.toml 出厂默认一致：srtt_permille=1100/floor_us=20000/
+# skyline-best explicitly carries [profiles.rack_rto] (enabled=true, matching the
+# shipped defaults of config/speeder.toml: srtt_permille=1100/floor_us=20000/
 # ceiling_us=200000/warmup_samples=4/rto_max_normal_permille=3000/
-# rto_max_congested_permille=6000），module_config 显式写全部字段（含
-# guardrail_gain=0.8，不依赖脚本默认值）。
+# rto_max_congested_permille=6000), and module_config explicitly writes every field (including
+# guardrail_gain=0.8, not relying on the script's defaults).
 #
-# 5 profile（b0/b1/bbr-fq/b2-skyline-base/skyline-best）× 9 场景（rtt{100,200,300}
-# × loss{10,15,20}%，rate_mbit=100，offload=off）× runs=2 = 90 case，
-# ~75-90 分钟。
+# 5 profiles (b0/b1/bbr-fq/b2-skyline-base/skyline-best) × 9 scenarios (rtt{100,200,300}
+# × loss{10,15,20}%, rate_mbit=100, offload=off) × runs=2 = 90 cases,
+# ~75-90 minutes.
 #
-# 验收：主判据 median(skyline-best) >= 1.05 * max(median(b0), median(b1),
-# median(bbr))；稳健性判据 min_over_runs(skyline-best) >
-# max_over_runs(baseline)（BBR 在部分点双峰分布，n=2 时用它的 median 做门
-# 槛不稳，改用"最小值仍大于对方任何一次跑出来的最大值"这种不受抽样运气
-# 影响的判据）。不达标点如实记录，不隐藏、不为了让某一项通过而重跑挑数据。
+# Acceptance: primary criterion median(skyline-best) >= 1.05 * max(median(b0), median(b1),
+# median(bbr)); robustness criterion min_over_runs(skyline-best) >
+# max_over_runs(baseline) (BBR has a bimodal distribution at some points, and with n=2 its median is an unstable
+# threshold, so this uses "the minimum is still above any maximum the other side ever produced", a criterion
+# not affected by sampling luck). Points that miss are recorded as they are: not hidden, and not rerun to cherry-pick data so that some item passes.
 name = "target-box"
 execution_class = "formal-kvm"
 performance_valid = true

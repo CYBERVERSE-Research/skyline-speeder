@@ -1,14 +1,14 @@
-# 中性性复核。guardrail_gain 已核对代码：queue_clamped 的增益钳位只发生
-# 在 M2 开启（skyline_set_cwnd_target）/M4 开启（skyline_apply_pacing）这两条路径
-# 里，b2-skyline-base 全模块关闭时完全不会经过这两个函数，理论上不影响这条
-# 中性基线；花小成本用真实测试确认一次比只依赖代码推理更可靠。
+# Neutrality recheck. guardrail_gain has been checked against the code: the gain clamp of queue_clamped only happens
+# on the two paths with M2 on (skyline_set_cwnd_target) / M4 on (skyline_apply_pacing);
+# b2-skyline-base with all modules off never goes through these two functions, so in theory it does not affect this
+# neutral baseline; confirming it once with a real test at small cost is more reliable than relying on code reasoning alone.
 #
-# 3 profile（b1-controlled-cubic/b2-skyline-base/skyline-best，skyline-best 同
-# target-box.toml 带 rack_rto+guardrail_gain）× 4 场景（0%~0.5%丢包）
-# × runs=2 = 24 case，~25 分钟。
+# 3 profiles (b1-controlled-cubic/b2-skyline-base/skyline-best, where skyline-best carries
+# rack_rto+guardrail_gain as in target-box.toml) × 4 scenarios (0%~0.5% loss)
+# × runs=2 = 24 cases, ~25 minutes.
 #
-# 验收：沿用 analyze_results.py 现成的 B1/B2 门槛（line-rate 场景 goodput
-# 差异 ±3%、P95 RTT 差异 ±10%）。
+# Acceptance: reuses the existing B1/B2 thresholds of analyze_results.py (in the line-rate scenario, goodput
+# difference ±3%, P95 RTT difference ±10%).
 name = "neutrality"
 execution_class = "formal-kvm"
 performance_valid = true

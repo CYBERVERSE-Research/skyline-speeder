@@ -1,25 +1,25 @@
-# 重传包 DSCP 标记——IPv6 机制验证。跟 retransmit-dscp-mechanism.toml
-# 是同一份验证的双栈孪生：profile 定义逐字复制（CC/modules 跟地址族无
-# 关，检测逻辑本身也是——见 bpf/skyline_tc.bpf.c 的 skyline_parse_ipv6()），唯一
-# 差异是两个 scenario 都加了 address_family = "v6"，manifest 级多一个
-# server_data_ip6。完整原理性说明（四组 case 分别验证什么、
-# retransmit_marked 跟 retransmit_capture_marked 的口径差异）见
-# retransmit-dscp-mechanism.toml 的头注释，这里不重复。
+# Retransmitted-packet DSCP marking: IPv6 mechanism validation. The dual-stack twin of the same validation as
+# retransmit-dscp-mechanism.toml: the profile definitions are copied verbatim (CC/modules have nothing to do with the address
+# family, and neither does the detection logic itself; see skyline_parse_ipv6() in bpf/skyline_tc.bpf.c); the only
+# difference is that both scenarios add address_family = "v6", and the manifest level has one more field,
+# server_data_ip6. For the full explanation of the principles (what each of the four case groups verifies, and
+# the difference in what retransmit_marked and retransmit_capture_marked count), see
+# the header comment of retransmit-dscp-mechanism.toml; it is not repeated here.
 #
-# IPv6 专属的验证点（v4 版本测不出来的）：
-#   - skyline_parse_ipv6() 的扩展头遍历/DSCP 读写路径本身是否正确——已通过独立
-#     spike（bpftool prog run 构造报文）和真实抓包验证过，这份 manifest
-#     是端到端集成验证，不是重新做 spike。
-#   - retransmit_dscp.stats 的 ipv6_marked/ipv6_chain_bailout 两个新计数
-#     器在真实流量下的行为（marked 应随真实重传增长，bailout 应保持在
-#     "非 TCP 背景流量"的基线附近，不应该异常飙高——见 skyline_abi.h 里
-#     ipv6_chain_bailout 的注释）。
-#   - analyze_results.py 的 IPv6 tcpdump 单行格式解析器（跟 IPv4 的
-#     header+缩进两行格式结构不同，已用真实抓包样本验证，见
-#     research/experiments/tests/test_analysis.py 的 *_ipv6 测试）。
+# Validation points specific to IPv6 (which the v4 version cannot measure):
+#   - whether the extension-header walk/DSCP read-write path of skyline_parse_ipv6() is itself correct: already verified through a separate
+#     spike (packets constructed with bpftool prog run) and real packet captures; this manifest
+#     is an end-to-end integration validation, not a redo of the spike.
+#   - the behaviour under real traffic of the two new counters ipv6_marked/ipv6_chain_bailout in
+#     retransmit_dscp.stats (marked should grow with real retransmissions; bailout should stay near
+#     the baseline of "non-TCP background traffic" and should not spike abnormally; see the comment on
+#     ipv6_chain_bailout in skyline_abi.h).
+#   - the IPv6 tcpdump single-line format parser in analyze_results.py (structured differently from IPv4's
+#     two-line header+indented format; already verified with real capture samples, see the
+#     *_ipv6 tests in research/experiments/tests/test_analysis.py).
 #
-# 地址：infra/topology.sh 的 fd20:1::/64（server 侧）/ fd20:2::/64
-# （client 侧）ULA 编址，跟 IPv4 的 10.20.1.0/24 / 10.20.2.0/24 一一对应。
+# Addresses: the fd20:1::/64 (server side) / fd20:2::/64
+# (client side) ULA addressing of infra/topology.sh, corresponding one to one to IPv4's 10.20.1.0/24 / 10.20.2.0/24.
 name = "retransmit-dscp-mechanism-v6"
 execution_class = "formal-kvm"
 performance_valid = true
@@ -100,8 +100,8 @@ rto_max_congestion_ratio_permille = 0
 enabled = true
 dscp_value = 10
 
-# 用于关闭对照。跟 bbr-fq 完全一致，只有 retransmit_dscp.enabled 换成
-# false——跟 v4 版本同样的理由，只需要证明一次"关掉开关确实不再标记"。
+# Used as the off control. Identical to bbr-fq; only retransmit_dscp.enabled is switched to
+# false. Same reason as in the v4 version: it only needs to prove once that "turning the switch off really stops the marking".
 [[profiles]]
 id = "bbr-fq-dscp-off"
 kind = "bbr"
@@ -112,7 +112,7 @@ modules = []
 enabled = false
 dscp_value = 0
 
-# 用于 DSCP 数值跟踪对照的第二个取值。
+# A second value, used as the control for tracking the DSCP value.
 [[profiles]]
 id = "bbr-fq-dscp46"
 kind = "bbr"

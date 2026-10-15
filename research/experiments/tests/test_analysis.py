@@ -81,8 +81,8 @@ class AnalysisTests(unittest.TestCase):
                 performance_valid=False,
             )
             text = report.read_text(encoding="utf-8")
-            self.assertIn("不代表 KVM、裸机或生产环境性能", text)
-            self.assertNotIn("B1/B2 中性底座门槛", text)
+            self.assertIn("do not represent KVM, bare-metal or production performance", text)
+            self.assertNotIn("B1/B2 neutral baseline gate", text)
 
     def test_load_runs_selects_latest_attempt(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -592,7 +592,7 @@ class AnalysisTests(unittest.TestCase):
             report = Path(directory) / "report.md"
             write_report(report, self._core_rows(), summary)
             text = report.read_text(encoding="utf-8")
-            self.assertIn("B2 在线速场景相对 B1 的", text)
+            self.assertIn("B2 relative to B1 in the line rate scenario:", text)
             self.assertIn("vs B1", text)
 
     def test_write_report_custom_parity_profiles(self):
@@ -622,7 +622,7 @@ class AnalysisTests(unittest.TestCase):
                 table_effect_key="sw",
             )
             text = report.read_text(encoding="utf-8")
-            self.assertIn("sw-base-rto 在primary场景相对 sw-base 的", text)
+            self.assertIn("sw-base-rto relative to sw-base in the primary scenario:", text)
             self.assertIn("vs SW", text)
 
 

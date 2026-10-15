@@ -1,65 +1,72 @@
-# Skyline Speeder —— Agent 部署手册
+# Skyline Speeder — Agent deployment manual
 
-面向**自动化 agent 与无人值守脚本**的确定性部署与运维手册，也是本项目**唯一**的部署文档：
-部署前判断、安装、验证、调参入口、升级、排障与卸载都在这里，人类运维同样照它操作。每一步
-都给出可由机器判定的成功条件，以及已知失败模式的处置。
+A deterministic deployment and operations manual for **automated agents and unattended scripts**, and the
+**only** deployment document of this project: pre-deployment assessment, installation, verification, where to
+tune, upgrades, troubleshooting and uninstallation are all here, and human operators follow it too. Every step
+gives a success condition a machine can check, and what to do about the known failure modes.
 
-- 新手调参、现成配方、连接卡顿排查：[docs/usage.md](docs/usage.md)
-- 每个命令、字段、配置项的精确定义：[docs/02-interface-reference.md](docs/02-interface-reference.md)
-- 算法原理：[docs/03-design.md](docs/03-design.md)；性能数据与适用边界：[docs/04-performance-report.md](docs/04-performance-report.md)
+- Tuning for newcomers, ready-made recipes, troubleshooting stalled connections: [docs/usage.md](docs/usage.md)
+- The exact definition of every command, field and configuration key: [docs/02-interface-reference.md](docs/02-interface-reference.md)
+- How the algorithm works: [docs/03-design.md](docs/03-design.md); performance data and where it applies: [docs/04-performance-report.md](docs/04-performance-report.md)
 
-**约定**
+**Conventions**
 
-- 所有命令以 root 执行。普通用户在命令前加 `sudo`；引导脚本的管道写成 `| sudo bash`，要把环境变量
-  带进去时用 `sudo -E`。
-- 退出码非零即失败，不要继续下一步。例外都在原处写明：`ssctl drain` 超时（§11.1）、`--check` 的
-  告警（§2.2）。
-- 命令按 systemd 写，OpenRC（Alpine）的写法见 §12 的对照表。
+- All commands run as root. As an ordinary user, prefix them with `sudo`; pipe the bootstrap script into
+  `| sudo bash`, and use `sudo -E` when environment variables have to be passed through.
+- A non-zero exit code is a failure: do not go on to the next step. The exceptions are stated where they occur:
+  an `ssctl drain` timeout (section 11.1) and the warnings of `--check` (section 2.2).
+- Commands are written for systemd; for the OpenRC (Alpine) equivalents see the table in section 12.
 
-从 `ssctl status --json` 取值用下面这个函数，每个新 shell 里先定义一次。它和 `install.sh` 用的是同一个办法：
-`ssctl` 输出的 JSON 一行一个键，取某个键**第一次出现**的值，不依赖 python3 或 jq（精简镜像上没有）。
-`version`、`enabled` 是 `status` 的头两个字段，`armed` 只出现在 `guard` 里，所以第一次出现的正是要的那个。
-v0.2.0 及更早的 `ssctl` 不认识 `--json`（它不带参数就输出 JSON），函数这时退回不带参数的 `ssctl status`：
+Read values out of `ssctl status --json` with the function below; define it once in every new shell. It works
+the way `install.sh` does: the JSON `ssctl` prints has one key per line, and the function takes the value of
+the **first occurrence** of a key, without depending on python3 or jq (minimal images lack them).
+`version` and `enabled` are the first two fields of `status`, and `armed` appears only inside `guard`, so the
+first occurrence is exactly the one wanted. `ssctl` v0.2.0 and earlier does not know `--json` (it prints JSON
+without arguments); the function then falls back to `ssctl status` without arguments:
 
 ```sh
 sv() { { ssctl status --json 2>/dev/null || ssctl status 2>/dev/null; } \
          | awk -v k="\"$1\":" '!f && $1 == k { v = $2; gsub(/[",]/, "", v); print v; f = 1 }'; }
-sv enabled    # true / false：skyline_cc 是否已挂载
-sv version    # 正在运行的 daemon 的版本；v0.2.0 及更早的 daemon 不报告版本，为空
-sv armed      # guard 是否武装
+sv enabled    # true / false: whether skyline_cc is attached
+sv version    # version of the running daemon; empty for daemons v0.2.0 and earlier, which do not report one
+sv armed      # whether the guard is armed
 ```
 
 > [!WARNING]
-> 不要用 `ssctl status --json | grep -q '"enabled": true'` 判断是否挂载：0.4.0 起 JSON 里还有默认
-> 为 `true` 的 `redundancy.config.enabled`，什么都没挂载时这条 grep 也成立。
+> Do not test whether it is attached with `ssctl status --json | grep -q '"enabled": true'`: since 0.4.0 the
+> JSON also has `redundancy.config.enabled`, which defaults to `true`, so that grep succeeds even when nothing
+> is attached.
 
 ---
 
-## 0. 速查
+## 0. Quick reference
 
-### 0.1 安装
+### 0.1 Installation
 
 ```bash
-# 有源码树（仓库根目录）
-./install.sh                  # 默认：装最新发布的预编译产物；本机跑不了时自动改为源码构建（§2.1）
-./install.sh --source         # 在本机从这份源码树构建
+# With a source tree (repository root)
+./install.sh                  # default: install the latest published prebuilt artifact; build from source automatically when this host cannot run it (section 2.1)
+./install.sh --source         # build from this source tree on this host
 
-# 没有源码树：Debian/Ubuntu、Fedora 与 RHEL 系（没有 curl 的先 apt-get/dnf install -y curl）
+# Without a source tree: Debian/Ubuntu, Fedora and the RHEL family (without curl, first apt-get/dnf install -y curl)
 curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | bash
-# Alpine：只有 busybox 的 wget，没有 curl 和 bash，引导脚本会补上
+# Alpine: only busybox's wget, no curl and no bash; the bootstrap script adds them
 wget -qO- https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sh
 ```
 
-`scripts/bootstrap.sh` 把源码树放到 `/usr/local/src/skyline-speeder`（已有的旧树挪成
-`<目录>.bak-<时间戳>`，不删除），按本机的包管理器补上缺的 `curl`、`bash`、`tar`，然后执行那里的
-`install.sh`。其余参数原样转交：`... | bash -s -- --source`（Alpine 是 `... | sh -s -- --source`）。
-它运行的 `install.sh` 来自 `--ref`（默认 `main`），装上的产物却来自最新 release（或 `--release` 指定
-的那个）：`--ref` 选的是安装器，不是安装的版本。之后升级或卸载可以直接用那份树：
-`/usr/local/src/skyline-speeder/install.sh --uninstall`；经引导脚本传 `--uninstall` 时它也直接用这份树，
-不再下载。没有这份树时，经引导脚本的 `--uninstall` 与 `--check` 直接运行下载来的安装器，不放置、也不挪动
-任何源码树。每次经引导脚本升级都多出一份 `<目录>.bak-<时间戳>`，多于一份时它提醒清理（它自己从不删除）。
+`scripts/bootstrap.sh` puts the source tree at `/usr/local/src/skyline-speeder` (an existing old tree is moved
+to `<dir>.bak-<timestamp>`, not deleted), installs whatever of `curl`, `bash` and `tar` is missing with the
+host's package manager, and then runs the `install.sh` there. Other arguments are passed through unchanged:
+`... | bash -s -- --source` (on Alpine, `... | sh -s -- --source`). The `install.sh` it runs comes from `--ref`
+(default `main`), but the artifact it installs comes from the latest release (or the one `--release` names):
+`--ref` chooses the installer, not the version installed. Later upgrades or an uninstall can use that tree
+directly: `/usr/local/src/skyline-speeder/install.sh --uninstall`; when `--uninstall` is passed through the
+bootstrap script, it also uses this tree directly and downloads nothing. Without that tree, `--uninstall` and
+`--check` through the bootstrap script run the downloaded installer directly, and place or move no source tree.
+Every upgrade through the bootstrap script leaves one more `<dir>.bak-<timestamp>`; when there is more than
+one, it reminds you to clean them up (it never deletes anything itself).
 
-### 0.2 成功判据
+### 0.2 Success criteria
 
 ```sh
 v=$(skyline-speederd --version 2>/dev/null | awk '{print $2}')
@@ -68,47 +75,58 @@ v=$(skyline-speederd --version 2>/dev/null | awk '{print $2}')
   && { [ -z "$v" ] || [ "$(sv version)" = "$v" ]; }
 ```
 
-三条依次确认：全机默认算法是 `skyline_cc`；daemon 自己报告已挂载（只看 sysctl 不够：daemon 被外部
-杀掉之后，默认值可能还指着已经注销的 `skyline_cc`）；内存里跑的就是刚装上的版本
-（`--version` 读磁盘上的二进制，`status` 的 `version` 来自正在运行的进程，不一致说明还没有重启到新版本）。
-v0.2.0 及更早的二进制没有 `--version`，第三条随之跳过。按设计不挂载的 `--no-enable` 安装（§2.2）
-不适用这组判据。
+The three conditions confirm, in order: the host-wide default algorithm is `skyline_cc`; the daemon itself
+reports that it is attached (the sysctl alone is not enough: after the daemon is killed from outside, the
+default can still point at a `skyline_cc` that has been unregistered); and what runs in memory is the version
+just installed (`--version` reads the binary on disk, the `version` of `status` comes from the running process;
+if they differ, the daemon has not been restarted into the new version yet). Binaries v0.2.0 and earlier have
+no `--version`, and the third condition is skipped with it. These criteria do not apply to a `--no-enable`
+install (section 2.2), which by design does not attach.
 
-### 0.3 输出与退出码
+### 0.3 Output and exit codes
 
-- stdout 不是终端时（agent、CI、重定向到文件），每一步开始、结束各打印一行
-  `[ n/N] <步骤名>` / `[ n/N] done in <耗时>`，最后一行是 `all N steps done in <耗时>`，随后是安装摘要
-  与使用指南；终端上则是一行原地刷新的进度条。N 是 9（预编译）或 11（源码构建），`--no-enable` 时各少 2。
-- `--verbose`（或环境变量 `SKYLINE_VERBOSE=1`）不画进度条：步骤行变成 `==> (n/N) <步骤名>`，没有
-  `done in` 与 `all N steps` 两种行，每条子命令的输出同时打到屏幕。
-- `warn …` 与 `error …` 写到 stderr，进度与摘要写到 stdout。
-- 包管理器、rustup、make、cargo 与验证器的全部输出写进 `/var/log/skyline-speeder-install.log`，每次安装
-  开头清空、结束后保留（`--check` 与 `--uninstall` 不写它）。某一步失败时打印 `error <原因>`、这一步在
-  日志里的最后至多 25 行和日志路径，退出码非零。Ctrl-C 中断时退出码为 130，后台的构建进程一并结束。
-- 耗时：预编译安装通常在一分钟以内，升级时再加最多 60 秒的 drain（§10）；源码构建在 1 vCPU 的主机上要
-  5–10 分钟，Alpine 更久。超时要留足。
+- When stdout is not a terminal (an agent, CI, a redirect to a file), each step prints one line when it starts
+  and one when it ends, `[ n/N] <step name>` / `[ n/N] done in <elapsed>`; the last such line is
+  `all N steps done in <elapsed>`, followed by the install summary and the usage guide. On a terminal it is a
+  single progress bar refreshed in place. N is 9 (prebuilt) or 11 (source build), 2 fewer each with
+  `--no-enable`.
+- `--verbose` (or the environment variable `SKYLINE_VERBOSE=1`) draws no progress bar: step lines become
+  `==> (n/N) <step name>`, there are no `done in` or `all N steps` lines, and the output of every subcommand
+  also goes to the screen.
+- `warn …` and `error …` go to stderr; progress and the summary go to stdout.
+- All output of the package manager, rustup, make, cargo and the verifier goes to
+  `/var/log/skyline-speeder-install.log`, which is emptied at the start of every install and kept afterwards
+  (`--check` and `--uninstall` do not write it). When a step fails, the installer prints `error <reason>`, at
+  most the last 25 lines of that step in the log, and the log path, and exits non-zero. Interrupted with
+  Ctrl-C, it exits with 130, and background build processes end with it.
+- Duration: a prebuilt install usually takes under a minute, plus up to 60 seconds of drain on an upgrade
+  (section 10); a source build takes 5–10 minutes on a 1-vCPU host, longer on Alpine. Allow generous timeouts.
 
 ---
 
-## 1. 部署前判断
+## 1. Pre-deployment assessment
 
-### 1.1 它装在哪、动了什么
+### 1.1 Where it goes and what it changes
 
-- **只部署在发送数据的那一端**（通常是服务器）。客户端保持标准 TCP，不需要任何改动。所以加速的是这台
-  机器**发出去**的数据：用户下载变快，上传不会。
-- `ssctl enable`（安装器自动执行）**全机生效**：之后这台机器上所有新建的 TCP 连接默认都走 `skyline_cc`，
-  不只是某个进程（§5.2）。
-- 挂载期间 `skyline-speederd` 独占三项设置：默认拥塞控制、`net.core.default_qdisc` 与出口网卡的根
-  qdisc（§9）。安装器不装代理、不开任何端口。
+- **Deploy it only on the end that sends the data** (usually the server). Clients stay on standard TCP and
+  need no change. So what it accelerates is the data this host **sends**: users' downloads get faster, uploads
+  do not.
+- `ssctl enable` (which the installer runs automatically) **takes effect host-wide**: from then on every new
+  TCP connection on this host uses `skyline_cc` by default, not just some process (section 5.2).
+- While attached, `skyline-speederd` exclusively owns three settings: the default congestion control,
+  `net.core.default_qdisc` and the root qdisc of the egress NIC (section 9). The installer installs no proxy and
+  opens no port.
 
-### 1.2 链路适用性
+### 1.2 Link suitability
 
 > [!WARNING]
-> 自保护机制只认两个真实拥塞信号：排队时延增长与 ECN 标记。它的前提是**丢包本身不代表拥塞**。如果链路
-> 的丢包其实来自设备排队溢出，丢包补偿与排队护栏会朝相反方向用力，只会更糟。它也不追求公平，不会刻意和
-> 竞争的流平分链路。
+> The self-protection mechanisms recognize only two real congestion signals: growing queueing delay and ECN
+> marks. They assume that **loss by itself does not mean congestion**. If the link's loss actually comes from
+> queue overflow in a device, loss compensation and the queueing guardrail pull in opposite directions and only
+> make things worse. Nor does it aim for fairness: it makes no deliberate effort to share the link evenly with
+> competing flows.
 
-判别方法：在对端跑 `iperf3 -s`，从本机发固定速率的 UDP，逐级加压：
+How to tell: run `iperf3 -s` on the peer and send fixed-rate UDP from this host, stepping up the load:
 
 ```bash
 for r in 100M 200M 400M 800M; do
@@ -116,300 +134,345 @@ for r in 100M 200M 400M 800M; do
 done
 ```
 
-| 观察结果 | 结论 |
+| Observation | Conclusion |
 |---|---|
-| UDP 各速率**都零丢包**，而 TCP 大量重传 | 丢包是自身突发造成的排队溢出，**不适用** |
-| UDP 在低速率下就有稳定丢包 | 链路层随机丢包，适用 |
-| 低速不丢，速率一高才丢 | 把链路撑满了，属于拥塞丢包，**不适用** |
+| UDP shows **zero loss at every rate**, while TCP retransmits heavily | The loss is queue overflow caused by its own bursts: **not suitable** |
+| UDP has steady loss even at low rates | Random link-layer loss: suitable |
+| No loss at low rates, loss only once the rate is high | The link is being filled: congestion loss, **not suitable** |
 
-ICMP 的丢包率**不能**作为判据：多数网络对 ICMP 限速，它和数据面的丢包无关。其余已知的有效性边界与
-局限见 `docs/04-performance-report.md` 第 8 节。
+ICMP loss rate **cannot** serve as the criterion: most networks rate-limit ICMP, and it has nothing to do with
+data-plane loss. For the other known validity boundaries and limitations see
+`docs/04-performance-report.md` section 8.
 
-### 1.3 硬性前置条件
+### 1.3 Hard prerequisites
 
-| 条件 | 判定命令 | 要求 |
+| Condition | Check command | Requirement |
 |---|---|---|
-| 内核版本 | `uname -r` | **>= 6.12**（ABI 下限 6.10，见下） |
-| 内核 BTF | `test -r /sys/kernel/btf/vmlinux` | 存在（`CONFIG_DEBUG_INFO_BTF=y`） |
-| cgroup v2 | `test -e /sys/fs/cgroup/cgroup.controllers` | 以 unified 方式挂在 `/sys/fs/cgroup`（OpenRC 主机上由 `cgroups` 服务挂载，安装器会启动它） |
-| `fq` qdisc | `modprobe sch_fq` | 内置或可加载 |
-| struct_ops | §4 能力报告的 `struct_ops` | `true` |
-| `fallback_cc` | §4 能力报告的 `fallback_cc_available` | `true`（§8.1） |
-| bpffs | `mount \| grep -q ' /sys/fs/bpf '` | 已挂载（没挂载时安装器在建 `/sys/fs/bpf/skyline-speeder` 那一步失败；能力报告的 `bpffs` 只检查 `/sys/fs/bpf` 这个目录存在——没挂载 bpffs 时它也在——代替不了这条） |
-| 发行版 | `cat /etc/os-release` | Debian/Ubuntu（apt + systemd）、Fedora 与 RHEL 系——Rocky Linux、AlmaLinux、CentOS Stream（dnf + systemd）、Alpine（apk + OpenRC）；其他发行版在第一步就以非零退出码被拒绝 |
+| Kernel version | `uname -r` | **>= 6.12** (ABI minimum 6.10, see below) |
+| Kernel BTF | `test -r /sys/kernel/btf/vmlinux` | Present (`CONFIG_DEBUG_INFO_BTF=y`) |
+| cgroup v2 | `test -e /sys/fs/cgroup/cgroup.controllers` | Mounted unified at `/sys/fs/cgroup` (on OpenRC hosts the `cgroups` service mounts it, and the installer starts that service) |
+| `fq` qdisc | `modprobe sch_fq` | Built in or loadable |
+| struct_ops | `struct_ops` in the capability report of section 4 | `true` |
+| `fallback_cc` | `fallback_cc_available` in the capability report of section 4 | `true` (section 8.1) |
+| bpffs | `mount \| grep -q ' /sys/fs/bpf '` | Mounted (when it is not, the installer fails at the step that creates `/sys/fs/bpf/skyline-speeder`; `bpffs` in the capability report only checks that the directory `/sys/fs/bpf` exists — it exists even when bpffs is not mounted — so it cannot stand in for this check) |
+| Distribution | `cat /etc/os-release` | Debian/Ubuntu (apt + systemd), Fedora and the RHEL family — Rocky Linux, AlmaLinux, CentOS Stream (dnf + systemd), Alpine (apk + OpenRC); other distributions are rejected at the first step with a non-zero exit code |
 
-daemon 自己强制的是能力报告里的六项：`btf`、`bpffs`、`cgroup_v2`、`fq_available`、`struct_ops`、
-`fallback_cc_available`。任一为 `false`，`--validate-only`、`ssctl validate`、`ssctl enable` 都直接
-拒绝，不会带着残缺的能力集运行；`skyline-speederd.service` 进程本身照样能启动。一键安装已在 Debian 13、
-Fedora 43、Rocky Linux 10.2、Alpine 3.23 上完整跑通。
+What the daemon itself enforces are six items of the capability report: `btf`, `bpffs`, `cgroup_v2`,
+`fq_available`, `struct_ops`, `fallback_cc_available`. If any is `false`, `--validate-only`, `ssctl validate`
+and `ssctl enable` all refuse outright rather than run with an incomplete capability set; the
+`skyline-speederd.service` process itself still starts. The one-line install has run end to end on Debian 13,
+Fedora 43, Rocky Linux 10.2 and Alpine 3.23.
 
 > [!CAUTION]
-> **`6.1.x` 与 `6.6.x` 两个 LTS 分支明确不支持。** `skyline_cc.bpf.c` 的 `cong_control` 回调按 4 个参数
-> （`sk, ack, flag, rs`）声明，这个签名从 v6.10 才有；更早的内核只有 2 参数版本（`sk, rs`），验证器会在
-> 加载时直接拒绝，报错明确指向参数个数不匹配。**这不是配置问题，不要尝试绕过。**
+> **The `6.1.x` and `6.6.x` LTS branches are explicitly unsupported.** The `cong_control` callback in
+> `skyline_cc.bpf.c` is declared with 4 arguments (`sk, ack, flag, rs`), a signature that exists only from
+> v6.10; earlier kernels have only the 2-argument version (`sk, rs`), and the verifier rejects the program
+> outright at load time, with an error that points clearly at the argument-count mismatch. **This is not a
+> configuration problem; do not try to work around it.**
 
-`6.10`/`6.11` 满足 ABI 但不是 LTS，不建议作为长期部署的目标；验证并承诺支持的是 **6.12 LTS 及以后**
-（6.12、6.18、7.1 等已实测通过）。这条限制只来自 `skyline_cc`：`skyline_tc` 与 `skyline_policy` 不碰
-`cong_control`，但发布只按整体 6.12 的门槛验证。
+`6.10`/`6.11` satisfy the ABI but are not LTS, and are not recommended as targets for long-term deployment;
+what is verified and committed to is **6.12 LTS and later** (6.12, 6.18, 7.1 and others have passed in
+testing). This restriction comes only from `skyline_cc`: `skyline_tc` and `skyline_policy` do not touch
+`cong_control`, but releases are verified only against the overall 6.12 threshold.
 
 ---
 
-## 2. 一键安装：`install.sh`
+## 2. One-line install: `install.sh`
 
-### 2.1 预编译产物还是源码构建
+### 2.1 Prebuilt artifact or source build
 
-不带参数时安装器先判断本机能否运行发布的二进制：架构是发布流水线出产物的架构（目前只有 x86_64），且
-C 库够新。两种 C 库各有一个产物：
+Without arguments, the installer first decides whether this host can run the released binaries: the
+architecture is one the release pipeline produces artifacts for (currently only x86_64), and the C library is
+new enough. There is one artifact for each of the two C libraries:
 
-- glibc 版 `skyline-speeder-<tag>-x86_64.tar.gz`：daemon 在 Ubuntu 24.04 上构建，需要 **glibc ≥ 2.38**
-  （`getconf GNU_LIBC_VERSION`）以及 `libelf.so.1`、`libz.so.1`。Debian 13、Ubuntu 24.04、Fedora 43、
-  Rocky Linux 10 及更新版本满足。
-- musl 版 `skyline-speeder-<tag>-x86_64-musl.tar.gz`（v0.4.1 起）：在 Alpine 3.21 容器里构建，需要
-  **musl ≥ 1.2.5**（`getconf GNU_LIBC_VERSION` 答不出 glibc、且 `/lib/ld-musl-*.so.1` 存在即是 musl——装了 Debian、Fedora 的 musl 包的 glibc 主机也有这个文件，所以先问 glibc；版本由加载器自己报出），即 Alpine 3.21 及更新，以及
-  `libelf`、`zlib`、`zstd-libs`、`libgcc`。
+- The glibc build, `skyline-speeder-<tag>-x86_64.tar.gz`: the daemon is built on Ubuntu 24.04 and needs
+  **glibc ≥ 2.38** (`getconf GNU_LIBC_VERSION`) as well as `libelf.so.1` and `libz.so.1`. Debian 13,
+  Ubuntu 24.04, Fedora 43, Rocky Linux 10 and newer versions satisfy this.
+- The musl build, `skyline-speeder-<tag>-x86_64-musl.tar.gz` (since v0.4.1): built in an Alpine 3.21
+  container, it needs **musl ≥ 1.2.5** (the host is musl when `getconf GNU_LIBC_VERSION` reports no glibc and `/lib/ld-musl-*.so.1` exists — a glibc host with the Debian or Fedora musl package installed has that file too, so glibc is asked first; the version is reported by the loader itself), that is, Alpine 3.21 and newer, as well as
+  `libelf`, `zlib`, `zstd-libs` and `libgcc`.
 
-两个产物里的 BPF 对象是同一套文件，逐字节相同。能运行就装产物，否则在 stderr 打印一行
-`warn building from source: <原因>` 后改为源码构建（例如 Debian 12 + backports 内核：内核够新，glibc
-不够）。musl 主机上默认路径还会先问一次 release API：最新 release 没有 musl 版（v0.4.0 及更早）时同样
-改为源码构建。
+The BPF objects in the two artifacts are the same set of files, byte for byte. If the host can run the
+artifact, it is installed; otherwise the installer prints one line `warn building from source: <reason>` on
+stderr and switches to a source build (for example Debian 12 with a backports kernel: the kernel is new enough,
+glibc is not). On a musl host the default path also asks the release API first: when the latest release has no
+musl build (v0.4.0 and earlier), it likewise switches to a source build.
 
-| | 预编译产物（默认） | 源码构建（`--source`，或默认路径在本机跑不了产物时） |
+| | Prebuilt artifact (default) | Source build (`--source`, or the default path when this host cannot run the artifact) |
 |---|---|---|
-| 命令 | `./install.sh`；`--prebuilt` 只装产物；`--release <tag>` 固定版本 | `./install.sh --source` |
-| 目标机需要 | 不需要任何工具链；安装器只装运行期依赖（§2.4 的包列表） | 编译工具链（clang/LLVM、bpftool、libbpf/libelf/zlib 开发包、Rust），安装器自动安装并记录，`--uninstall` 再卸掉 |
-| 装的是什么 | 最新（或 `--release` 指定的）release：`main` 上在它之后合并的改动不在其中 | 运行的这份源码树（一键安装时即 `--ref`，默认 `main`） |
-| BPF 对象的类型来源 | 发布流水线固定的 6.12 LTS 参考头；加载时由 CO-RE 按本机内核的 BTF 修正字段偏移 | 本机 `/sys/kernel/btf/vmlinux` |
-| 完整性校验 | 产物旁的 `.sha256` 必须匹配；取不到 `.sha256` 时告警：下载的产物只信任 TLS，本机文件不作校验 | 源码树本身（`scripts/bootstrap.sh` 可用 `SKYLINE_SHA256` 固定 tarball 的摘要） |
+| Command | `./install.sh`; `--prebuilt` installs only the artifact; `--release <tag>` pins a version | `./install.sh --source` |
+| The target host needs | No toolchain at all; the installer installs only runtime dependencies (the package lists in section 2.4) | A build toolchain (clang/LLVM, bpftool, libbpf/libelf/zlib development packages, Rust), which the installer installs and records automatically and `--uninstall` removes again |
+| What gets installed | The latest release (or the one `--release` names): changes merged into `main` after it are not included | The source tree being run (for the one-line install, `--ref`, default `main`) |
+| Where the BPF objects' types come from | The 6.12 LTS reference header pinned by the release pipeline; at load time CO-RE fixes field offsets against this host's kernel BTF | This host's `/sys/kernel/btf/vmlinux` |
+| Integrity check | The `.sha256` next to the artifact must match; when no `.sha256` can be fetched, it warns: a downloaded artifact is then trusted on TLS alone, and a local file is not checked | The source tree itself (`scripts/bootstrap.sh` can pin the tarball's digest with `SKYLINE_SHA256`) |
 
-其余步骤完全相同：同样过验证器，同样的服务（systemd unit 或 OpenRC 脚本）与配置模板。
+All other steps are identical: the same verifier pass, the same services (systemd units or OpenRC scripts) and
+the same configuration template.
 
-### 2.2 参数与环境变量
+### 2.2 Arguments and environment variables
 
-| 参数 | 作用 |
+| Argument | Effect |
 |---|---|
-| （不带参数） | 本机能运行发布的二进制时装最新 release 的产物，否则打印原因并改为源码构建（§2.1） |
-| `--source` | 无条件从这份源码树构建 |
-| `--prebuilt` | 只装已发布的产物：本机跑不了时在第一步之前就以 `error --prebuilt/--release cannot install here: <原因>` 中止，不会改为构建 |
-| `--release <tag>` | 同 `--prebuilt`，固定到该版本（也是装回旧版本的办法，§10.3） |
-| `--check` | 只做前置检查，不改动任何东西：报告将走哪条路径（`would install the published release` / `would build from source: <原因>`）、包能否装上、当前拥塞控制与 qdisc（含 guard 将要维护的网卡）、开机时 systemd-sysctl 会写入的相关设置、`/etc/sysctl.conf` 里只由 `sysctl -p`/`sysctl --system` 应用的设置，以及新建配置会得到的 `fallback_cc`。设了 `SKYLINE_ARTIFACT_URL` 时报告将装它 |
-| `--no-enable` | 安装或升级并启动 daemon，但不新挂载 `skyline_cc`：不启用 `skyline-speeder-enable.service`，此前已经启用的也不停用；升级前是用裸 `ssctl enable` 挂着的，重启后再 `ssctl enable` 一次（仍是手工挂载，开机不会自动挂）。结束时按新 daemon 的 `enabled` 与当前默认拥塞控制报告实际的挂载状态，并给出挂载命令 |
-| `--verbose` | 不画进度条，所有子命令的输出同时打到屏幕；环境变量 `SKYLINE_VERBOSE=1` 同效 |
-| `--uninstall` | 卸载，切到 bbr + fq，并卸掉安装时装上的包（§11.3） |
-| `--restore-pre-install` | 只能配合 `--uninstall`（单独使用直接报错退出）：还原安装前的拥塞控制与 qdisc，而不是 bbr + fq（§11.4） |
-| `-h`/`--help` | 打印用法；其他参数一律以 `unknown argument` 退出 |
+| (no arguments) | Installs the latest release's artifact when this host can run the released binaries; otherwise prints the reason and switches to a source build (section 2.1) |
+| `--source` | Builds from this source tree unconditionally |
+| `--prebuilt` | Installs only the published artifact: when this host cannot run it, aborts before the first step with `error --prebuilt/--release cannot install here: <reason>` and does not switch to a build |
+| `--release <tag>` | Like `--prebuilt`, pinned to that version (also the way to go back to an older version, section 10.3) |
+| `--check` | Only runs the prerequisite checks and changes nothing: reports which path would be taken (`would install the published release` / `would build from source: <reason>`), whether the packages can be installed, the current congestion control and qdiscs (including the NICs the guard would maintain), the relevant settings systemd-sysctl will write at boot, the settings in `/etc/sysctl.conf` that only `sysctl -p`/`sysctl --system` apply, and the `fallback_cc` a newly created configuration would get. With `SKYLINE_ARTIFACT_URL` set, it reports that it would install that |
+| `--no-enable` | Installs or upgrades and starts the daemon, but does not newly attach `skyline_cc`: it does not enable `skyline-speeder-enable.service`, and does not disable it if it was already enabled; if `skyline_cc` was attached with a bare `ssctl enable` before the upgrade, it runs `ssctl enable` once more after the restart (still a manual attach, not attached automatically at boot). At the end it reports the actual attach state from the new daemon's `enabled` and the current default congestion control, and gives the command to attach |
+| `--verbose` | Draws no progress bar; the output of every subcommand also goes to the screen; the environment variable `SKYLINE_VERBOSE=1` does the same |
+| `--uninstall` | Uninstalls, switches to bbr + fq, and removes the packages the install added (section 11.3) |
+| `--restore-pre-install` | Only together with `--uninstall` (on its own it exits with an error): restores the pre-install congestion control and qdiscs instead of bbr + fq (section 11.4) |
+| `-h`/`--help` | Prints usage; any other argument exits with `unknown argument` |
 
-`--check` 的退出码：发行版、服务管理器、内核、BTF、cgroup 不满足，或 `--prebuilt`/`--release` 在本机装不
-了时非零；包装不上、工具链装不上这类问题只在 stderr 打 `warn`，退出码仍是 0。agent 要同时看 stderr。
+Exit code of `--check`: non-zero when the distribution, service manager, kernel, BTF or cgroup requirement is
+not met, or when `--prebuilt`/`--release` cannot install on this host; problems such as packages or the
+toolchain failing to install only print a `warn` on stderr, and the exit code is still 0. Agents must read
+stderr as well.
 
-| 环境变量 | 作用 |
+| Environment variable | Effect |
 |---|---|
-| `SKYLINE_ARTIFACT_URL` | 跳过 release 查找，直接用一个 https URL（镜像、内网制品库）或本机文件路径作为产物；优先于 `--release`，两者同时给出时告警说 `--release` 没有用上；`<URL 或路径>.sha256` 存在就校验（§2.3）。改为源码构建（本机跑不了产物，或 `--source`）时它不起作用，同样告警 |
-| `SKYLINE_VERBOSE=1` | 同 `--verbose` |
-| `SKYLINE_REPO` | 查询 release 的仓库，默认 `CYBERVERSE-Research/skyline-speeder` |
+| `SKYLINE_ARTIFACT_URL` | Skips the release lookup and uses an https URL (a mirror, an internal artifact repository) or a local file path directly as the artifact; takes precedence over `--release`, and when both are given it warns that `--release` was not used; `<URL or path>.sha256` is checked when it exists (section 2.3). When the install switches to a source build (the host cannot run the artifact, or `--source`), it has no effect, and the installer likewise warns |
+| `SKYLINE_VERBOSE=1` | Same as `--verbose` |
+| `SKYLINE_REPO` | The repository releases are looked up in, default `CYBERVERSE-Research/skyline-speeder` |
 
-`scripts/bootstrap.sh` 自己的参数：`--ref <git 引用>`（环境变量 `SKYLINE_REF`，默认 `main`）、
-`--repo <owner/name>`（`SKYLINE_REPO`，取源码的仓库）、`--src-dir <路径>`（`SKYLINE_SRC_DIR`，默认
-`/usr/local/src/skyline-speeder`）；`SKYLINE_SHA256=<摘要>` 固定下载的源码 tarball（用 `sudo -E` 传进去）。
-`--repo` 只决定从哪里取源码；要让安装器也从那个仓库取 release，设环境变量 `SKYLINE_REPO`。
+The arguments of `scripts/bootstrap.sh` itself: `--ref <git ref>` (environment variable `SKYLINE_REF`, default
+`main`), `--repo <owner/name>` (`SKYLINE_REPO`, the repository the source is taken from), `--src-dir <path>`
+(`SKYLINE_SRC_DIR`, default `/usr/local/src/skyline-speeder`); `SKYLINE_SHA256=<digest>` pins the downloaded
+source tarball (pass it in with `sudo -E`). `--repo` only decides where the source comes from; to make the
+installer take releases from that repository too, set the environment variable `SKYLINE_REPO`.
 
-### 2.3 产物来源与校验
+### 2.3 Artifact source and checksum
 
-- 默认：GitHub 上的最新 release；`--release <tag>`：指定版本；
-- `SKYLINE_ARTIFACT_URL`：https URL 或本机文件路径。连不上 GitHub 的主机把 tarball 连同它的 `.sha256`
-  一起拷过去：
+- Default: the latest release on GitHub; `--release <tag>`: the version named;
+- `SKYLINE_ARTIFACT_URL`: an https URL or a local file path. For a host that cannot reach GitHub, copy the
+  tarball over together with its `.sha256`:
 
 ```bash
 SKYLINE_ARTIFACT_URL=https://mirror.example/skyline-speeder-<tag>-x86_64.tar.gz ./install.sh --prebuilt
 SKYLINE_ARTIFACT_URL=/path/to/skyline-speeder-<tag>-x86_64.tar.gz ./install.sh --prebuilt
 ```
 
-产物旁发布的 `<产物>.sha256` 必须与下载（或拷来）的 tarball 一致，不一致即中止；本机文件旁没有 `.sha256`
-时告警它未经校验。tarball 里的 `MANIFEST`
-记录 tag、commit、参考头摘要、`libc=` 以及每个二进制与对象的 SHA-256：完整内容写进安装日志，摘要里显示
-一行出处（产物名、commit、是否已校验 sha256）。`libc=` 与本机 C 库不符的产物（例如
-`SKYLINE_ARTIFACT_URL` 指错了文件）在验证器之前就被拒绝，并说明该用哪一个。
+The `<artifact>.sha256` published next to the artifact must match the downloaded (or copied) tarball, or the
+install aborts; when a local file has no `.sha256` next to it, the installer warns that it is unchecked. The
+`MANIFEST` in the tarball records the tag, the commit, the reference header's digest, `libc=`, and the SHA-256
+of every binary and object: the full content goes into the install log, and the summary shows one line of
+provenance (artifact name, commit, whether the sha256 was checked). An artifact whose `libc=` does not match
+this host's C library (for example, `SKYLINE_ARTIFACT_URL` pointing at the wrong file) is rejected before the
+verifier, with a note on which one to use.
 
-装上的是已发布的 release，不是 `main`：`main` 上在最新 release 之后合并的改动，要等下一个 release 才会
-进入默认安装。
+What is installed is a published release, not `main`: changes merged into `main` after the latest release
+reach the default install only with the next release.
 
-### 2.4 安装器依次做了什么
+### 2.4 What the installer does, step by step
 
-| 步骤（输出里的名字） | 做什么 |
+| Step (its name in the output) | What it does |
 |---|---|
-| Checking the system | 发行版及其包管理器、服务管理器；内核 ≥ 6.12、BTF、挂在 `/sys/fs/cgroup` 的 cgroup v2（OpenRC 主机上还没挂时启动 `cgroups` 服务）；本机能否运行发布的二进制 |
-| Installing packages | 见下面的包列表与计划规则 |
-| Downloading the release artifact | 预编译路径：取产物、校验 sha256 与 `MANIFEST` |
-| Preparing the Rust toolchain / Building the BPF objects / Building the Rust control plane | 源码构建路径：rustup（`rust-toolchain.toml` 固定版本）、`make bpf`、`cargo build --release` |
-| Running the kernel verifier | 在替换任何文件之前，用**新的** daemon 和新的对象跑 `--validate-only --verify-bpf`（§4）：配置用已装的那份，首次安装用模板，`bpf_dir` 指向新对象；daemon 先放在 `/usr/local/sbin/.skyline-speederd.new`（`/tmp` 可能是 noexec）。失败即中止，已装的文件与正在运行的 daemon 原样不动 |
-| Installing files | 预编译路径直接复制产物里的文件（daemon 就是验证器跑过的那个文件，改名到位）；源码构建路径执行 `infra/install-guest.sh`。文件清单见 §2.5 |
-| Configuring speeder.toml | 配置不存在时才用模板新建；改写出口网卡与 `fallback_cc`（见下）。这里的改动不影响上一步的结论：`tc_interface` 不参与校验，`fallback_cc` 只会改成本机内核有的算法 |
-| Starting skyline-speederd | 升级时是 `Draining live flows (up to 60 s), restarting skyline-speederd`（§10） |
-| Attaching skyline_cc | `systemctl enable --now skyline-speeder-enable.service`（`--no-enable` 时跳过） |
-| Verifying | 向新 daemon 确认 `enabled` 为 `true`（带 guard 的版本还要 `armed`），且默认拥塞控制确实是 `skyline_cc`；不满足时重启一次 enable unit 再查，仍不满足就失败，并提示 `ssctl enable` 与 enable unit 的日志 |
+| Checking the system | The distribution and its package manager, the service manager; kernel ≥ 6.12, BTF, cgroup v2 mounted at `/sys/fs/cgroup` (on an OpenRC host where it is not mounted yet, starts the `cgroups` service); whether this host can run the released binaries |
+| Installing packages | See the package lists and planning rules below |
+| Downloading the release artifact | Prebuilt path: fetches the artifact, checks the sha256 and the `MANIFEST` |
+| Preparing the Rust toolchain / Building the BPF objects / Building the Rust control plane | Source-build path: rustup (version pinned by `rust-toolchain.toml`), `make bpf`, `cargo build --release` |
+| Running the kernel verifier | Before any file is replaced, runs `--validate-only --verify-bpf` (section 4) with the **new** daemon and the new objects: with the installed configuration, or the template on a first install, and `bpf_dir` pointing at the new objects; the daemon is first placed at `/usr/local/sbin/.skyline-speederd.new` (`/tmp` may be noexec). A failure aborts the install, leaving the installed files and the running daemon untouched |
+| Installing files | The prebuilt path copies the files from the artifact directly (the daemon is the very file the verifier ran, renamed into place); the source-build path runs `infra/install-guest.sh`. The file list is in section 2.5 |
+| Configuring speeder.toml | Creates the configuration from the template only when it does not exist; rewrites the egress NIC and `fallback_cc` (see below). These changes do not affect the conclusion of the verifier step above: `tc_interface` plays no part in validation, and `fallback_cc` is only ever changed to an algorithm this host's kernel has |
+| Starting skyline-speederd | On an upgrade it is `Draining live flows (up to 60 s), restarting skyline-speederd` (section 10) |
+| Attaching skyline_cc | `systemctl enable --now skyline-speeder-enable.service` (skipped with `--no-enable`) |
+| Verifying | Confirms with the new daemon that `enabled` is `true` (and, for versions with the guard, `armed`), and that the default congestion control really is `skyline_cc`; if not, restarts the enable unit once and checks again, and if it still does not hold, fails and points to `ssctl enable` and the enable unit's log |
 
-**包。** 预编译路径只装运行期依赖：apt `curl ca-certificates tar iproute2`；dnf `curl ca-certificates tar
-iproute iproute-tc` 加按 soname 请求的 `libelf.so.1`、`libz.so.1`；apk `curl ca-certificates tar iproute2
-bash libelf zlib zstd-libs libgcc`。源码构建装的是另一份列表：apt `build-essential pkg-config clang llvm
-libbpf-dev libelf-dev zlib1g-dev bpftool curl iproute2`；dnf `gcc make pkgconf-pkg-config clang llvm libbpf-devel
-elfutils-libelf-devel zlib-devel bpftool curl ca-certificates tar iproute iproute-tc`；apk `build-base pkgconf clang
-llvm libbpf-dev elfutils-dev zlib-dev linux-headers bpftool curl ca-certificates tar iproute2 bash libgcc`。
-`iproute2`（Fedora/RHEL 上的 `iproute-tc`）是运行期必需的：guard 用其中的 `tc` 维护网卡的根 qdisc。
+**Packages.** The prebuilt path installs only runtime dependencies: apt `curl ca-certificates tar iproute2`;
+dnf `curl ca-certificates tar
+iproute iproute-tc` plus `libelf.so.1` and `libz.so.1` requested by soname; apk `curl ca-certificates tar iproute2
+bash libelf zlib zstd-libs libgcc`. A source build installs a different list: apt `build-essential pkg-config clang llvm
+libbpf-dev libelf-dev zlib1g-dev bpftool curl iproute2`; dnf `gcc make pkgconf-pkg-config clang llvm libbpf-devel
+elfutils-libelf-devel zlib-devel bpftool curl ca-certificates tar iproute iproute-tc`; apk `build-base pkgconf clang
+llvm libbpf-dev elfutils-dev zlib-dev linux-headers bpftool curl ca-certificates tar iproute2 bash libgcc`.
+`iproute2` (`iproute-tc` on Fedora/RHEL) is required at run time: the guard uses its `tc` to maintain the
+NIC's root qdisc.
 
-- apt 先出一份计划（`apt-get -s install`），确认解得开再真正安装。上一次 `dpkg` 被打断（例如 VPS 在升级
-  中途被重置）就先 `dpkg --configure -a` / `apt-get -f install --no-remove` 补完——`--no-remove` 是刻意的，
-  为了依赖自洽而卸掉运维装的包不是安装器能替他做的决定。某个包放不下去，就按 `apt-cache madison` 从新到旧
-  试它的其他版本，直到整份计划成立（Debian 12 上装了 `bookworm-backports` 的 6.12 内核时，正是只把
-  `libelf-dev` 换成 `0.192-4~bpo12+1`，刻意不用 `-t bookworm-backports`：那会换掉 55 个包）。换版本后的
-  计划要卸载任何包时**中止**并列出这些包；`apt-get update` 因为某个仓库不可达而失败时只告警并继续。
-- dnf 与 apk 把整份请求一起求解，要么全装、要么一个不装，装不上时直接转述它们自己的报错。dnf 不装弱依赖。
-  RHEL 系的 `libbpf-devel` 在默认关闭的 CodeReady Builder 仓库里，源码构建时只对这一次事务
-  `--enablerepo=crb`（RHEL 上是 `codeready-builder-for-rhel-N-<arch>-rpms`，Oracle Linux 上是
-  `olN_codeready_builder`），不改 `.repo` 文件。apk 的 `bpftool` 在 community 仓库：主机没启用时只对这一次
-  命令加上同一镜像、同一版本的 `--repository .../community`，不改 `/etc/apk/repositories`。
+- apt first produces a plan (`apt-get -s install`) and installs for real only once it is confirmed to resolve.
+  If the previous `dpkg` run was interrupted (for example a VPS reset in the middle of an upgrade), it first
+  completes it with `dpkg --configure -a` / `apt-get -f install --no-remove` — the `--no-remove` is deliberate:
+  removing packages the operator installed, to make dependencies consistent, is not a decision the installer
+  can make on the operator's behalf. When one package will not fit, it tries that package's other versions from
+  newest to oldest according to `apt-cache madison` until the whole plan holds (on Debian 12 with the 6.12
+  kernel from `bookworm-backports`, that means swapping only `libelf-dev` to `0.192-4~bpo12+1`, deliberately
+  not using `-t bookworm-backports`: that would replace 55 packages). If the plan after a version swap would
+  remove any package, it **aborts** and lists those packages; when `apt-get update` fails because some
+  repository is unreachable, it only warns and continues.
+- dnf and apk solve the whole request together, installing either everything or nothing, and when it cannot be
+  installed the installer relays their own error. dnf does not install weak dependencies. On the RHEL family,
+  `libbpf-devel` is in the CodeReady Builder repository, which is disabled by default; a source build adds
+  `--enablerepo=crb` for that one transaction only (`codeready-builder-for-rhel-N-<arch>-rpms` on RHEL,
+  `olN_codeready_builder` on Oracle Linux) and does not change any `.repo` file. apk's `bpftool` is in the
+  community repository: when the host has not enabled it, `--repository .../community` for the same mirror and
+  the same release is added to that one command only, and `/etc/apk/repositories` is not changed.
 
-**出口网卡（`runtime.tc_interface`）。** 只在配置里还是模板值 `data0` 时改写，运维改过的配置不动（它指向
-的网卡不存在也只告警）。取默认路由经过的第一块**以太网**设备（`/sys/class/net/<网卡>/type` 为 1；VLAN、
-bond、网桥也算）：先看 IPv4 默认路由，再看 IPv6（纯 IPv6 主机没有 IPv4 默认路由）。默认路由只从
-WireGuard/WARP、tun、gre、ppp 这类三层隧道离开时保留模板值并告警：`skyline_tc` 按以太网帧头解析报文，
-daemon 拒绝把它挂到非以太网设备上，这种主机要手工设成承载隧道流量的那块物理网卡（§8.1）。
+**Egress NIC (`runtime.tc_interface`).** Rewritten only while the configuration still holds the template value
+`data0`; a configuration the operator has changed is left alone (if the NIC it names does not exist, the
+installer only warns). It takes the first **Ethernet** device the default route goes through
+(`/sys/class/net/<nic>/type` is 1; VLANs, bonds and bridges count too): first the IPv4 default route, then IPv6
+(an IPv6-only host has no IPv4 default route). When the default route leaves only through a layer-3 tunnel such
+as WireGuard/WARP, tun, gre or ppp, the template value is kept and the installer warns: `skyline_tc` parses
+packets by their Ethernet header, and the daemon refuses to attach it to a non-Ethernet device; on such a host,
+set it by hand to the physical NIC that carries the tunnel traffic (section 8.1).
 
-**`fallback_cc`。** 同样只在这次运行新建配置文件时改写。它是 `skyline_cc` 不在时新连接用的算法（§8.1），
-模板值是 `cubic`；安装器改用开机时 sysctl 配置选定的那个算法（按 systemd-sysctl 的规则找出生效的文件，例如
-"一键 BBR"脚本留下的 `/etc/sysctl.d/99-bbr.conf` 里的 `bbr`）：它就是这台机器不装 Skyline Speeder 时运行的
-算法，也是每次开机 `skyline-speederd` 启动前一定已经注册的算法——systemd-sysctl（OpenRC 上是 sysctl 服务）
-在那之前写入它，内核顺带加载它的模块。开机配置里没有设定、设的是 `skyline_cc`、或设的算法本机此刻没有注册
-时，保留 `cubic`。选择结果（`fallback_cc set to …` / `fallback_cc left at …`）写在安装日志里，
-`--verbose` 时也打到屏幕；`--check` 会报告新建的配置将得到哪个值。
+**`fallback_cc`.** Likewise rewritten only when this run creates the configuration file. It is the algorithm
+new connections use when `skyline_cc` is not there (section 8.1), and the template value is `cubic`; the
+installer uses instead the algorithm the boot-time sysctl configuration selects (finding the effective file by
+systemd-sysctl's rules, for example `bbr` in the `/etc/sysctl.d/99-bbr.conf` left by a "one-click BBR"
+script): that is the algorithm this host runs without Skyline Speeder, and also an algorithm that is certain to
+be registered before `skyline-speederd` starts on every boot — systemd-sysctl (on OpenRC, the sysctl service)
+writes it before then, and the kernel loads its module along the way. When the boot-time configuration sets
+nothing, sets `skyline_cc`, or sets an algorithm this host has not registered at the moment, `cubic` is kept.
+The choice (`fallback_cc set to …` / `fallback_cc left at …`) is written to the install log, and also to the
+screen with `--verbose`; `--check` reports which value a newly created configuration would get.
 
-**安装前记录。** 动手之前记下当前的拥塞控制、`net.core.default_qdisc`，以及 guard 将要维护的每块网卡的
-根 qdisc，写入 `/etc/skyline-speeder/pre-install-state`（§2.5），供结束时的前后对比和
-`--uninstall --restore-pre-install` 使用。这份快照只写一次，重装不会把 `skyline_cc` 误记成"原值"。
+**Pre-install record.** Before changing anything, the installer records the current congestion control,
+`net.core.default_qdisc`, and the root qdisc of every NIC the guard will maintain, in
+`/etc/skyline-speeder/pre-install-state` (section 2.5), for the before/after comparison at the end and for
+`--uninstall --restore-pre-install`. This snapshot is written only once, so a reinstall cannot record
+`skyline_cc` as the "original value" by mistake.
 
-**结束摘要。** 拥塞控制与 qdisc 的前后对比（如 `skyline_cc (was bbr)`、
-`mq/fq on eth0 (was cake), default fq (was cake)`；bond 这类由多块网卡承载的每块一行；没动的注明原因，如
-`cake on eth0 (bandwidth 90Mbit: it shapes, so it was left alone)`）以及由谁守住它们；仍会把它们设成别的值的
-sysctl 文件（按 systemd-sysctl 的规则判断开机时哪个文件生效：`/etc` 下的同名文件——包括指向 `/dev/null` 的
-链接或空文件——盖过 `/run`、`/usr/lib` 下的，各文件按文件名顺序应用；`/etc/sysctl.conf` 只有被 `sysctl.d`
-里的链接引用时才在开机生效）。安装器**不修改**这些文件：它们开机时先生效，随后被 `skyline-speederd` 覆盖。
-最后是日常命令、几个常用参数的当前值与调参入口，以及卸载会删掉多少个包。
+**Final summary.** A before/after comparison of the congestion control and qdiscs (such as
+`skyline_cc (was bbr)`, `mq/fq on eth0 (was cake), default fq (was cake)`; one line per NIC for something like
+a bond carried by several NICs; what was left untouched comes with the reason, such as
+`cake on eth0 (bandwidth 90Mbit: it shapes, so it was left alone)`) and who keeps them in place; the sysctl
+files that would still set them to something else (judging which file takes effect at boot by systemd-sysctl's
+rules: a file of the same name under `/etc` — including a link to `/dev/null` or an empty file — overrides
+those under `/run` and `/usr/lib`, and files are applied in filename order; `/etc/sysctl.conf` takes effect at
+boot only when a link in `sysctl.d` refers to it). The installer **does not modify** these files: they take
+effect first at boot and are then overridden by `skyline-speederd`. Last come everyday commands, the current
+values of a few common parameters and where to tune them, and how many packages an uninstall would remove.
 
-### 2.5 装上的文件与状态
+### 2.5 Installed files and state
 
-| 路径 | 内容 |
+| Path | Contents |
 |---|---|
-| `/usr/local/sbin/skyline-speederd`、`/usr/local/bin/ssctl` | daemon 与命令行 |
-| `/opt/skyline-speeder/bpf/*.bpf.o` | 三个 BPF 对象 |
-| `/opt/skyline-speeder/infra/*.sh` | enable unit 调用的 `boot-enable.sh`/`boot-disable.sh`、§7 的 `run-in-skyline-cgroup.sh`，以及 `apply-guest-profile.sh`、`collect-guest-metrics.sh`、`snapshot-skyline-events.sh` |
-| `/etc/systemd/system/skyline-speederd.service`、`skyline-speeder-enable.service` | systemd 的两个 unit；OpenRC 主机上是 `/etc/init.d/skyline-speederd`、`/etc/init.d/skyline-speeder-enable`（§12） |
-| `/etc/skyline-speeder/speeder.toml` | 配置；只在不存在时由模板创建，之后的安装与升级从不覆盖 |
-| `/etc/skyline-speeder/pre-install-state` | 安装前快照：`PRE_INSTALL_CC`、`PRE_INSTALL_QDISC`，以及 `PRE_INSTALL_QDISC_DEV`/`PRE_INSTALL_ROOT_QDISC`（一一对应、以空格分隔的网卡与根 qdisc 摘要两个列表；不知道网卡时为空）。只写一次；0.2.0 写的快照没有后两个键，升级时补上 |
-| `/etc/skyline-speeder/added-packages`、`added-rustup` | 这次安装给主机装上的包与 rustup（§11.3 据此卸载） |
-| `/var/log/skyline-speeder-install.log` | 安装日志 |
-| `/usr/local/src/skyline-speeder` | 经引导脚本安装时的源码树 |
-| `/run/skyline-speeder/` | 运行时：控制 socket `speeder.sock`、事件日志 `events.jsonl`、`state.json`（§13） |
-| `/sys/fs/cgroup/skyline-speeder`、`/sys/fs/bpf/skyline-speeder` | §7 的 cgroup；bpffs 下的目录 |
+| `/usr/local/sbin/skyline-speederd`, `/usr/local/bin/ssctl` | The daemon and the command-line tool |
+| `/opt/skyline-speeder/bpf/*.bpf.o` | The three BPF objects |
+| `/opt/skyline-speeder/infra/*.sh` | `boot-enable.sh`/`boot-disable.sh`, which the enable unit calls, `run-in-skyline-cgroup.sh` from section 7, and `apply-guest-profile.sh`, `collect-guest-metrics.sh`, `snapshot-skyline-events.sh` |
+| `/etc/systemd/system/skyline-speederd.service`, `skyline-speeder-enable.service` | The two systemd units; on OpenRC hosts, `/etc/init.d/skyline-speederd` and `/etc/init.d/skyline-speeder-enable` (section 12) |
+| `/etc/skyline-speeder/speeder.toml` | The configuration; created from the template only when it does not exist, never overwritten by later installs and upgrades |
+| `/etc/skyline-speeder/pre-install-state` | The pre-install snapshot: `PRE_INSTALL_CC`, `PRE_INSTALL_QDISC`, and `PRE_INSTALL_QDISC_DEV`/`PRE_INSTALL_ROOT_QDISC` (two space-separated lists, of NICs and of root-qdisc summaries, matching one to one; empty when the NIC is not known). Written only once; a snapshot written by 0.2.0 lacks the last two keys, which an upgrade adds |
+| `/etc/skyline-speeder/added-packages`, `added-rustup` | The packages and rustup this install added to the host (section 11.3 uninstalls based on them) |
+| `/var/log/skyline-speeder-install.log` | The install log |
+| `/usr/local/src/skyline-speeder` | The source tree, when installed through the bootstrap script |
+| `/run/skyline-speeder/` | Runtime: the control socket `speeder.sock`, the event log `events.jsonl`, `state.json` (section 13) |
+| `/sys/fs/cgroup/skyline-speeder`, `/sys/fs/bpf/skyline-speeder` | The cgroup of section 7; the directory under bpffs |
 
-### 2.6 早于 guard 的 release
+### 2.6 Releases older than the guard
 
-`--prebuilt`/`--release` 装的是已发布的 release，可能比正在运行的 `install.sh` 旧。v0.2.0 及更早的 release
-没有 guard（§9）：`ssctl enable` 本身不碰 qdisc，之后也不守住默认拥塞控制；同一 release 附带的 enable unit
-（它自己的 `boot-enable.sh`）在每次挂载和每次开机时写一次 `net.core.default_qdisc=fq`，不换网卡的根
-qdisc，也没有谁守住这个值。安装器据此告警（`... is a release older than the guard ...`），摘要的 qdisc 行注明
-`(not managed by this release)`；此时 §6 的 G7 不适用。判断依据是 daemon 报告的版本（这些版本的
-`sv version` 为空），不要看 JSON 里有没有 `guard` 键：0.3.0 起的 `ssctl` 对任何 daemon 都会打印这个键。
+`--prebuilt`/`--release` installs a published release, which may be older than the `install.sh` running.
+Releases v0.2.0 and earlier have no guard (section 9): `ssctl enable` itself does not touch qdiscs and does not
+keep the default congestion control in place afterwards; the enable unit shipped with the same release (with
+its own `boot-enable.sh`) writes `net.core.default_qdisc=fq` once on every attach and every boot, does not
+replace the NIC's root qdisc, and nothing keeps that value in place. The installer warns about this
+(`... is a release older than the guard ...`), and the summary's qdisc line says
+`(not managed by this release)`; G7 of section 6 does not apply then. Decide by the version the daemon reports
+(`sv version` is empty for these versions), not by whether the JSON has a `guard` key: `ssctl` since 0.3.0
+prints that key for any daemon.
 
 ---
 
-## 3. 手动分步部署（不经 `install.sh`）
+## 3. Manual step-by-step deployment (without `install.sh`)
 
-只在需要逐步控制时用；一键安装就是把下面这些做完。手动安装的主机没有安装前快照和包记录，`--uninstall`
-因此不会卸任何工具链，`--restore-pre-install` 也无从还原（§11.3）。全程以 root 执行：
-`infra/install-guest.sh` 以 root 运行 `make bpf` 和 `cargo build`，Rust 要装在 root 名下。
+Use this only when you need step-by-step control; the one-line install does exactly the following. A manually
+installed host has no pre-install snapshot and no package record, so `--uninstall` removes no toolchain and
+`--restore-pre-install` has nothing to restore from (section 11.3). Run everything as root:
+`infra/install-guest.sh` runs `make bpf` and `cargo build` as root, so Rust must be installed for root.
 
 ```bash
-# 3.1 工具链（Debian/Ubuntu）
+# 3.1 Toolchain (Debian/Ubuntu)
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq build-essential pkg-config clang llvm \
-    libbpf-dev libelf-dev zlib1g-dev bpftool curl iproute2   # guard 用 tc 维护网卡 qdisc
-# Fedora / RHEL 系（RHEL 系的 libbpf-devel 在 CodeReady Builder 里：加 --enablerepo=crb）：
+    libbpf-dev libelf-dev zlib1g-dev bpftool curl iproute2   # the guard uses tc to maintain the NIC qdisc
+# Fedora / RHEL family (on the RHEL family libbpf-devel is in CodeReady Builder: add --enablerepo=crb):
 #   dnf install -y gcc make pkgconf-pkg-config clang llvm libbpf-devel elfutils-libelf-devel zlib-devel bpftool curl iproute iproute-tc
-# Alpine（bpftool 在 community 仓库）：
+# Alpine (bpftool is in the community repository):
 #   apk add build-base pkgconf clang llvm libbpf-dev elfutils-dev zlib-dev linux-headers bpftool curl iproute2 bash libgcc
 
-# Debian 12 + bookworm-backports 的 6.12 内核：linux-headers-* 把 libelf1 带到 0.192，而 bookworm 的
-# libelf-dev 依赖 libelf1 (= 0.188-2.1)，上面的 apt-get 会以 "held broken packages" 失败。只换这一个包，
-# 取与机上那份库同源的版本：
+# Debian 12 + the 6.12 kernel from bookworm-backports: linux-headers-* pulls libelf1 up to 0.192, while bookworm's
+# libelf-dev depends on libelf1 (= 0.188-2.1), so the apt-get above fails with "held broken packages". Swap only
+# this one package, taking the version from the same source as the library on the host:
 #   apt-cache madison libelf-dev
 #   apt-get install -y libelf-dev=0.192-4~bpo12+1
-# 不要用 -t bookworm-backports：那会连 curl、iproute2、bpftool、libbpf1 一起换源（实测 55 个包）。
+# Do not use -t bookworm-backports: that switches curl, iproute2, bpftool and libbpf1 to the other source as well (55 packages, measured).
 
-# 3.2 Rust（rust-toolchain.toml 固定了版本，rustup 会自动遵循）
+# 3.2 Rust (rust-toolchain.toml pins the version; rustup follows it automatically)
 command -v cargo >/dev/null || {
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
     . "$HOME/.cargo/env"
 }
 
-# 3.3 构建并安装（不带 --confirm-install 只打印将要做的事，退出码 2）
+# 3.3 Build and install (without --confirm-install it only prints what it would do, exit code 2)
 ./infra/install-guest.sh --confirm-install
 ```
 
-`make bpf` 默认从本机 `/sys/kernel/btf/vmlinux` 生成 `vmlinux.h`。对象是 CO-RE 的：头文件只需定义代码用到的
-类型，字段偏移在加载时按运行内核修正——发布产物正是在 6.12 参考头上编译、在更新的内核上加载的。为别的
-机器构建时，指定对方内核的 BTF，或直接给一份现成的头（这条路径不需要 bpftool，也不需要本机 BTF）：
+`make bpf` generates `vmlinux.h` from this host's `/sys/kernel/btf/vmlinux` by default. The objects are CO-RE:
+the header only has to define the types the code uses, and field offsets are fixed against the running kernel
+at load time — the release artifacts are exactly that, compiled against the 6.12 reference header and loaded on
+newer kernels. To build for another machine, point it at that machine's kernel BTF, or hand it a ready-made
+header (that path needs neither bpftool nor this host's BTF):
 
 ```bash
 make VMLINUX_BTF=/path/to/target/vmlinux bpf
 make PREBUILT_VMLINUX_H=/path/to/vmlinux.h bpf
 ```
 
-CO-RE 修得了偏移，修不了字段改名或删除：对象换到另一个内核上，**必须**先在目标机上跑 §4 的验证器。
-`bpf/include/vmlinux.h` 是构建产物，已在 `.gitignore` 中排除。
+CO-RE can fix offsets, but not a field that was renamed or removed: when objects move to another kernel, you
+**must** first run the verifier of section 4 on the target host. `bpf/include/vmlinux.h` is a build artifact
+and is excluded in `.gitignore`.
 
-`install-guest.sh` 安装 §2.5 表里的二进制、对象、脚本与两个 unit（OpenRC 主机上是两个 init 脚本），只在
-`/etc/skyline-speeder/speeder.toml` 不存在时用 `config/speeder-guest.toml` 创建它，并把
-`skyline-speederd.service` 设为开机启动；**刻意不启用** `skyline-speeder-enable.service`——挂载会改变全机
-新连接的拥塞控制，是运维决定，由 §5.1 的第 ③ 步显式执行。
+`install-guest.sh` installs the binaries, objects, scripts and the two units (two init scripts on OpenRC hosts)
+from the table in section 2.5, creates `/etc/skyline-speeder/speeder.toml` from `config/speeder-guest.toml`
+only when it does not exist, and enables `skyline-speederd.service` at boot; it **deliberately does not
+enable** `skyline-speeder-enable.service` — attaching changes the congestion control of every new connection
+on the host, which is an operator decision, made explicitly by step ③ of section 5.1.
 
 ```bash
-# 3.4 出口网卡：模板值 data0 是测试床的接口名，几乎不会匹配真实主机。
-# 取 "dev" 后面那个词（`default dev wg0 scope link` 这类没有 via 的路由里它不在第 5 列）；
-# 先 IPv4、再 IPv6；只取以太网设备（type 1，VLAN/bond/bridge 也是），skyline_tc 不挂在隧道上
+# 3.4 Egress NIC: the template value data0 is the test bed's interface name and will almost never match a real host.
+# Take the word after "dev" (in a route without via, such as `default dev wg0 scope link`, it is not in column 5);
+# IPv4 first, then IPv6; Ethernet devices only (type 1; VLAN/bond/bridge are too), skyline_tc is not attached to tunnels
 DEV=$({ ip -o route show default; ip -6 -o route show default; } 2>/dev/null \
   | awk '$1 == "default" { for (i = 2; i < NF; i++) if ($i == "dev" && $(i + 1) != "lo") print $(i + 1) }' \
   | while read -r d; do
         if [ "$(cat "/sys/class/net/$d/type" 2>/dev/null)" = 1 ]; then echo "$d"; break; fi
     done)
-test -n "$DEV"    # 失败：没有默认路由，或默认路由只走隧道——见下方说明
+test -n "$DEV"    # fails: no default route, or the default route goes only through a tunnel -- see the note below
 sed -i "s|^tc_interface = \".*\"|tc_interface = \"$DEV\"|" /etc/skyline-speeder/speeder.toml
 grep '^tc_interface' /etc/skyline-speeder/speeder.toml
 
-# 3.5 fallback_cc：挂载 skyline_cc 之前的默认算法，就是主机自己的算法（§8.1）
+# 3.5 fallback_cc: the default algorithm before skyline_cc is attached, i.e. the host's own algorithm (section 8.1)
 CC=$(sysctl -n net.ipv4.tcp_congestion_control)
 [ "$CC" = skyline_cc ] || sed -i "s|^fallback_cc = \".*\"|fallback_cc = \"$CC\"|" /etc/skyline-speeder/speeder.toml
 grep '^fallback_cc' /etc/skyline-speeder/speeder.toml
 ```
 
-`test -n "$DEV"` 失败而默认路由存在，说明它只经 WireGuard/WARP、tun、gre、ppp 这类三层隧道离开：把
-`tc_interface` 手工设成承载隧道流量的那块物理网卡（`install.sh` 此时同样保留模板值并告警）。`tc_interface`
-是 VLAN、bond 或网桥时照填即可，guard 维护的是它下面的物理网卡（§9）。
+If `test -n "$DEV"` fails although a default route exists, the route leaves only through a layer-3 tunnel such
+as WireGuard/WARP, tun, gre or ppp: set `tc_interface` by hand to the physical NIC that carries the tunnel
+traffic (`install.sh` likewise keeps the template value and warns in this case). When `tc_interface` is a VLAN,
+bond or bridge, fill it in as is; the guard maintains the physical NICs under it (section 9).
 
-然后依次执行 §4（验证）、§5（启动与挂载）、§6（门禁）。手动安装的主机如何升级见 §10.2。
+Then run section 4 (verification), section 5 (start and attach) and section 6 (gates) in order. For how to
+upgrade a manually installed host, see section 10.2.
 
 ---
 
-## 4. 启动前验证
+## 4. Verification before start
 
 ```bash
 skyline-speederd --config /etc/skyline-speeder/speeder.toml --validate-only --verify-bpf
 ```
 
-它读入磁盘上的配置、探测内核能力，把三个 BPF 对象都过一遍内核验证器后退出：**不挂载任何程序，不写任何
-sysctl**，只会建出 `/run/skyline-speeder/` 与一个空的 `events.jsonl`。stdout 是 daemon 的状态 JSON
-（含 `capabilities`），全部通过时 stderr 的最后一行是 `all BPF objects passed the kernel verifier`，退出码 0。
-能力不满足时它先打印状态 JSON 再以非零退出，所以失败时也能读到原因。不带 `--verify-bpf` 时只校验配置与能力。
+It reads the configuration on disk, probes the kernel's capabilities, runs all three BPF objects through the
+kernel verifier, and exits: **it attaches no program and writes no sysctl**; all it creates is
+`/run/skyline-speeder/` and an empty `events.jsonl`. stdout is the daemon's status JSON (including
+`capabilities`); when everything passes, the last line on stderr is `all BPF objects passed the kernel verifier`
+and the exit code is 0. When a capability is missing it prints the status JSON first and then exits non-zero,
+so the reason can be read on failure too. Without `--verify-bpf` it only validates the configuration and the
+capabilities.
 
-逐项检查六项硬性能力：
+Check the six hard capabilities one by one:
 
 ```sh
 out=$(skyline-speederd --config /etc/skyline-speeder/speeder.toml --validate-only --verify-bpf); rc=$?
@@ -420,153 +483,174 @@ done
 [ "$rc" -eq 0 ] && echo "verifier OK"
 ```
 
-- `rack_reo_hook: false` 是**正常的**：它只表示 early-loss 停留在观测模式，不阻断部署。`capabilities.notes`
-  因此在原装内核上总有一条 `early-loss remains observation-only ...`，`ssctl status` 的 ATTENTION 段落有内容
-  不等于部署失败。
-- `fallback_cc_available: false`（`Error: configured fallback congestion control is unavailable`）：
-  `fallback_cc` 填的算法这个内核既没有注册，也没有可加载的模块 `tcp_<名字>`；`notes` 列出本机已注册的算法，
-  把 `fallback_cc` 改成其中之一（通常是主机原本在用的 `bbr`），见 §8.1 与 §13.4。
+- `rack_reo_hook: false` is **normal**: it only means early-loss stays in observation mode, and does not block
+  deployment. That is why `capabilities.notes` always has an `early-loss remains observation-only ...` entry on
+  a stock kernel, and content in the ATTENTION section of `ssctl status` does not mean the deployment failed.
+- `fallback_cc_available: false` (`Error: configured fallback congestion control is unavailable`):
+  this kernel neither has the algorithm named in `fallback_cc` registered nor a loadable module `tcp_<name>`
+  for it; `notes` lists the algorithms registered on this host. Change `fallback_cc` to one of them (usually
+  `bbr`, which the host was using); see sections 8.1 and 13.4.
 
 ---
 
-## 5. 启动与挂载
+## 5. Start and attach
 
-### 5.1 启动序列（顺序不可颠倒）
+### 5.1 Start sequence (the order cannot be reversed)
 
 ```bash
-# ① 启动常驻进程
+# ① Start the resident process
 systemctl enable --now skyline-speederd.service
 
-# ② 等 daemon 应答 —— 必须等，不能假设立即可用
+# ② Wait for the daemon to answer — you must wait; do not assume it is available at once
 timeout 60 sh -c 'until ssctl status --json >/dev/null 2>&1; do sleep 1; done'
 
-# ③ 挂载 skyline_cc 并切换默认算法（开机自启走的也是这条路径）
+# ③ Attach skyline_cc and switch the default algorithm (the attach at boot takes this same path)
 systemctl enable --now skyline-speeder-enable.service
 ```
 
-`skyline-speederd.service` 没有 readiness 通知：进程起来的头几秒 socket 可能还不存在，此时执行 `ssctl` 会报
-`connect to /run/skyline-speeder/speeder.sock (is skyline-speederd running?)`，下一行 `Caused by` 是
-`No such file or directory`。这只是启动竞态，所以第 ② 步要等——等它应答，而不是等 socket 文件出现：被杀掉的
-daemon 会留下 socket 文件，OpenRC 也不像 systemd 的 `RuntimeDirectory=` 那样在停止时清空 `/run/skyline-speeder`。
+`skyline-speederd.service` has no readiness notification: in the first few seconds after the process comes
+up, the socket may not exist yet, and `ssctl` run then reports
+`connect to /run/skyline-speeder/speeder.sock (is skyline-speederd running?)`, with
+`No such file or directory` on the next, `Caused by` line. This is only a start-up race, which is why step ②
+waits — for the daemon to answer, not for the socket file to appear: a daemon that was killed leaves its socket
+file behind, and OpenRC, unlike systemd's `RuntimeDirectory=`, does not empty `/run/skyline-speeder` on stop.
 
 > [!IMPORTANT]
-> **`skyline-speederd.service` 启动后不会自动挂载 `skyline_cc`。** 它只保持进程常驻，除了 `[rack_tuning]`
-> 里声明的 tier-1 sysctl（随附模板不声明）之外不写任何 sysctl；
-> 不执行第 ③ 步，新连接就一直走主机当前的默认算法，**且不报任何错误**。`skyline-speeder-enable.service`
-> 正是为消除这个静默失效而存在：它的 `boot-enable.sh` 先等 daemon 应答（最多 60 秒）再执行 `ssctl enable`，
-> 每次开机都挂载一次；停止它时 `boot-disable.sh` 执行 drain（§11）。
+> **`skyline-speederd.service` does not attach `skyline_cc` automatically after it starts.** It only keeps the
+> process resident, and writes no sysctl apart from the tier-1 sysctls declared in `[rack_tuning]` (the shipped
+> template declares none);
+> without step ③, new connections keep using the host's current default algorithm, **with no error of any
+> kind**. `skyline-speeder-enable.service` exists precisely to remove this silent failure: its `boot-enable.sh`
+> waits for the daemon to answer (up to 60 seconds) and then runs `ssctl enable`, attaching once on every boot;
+> stopping it makes `boot-disable.sh` run a drain (section 11).
 
-### 5.2 `ssctl enable` 做了什么
+### 5.2 What `ssctl enable` does
 
-1. 校验配置与六项能力（§1.3）；
-2. 第一次挂载时先把默认拥塞控制写成 `fallback_cc`（基线：挂载失败时主机停在一个确定可用的算法上），再加载并注册
-   `skyline_cc`（内核 ≥ 7.1 上注册它的 struct_ops map 叫 `skyline_cc_txs`，算法名仍是 `skyline_cc`），并让 §7 的
-   cgroup 里的进程建连时切到它；
-3. 挂载成功之后才把 `net.ipv4.tcp_congestion_control` 写成 `skyline_cc`——内核不接受还没注册的算法名；
-4. 武装 guard 并立即做一遍完整检查（§9）：`[guard] qdisc = true`（默认）时把 `net.core.default_qdisc` 写成
-   `fq`，并把出口网卡的根 qdisc 换成 `fq`（多队列网卡上是子队列全为 `fq` 的 `mq`；VLAN、bond、网桥则换它下面的
-   物理网卡）；
-5. 打开首轮冗余：本机发出的每个带套接字的 SYN-ACK（不论它的连接将来跑哪种拥塞控制：发出时还没有选定），
-   以及 `skyline_cc` 连接的 SYN 与前 64 KiB（含其中的重传）各发两份，第二份晚 10 ms（§8.1）。
+1. Validates the configuration and the six capabilities (section 1.3);
+2. On the first attach, first writes `fallback_cc` as the default congestion control (a baseline: if the attach
+   fails, the host stays on an algorithm known to work), then loads and registers `skyline_cc` (on kernels
+   ≥ 7.1 the struct_ops map that registers it is called `skyline_cc_txs`; the algorithm name is still
+   `skyline_cc`), and makes processes in the cgroup of section 7 switch to it when they connect;
+3. Only after a successful attach writes `skyline_cc` into `net.ipv4.tcp_congestion_control` — the kernel does
+   not accept an algorithm name that is not registered yet;
+4. Arms the guard and immediately runs one full check (section 9): with `[guard] qdisc = true` (the default),
+   writes `fq` into `net.core.default_qdisc` and replaces the egress NIC's root qdisc with `fq` (on a
+   multi-queue NIC, an `mq` whose child queues are all `fq`; for a VLAN, bond or bridge, the physical NICs under
+   it are changed instead);
+5. Turns on first-flight redundancy: every SYN-ACK this host sends that has a socket (whatever congestion
+   control its connection will run: none has been chosen when it is sent), and the SYN and the first 64 KiB
+   (retransmissions within them included) of `skyline_cc` connections, are each sent twice, the second copy
+   10 ms later (section 8.1).
 
-不带 `--modules` 的 `ssctl enable` 沿用 daemon 当前的模块集合：执行过 `ssctl enable --all-off` 之后，要用
-`--modules early-loss,adaptive-cwnd,loss-classifier,pacing` 才能回到全开（或重启 daemon）。
+`ssctl enable` without `--modules` keeps the daemon's current module set: after `ssctl enable --all-off`, it
+takes `--modules early-loss,adaptive-cwnd,loss-classifier,pacing` to get back to all on (or a daemon restart).
 
 > [!IMPORTANT]
-> **`ssctl enable` 是全机生效的。** 挂载之后这台机器上**所有**新建 TCP 连接（不只是
-> `/sys/fs/cgroup/skyline-speeder` 里的进程建的）都默认使用 `skyline_cc`，guard 也一直守着这一点：手工把
-> sysctl 改回去，会在 `[guard] interval_s` 秒内（默认 5 秒）被改回来，日志里还会记成"主机上有别的东西改了它"。
-> 确实只想让 cgroup 里的进程走 `skyline_cc` 时：设 `[guard] interval_s = 0`（不做周期检查，重启 daemon
-> 生效），每次 `enable` 之后手工把 `net.ipv4.tcp_congestion_control` 写回 `fallback_cc`——cgroup 里的进程
-> 建连时仍由 `skyline_policy` 切到 `skyline_cc`。这只维持到下一次 `enable`，**包括开机时 enable unit 执行的
-> 那一次**。回退是对称的：`ssctl drain` 先把 sysctl 写回 `fallback_cc`，再等存量连接（§11.1）。
+> **`ssctl enable` takes effect host-wide.** After the attach, **every** new TCP connection on this host (not
+> just those made by processes in `/sys/fs/cgroup/skyline-speeder`) uses `skyline_cc` by default, and the guard
+> keeps it that way: change the sysctl back by hand and it is changed back again within `[guard] interval_s`
+> seconds (5 by default), and the log even records it as "something else on this host changed it".
+> If you really want only processes in the cgroup to use `skyline_cc`: set `[guard] interval_s = 0` (no
+> periodic check; takes effect when the daemon restarts) and, after every `enable`, write `fallback_cc` back
+> into `net.ipv4.tcp_congestion_control` by hand — processes in the cgroup are still switched to `skyline_cc`
+> by `skyline_policy` when they connect. This holds only until the next `enable`, **including the one the
+> enable unit runs at boot**. Falling back is symmetric: `ssctl drain` first writes `fallback_cc` back into the
+> sysctl, then waits for existing connections (section 11.1).
 
 ---
 
-## 6. 验证门禁
+## 6. Verification gates
 
 ```sh
-# G1 daemon 与挂载单元均已启动
+# G1 the daemon and the attach unit have both started
 systemctl is-active skyline-speederd.service skyline-speeder-enable.service
 
-# G2（可选）struct_ops 已注册：需要 bpftool，预编译安装的主机上没有它，以 G3 为准。
-#    内核 >= 7.1 上这张 map 叫 skyline_cc_txs，下面的 grep 同样匹配
+# G2 (optional) struct_ops is registered: needs bpftool, which hosts with a prebuilt install do not have; G3 is authoritative.
+#    On kernels >= 7.1 the map is called skyline_cc_txs; the grep below matches it too
 bpftool struct_ops show | grep -q skyline_cc
 
-# G3 算法已进入内核可用列表
+# G3 the algorithm is in the kernel's available list
 sysctl -n net.ipv4.tcp_available_congestion_control | grep -qw skyline_cc
 
-# G4 已成为系统默认
+# G4 it is the system default
 [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = skyline_cc ]
 
-# G5 daemon 自述已挂载（sv 的定义见文首）
+# G5 the daemon itself says it is attached (sv is defined at the top of this document)
 [ "$(sv enabled)" = true ]
 
-# G6 开机自启
+# G6 starts at boot
 systemctl is-enabled skyline-speederd.service skyline-speeder-enable.service
 
-# G7 guard 已武装，qdisc 已就位（[guard] qdisc = false 时跳过后两条；没有可维护的网卡时跳过最后一条）。
-#    最后一条看的是 guard 实际维护的网卡（guard.live.devices：tc_interface 自己，
-#    或它是 VLAN/bond/bridge 时下面的物理网卡），每块的根必须是 fq 或 mq/fq
+# G7 the guard is armed and the qdiscs are in place (skip the last two with [guard] qdisc = false; skip the last one when there is no NIC to maintain).
+#    The last one looks at the NICs the guard actually maintains (guard.live.devices: tc_interface itself,
+#    or the physical NICs under it when it is a VLAN/bond/bridge); the root of each must be fq or mq/fq
 [ "$(sv armed)" = true ]
 [ "$(sysctl -n net.core.default_qdisc)" = fq ]
-#    （读不到根 qdisc 的网卡——例如 down 了——在 JSON 里是 null，同样算失败）
+#    (a NIC whose root qdisc cannot be read -- for example one that is down -- is null in the JSON and also counts as a failure)
 q=$(ssctl status --json | grep -E '^ +"qdisc": ("|null)' | sed -E 's/.*"qdisc": "?([^",]*)"?,?$/\1/')
 [ -n "$q" ] && ! printf '%s\n' "$q" | grep -vqxE 'fq|mq/fq' && echo "qdisc OK:" $q
 ```
 
-`ssctl status` 报告标题右侧就是结论：`● ACCELERATING`（已挂载且是全机默认）、`○ ATTACHED, NOT DEFAULT`
-（挂上了但新连接绕开了它，等于没生效）、`○ DRAINING`（执行过 drain，新连接已回到 `fallback_cc`，skyline_cc
-只服务剩下的连接，§11.1）、`○ STANDBY`（没挂载）。是 `ATTACHED, NOT DEFAULT` 或 `STANDBY` 时，最下面的
-ATTENTION 段落逐条写明问题与处理动作。所有 `ssctl` 子命令默认打印给人看的报告，脚本解析一律加 `--json`；
-应答 `ok` 为 `false` 时 `ssctl` 的退出码是 1。
+The verdict is at the right of the `ssctl status` report's title: `● ACCELERATING` (attached and the host-wide
+default), `○ ATTACHED, NOT DEFAULT` (attached, but new connections bypass it, which amounts to no effect),
+`○ DRAINING` (a drain was run; new connections are back on `fallback_cc` and skyline_cc only serves the
+remaining connections, section 11.1), `○ STANDBY` (not attached). On `ATTACHED, NOT DEFAULT` or `STANDBY`, the
+ATTENTION section at the bottom lists each problem and what to do about it. Every `ssctl` subcommand prints a
+human-readable report by default; scripts that parse output always add `--json`. When the reply's `ok` is
+`false`, `ssctl` exits with 1.
 
-G7 后两条失败时看 `ssctl status` 的 DRIFT GUARD 段落（`--json` 里是 `guard` 的 `notes` 与 `last_error`，
-打印整段：`ssctl status --json | sed -n '/^    "guard": {/,/^    }/p'`）：根 qdisc 是 `htb`/`tbf`/`netem` 等
-刻意搭建的整形结构、或设了带宽的 `cake` 时，guard 按设计不动它；`tc_interface` 是根为 `noqueue`、下面又找
-不到物理网卡的隧道时没有可维护的网卡——这两种都不是部署失败（§9）。
+When the last two checks of G7 fail, look at the DRIFT GUARD section of `ssctl status` (in `--json`, `notes`
+and `last_error` of `guard`; print the whole object with
+`ssctl status --json | sed -n '/^    "guard": {/,/^    }/p'`): when the root qdisc is a deliberately built
+shaping setup such as `htb`/`tbf`/`netem`, or a `cake` with a bandwidth set, the guard leaves it alone by
+design; when `tc_interface` is a tunnel whose root is `noqueue` and no physical NIC can be found under it,
+there is no NIC to maintain — neither case is a failed deployment (section 9).
 
-**G8 重启存活**（强烈建议）：`systemctl reboot`，重启后重新执行 G1–G7。
+**G8 Survives a reboot** (strongly recommended): `systemctl reboot`, then run G1–G7 again after the reboot.
 
-**G9 实流验证**：确认真实连接确实走了这个算法，而不只是 sysctl 值正确。
+**G9 Live-traffic check**: confirm that real connections actually use this algorithm, not just that the sysctl
+value is right.
 
 ```bash
-ss -tin | grep -c skyline_cc          # 应 > 0（已建立的老连接不会中途切换，等新连接）
-ssctl flows                           # CONNECTIONS 段落：coverage 一行与逐条连接
+ss -tin | grep -c skyline_cc          # should be > 0 (established old connections do not switch midway; wait for new ones)
+ssctl flows                           # CONNECTIONS section: the coverage line and one row per connection
 ```
 
-`ssctl flows` 就是 daemon 替你跑的那条 `ss`：coverage 一行写"主机上多少条 TCP 连接跑在 `skyline_cc` 上"，
-下面逐条列出 RTT、cwnd、pacing、交付速率与重传占比（按已发字节排序，最多 50 条，其余只显示一行
-条数 "N more, not shown"），再下面是生效中的参数与算法决策计数器。
+`ssctl flows` is that `ss` run for you by the daemon: the coverage line says "how many TCP connections on the
+host run on `skyline_cc`", and below it each connection is listed with RTT, cwnd, pacing, delivery rate and
+retransmission share (sorted by bytes sent, at most 50; the rest are shown only as a one-line count,
+"N more, not shown"), followed by the parameters in force and the algorithm's decision counters.
 
 ---
 
-## 7. cgroup 前提（M1 动态 RTO）
+## 7. The cgroup prerequisite (M1 dynamic RTO)
 
-`skyline_policy` 挂在 cgroup `/sys/fs/cgroup/skyline-speeder` 上：**只有这个 cgroup 里的进程建立的连接**
-才经过这段 BPF 代码，进程不迁移进去不报任何错误。受影响的只有 M1 tier-2 动态 RTO 调节；`skyline_cc`
-（全局 struct_ops）与 `skyline_tc`（接口级 TC）**不受**此限制。
+`skyline_policy` is attached to the cgroup `/sys/fs/cgroup/skyline-speeder`: **only connections made by
+processes in this cgroup** pass through this BPF code, and no error of any kind is reported when a process is
+not moved in. Only M1 tier-2 dynamic RTO tuning is affected; `skyline_cc` (a global struct_ops) and
+`skyline_tc` (interface-level TC) are **not** subject to this restriction.
 
-**动态 RTO 默认关闭。** daemon 每次启动都把它清零，配置文件里的 `[rack_rto]` 在启动时**不会**下发（随附的
-模板没有这一段，即关闭）。打开它：
-
-```bash
-ssctl set-rack-rto --srtt-permille 1100 --floor-us 20000 --ceiling-us 200000 --warmup-samples 4   # 下发命令行给的值
-ssctl reset-rack-rto      # 或者：下发配置文件里 [rack_rto] 的值
-ssctl set-rack-rto --disable   # 无条件关闭
-```
-
-两者都是绝对覆盖，每次 daemon 重启后要重新执行一次。参数含义、RTO 上限（`--rto-max-*`，需要内核 ≥ 6.15）
-与建议值见 `docs/usage.md` 第五节。
-
-迁移进程：
+**Dynamic RTO is off by default.** The daemon clears it on every start, and `[rack_rto]` in the configuration
+file is **not** pushed at start (the shipped template has no such section, i.e. it is off). To turn it on:
 
 ```bash
-/opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <服务启动命令...>
+ssctl set-rack-rto --srtt-permille 1100 --floor-us 20000 --ceiling-us 200000 --warmup-samples 4   # push the values given on the command line
+ssctl reset-rack-rto      # or: push the values of [rack_rto] in the configuration file
+ssctl set-rack-rto --disable   # turn it off unconditionally
 ```
 
-需要 root 只是为了写 `cgroup.procs`；经 `sudo` 调用时，被包装的命令以 `$SUDO_USER` 的身份运行。systemd 服务
-用 drop-in 迁移（`+` 前缀提权，写 `cgroup.procs` 需要 root）：
+Both are absolute overwrites and must be run again after every daemon restart. For what the parameters mean,
+the RTO ceiling (`--rto-max-*`, needs kernel ≥ 6.15) and recommended values, see `docs/usage.md` section 5.
+
+Moving processes in:
+
+```bash
+/opt/skyline-speeder/infra/run-in-skyline-cgroup.sh <service start command...>
+```
+
+Root is needed only to write `cgroup.procs`; when it is called through `sudo`, the wrapped command runs as
+`$SUDO_USER`. Move a systemd service with a drop-in (the `+` prefix raises privileges; writing `cgroup.procs`
+needs root):
 
 ```ini
 # /etc/systemd/system/<unit>.d/10-skyline-cgroup.conf
@@ -577,288 +661,362 @@ After=skyline-speederd.service skyline-speeder-enable.service
 ExecStartPost=+/bin/sh -c 'echo $MAINPID > /sys/fs/cgroup/skyline-speeder/cgroup.procs'
 ```
 
-诊断（`ssctl flows` 的 DYNAMIC RTO 段落；动态 RTO 关闭时是 CGROUP POLICY 段落，只显示 *connections seen*；
-全部计数在 `--json` 的 `rack_rto.stats` 里）：
+Diagnosis (the DYNAMIC RTO section of `ssctl flows`; when dynamic RTO is off, the CGROUP POLICY section, which
+shows only *connections seen*; all counters are in `rack_rto.stats` of `--json`):
 
-| 现象 | 结论 |
+| Symptom | Conclusion |
 |---|---|
-| `established_cb`（*connections seen*）为 0 | 没有进程的连接经过 `skyline_policy` → 目标进程不在 cgroup 内。这一行不论 RTO 调节开没开都显示（0.5.1 及更早只在打开后显示）；RTO 调节打开时 ATTENTION 段落也会写明 |
-| `established_cb` 增长，`subscribe_ok`、`rtt_callbacks` 为 0 | RTO 调节没有打开（daemon 启动后默认关闭）→ 执行上面的 `set-rack-rto` / `reset-rack-rto` |
-| `subscribe_err` 非零 | 订阅 RTT 回调失败 → 检查内核的 sockops 能力 |
-| `subscribe_ok` 非零、`applied` 为 0、`rejected` 非零 | 内核拒绝下发的值 → 取值超出内核对 RTO 的合法区间 |
-| `rto_max_rejected` 增长、`rto_max_applied` 为 0 | 内核 < 6.15，没有 `TCP_RTO_MAX_MS`；RTO 上限不生效，下限照常工作 |
+| `established_cb` (*connections seen*) is 0 | No process's connections pass through `skyline_policy` → the target process is not in the cgroup. This line is shown whether or not RTO tuning is on (0.5.1 and earlier showed it only once it was on); with RTO tuning on, the ATTENTION section says so as well |
+| `established_cb` grows, `subscribe_ok` and `rtt_callbacks` are 0 | RTO tuning is not on (it is off by default after the daemon starts) → run `set-rack-rto` / `reset-rack-rto` above |
+| `subscribe_err` is non-zero | Subscribing to the RTT callback failed → check the kernel's sockops capability |
+| `subscribe_ok` non-zero, `applied` 0, `rejected` non-zero | The kernel rejects the values pushed → they are outside the kernel's valid range for RTO |
+| `rto_max_rejected` grows, `rto_max_applied` is 0 | Kernel < 6.15, which has no `TCP_RTO_MAX_MS`; the RTO ceiling has no effect, the floor works as usual |
 
 ---
 
-## 8. 配置与调参
+## 8. Configuration and tuning
 
-### 8.1 配置文件要点
+### 8.1 Configuration file essentials
 
-配置在 `/etc/skyline-speeder/speeder.toml`，模板是仓库里的 `config/speeder-guest.toml`（发布产物里叫
-`config/speeder.toml`）。每个字段的类型、范围与何时生效见 `docs/02-interface-reference.md` 第 6 节。
+The configuration is `/etc/skyline-speeder/speeder.toml`; its template is `config/speeder-guest.toml` in the
+repository (called `config/speeder.toml` in the release artifact). For each field's type, range and when it
+takes effect, see `docs/02-interface-reference.md` section 6.
 
-- 四个模块（`early-loss`/`adaptive-cwnd`/`loss-classifier`/`pacing`）默认全部启用；
-- `[redundancy]` 默认开启：`first_kib = 64`、`delay_ms = 10`（§5.2）；
-- `[rack_tuning]` 整段留空：全局 sysctl 的默认值不由 `skyline-speederd` 接管；
-- `[rack_rto]`、`[retransmit_dscp]` 默认关闭，而且写进文件也**不会在 daemon 启动时下发**，要
-  `ssctl reset-rack-rto` / `reset-retransmit-dscp`（下发文件里的值）或 `set-*`（下发命令行的值）。
-  0.5.1 起状态如实显示它们关闭（`--json` 里 `config.enabled` 为 `false`，文件值在 `declared`），文件开启而
-  未下发时 `ssctl status` 的 ATTENTION 会提示；0.5.0 及更早的 `config` 照着文件显示为开启。
-  `dscp_value` 是占位值，启用前必须由网络侧给出具体编码（`docs/usage.md` 第六节）；
-- `[guard]` 默认 `interval_s = 5`、`qdisc = true`（§9）；
-- `fallback_cc`：`skyline_cc` 不在时新连接用的算法。每次 enable 挂载前、`ssctl drain`、enable unit 的 ExecStop
-  都写它；daemon 自己停止时不写。可以填内核已注册的算法（`/proc/sys/net/ipv4/tcp_available_congestion_control`），
-  也可以填内核能自动加载的模块 `tcp_<名字>`（0.4.3 起；更早的版本只认已注册的）；
-- `runtime.tc_interface` 必须是承载流量的以太网设备：`skyline_tc` 的重传 DSCP 标记与首轮冗余按以太网帧头
-  解析报文，daemon 不会把它挂到 WireGuard/WARP、tun、gre、ppp 这类三层隧道上（原因写在 ATTENTION 段落里，
-  `--json` 里是 `capabilities.notes`；`set-retransmit-dscp` 随之失败）。guard 维护的也是这块网卡的根 qdisc。
+- All four modules (`early-loss`/`adaptive-cwnd`/`loss-classifier`/`pacing`) are enabled by default;
+- `[redundancy]` is on by default: `first_kib = 64`, `delay_ms = 10` (section 5.2);
+- `[rack_tuning]` is left empty as a whole: `skyline-speederd` does not take over the defaults of the global
+  sysctls;
+- `[rack_rto]` and `[retransmit_dscp]` are off by default, and even when written into the file they are **not
+  pushed when the daemon starts**: that takes `ssctl reset-rack-rto` / `reset-retransmit-dscp` (pushing the
+  values in the file) or `set-*` (pushing values from the command line).
+  Since 0.5.1 the status truthfully shows them as off (in `--json`, `config.enabled` is `false` and the file's
+  values are in `declared`), and when the file turns them on but they have not been pushed, the ATTENTION
+  section of `ssctl status` points this out; in 0.5.0 and earlier, `config` shows them as on, following the
+  file. `dscp_value` is a placeholder: before enabling it, the network side must supply the actual code point
+  (`docs/usage.md` section 6);
+- `[guard]` defaults to `interval_s = 5`, `qdisc = true` (section 9);
+- `fallback_cc`: the algorithm new connections use when `skyline_cc` is not there. It is written before every
+  enable attaches, by `ssctl drain`, and by the enable unit's ExecStop; not when the daemon itself stops. It can
+  name an algorithm the kernel has registered (`/proc/sys/net/ipv4/tcp_available_congestion_control`), or one
+  whose module `tcp_<name>` the kernel can load automatically (since 0.4.3; earlier versions accept only
+  registered ones);
+- `runtime.tc_interface` must be the Ethernet device that carries the traffic: `skyline_tc`'s retransmit DSCP
+  marking and first-flight redundancy parse packets by their Ethernet header, and the daemon will not attach it
+  to a layer-3 tunnel such as WireGuard/WARP, tun, gre or ppp (the reason is given in the ATTENTION section,
+  `capabilities.notes` in `--json`; `set-retransmit-dscp` then fails). The root qdisc the guard maintains is
+  also this NIC's.
 
 > [!CAUTION]
-> 0.5.0 起 daemon 拒绝它不认识的键：写错段落的键（例如把 `loss_inflation_max_ratio` 写进 `[adaptive_cwnd]`）
-> 或拼错的键，会让 `--validate-only` 和 daemon 启动都失败，报错逐个列出这些键，键名属于别的段落时指明是哪一段。
-> **0.4.x 及更早的 daemon 静默忽略它们**，`--validate-only` 也照样通过。无论哪个版本，改完之后都用
-> `ssctl flows` 的 PARAMETERS IN FORCE 段落核对生效的值。
+> Since 0.5.0 the daemon rejects keys it does not know: a key in the wrong section (for example
+> `loss_inflation_max_ratio` written into `[adaptive_cwnd]`) or a misspelled key makes both `--validate-only`
+> and daemon start-up fail, with an error that lists each such key and, when a key belongs to another section,
+> names that section. **Daemons 0.4.x and earlier silently ignore them**, and `--validate-only` passes as well.
+> Whatever the version, after a change check the values in force in the PARAMETERS IN FORCE section of
+> `ssctl flows`.
 
-### 8.2 在线调参
+### 8.2 Live tuning
 
 ```bash
-ssctl set-module-config --cruise-pacing-gain 1.3     # M2/M3/M4 系数与上限
-ssctl reset-module-config                            # 回到配置文件里的值
+ssctl set-module-config --cruise-pacing-gain 1.3     # M2/M3/M4 coefficients and limits
+ssctl reset-module-config                            # back to the values in the configuration file
 ```
 
-- `set-module-config` 是**绝对覆盖**：每次发送全部 17 个系数，命令行没写的取 `ssctl` 内置默认值，不是配置文件里
-  的值（全新安装时两者相同；从 0.3.x 及更早升级、保留了旧配置的主机上不同）。`--disable-prr-pacing`、
-  `--disable-auto-pacing` 同理：不写就是打开。任何一个参数越界，整条命令被拒绝，已生效的配置不变。
-- 新系数写进当前没被指向的那个配置槽，再把配置序号指过去；每条连接在 RTT 边界把它复制进自己的状态，之后只读
-  自己的副本，所以同一轮里读到的不会新旧混杂，脚本里连着下发两次也一样（0.4.x 在一个 RTT 内连续下发两次时会
-  改写仍有连接在读的槽）。`skyline_cc` 未挂载时改的系数在下一次 `enable` 时生效。
-- `set-rack-rto` 同样是绝对覆盖，但直接改写那一份 RTO 参数，不经过配置槽（§7）。
-- 四档现成配方（保守、默认、激进、高随机丢包）与每个参数调大调小的后果见 `docs/usage.md` 第四节。
+- `set-module-config` is an **absolute overwrite**: every call sends all 17 coefficients, and those not given
+  on the command line take `ssctl`'s built-in defaults, not the values in the configuration file (the two are
+  the same on a fresh install; they differ on a host upgraded from 0.3.x or earlier that kept its old
+  configuration). The same goes for `--disable-prr-pacing` and `--disable-auto-pacing`: leaving them out means
+  on. If any one parameter is out of bounds, the whole command is rejected and the configuration in force stays
+  unchanged.
+- New coefficients are written into the configuration slot not currently pointed to, and then the
+  configuration sequence number is pointed at it; each connection copies it into its own state at an RTT
+  boundary and from then on reads only its own copy, so what it reads within one round is never a mix of old
+  and new, even when a script pushes twice in a row (0.4.x, when pushed twice within one RTT, rewrote a slot
+  that connections were still reading). Coefficients changed while `skyline_cc` is not attached take effect at
+  the next `enable`.
+- `set-rack-rto` is also an absolute overwrite, but it rewrites the single set of RTO parameters directly,
+  without going through the configuration slots (section 7).
+- For the four ready-made preset recipes (conservative, default, aggressive, high random loss) and the
+  consequences of raising or lowering each parameter, see `docs/usage.md` section 4.
 
-### 8.3 持久修改
+### 8.3 Persistent changes
 
-在线修改只在 daemon 的内存里，重启即丢。要长期生效：
+Live changes live only in the daemon's memory and are lost on restart. To make them last:
 
 ```bash
 cp /etc/skyline-speeder/speeder.toml /etc/skyline-speeder/speeder.toml.bak
 vi /etc/skyline-speeder/speeder.toml
-skyline-speederd --config /etc/skyline-speeder/speeder.toml --validate-only    # 不通过就别重启
+skyline-speederd --config /etc/skyline-speeder/speeder.toml --validate-only    # if this does not pass, do not restart
 systemctl restart skyline-speederd.service
 ```
 
-重启 daemon 会连带重启处于 active 的 enable unit（`Requires=`）：它的 ExecStop 先 drain（最多 60 秒），新 daemon
-起来后重新挂载。之后按 §8.1 的提示核对 PARAMETERS IN FORCE。
+Restarting the daemon also restarts the enable unit when it is active (`Requires=`): its ExecStop first drains
+(up to 60 seconds), and it attaches again once the new daemon is up. Afterwards, check PARAMETERS IN FORCE as
+section 8.1 advises.
 
 ---
 
-## 9. guard：守住拥塞控制与 qdisc
+## 9. The guard: keeping the congestion control and qdiscs in place
 
-`default_qdisc` 只影响之后新建的 qdisc，网卡的根 qdisc 往往在它生效前就建好了，所以光改 sysctl 改不到网卡；而
-VPS 上常见的"一键 BBR"脚本把 `bbr` 与 `cake`/`fq_pie` 写进 `/etc/sysctl.d`，之后任何一次 `sysctl --system`
-都会悄悄把拥塞控制翻回 `bbr`，新连接从此绕开 `skyline_cc` 且没有任何报错。因此从 `enable` 到下一次 `drain`，
-`skyline-speederd` 独占三项设置：`net.ipv4.tcp_congestion_control`，以及 `[guard] qdisc = true`（默认）时的
-`net.core.default_qdisc` 与受管网卡的根 qdisc。`enable` 时立即检查一遍，此后每 `[guard] interval_s` 秒（默认 5）
-再查一次，被改了就改回，并在日志里记一行 `guard: <项> <原值> -> <新值> (...)`。guard 与安装器都**不修改**
-`/etc/sysctl.conf` 与 `/etc/sysctl.d` 下的任何文件。`drain` 立即解除守护，且不动任何 qdisc。完整规则见
-`docs/02-interface-reference.md` 第 9 节。
+`default_qdisc` only affects qdiscs created afterwards, and a NIC's root qdisc has usually been created before
+it takes effect, so changing the sysctl alone does not reach the NIC; and the "one-click BBR" scripts common on
+VPSes write `bbr` and `cake`/`fq_pie` into `/etc/sysctl.d`, after which any `sysctl --system` quietly flips the
+congestion control back to `bbr`, and from then on new connections bypass `skyline_cc` without any error. So
+from `enable` to the next `drain`, `skyline-speederd` exclusively owns three settings:
+`net.ipv4.tcp_congestion_control` and, with `[guard] qdisc = true` (the default), `net.core.default_qdisc` and
+the root qdisc of the managed NICs. It checks once immediately on `enable` and then again every
+`[guard] interval_s` seconds (5 by default); whatever has been changed is changed back, with a log line
+`guard: <item> <old value> -> <new value> (...)`. Neither the guard nor the installer **modifies**
+`/etc/sysctl.conf` or any file under `/etc/sysctl.d`. `drain` lifts the guard immediately and touches no qdisc.
+The full rules are in `docs/02-interface-reference.md` section 9.
 
-**受管网卡。** 就是 `runtime.tc_interface` 自己；它的根是内核默认的 `noqueue`（VLAN、bond、网桥）时，报文真正
-排队的是下面物理网卡的根 qdisc，guard 顺着 `/sys/class/net/<网卡>/lower_*` 往下找（最多 4 层，每块只看一次），
-管理有 `device` 链接的物理/virtio 网卡（bond 的从属网卡、VLAN 的真实网卡、网桥的物理端口），纠正记录里写明路径，
-如 `eth0 (under bond0) root qdisc cake -> fq`。没有 `device` 链接的端口（虚拟机的 tap、容器的 veth、ifb）一律不碰。
-根是 `noqueue`、下面又找不到网卡的（内核 WireGuard 设备、只挂着 tap 的网桥），只记一条
-`<网卡> is a virtual device (noqueue is its kernel default) and no NIC under it is visible to the guard; no qdisc checked`。
-tun、PPP 设备（OpenVPN、wireguard-go、WARP 客户端、PPPoE）有自己的默认 qdisc，被当作 `tc_interface` 时 guard
-管的就是它自己的根。受管网卡列在 `ssctl status` 的 DRIFT GUARD 段落（`--json` 里是 `guard.live.devices`）。
+**Managed NICs.** That is `runtime.tc_interface` itself; when its root is the kernel default `noqueue` (VLAN,
+bond, bridge), packets actually queue in the root qdisc of the physical NICs under it, so the guard walks down
+`/sys/class/net/<nic>/lower_*` (at most 4 levels, each device looked at once) and manages the physical/virtio
+NICs that have a `device` link (a bond's slave NICs, a VLAN's real NIC, a bridge's physical ports), with the
+path written into the correction record, such as `eth0 (under bond0) root qdisc cake -> fq`. Ports without a
+`device` link (a virtual machine's tap, a container's veth, ifb) are never touched.
+When the root is `noqueue` and no NIC can be found under it (a kernel WireGuard device, a bridge with only taps
+attached), it only records
+`<nic> is a virtual device (noqueue is its kernel default) and no NIC under it is visible to the guard; no qdisc checked`.
+tun and PPP devices (OpenVPN, wireguard-go, the WARP client, PPPoE) have their own default qdisc; when one is
+used as `tc_interface`, the guard manages its own root. The managed NICs are listed in the DRIFT GUARD section
+of `ssctl status` (`guard.live.devices` in `--json`).
 
-**只替换没有配置值得保留的 qdisc**（`pfifo_fast`、`fq_codel`、未整形的 `cake`、`fq_pie` 等）。刻意搭建的整形、
-分类、卸载类 qdisc（`htb`、`tbf`、`netem`、`mqprio` 等）、设了带宽或 `autorate-ingress` 的 `cake`、运维亲手在
-物理网卡上设成的 `noqueue`、以及不认识的种类一律不动，只在 `notes` 里说明，例如
-`eth0 root qdisc cake (bandwidth 90Mbit) looks deliberate; left alone`。
+**Only qdiscs with no configuration worth keeping are replaced** (`pfifo_fast`, `fq_codel`, an unshaped
+`cake`, `fq_pie` and the like). Deliberately built shaping, classful and offload qdiscs (`htb`, `tbf`,
+`netem`, `mqprio` and the like), a `cake` with a bandwidth or `autorate-ingress` set, a `noqueue` the operator
+set on a physical NIC by hand, and unknown kinds are all left alone, with only an explanation in `notes`, for
+example `eth0 root qdisc cake (bandwidth 90Mbit) looks deliberate; left alone`.
 
-判定命令：
+Commands to check:
 
 ```bash
-ssctl status                                                          # DRIFT GUARD 段落
-ssctl status --json | sed -n '/^    "guard": {/,/^    }/p'            # guard 整段 JSON
+ssctl status                                                          # DRIFT GUARD section
+ssctl status --json | sed -n '/^    "guard": {/,/^    }/p'            # the whole guard JSON object
 journalctl -u skyline-speederd.service | grep 'guard:'
 ```
 
-| 现象 | 结论与处置 |
+| Symptom | Conclusion and action |
 |---|---|
-| `cc_restored` 持续增长，日志反复出现 `guard: tcp_congestion_control ... (something else on this host changed it)` | 主机上有东西在反复写这个 sysctl（常见：`sysctl --system`/`sysctl -p` 重新应用了 `/etc/sysctl.conf` 或 `/etc/sysctl.d/*.conf` 里的 `bbr`）。guard 会一直改回，生效不受影响；要根除，找出并删掉那一行（安装摘要列出了这些文件） |
-| `notes` 含 `looks deliberate; left alone`，或 `is not a kind the guard knows is safe to replace` | 网卡根 qdisc 是整形、分类、卸载类，或设了带宽的 `cake`，或不认识的种类：按设计不动，以免毁掉整形配置 |
-| `notes` 含 `is a virtual device (noqueue is its kernel default) and no NIC under it is visible to the guard` | `tc_interface` 是根为 `noqueue`、下面没有物理网卡的设备，guard 不检查任何根 qdisc。把 `runtime.tc_interface` 改成承载流量的物理网卡并重启 `skyline-speederd` |
-| `capabilities.notes` 含 `is not an Ethernet device` | `tc_interface` 不是以太网设备，`skyline_tc` 不挂载（`set-retransmit-dscp` 随之失败）。处置同上 |
-| `last_error`/`notes` 含 `tc is not installed` | 安装 `iproute2`（Fedora/RHEL 上是 `iproute-tc`），然后 `ssctl enable` |
-| `notes` 含 `the last replace failed; retrying in <N> s` | 一次替换没有生效，周期检查按退避重试（30 秒起，`interval_s` 更长时按它，每次失败翻倍，最长 300 秒）；原因看 `last_error`。排除后想立即重试执行 `ssctl enable`。`interval_s = 0` 时写作 `retried on the next ssctl enable` |
-| `last_error` 含 `left alone: default_qdisc is` | `default_qdisc` 不是 `fq`（写入被拒，或有东西马上又改了它）；多队列网卡上新建的 `mq` 会按它建子队列，所以 guard 不动根 qdisc。先查谁在改 `default_qdisc` |
-| `last_error` 含 `did not finish within 10000ms and was killed`，或 `a previous tc has not exited yet (rtnl lock held?); skipped` | `tc` 卡在内核的 rtnl 锁上：被杀掉的 `tc` 退出之前，guard 的每个 `tc` 都立即跳过，不会越积越多；锁释放后下一次检查自动恢复。持续出现时查是谁长时间持有 rtnl（例如卡住的网卡驱动） |
-| `enabled` 为 `true` 而 `armed` 为 `false` | drain 超时之后的正常状态（§11.1）：struct_ops 仍挂着，guard 已解除。要恢复加速执行 `ssctl enable` |
+| `cc_restored` keeps growing, and the log repeatedly shows `guard: tcp_congestion_control ... (something else on this host changed it)` | Something on the host keeps writing this sysctl (commonly `sysctl --system`/`sysctl -p` re-applying the `bbr` in `/etc/sysctl.conf` or `/etc/sysctl.d/*.conf`). The guard keeps changing it back, so the effect is unharmed; to get rid of it for good, find and delete that line (the install summary lists these files) |
+| `notes` contains `looks deliberate; left alone` or `is not a kind the guard knows is safe to replace` | The NIC's root qdisc is a shaping, classful or offload kind, or a `cake` with a bandwidth set, or an unknown kind: left alone by design, so as not to destroy a shaping setup |
+| `notes` contains `is a virtual device (noqueue is its kernel default) and no NIC under it is visible to the guard` | `tc_interface` is a device whose root is `noqueue` with no physical NIC under it, and the guard checks no root qdisc. Change `runtime.tc_interface` to the physical NIC that carries the traffic and restart `skyline-speederd` |
+| `capabilities.notes` contains `is not an Ethernet device` | `tc_interface` is not an Ethernet device, so `skyline_tc` is not attached (`set-retransmit-dscp` then fails). Same action as above |
+| `last_error`/`notes` contains `tc is not installed` | Install `iproute2` (`iproute-tc` on Fedora/RHEL), then `ssctl enable` |
+| `notes` contains `the last replace failed; retrying in <N> s` | A replacement did not take effect, and the periodic check retries with backoff (starting at 30 seconds, or at `interval_s` when that is longer, doubling with every failure, up to 300 seconds); see `last_error` for the reason. Once the cause is fixed, run `ssctl enable` to retry immediately. With `interval_s = 0` it reads `retried on the next ssctl enable` |
+| `last_error` contains `left alone: default_qdisc is` | `default_qdisc` is not `fq` (the write was refused, or something changed it again right away); a newly created `mq` on a multi-queue NIC builds its child queues from it, so the guard does not touch the root qdisc. First find out who is changing `default_qdisc` |
+| `last_error` contains `did not finish within 10000ms and was killed`, or `a previous tc has not exited yet (rtnl lock held?); skipped` | `tc` is stuck on the kernel's rtnl lock: until the killed `tc` exits, every `tc` the guard would run is skipped at once, so they do not pile up; after the lock is released, the next check recovers by itself. If it persists, find out who is holding rtnl for so long (for example a stuck NIC driver) |
+| `enabled` is `true` but `armed` is `false` | The normal state after a drain timed out (section 11.1): the struct_ops is still attached, the guard is disarmed. Run `ssctl enable` to resume acceleration |
 
-**退出。** 只让它管拥塞控制：`[guard] qdisc = false`；不要周期检查：`interval_s = 0`（`enable` 仍会做一次）。
-两者都改配置文件后重启 `skyline-speederd` 才生效。
+**Opting out.** To have it manage only the congestion control: `[guard] qdisc = false`; for no periodic check:
+`interval_s = 0` (`enable` still runs one). Both take effect only after changing the configuration file and
+restarting `skyline-speederd`.
 
 ---
 
-## 10. 升级
+## 10. Upgrades
 
-### 10.1 一键安装的主机
+### 10.1 Hosts installed with the one-line install
 
-再运行一次安装器即可，当初带了 `--source`/`--no-enable` 的照样带上（从源码构建的主机不带 `--source` 重跑，会
-换成已发布的产物）。经引导脚本安装的主机重跑同一条一键命令。安装器的做法：
+Just run the installer again, with `--source`/`--no-enable` again if they were used originally (rerunning
+without `--source` on a host built from source switches it to the published artifact). On a host installed
+through the bootstrap script, rerun the same one-line command. What the installer does:
 
-1. 新的 daemon 与对象先通过内核验证器（配置用已装的那份，`bpf_dir` 指向新对象），然后才替换已装的二进制、对象、
-   脚本与 unit，再动正在运行的 daemon；验证不过时什么都不替换（§10.3）；
-2. `skyline-speederd.service` 处于 active 时，执行 `systemctl restart skyline-speederd.service`。enable unit
-   处于 active 时随之重启：它的 ExecStop（`boot-disable.sh`）执行 `ssctl drain`——先解除 guard、写回
-   `fallback_cc`，再等存量连接至多 60 秒（经 SSH 必然走到超时，无害）——新 daemon 起来后重新挂载；
-3. `skyline_cc` 是用裸 `ssctl enable` 挂载的主机（enable unit 不是 active，而当前默认拥塞控制是 `skyline_cc`）
-   没有 ExecStop 替它 drain，daemon 自己停止时又刻意不写 sysctl，所以安装器在重启前自己执行
-   `timeout 75 ssctl drain --timeout 60`（失败只记日志）。重启后不带 `--no-enable` 时由 enable unit 挂载（此后
-   开机自启），带 `--no-enable` 时再执行一次 `ssctl enable`（仍是手工挂载）。只看当前默认值、不看旧 daemon 的
-   `enabled`，是因为一次超时的 drain 已经写回了 `fallback_cc` 却留着 `enabled: true`——那台主机是被有意摘除的。
+1. The new daemon and objects first pass the kernel verifier (with the installed configuration and `bpf_dir`
+   pointing at the new objects); only then are the installed binaries, objects, scripts and units replaced, and
+   only then is the running daemon touched; if verification fails, nothing is replaced (section 10.3);
+2. When `skyline-speederd.service` is active, it runs `systemctl restart skyline-speederd.service`. When the
+   enable unit is active, it restarts along with it: its ExecStop (`boot-disable.sh`) runs `ssctl drain` —
+   first disarming the guard and writing `fallback_cc` back, then waiting up to 60 seconds for existing
+   connections (over SSH it always runs into the timeout, harmlessly) — and it attaches again once the new
+   daemon is up;
+3. A host where `skyline_cc` was attached with a bare `ssctl enable` (the enable unit is not active, and the
+   current default congestion control is `skyline_cc`) has no ExecStop to drain for it, and the daemon
+   deliberately writes no sysctl when it stops, so the installer runs `timeout 75 ssctl drain --timeout 60`
+   itself before the restart (a failure is only logged). After the restart, without `--no-enable` the enable
+   unit attaches (and from then on at every boot); with `--no-enable`, it runs `ssctl enable` once more (still a
+   manual attach). It looks only at the current default, not at the old daemon's `enabled`, because a drain
+   that timed out has already written `fallback_cc` back but leaves `enabled: true` — `skyline_cc` was taken
+   off that host on purpose.
 
-升级之后：
+After the upgrade:
 
-- 已有的 `/etc/skyline-speeder/speeder.toml` 不会被覆盖，缺少的新配置段按默认值生效。升级到 0.5.0 及以后时，
-  文件里有新 daemon 不认识的键（写错段落、拼错）的，安装器在验证器这一步停下，报错列出这些键，已装的文件与旧
-  daemon 原样不动（§10.3）：按报错改好文件再重跑；
-- 用 `ssctl` 做的在线修改只在旧 daemon 的内存里，重启后不保留；安装器把旧的 `ssctl status --json` 写进了安装
-  日志，需要时照着重新下发；
-- 摘要里显示 `upgraded <旧> -> <新>`，装回旧版本时是 `downgraded <旧> -> <新>`（v0.2.0 及更早的二进制没有
-  `--version`，显示 `from a release without --version (v0.2.0 or older)`）；用 §0.2 的判据确认运行的是新版本；
-- 各版本的升级注意事项见 `CHANGELOG.md` 里对应的 *Upgrading from ...* 小节。
+- An existing `/etc/skyline-speeder/speeder.toml` is not overwritten; new configuration sections it lacks take
+  effect with their defaults. When upgrading to 0.5.0 or later, if the file has keys the new daemon does not
+  know (in the wrong section, misspelled), the installer stops at the verifier step with an error listing those
+  keys, leaving the installed files and the old daemon untouched (section 10.3): fix the file as the error says
+  and rerun;
+- Live changes made with `ssctl` exist only in the old daemon's memory and do not survive the restart; the
+  installer has written the old `ssctl status --json` into the install log, so push them again from it if
+  needed;
+- The summary shows `upgraded <old> -> <new>`, or `downgraded <old> -> <new>` when going back to an older
+  version (binaries v0.2.0 and earlier have no `--version` and show
+  `from a release without --version (v0.2.0 or older)`); confirm with the criteria of section 0.2 that the new
+  version is running;
+- For each version's upgrade notes, see the matching *Upgrading from ...* subsection in `CHANGELOG.md`.
 
-### 10.2 手动安装的主机
+### 10.2 Manually installed hosts
 
-`install-guest.sh` 只替换文件，**不会重启**正在运行的 daemon，旧版本继续留在内存里。装完先跑 §4 的验证器（不影响
-正在运行的 daemon），通过后：
+`install-guest.sh` only replaces files and **does not restart** the running daemon; the old version stays in
+memory. After installing, first run the verifier of section 4 (it does not affect the running daemon); once it
+passes:
 
 ```bash
-# enable unit 是 active（按 §5 挂载的主机）：restart 会连带重启它，它的 ExecStop 自己 drain，无需手动。
-# 它不是 active（skyline_cc 由裸 ssctl enable 挂载）时才手动 drain：单独停止 daemon 不会写回 fallback_cc。
-# 经 SSH 执行的 drain 必然超时并返回非零（§11.1），属预期。
+# The enable unit is active (a host attached as in section 5): restart restarts it too, and its ExecStop drains by itself, no manual step needed.
+# Drain by hand only when it is not active (skyline_cc attached with a bare ssctl enable): stopping the daemon alone does not write fallback_cc back.
+# A drain run over SSH always times out and returns non-zero (section 11.1); this is expected.
 systemctl is-active -q skyline-speeder-enable.service || ssctl drain --timeout 60 || true
 systemctl restart skyline-speederd.service
 ```
 
-enable unit 此前不是 active、而这台主机应当挂载 `skyline_cc` 的，restart 之后按 §5.1 的第 ③ 步启动它（或再执行一次
-`ssctl enable`，但那样开机不会自动挂载）。
+If the enable unit was not active before but this host should have `skyline_cc` attached, start it after the
+restart as in step ③ of section 5.1 (or run `ssctl enable` once more, but then it is not attached
+automatically at boot).
 
-### 10.3 验证器失败、或要装回旧版本
+### 10.3 When the verifier fails, or to go back to an older version
 
-安装器在替换任何文件**之前**跑验证器：验证器失败时它停下，已装的文件与正在运行的 daemon 原样不动。（2026-10 之前
-的安装器先替换文件、后跑验证器：验证失败时磁盘上已是新文件，旧 daemon 在 drain 之后的下一次 enable 会读入新的
-`skyline_cc.bpf.o`，与它自己不配对。那样留下的主机，重跑现在的安装器即可。）先看 §4 的输出排除原因再重跑；要回到
-旧版本，用 `--release <旧 tag>` 安装那个版本，摘要会写 `downgraded`——配置文件原样保留。0.4.x 及更早的 daemon 会忽略它不认识的新键；0.5.0 及以后的会拒绝它们，要先删掉报错列出的键。
+The installer runs the verifier **before** replacing any file: when the verifier fails, it stops, leaving the
+installed files and the running daemon untouched. (Installers before 2026-10 replaced the files first and ran
+the verifier afterwards: when verification failed, the new files were already on disk, and at the next enable
+after a drain the old daemon would read the new `skyline_cc.bpf.o`, which does not pair with it. For a host
+left in that state, just rerun the current installer.) First find and remove the cause from the output of
+section 4, then rerun; to go back to an older version, install it with `--release <old tag>`, and the summary
+says `downgraded` — the configuration file is kept as is. Daemons 0.4.x and earlier ignore new keys they do not know; 0.5.0 and later reject them, so first delete the keys the error lists.
 
 ---
 
-## 11. 摘除、停止与卸载
+## 11. Removal, stopping and uninstallation
 
-### 11.1 优雅摘除：`ssctl drain`
+### 11.1 Graceful removal: `ssctl drain`
 
 ```bash
 ssctl drain --timeout 60
 ```
 
-依次：解除 guard，并在仍持有它的锁时把默认拥塞控制写回 `fallback_cc`（此后不再有检查把 `skyline_cc` 写回去）→
-cgroup 里的进程不再被切到 `skyline_cc` → 停止首轮冗余 →
-等存量 `skyline_cc` 连接自然结束（默认 300 秒，`--timeout` 覆盖）→ 全部结束后注销 struct_ops。新连接此后落回
-`fallback_cc`。`drain` 不动 qdisc，`default_qdisc` 与网卡根 qdisc 保持 `fq`。
+In order: disarm the guard, and while still holding its lock write `fallback_cc` back as the default congestion
+control (after this, no check writes `skyline_cc` back) →
+processes in the cgroup are no longer switched to `skyline_cc` → stop first-flight redundancy →
+wait for existing `skyline_cc` connections to end naturally (300 seconds by default, overridden by
+`--timeout`) → once they have all ended, unregister the struct_ops. From then on new connections fall back to
+`fallback_cc`. `drain` does not touch qdiscs: `default_qdisc` and the NIC's root qdisc stay `fq`.
 
 > [!IMPORTANT]
-> **经 SSH 执行的 `drain` 必然走到超时**：你自己的 SSH 连接就是一条 `skyline_cc` 流，不会在等待期间结束。
-> 超时时 `ssctl` 打印 `drain timeout expired; struct_ops remains attached, but the default congestion control is
-> already back on <fallback_cc> ...` 并以 1 退出——按这行消息识别，属预期。此时 sysctl 早已写回、guard 已解除，
-> "新连接不再使用 `skyline_cc`"已经成立；`skyline_cc` 本身仍保持注册（`sv enabled` 仍为 `true`、`sv armed`
-> 为 `false`、`sv draining` 为 `true`），直到之后某次 drain 等到连接归零、或 daemon 停止。`ssctl status` 与
-> `ssctl flows` 这时显示 `DRAINING` 和还剩的连接数（0.5.1 及更早显示 `ATTACHED, NOT DEFAULT` / `BYPASSED`，
-> 并提示重新 enable，那是误报）。要恢复加速执行 `ssctl enable`；要让 drain
-> 真正等到归零并注销，从串口控制台或一条不走本机 `skyline_cc` 的通道执行它。
+> **A `drain` run over SSH always runs into the timeout**: your own SSH connection is a `skyline_cc` flow and
+> will not end while it waits.
+> On the timeout, `ssctl` prints `drain timeout expired; struct_ops remains attached, but the default congestion control is
+> already back on <fallback_cc> ...` and exits with 1 — recognize it by this message; it is expected. By then
+> the sysctl has long been written back and the guard disarmed, so "new connections no longer use
+> `skyline_cc`" already holds; `skyline_cc` itself stays registered (`sv enabled` is still `true`, `sv armed`
+> is `false`, `sv draining` is `true`) until some later drain sees the connections reach zero, or the daemon
+> stops. `ssctl status` and `ssctl flows` then show `DRAINING` and the number of connections left (0.5.1 and
+> earlier showed `ATTACHED, NOT DEFAULT` / `BYPASSED` and suggested enabling again, which was a false alarm).
+> To resume acceleration, run `ssctl enable`; to make the drain really wait for zero and unregister, run it
+> from a serial console or a channel that does not go through this host's `skyline_cc`.
 
-daemon 一次只处理一个请求：`drain` 等待期间，其他 `ssctl` 调用都排在它后面，不要在 drain 期间轮询状态。
+The daemon handles one request at a time: while `drain` waits, every other `ssctl` call queues behind it, so do
+not poll the status during a drain.
 
-M1 动态 RTO 与重传 DSCP 标记**不受 drain 影响**，要单独关：
+M1 dynamic RTO and retransmit DSCP marking are **not affected by drain**; turn them off separately:
 
 ```bash
-ssctl set-rack-rto --disable      # 无条件关闭 RTO 调节（reset-rack-rto 是回到配置文件的设置）
-ssctl set-retransmit-dscp --disable   # 无条件关闭标记（0.5.2 起；reset-retransmit-dscp 是回到配置文件的设置）
+ssctl set-rack-rto --disable      # turn RTO tuning off unconditionally (reset-rack-rto goes back to the configuration file's setting)
+ssctl set-retransmit-dscp --disable   # turn marking off unconditionally (since 0.5.2; reset-retransmit-dscp goes back to the configuration file's setting)
 ```
 
-### 11.2 停止
+### 11.2 Stopping
 
 ```bash
 systemctl stop skyline-speeder-enable.service skyline-speederd.service
 ```
 
-停止 daemon（等价于 SIGTERM）会先停 guard 线程，再注销全部 struct_ops 与 BPF 链接；它本身**不写任何 sysctl**
-（刻意如此）。enable unit 处于 active 时，停止 daemon 会先停这个 unit，由它的 ExecStop（`boot-disable.sh`）写回
-`fallback_cc`：它先 `ssctl drain`，之后只在默认仍是 `skyline_cc`（daemon 已经不在、drain 没能执行）时才自己写一次——
-顺序反过来的话，仍处于武装状态的 guard 会把刚写回的值又改成 `skyline_cc`。用裸 `ssctl enable` 挂载的主机上，
-停止之前先 `ssctl drain`。
+Stopping the daemon (equivalent to SIGTERM) first stops the guard thread, then unregisters all struct_ops and
+BPF links; by itself it **writes no sysctl** (deliberately). When the enable unit is active, stopping the
+daemon stops that unit first, and its ExecStop (`boot-disable.sh`) writes `fallback_cc` back: it runs
+`ssctl drain` first, and only afterwards, if the default is still `skyline_cc` (the daemon is already gone and
+the drain could not run), writes it once itself — in the reverse order, the still-armed guard would change the
+value just written back into `skyline_cc` again. On a host attached with a bare `ssctl enable`, run
+`ssctl drain` before stopping.
 
-`systemctl stop` 不改开机设置，下次开机仍会挂载。要持久摘除：`systemctl disable --now skyline-speeder-enable.service`
-（daemon 照常常驻，开机不再挂载）。
+`systemctl stop` does not change the boot settings; it is attached again at the next boot. To remove it
+persistently: `systemctl disable --now skyline-speeder-enable.service` (the daemon stays resident as usual, but
+nothing is attached at boot).
 
-### 11.3 卸载：`install.sh --uninstall`
+### 11.3 Uninstalling: `install.sh --uninstall`
 
 ```bash
-./install.sh --uninstall                         # 在源码树里；经引导脚本安装的主机：
+./install.sh --uninstall                         # in the source tree; on a host installed through the bootstrap script:
 /usr/local/src/skyline-speeder/install.sh --uninstall
 ```
 
-它先 drain（同时解除 guard；enable unit 是 active 时由它停止时的 ExecStop 来 drain，不重复等待），停用并删除两个
-unit（或两个 OpenRC 脚本）、二进制与 `/opt/skyline-speeder`，
-**保留** `/etc/skyline-speeder`（重装时配置还在）、安装日志、引导脚本的源码树与
-`/sys/fs/{cgroup,bpf}/skyline-speeder`，然后：
+It first drains (disarming the guard as well; when the enable unit is active, the unit's ExecStop drains as it
+stops, without a second wait), disables and deletes the two units (or the two OpenRC scripts), the binaries and
+`/opt/skyline-speeder`,
+**keeps** `/etc/skyline-speeder` (so the configuration is still there on a reinstall), the install log, the
+bootstrap script's source tree and `/sys/fs/{cgroup,bpf}/skyline-speeder`, and then:
 
-1. **切到 bbr + fq**（默认）：`net.ipv4.tcp_congestion_control=bbr`、`net.core.default_qdisc=fq`，并把
-   `runtime.tc_interface` 解析出来的网卡（guard 武装时维护的正是这些，与 `[guard] qdisc` 是否关过无关；它在本机
-   不存在时——例如仍是模板值 `data0`——不动任何网卡，只用快照里记下的网卡）的根 qdisc 确认成 `fq`（多队列网卡是子队列全为 `fq` 的 `mq`）。已经是 `fq` 的不动；`htb`/`tbf`/`netem`/设了带宽的 `cake`
-   这类看起来特意建的原样留下、只告警并给出手工命令。内核没有 bbr 时先 `modprobe tcp_bbr`，仍然没有则退回
-   `PRE_INSTALL_CC`，再退 cubic、reno，并告警用了哪一个。**只在本次运行时生效**：不写也不改 `/etc/sysctl.d`
-   下的任何文件，重启后仍由那些文件决定，结束时会提示。
-2. **卸掉安装时装上的包**：只卸 `/etc/skyline-speeder/added-packages` 里记录的（安装时取包管理器执行前后已安装
-   集合的差集，含顺带拉进来的依赖，不含主机本来就有的包；apt 还与这次请求被接受的计划取交集，排除并行跑着的
-   unattended-upgrades 装的包）。没有这份记录的主机——手动安装的，或在安装器开始记录之前（v0.3.0 之前）装的——
-   这一步什么也不卸。护栏：
-   - `iproute2`（Fedora/RHEL 上 `iproute`、`iproute-tc`）、`curl`、`ca-certificates`、`tar`（Alpine 上还有
-     `bash`）永不移除；
-   - **这几个包递归依赖的东西也永不移除**——保留 `curl` 却删掉它底下的 `libcurl4t64`，apt 只会用"连 curl 一起删"
-     解决，结果整条工具链一个都卸不掉；
-   - dpkg 优先级 `required`/`important`（按架构分别判断）与 dnf 的 protected packages 永不移除；
-   - 先出计划：apt 用 `apt-get -s --purge remove`，计划里出现清单之外的 `Purg`/`Remv` 时，把被依赖的那个包单独留下
-     并告警说明是谁需要它，其余照卸、重新出计划（最多三轮）；dnf 用 `rpm -e --test` 同样处理（最多十轮），由
-     `dnf remove` 执行并关掉 `clean_requirements_on_remove`；dnf 的记录只取这次请求所在的事务，并始终排除
-     `gpg-pubkey`。apk 对记录里加进 `/etc/apk/world` 的名字执行 `apk del`，还被别的包需要的依赖由 apk 自己保留。
-     仍凑不出不越界的方案时**一个都不卸**，改为打印手工命令。
-   - rustup 只在 `/etc/skyline-speeder/added-rustup` 存在时移除。这一步的任何失败都只是告警：此时本体已经卸完。
+1. **Switches to bbr + fq** (the default): `net.ipv4.tcp_congestion_control=bbr`, `net.core.default_qdisc=fq`,
+   and makes sure the root qdisc of the NICs `runtime.tc_interface` resolves to (exactly those the guard
+   maintains while armed, regardless of whether `[guard] qdisc` was ever turned off; when it does not exist on
+   this host — for example while it is still the template value `data0` — no NIC is picked in its place, and only the NICs recorded in the snapshot are used) is `fq` (on a multi-queue NIC, an `mq` whose child queues are all `fq`). Those already on `fq` are left alone; anything
+   that looks deliberately built, such as `htb`/`tbf`/`netem`/a `cake` with a bandwidth set, is left as it is,
+   with only a warning and the commands to do it by hand. When the kernel has no bbr, it first tries
+   `modprobe tcp_bbr`; if there is still none, it falls back to `PRE_INSTALL_CC`, then cubic, then reno, and
+   warns which one it used. **This applies to the running system only**: it writes and changes no file under
+   `/etc/sysctl.d`, so after a reboot those files decide again, which it points out at the end.
+2. **Removes the packages the install added**: only those recorded in `/etc/skyline-speeder/added-packages`
+   (at install time, the difference between the installed sets before and after the package manager ran,
+   including dependencies pulled in along the way and excluding packages the host already had; for apt, also
+   intersected with the plan accepted for this request, which excludes packages installed by an
+   unattended-upgrades run in parallel). On a host without this record — installed by hand, or installed before
+   the installer started recording (before v0.3.0) — this step removes nothing. Guardrails:
+   - `iproute2` (`iproute` and `iproute-tc` on Fedora/RHEL), `curl`, `ca-certificates` and `tar` (and on Alpine
+     also `bash`) are never removed;
+   - **nor is anything these packages depend on, recursively** — keep `curl` but remove the `libcurl4t64`
+     under it, and apt's only resolution is "remove curl too", with the result that not a single package of the
+     toolchain can be removed;
+   - packages of dpkg priority `required`/`important` (judged per architecture) and dnf's protected packages
+     are never removed;
+   - a plan comes first: apt uses `apt-get -s --purge remove`; when the plan shows a `Purg`/`Remv` outside the
+     list, the package depended upon is kept back on its own, with a warning saying who needs it, the rest stay
+     on the list, and the plan is made again (at most three rounds); dnf is handled the same way with
+     `rpm -e --test` (at most ten rounds), executed by `dnf remove` with `clean_requirements_on_remove` turned
+     off; dnf's record takes only the transaction of this request and always excludes `gpg-pubkey`. apk runs
+     `apk del` on the names the record added to `/etc/apk/world`, and apk itself keeps dependencies that other
+     packages still need. When there is still no plan that stays within bounds, it removes **nothing at all**
+     and prints the manual commands instead.
+   - rustup is removed only when `/etc/skyline-speeder/added-rustup` exists. Any failure in this step is only a
+     warning: by then the product itself has been uninstalled.
 
-安装结束时指南里"卸载还会删掉 N 个包"的 N 按同一套护栏计算，与实际卸载一致。主机上什么都没装时以 0 退出并说明
-`nothing of Skyline Speeder is installed here`；只剩 `/etc/skyline-speeder` 时不改任何 sysctl 或 qdisc。
+The N in "uninstalling will also remove N packages" in the guide at the end of an install is computed with the
+same guardrails, and matches what an uninstall actually does. When nothing is installed on the host, it exits
+with 0 and says `nothing of Skyline Speeder is installed here`; when only `/etc/skyline-speeder` is left, it
+changes no sysctl or qdisc.
 
-卸载后的判据：
+Criteria after uninstalling:
 
 ```sh
 ! command -v skyline-speederd >/dev/null
 [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = bbr ] && [ "$(sysctl -n net.core.default_qdisc)" = fq ]
 ```
 
-（内核没有 bbr 时第二条换成告警里写明的那个算法；`--restore-pre-install` 时换成快照里的值。）
+(When the kernel has no bbr, use the algorithm named in the warning in the second line instead; with
+`--restore-pre-install`, the values in the snapshot.)
 
 ### 11.4 `--restore-pre-install`
 
-把 §11.3 的第 1 步换成按 `/etc/skyline-speeder/pre-install-state` 还原：拥塞控制与 `default_qdisc`；快照里记有
-网卡及其根 qdisc 时，逐块还原根 qdisc 的**种类**——只在它仍是本项目留下的 `fq`/`mq/fq` 时才动，且只还原种类、用
-默认参数（例如 `cake` 的带宽设置不会回来）；`mq` 下混有多种 qdisc 的只告警不还原；两个列表长度不同时一块都不还原。
-还原 `mq/<种类>` 时临时把 `default_qdisc` 设成该种类，`tc qdisc del dev <网卡> root` 让内核按它重建自己的 `mq`
-（对 guard 留下的、由 `tc` 建的 `mq` 执行 `replace root mq` 是空操作），删不掉（内核自己的句柄 0 的 `mq`）时才
-`tc qdisc replace dev <网卡> root mq`，然后设回 `default_qdisc`、重新读取核对。没有快照（手动安装的主机）时只告警，
-cc 与 qdisc 保持现状。
+Replaces step 1 of section 11.3 with a restore from `/etc/skyline-speeder/pre-install-state`: the congestion
+control and `default_qdisc`; when the snapshot records NICs and their root qdiscs, it restores the **kind** of
+each NIC's root qdisc — only when it is still the `fq`/`mq/fq` this project left there, and it restores only
+the kind, with default parameters (a `cake`'s bandwidth setting, for example, does not come back); an `mq` with
+a mix of qdiscs under it only gets a warning, not a restore; when the two lists differ in length, no NIC is
+restored. To restore `mq/<kind>`, it temporarily sets `default_qdisc` to that kind and runs
+`tc qdisc del dev <nic> root` so that the kernel rebuilds its own `mq` from it (running `replace root mq` on an
+`mq` the guard left, built by `tc`, is a no-op); only when the delete fails (the kernel's own `mq` with
+handle 0) does it run `tc qdisc replace dev <nic> root mq`; then it sets `default_qdisc` back and reads
+everything again to check. Without a snapshot (a manually installed host) it only warns, and the cc and qdiscs
+stay as they are.
 
-### 11.5 不用安装器卸载
+### 11.5 Uninstalling without the installer
 
 ```bash
 ssctl drain --timeout 60 || true
@@ -869,133 +1027,155 @@ rm -rf /opt/skyline-speeder
 systemctl daemon-reload
 ```
 
-OpenRC：先后对 `skyline-speeder-enable`、`skyline-speederd` 执行 `rc-service <服务> stop` 与
-`rc-update del <服务> default`，再删除 `/etc/init.d/` 下的两个脚本。拥塞控制与 qdisc 需要自己改回。
+OpenRC: run `rc-service <service> stop` and `rc-update del <service> default` for `skyline-speeder-enable` and
+then for `skyline-speederd`, then delete the two scripts under `/etc/init.d/`. Change the congestion control and
+qdiscs back yourself.
 
-### 11.6 已知行为：struct_ops 在连接结束前不会消失
+### 11.6 Known behaviour: the struct_ops does not disappear before its connections end
 
-注销或卸载之后，`bpftool struct_ops show` 可能仍列出 `skyline_cc`（内核 ≥ 7.1 上是 `skyline_cc_txs`）。**这不是
-失败**：struct_ops map 只要还有 socket 引用就不会被内核释放，与内核模块"in use"时 `rmmod` 失败是同一类引用计数
-行为。判据（内核注册表本身是干净的）：
+After unregistering or uninstalling, `bpftool struct_ops show` may still list `skyline_cc` (`skyline_cc_txs` on
+kernels ≥ 7.1). **This is not a failure**: the kernel does not free a struct_ops map while any socket still
+references it, the same kind of reference counting as `rmmod` failing on a kernel module that is "in use". The
+criteria (the kernel's registry itself is clean):
 
 ```bash
-# 应恰好输出 1（启用中）或 0（已停用），绝不会因为残留 map 而出现重复注册
+# should print exactly 1 (enabled) or 0 (disabled), never a duplicate registration because of a leftover map
 sysctl -n net.ipv4.tcp_available_congestion_control | tr ' ' '\n' | grep -c '^skyline_cc$'
-ss -tin | grep -c skyline_cc       # 仍在引用它的连接数
+ss -tin | grep -c skyline_cc       # number of connections still referencing it
 ```
 
-残留 map 在这些连接自然结束后、或重启后由内核回收。**不要**强制 detach 仍被活跃 socket 使用的 struct_ops。
+The kernel reclaims the leftover map after these connections end naturally, or after a reboot. **Do not**
+force-detach a struct_ops that live sockets are still using.
 
 ---
 
-## 12. OpenRC 主机（Alpine）
+## 12. OpenRC hosts (Alpine)
 
-一键安装照样适用，区别只有这些：
+The one-line install applies as usual; these are the only differences:
 
-- **装 musl 版产物**（§2.1），外加它运行时要的 `libelf`、`zlib`、`zstd-libs`、`libgcc`；两个 OpenRC 脚本也在产物
-  里。`--release v0.4.0` 这类没有 musl 版的版本会直接中止。源码构建在 1 vCPU 上约 10 分钟：Rust 的 musl 目标默认
-  静态链接，而 Alpine 把 zlib 的静态库放在没人装的 `zlib-static` 里，链接会以 `cannot find -lz` 失败，仓库的
-  `.cargo/config.toml` 因此让 musl 上的构建改为动态链接。
-- **两个服务**是 `packaging/openrc/` 下的脚本，装到 `/etc/init.d/`，与两个 systemd unit 一一对应：
-  - `skyline-speederd` 由 `supervise-daemon` 托管：异常退出 2 秒后重拉，60 秒内 5 次仍失败就放弃（对应
-    `Restart=on-failure`）；停止时先发 SIGTERM，留 30 秒让它注销 struct_ops；输出经 `logger` 进 syslog（Alpine 上
-    是 `/var/log/messages`）；启动前建好 `/run/skyline-speeder`（`RuntimeDirectory=` 的对应物，**必须是
-    `socket_path`、`events_path`、`state_path` 的父目录**）、`/sys/fs/bpf/skyline-speeder` 与
-    `/sys/fs/cgroup/skyline-speeder`。
-  - `skyline-speeder-enable`：`need skyline-speederd`，start 执行 `boot-enable.sh`，stop 执行 `boot-disable.sh`。与
-    systemd 的 `Requires=` + `After=` 效果相同，但 OpenRC 是在**后台**重启它：`rc-service skyline-speederd restart`
-    返回时 `boot-enable.sh` 可能还在等 socket，检查前要等它结束（安装器升级时会等）。
-- **cgroup v2**：Alpine 上只有 OpenRC 的 `cgroups` 服务会挂它，而它默认不在任何 runlevel 里。`skyline-speederd`
-  声明了 `need cgroups`，每次开机由 OpenRC 先启动它；安装时安装器自己启动一次。`/etc/rc.conf` 的 `rc_cgroup_mode`
-  设成 `hybrid`/`legacy` 时 v2 不在这个路径上，安装器中止并说明。
-- Alpine 默认没有 `sudo`，以 root 执行；安装器最后打印的指南已经按本机写好命令。
+- **It installs the musl artifact** (section 2.1), plus the `libelf`, `zlib`, `zstd-libs` and `libgcc` it
+  needs at run time; the two OpenRC scripts are in the artifact too. A version without a musl build, such as
+  `--release v0.4.0`, aborts outright. A source build takes about 10 minutes on 1 vCPU: Rust's musl target
+  links statically by default, but Alpine keeps zlib's static library in `zlib-static`, which nobody installs,
+  so linking would fail with `cannot find -lz`; the repository's `.cargo/config.toml` therefore makes builds on
+  musl link dynamically.
+- **The two services** are the scripts under `packaging/openrc/`, installed to `/etc/init.d/`, one for each of
+  the two systemd units:
+  - `skyline-speederd` is supervised by `supervise-daemon`: after an abnormal exit it is restarted 2 seconds
+    later, and after 5 failures within 60 seconds it gives up (the counterpart of `Restart=on-failure`); on stop
+    it sends SIGTERM first and allows 30 seconds for the struct_ops to be unregistered; output goes through
+    `logger` into syslog (`/var/log/messages` on Alpine); before start it creates `/run/skyline-speeder` (the
+    counterpart of `RuntimeDirectory=`, which **must be the parent directory of `socket_path`, `events_path`
+    and `state_path`**), `/sys/fs/bpf/skyline-speeder` and `/sys/fs/cgroup/skyline-speeder`.
+  - `skyline-speeder-enable`: `need skyline-speederd`; start runs `boot-enable.sh`, stop runs
+    `boot-disable.sh`. The effect is the same as systemd's `Requires=` + `After=`, but OpenRC restarts it in the
+    **background**: when `rc-service skyline-speederd restart` returns, `boot-enable.sh` may still be waiting
+    for the socket, so wait for it to finish before checking (the installer waits on an upgrade).
+- **cgroup v2**: on Alpine only OpenRC's `cgroups` service mounts it, and that service is in no runlevel by
+  default. `skyline-speederd` declares `need cgroups`, so OpenRC starts it first on every boot; at install time
+  the installer starts it once itself. When `rc_cgroup_mode` in `/etc/rc.conf` is set to `hybrid`/`legacy`, v2
+  is not at this path, and the installer aborts and says so.
+- Alpine has no `sudo` by default: run as root; the guide the installer prints at the end already has the
+  commands written for this host.
 
 | systemd | OpenRC |
 |---|---|
 | `systemctl restart skyline-speederd` | `rc-service skyline-speederd restart` |
 | `systemctl enable --now skyline-speeder-enable.service` | `rc-update add skyline-speeder-enable default && rc-service skyline-speeder-enable start` |
 | `systemctl disable --now skyline-speeder-enable.service` | `rc-service skyline-speeder-enable stop && rc-update del skyline-speeder-enable default` |
-| `systemctl stop <服务>` | `rc-service <服务> stop` |
-| `systemctl is-active <服务>`（G1） | `rc-service <服务> status`（输出 `status: started`） |
-| `systemctl is-enabled <服务>`（G6） | `test -e /etc/runlevels/default/<服务>` |
+| `systemctl stop <service>` | `rc-service <service> stop` |
+| `systemctl is-active <service>` (G1) | `rc-service <service> status` (prints `status: started`) |
+| `systemctl is-enabled <service>` (G6) | `test -e /etc/runlevels/default/<service>` |
 | `journalctl -u skyline-speederd.service` | `grep skyline-speederd /var/log/messages` |
 
 ---
 
-## 13. 可观测性与排障
+## 13. Observability and troubleshooting
 
-### 13.1 故障速查
+### 13.1 Fault quick reference
 
-| 现象 | 先看 |
+| Symptom | Look first at |
 |---|---|
-| 安装在某一步失败 | 屏幕上的 `error` 行与日志尾部；完整输出在 `/var/log/skyline-speeder-install.log`（§0.3） |
-| `Error: configured fallback congestion control is unavailable` | §13.4 |
-| 验证器拒绝 `skyline_cc`，报错指向参数个数 | 内核是 6.1/6.6 这类旧分支，不支持（§1.3） |
-| `ssctl` 报 `connect to /run/skyline-speeder/speeder.sock` | daemon 没起来或还在启动（§5.1）；`journalctl -u skyline-speederd.service` |
-| 状态是 `○ STANDBY` | 没挂载：`systemctl enable --now skyline-speeder-enable.service` 或 `ssctl enable`（§5） |
-| 状态是 `○ ATTACHED, NOT DEFAULT` | 默认拥塞控制被改走了：看 DRIFT GUARD 段落与 `guard:` 日志（§9） |
-| 状态是 `○ DRAINING` | 执行过 drain、还在等存量连接（经 SSH 必然如此，§11.1）：要恢复加速就 `ssctl enable` |
-| 重启后没有挂载 | enable unit 没有启用：G6（§6） |
-| `rack_rto.stats` 一直是 0 | §7 的诊断表 |
-| 网卡 qdisc 不是 `fq` | DRIFT GUARD 段落的 `notes`（§9） |
-| `drain` 返回非零 | 经 SSH 时是预期的超时（§11.1） |
-| 卸载后 `bpftool` 仍看到 `skyline_cc` | §11.6 |
-| 连接卡几十秒、大文件中断、4K 卡 2K 不卡 | `docs/usage.md` 的"附：视频卡顿 / 大文件传输中断怎么查" |
-| 版本不对 | `skyline-speederd --version`（磁盘）与 `sv version`（内存）不一致 = 还没重启到新版本（§0.2） |
+| The install fails at some step | The `error` line on screen and the tail of the log; the full output is in `/var/log/skyline-speeder-install.log` (section 0.3) |
+| `Error: configured fallback congestion control is unavailable` | Section 13.4 |
+| The verifier rejects `skyline_cc` with an error pointing at the argument count | The kernel is an old branch such as 6.1/6.6, which is unsupported (section 1.3) |
+| `ssctl` reports `connect to /run/skyline-speeder/speeder.sock` | The daemon did not come up or is still starting (section 5.1); `journalctl -u skyline-speederd.service` |
+| The status is `○ STANDBY` | Not attached: `systemctl enable --now skyline-speeder-enable.service` or `ssctl enable` (section 5) |
+| The status is `○ ATTACHED, NOT DEFAULT` | The default congestion control has been changed away: see the DRIFT GUARD section and the `guard:` log lines (section 9) |
+| The status is `○ DRAINING` | A drain was run and is still waiting for existing connections (always so over SSH, section 11.1): to resume acceleration, `ssctl enable` |
+| Not attached after a reboot | The enable unit is not enabled: G6 (section 6) |
+| `rack_rto.stats` stays at 0 | The diagnosis table in section 7 |
+| The NIC's qdisc is not `fq` | `notes` in the DRIFT GUARD section (section 9) |
+| `drain` returns non-zero | Over SSH, the expected timeout (section 11.1) |
+| `bpftool` still sees `skyline_cc` after uninstalling | Section 11.6 |
+| Connections stall for tens of seconds, large files break off, 4K video stalls but 2K does not | `docs/usage.md`, "Appendix: how to investigate video stalls / interrupted large-file transfers" |
+| Wrong version | `skyline-speederd --version` (disk) differs from `sv version` (memory) = not yet restarted into the new version (section 0.2) |
 
-### 13.2 报告、计数器与状态文件
+### 13.2 Reports, counters and the state file
 
-- `ssctl status`：是否挂载、全机默认、guard、内核能力、全局 sysctl、daemon 运行时长；`ssctl flows`：被加速的
-  连接、生效中的参数与首轮冗余、算法决策计数器（WHAT THE ALGORITHM DID 段落，`--json` 里是 `status.metrics`）。`metrics` 在没有已加载的
-  struct_ops 时为 `null`——从未挂载、一次 drain 完成之后、daemon 重启之后都是——每次重新挂载从零计起。完整字段见
-  `docs/02-interface-reference.md` 第 4、4.1 节。
-- 那些计数器**自挂载起累计**。WHAT THE ALGORITHM DID 段落最后的 `last …` 两行是最近约一分钟的同一组比率
-  （`--json` 里是 `status.metrics_recent`），用来区分"现在仍在发生"和"挂载以来某个时候发生过"。
-  `guardrail trips` 是队列时延/ECN 护栏触发的轮数占检查轮数的比例，`cwnd at the cap` 是 cwnd 顶在
-  `max_cwnd_packets` 上的 ACK 占全部 ACK 的比例——后者是上限在起作用，不是拥塞。0.4.x 把两者合在一个
-  `guardrail hits` 里、都除以 ACK 数，读不出是哪一个；要在 0.4.x 上拆开，数事件日志里 `"type":9` 的行（护栏
-  触发，§13.3），其余就是顶到上限的 ACK。
-- `/run/skyline-speeder/state.json` 只在 daemon 启动时和每次成功处理请求后改写，**不是**实时状态；监控请调用
-  `ssctl status --json`。
-- `ssctl snapshot <路径>` 由 daemon 写文件，相对路径按 daemon 的工作目录解析；只写普通文件，目标是符号链接、
-  目录、设备或 FIFO 时拒绝（0.5.2 起）。systemd 主机上 daemon 跑在
-  `ProtectSystem=strict` 与私有 `/tmp` 里：大部分路径对它只读，它写进 `/tmp` 的文件你看不到，写到
-  `/run/skyline-speeder/` 下最稳妥。
+- `ssctl status`: whether it is attached, the host-wide default, the guard, kernel capabilities, global
+  sysctls, daemon uptime; `ssctl flows`: the accelerated connections, the parameters in force and first-flight
+  redundancy, the algorithm's decision counters (the WHAT THE ALGORITHM DID section, `status.metrics` in
+  `--json`). `metrics` is `null` when no struct_ops is loaded — never attached, after a drain has completed,
+  after a daemon restart — and every new attach counts from zero. For all fields see
+  `docs/02-interface-reference.md` sections 4 and 4.1.
+- Those counters **accumulate from the attach**. The two `last …` lines at the end of the WHAT THE ALGORITHM
+  DID section are the same ratios over roughly the last minute (`status.metrics_recent` in `--json`), to tell
+  "still happening now" from "happened at some point since the attach".
+  `guardrail trips` is the share of checked rounds in which the queueing-delay/ECN guardrail tripped, and
+  `cwnd at the cap` is the share of all ACKs on which cwnd sat at `max_cwnd_packets` — the latter is the cap at
+  work, not congestion. 0.4.x combined the two into one `guardrail hits`, both divided by the ACK count, so you
+  cannot tell which one it was; to separate them on 0.4.x, count the `"type":9` lines in the event log
+  (guardrail trips, section 13.3), and the rest are ACKs at the cap.
+- `/run/skyline-speeder/state.json` is rewritten only when the daemon starts and after each successfully
+  handled request; it is **not** live state. For monitoring, call `ssctl status --json`.
+- With `ssctl snapshot <path>` the daemon writes the file, and a relative path is resolved against the
+  daemon's working directory; it writes only regular files and refuses a target that is a symbolic link,
+  directory, device or FIFO (since 0.5.2). On systemd hosts the daemon runs under
+  `ProtectSystem=strict` with a private `/tmp`: most paths are read-only to it, and a file it writes into
+  `/tmp` is invisible to you; writing under `/run/skyline-speeder/` is the safest choice.
 
-### 13.3 事件日志
+### 13.3 Event log
 
-事件环形缓冲区落盘到 `runtime.events_path`（默认 `/run/skyline-speeder/events.jsonl`），一行一个 JSON，记录状态
-切换、护栏触发、配置代际切换等；字段与事件码见 `docs/02-interface-reference.md` 第 8 节。它在 `/run`（内存
-tmpfs）里，大小受 `runtime.events_max_mib` 限制（默认 8 MiB，满了轮转为 `events.jsonl.1`，最多约占两倍）；设为
-`0` 关闭。0.2.0 之前的版本没有这个上限，可能写满 `/run`，让 Docker 等依赖 `/run` 的服务失败：在这类版本上用
-`truncate -c -s 0 /run/skyline-speeder/events.jsonl` 回收空间，不要 `rm`——daemon 仍持有文件句柄，删除后空间不会释放。
+The event ring buffer is persisted to `runtime.events_path` (default `/run/skyline-speeder/events.jsonl`), one
+JSON object per line, recording state transitions, guardrail trips, configuration generation switches and so
+on; for fields and event codes see `docs/02-interface-reference.md` section 8. It lives in `/run` (an in-memory
+tmpfs), and its size is limited by `runtime.events_max_mib` (default 8 MiB; when full it rotates to
+`events.jsonl.1`, so it takes at most about twice that); set it to `0` to turn the event log off. Versions
+before 0.2.0 have no such limit and can fill `/run`, making services that depend on `/run`, such as Docker,
+fail: on such versions reclaim the space with `truncate -c -s 0 /run/skyline-speeder/events.jsonl`, not `rm` —
+the daemon still holds the file handle, so after a delete the space is not freed.
 
 ### 13.4 `configured fallback congestion control is unavailable`
 
-校验（安装器的 *Running the kernel verifier* 一步、`--validate-only`、`ssctl enable`）在加载任何 BPF 对象之前就停下
-了：`fallback_cc` 填的算法这个内核既没有注册，也没有可加载的模块 `tcp_<名字>`，能力报告的 `notes` 列出本机已注册的
-算法。改 `/etc/skyline-speeder/speeder.toml` 里的 `fallback_cc` 为其中之一（通常是主机原本在用的 `bbr`），再重跑安装
-命令或 `systemctl restart skyline-speederd`。0.4.3 之前的版本只认**已注册**的算法：xanmod 这类默认 bbr、把 cubic 编成
-模块的内核上，模板的 `cubic` 开机后并未注册，安装因此失败，按同样的办法改成 `bbr` 即可。不要用 `modprobe tcp_cubic`
-绕过：daemon 只在启动时探测一次，重启后 cubic 没有加载，开机自动挂载就会失败。
+Validation (the installer's *Running the kernel verifier* step, `--validate-only`, `ssctl enable`) stopped
+before loading any BPF object: this kernel neither has the algorithm named in `fallback_cc` registered nor a
+loadable module `tcp_<name>` for it, and the capability report's `notes` lists the algorithms registered on
+this host. Change `fallback_cc` in `/etc/skyline-speeder/speeder.toml` to one of them (usually `bbr`, which the
+host was using), then rerun the install command or `systemctl restart skyline-speederd`. Versions before 0.4.3
+accept only **registered** algorithms: on kernels such as xanmod that default to bbr and build cubic as a
+module, the template's `cubic` is not registered after boot, so the install failed; change it to `bbr` in the
+same way. Do not work around it with `modprobe tcp_cubic`: the daemon probes only once, at start, and after a
+reboot cubic is not loaded, so the automatic attach at boot fails.
 
-### 13.5 双栈监听与地址族
+### 13.5 Dual-stack listeners and address families
 
-双栈监听 socket 上的 IPv4 连接以 IPv4-mapped `AF_INET6`（`::ffff:a.b.c.d`）的形态出现，而不是纯 `AF_INET`——
-这是大多数不显式绑定地址族的服务的常态，不是异常。Skyline Speeder 的地址族判断同时接受两种形态。
+IPv4 connections on a dual-stack listening socket appear as IPv4-mapped `AF_INET6` (`::ffff:a.b.c.d`), not as
+plain `AF_INET` — this is normal for most services that do not bind an address family explicitly, not an
+anomaly. Skyline Speeder's address-family checks accept both forms.
 
 ---
 
-## 14. 相关文档
+## 14. Related documents
 
-| 文档 | 内容 |
+| Document | Contents |
 |---|---|
-| [README.md](README.md) / [README.zh.md](README.zh.md) | 按上手顺序：这是什么、内核版本要求、快速开始、原理、配置（每个功能，以及 `ssctl status` / `ssctl flows` 的每一行）、实测性能 |
-| [docs/usage.md](docs/usage.md) | 新手向：每个开关和参数、四档配方、动态 RTO、DSCP、卡顿排查 |
-| [docs/02-interface-reference.md](docs/02-interface-reference.md) | `ssctl` 命令、线协议、状态字段、配置字段、事件码、guard 规则 |
-| [docs/03-design.md](docs/03-design.md) | 各模块的设计与取舍 |
-| [docs/04-performance-report.md](docs/04-performance-report.md) | 测试床数据、有效性边界与局限（第 8 节） |
-| [research/experiments/README.md](research/experiments/README.md) | 在自己的环境里复现性能测试 |
-| [research/experiments/single-ended/](research/experiments/single-ended/) | README「实测性能」引用的单条公网链路现场对比：方法、逐轮数据、原始记录与脚本（不是测试床数据） |
-| [CHANGELOG.md](CHANGELOG.md) | 每个版本的变化与 *Upgrading from ...* 升级注意事项 |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | 构建、验证器、硬性不变量、发版流程 |
+| [README.md](README.md) / [README.zh.md](README.zh.md) | In the order you get started: what it is, the kernel requirement, quick start, how it works, configuration (every feature, and every line of `ssctl status` / `ssctl flows`), measured performance |
+| [docs/usage.md](docs/usage.md) | For newcomers: every switch and parameter, the four preset recipes, dynamic RTO, DSCP, troubleshooting stalls |
+| [docs/02-interface-reference.md](docs/02-interface-reference.md) | `ssctl` commands, the wire protocol, status fields, configuration fields, event codes, guard rules |
+| [docs/03-design.md](docs/03-design.md) | The design of each module and its trade-offs |
+| [docs/04-performance-report.md](docs/04-performance-report.md) | Test-bed data, validity boundaries and limitations (section 8) |
+| [research/experiments/README.md](research/experiments/README.md) | Reproducing the performance tests in your own environment |
+| [research/experiments/single-ended/](research/experiments/single-ended/) | The field comparison on a single public Internet path cited in the README's *Measured performance*: method, per-round data, raw records and scripts (not test-bed data) |
+| [CHANGELOG.md](CHANGELOG.md) | What changed in each version, and the *Upgrading from ...* upgrade notes |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Building, the verifier, hard invariants, the release process |

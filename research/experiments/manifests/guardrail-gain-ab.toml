@@ -1,18 +1,18 @@
-# 护栏真正生效的场景 + guardrail_gain A/B。目标 box 网格里护栏基本不
-# 触发，这份 manifest 专门选了护栏确实频繁触发的 7 个场景做定向验证
-# （按需单独跑，不是默认回归矩阵的一部分）：
-#   intercontinental-clean、reorder-dsack、burst-loss、light-loss、
-#   primary、heavy-loss、line-rate
+# Scenarios where the guardrail really takes effect + guardrail_gain A/B. In the target box grid the guardrail
+# hardly fires at all, so this manifest picks the 7 scenarios where the guardrail does fire often, for targeted validation
+# (run separately on demand, not part of the default regression matrix):
+#   intercontinental-clean, reorder-dsack, burst-loss, light-loss,
+#   primary, heavy-loss, line-rate
 #
-# skyline-guardrail-neutral 跟 skyline-best 完全一致，只把 guardrail_gain 改回
-# 0.0（钳位到中性 1.0，不主动降速）——skyline-best 减 skyline-guardrail-neutral
-# 的差值就是这个系数本身的边际效果。intercontinental-clean（0%丢包/
-# 400ms RTT/1000Mbit 纯净对照场景）风险最高：护栏一直触发，"钳位到中性"
-# 变成"真的降到 0.8x"可能让该场景从反超基线变成不如基线——如果真的退步，
-# 如实记录、讨论取舍，不为了让这一项也"通过"而回退这个系数。
+# skyline-guardrail-neutral is identical to skyline-best except that guardrail_gain is set back to
+# 0.0 (clamped to a neutral 1.0, no active slowdown); skyline-best minus skyline-guardrail-neutral
+# is the marginal effect of this coefficient itself. intercontinental-clean (0% loss/
+# 400ms RTT/1000Mbit clean control scenario) carries the highest risk: the guardrail fires all the time, and "clamped to neutral"
+# becoming "really reduced to 0.8x" may turn that scenario from beating the baseline into falling behind it. If it really regresses,
+# record it as it is and discuss the trade-off; do not revert this coefficient just so that this item "passes" as well.
 #
-# 5 profile（b0-stock-cubic/b1-controlled-cubic/bbr-fq/skyline-best/
-# skyline-guardrail-neutral）× 7 场景 × runs=3 = 105 case，~1.5-2 小时。
+# 5 profiles (b0-stock-cubic/b1-controlled-cubic/bbr-fq/skyline-best/
+# skyline-guardrail-neutral) × 7 scenarios × runs=3 = 105 cases, ~1.5-2 hours.
 name = "guardrail-gain-ab"
 execution_class = "formal-kvm"
 performance_valid = true
