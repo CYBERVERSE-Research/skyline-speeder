@@ -35,7 +35,7 @@ CO-RE cannot supply a field the running kernel lacks -- objects built against a
 newer kernel's header can fail to load on 6.12, which is why releases build
 against the 6.12 reference header. What has been verified is a 6.12 header:
 objects built against it under 6.12.63 load on 6.19.14, and built against it
-under 6.19.14 load on 6.12.63 (CHANGELOG 0.1.0, *Verified*);
+under 6.19.14 load on 6.12.63;
 `infra/kernel/core-portability.sh` reproduces this. CO-RE cannot fix a field
 that was renamed or removed either, so after a data-plane change, rerun that
 script before relying on it. `bpf/include/vmlinux.h` is a build artefact and is
@@ -241,7 +241,6 @@ and **must not be used to draw performance conclusions**.
 | `docs/04-performance-report.md` | The two-VM test bed's data, what it does and does not show |
 | `research/experiments/README.md` | The experiment harness and how to reproduce a run |
 | `research/experiments/single-ended/` | The one-path field comparison of bbr, tcp-brutal and skyline_cc the README's performance section cites; not test-bed data |
-| `CHANGELOG.md` | Every release and its *Upgrading from ...* notes |
 | `CLAUDE.md` and the `CLAUDE.md` in `bpf/`, `crates/`, `config/`, `packaging/`, `infra/` and `docs/` | The same conventions, for AI coding agents. The root file is loaded in every session and holds the repository-wide rules and an index; each directory's file is loaded when an agent reads or edits a file there and holds that directory's details |
 
 ## Documentation you must update with your change
@@ -256,7 +255,7 @@ and **must not be used to draw performance conclusions**.
 | Anything user-facing in the README | Both `README.md` and `README.zh.md` |
 | A new feature, a changed default, or report wording in `crates/ssctl/src/view.rs` | Both READMEs' table of what a default install runs, the feature's subsection, and the line-by-line key to `ssctl status` and `ssctl flows` (`cargo test -p ssctl -- --nocapture renders_for_review` prints both reports) |
 | A hard invariant or the contribution process | This file, the `CLAUDE.md` of the directory the invariant lives in (the same conventions, for AI coding agents; the root `CLAUDE.md` keeps a one-line summary of each) and the Invariants list in `.github/PULL_REQUEST_TEMPLATE.md` |
-| A release (`v*` tag) | `[workspace.package] version` in `Cargo.toml`, the three workspace crates in `Cargo.lock`, and a `## [<version>] - <date>` section in `CHANGELOG.md` with its compare link at the bottom; `release.yml` refuses a tag that is not exactly `v<version>` or has no such section |
+| A release (`v*` tag) | `[workspace.package] version` in `Cargo.toml` and the three workspace crates in `Cargo.lock`; `release.yml` refuses a tag that is not exactly `v<version>`. There is no changelog to update: the repository keeps none |
 
 ## Style
 
@@ -279,14 +278,13 @@ is pushed: one per C library, the glibc build and a musl build for Alpine
 (`skyline-speeder-<tag>-<arch>-musl.tar.gz`, built in an Alpine 3.21
 container by `infra/build-musl.sh`, which needs docker and which CI runs on
 every pull request too), carrying the same BPF objects. Before building anything it checks that the tag is exactly `v`
-followed by the workspace version in `Cargo.toml`, and that `CHANGELOG.md` has a
-`## [<version>]` heading for it; otherwise it stops. So bump
+followed by the workspace version in `Cargo.toml`; otherwise it stops. So bump
 `[workspace.package] version` in `Cargo.toml` and the three workspace crates'
-entries in `Cargo.lock` (every build runs with `--locked`), and add a
-`## [<version>] - <YYYY-MM-DD>` section with an *Upgrading from ...* subsection
-at the top of `CHANGELOG.md` (there is no `[Unreleased]` section), plus its
-compare link at the bottom, before tagging: the version is what `--version`, `ssctl status` and the
-installer's upgrade summary report. The build uses `--locked`, as CI does. It
+entries in `Cargo.lock` (every build runs with `--locked`) before tagging: the
+version is what `--version`, `ssctl status` and the installer's upgrade summary
+report. The repository keeps no changelog: do not add `CHANGELOG.md` or a
+release-notes file; a release's notes are its tag message and the release
+page. The build uses `--locked`, as CI does. It
 compiles the BPF objects against a **pinned reference header**
 generated from the oldest supported kernel, not against whatever the runner
 boots — CO-RE fixes field offsets, but it cannot conjure a field that does not

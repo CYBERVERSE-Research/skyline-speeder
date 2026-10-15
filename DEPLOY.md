@@ -852,8 +852,7 @@ After the upgrade:
 - The summary shows `upgraded <old> -> <new>`, or `downgraded <old> -> <new>` when going back to an older
   version (binaries v0.2.0 and earlier have no `--version` and show
   `from a release without --version (v0.2.0 or older)`); confirm with the criteria of section 0.2 that the new
-  version is running;
-- For each version's upgrade notes, see the matching *Upgrading from ...* subsection in `CHANGELOG.md`.
+  version is running.
 
 ### 10.2 Manually installed hosts
 
@@ -1177,5 +1176,4 @@ anomaly. Skyline Speeder's address-family checks accept both forms.
 | [docs/04-performance-report.md](docs/04-performance-report.md) | Test-bed data, validity boundaries and limitations (section 8) |
 | [research/experiments/README.md](research/experiments/README.md) | Reproducing the performance tests in your own environment |
 | [research/experiments/single-ended/](research/experiments/single-ended/) | The field comparison on a single public Internet path cited in the README's *Measured performance*: method, per-round data, raw records and scripts (not test-bed data) |
-| [CHANGELOG.md](CHANGELOG.md) | What changed in each version, and the *Upgrading from ...* upgrade notes |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Building, the verifier, hard invariants, the release process |

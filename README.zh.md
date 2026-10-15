@@ -82,7 +82,7 @@ sudo ./install.sh --uninstall --restore-pre-install   # 同上，但还原成
 已发布的版本不需要编译工具链，只需要 `curl`、`tar` 和 `iproute2`（安装器会自动安装）：对象是 CO-RE 的，用固定的 6.12 参考头编译，加载时再按这台机器的内核重定位。预编译的 daemon 有两个构建：一个在 Ubuntu 24.04 上构建，需要 glibc 2.38 以上以及 `libelf.so.1`、`libz.so.1`（Debian 13、Ubuntu 24.04、Fedora 43、Rocky Linux 10 及更新版本满足）；另一个自 v0.4.1 起在 Alpine 3.21 里针对 musl 构建，Alpine 3.21 及更新会装它，外加 `libelf`、`zlib`、`zstd-libs`、`libgcc`。用户态更旧的系统，默认安装会自动改为从源码构建，`--source` 则在任何机器上都从源码构建。`--release <tag>` 指定版本；连不上 GitHub 的机器，把产物拷过去后用 `SKYLINE_ARTIFACT_URL=/path/to/tarball sudo -E ./install.sh --prebuilt` 安装。装上的是已发布的 release，可能比这份 README、也比 `main` 旧：`main` 上在最新 release 之后合并的改动，要等下一个 release 才会进入一键安装。装的 release 早于这里描述的某个功能时（例如 v0.2.0 这个 release 还没有 qdisc 守护），安装器会明确提示。
 
 > [!IMPORTANT]
-> **升级：** 再运行一次安装器即可。新对象通过内核验证器后，它会自己重启 `skyline-speederd`：先让现有连接排空（最多 60 秒），再重新挂载 `skyline_cc`；原先是手工 `ssctl enable` 挂载的主机也一样。用 `ssctl` 做的修改不会保留到重启之后。原先从源码构建的主机会换成已发布的版本，除非再次带上 `--source`——v0.4.1 起 Alpine 也是如此。详见 [CHANGELOG.md](CHANGELOG.md) 的 *Upgrading from 0.4.0*。
+> **升级：** 再运行一次安装器即可。新对象通过内核验证器后，它会自己重启 `skyline-speederd`：先让现有连接排空（最多 60 秒），再重新挂载 `skyline_cc`；原先是手工 `ssctl enable` 挂载的主机也一样。用 `ssctl` 做的修改不会保留到重启之后。原先从源码构建的主机会换成已发布的版本，除非再次带上 `--source`——v0.4.1 起 Alpine 也是如此。详见 [DEPLOY.md](DEPLOY.md) 第 10 节。
 
 日常操作：
 
@@ -342,7 +342,6 @@ skyline-speeder/
 ├── infra/                        安装辅助、cgroup 工具、双 VM 测试床
 ├── research/experiments/         测试 manifest、执行、分析与现场测量
 ├── docs/                         使用指南、接口参考、设计、性能报告
-├── CHANGELOG.md                  版本说明与升级步骤
 ├── DEPLOY.md                     部署与运维手册，面向自动化 agent
 └── CONTRIBUTING.md               改动不能破坏的不变量
 ```
