@@ -242,7 +242,7 @@ and **must not be used to draw performance conclusions**.
 | `research/experiments/README.md` | The experiment harness and how to reproduce a run |
 | `research/experiments/single-ended/` | The one-path field comparison of bbr, tcp-brutal and skyline_cc the README's performance section cites; not test-bed data |
 | `CHANGELOG.md` | Every release and its *Upgrading from ...* notes |
-| `CLAUDE.md` | These conventions in Chinese, for AI coding agents |
+| `CLAUDE.md` and the `CLAUDE.md` in `bpf/`, `crates/`, `config/`, `packaging/`, `infra/` and `docs/` | These conventions in Chinese, for AI coding agents. The root file is loaded in every session and holds the repository-wide rules and an index; each directory's file is loaded when an agent reads or edits a file there and holds that directory's details |
 
 ## Documentation you must update with your change
 
@@ -255,7 +255,7 @@ and **must not be used to draw performance conclusions**.
 | Algorithm behaviour | `docs/03-design.md`; performance claims need data in `docs/04-performance-report.md` |
 | Anything user-facing in the README | Both `README.md` and `README.zh.md` |
 | A new feature, a changed default, or report wording in `crates/ssctl/src/view.rs` | Both READMEs' table of what a default install runs, the feature's subsection, and the line-by-line key to `ssctl status` and `ssctl flows` (`cargo test -p ssctl -- --nocapture renders_for_review` prints both reports) |
-| A hard invariant or the contribution process | This file, `CLAUDE.md` (the same conventions in Chinese) and the Invariants list in `.github/PULL_REQUEST_TEMPLATE.md` |
+| A hard invariant or the contribution process | This file, the `CLAUDE.md` of the directory the invariant lives in (the same conventions in Chinese; the root `CLAUDE.md` keeps a one-line summary of each) and the Invariants list in `.github/PULL_REQUEST_TEMPLATE.md` |
 | A release (`v*` tag) | `[workspace.package] version` in `Cargo.toml`, the three workspace crates in `Cargo.lock`, and a `## [<version>] - <date>` section in `CHANGELOG.md` with its compare link at the bottom; `release.yml` refuses a tag that is not exactly `v<version>` or has no such section |
 
 ## Style

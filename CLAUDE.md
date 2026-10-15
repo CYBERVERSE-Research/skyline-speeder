@@ -1,6 +1,19 @@
 # CLAUDE.md
 
-面向 Claude Code / AI 编码助手的仓库约定。修改本仓库前请通读。
+面向 Claude Code / AI 编码助手的仓库约定。本文件每次会话都会加载，只放全仓库通用的约定和索引；各目录的细则写在
+该目录自己的 `CLAUDE.md` 里，Claude Code 读写那个目录下的文件时才加载。修改本仓库前请通读本文件；**跨目录的改动**
+（批量重命名、换 sysctl 的写入者、改 ABI）开工前，把涉及目录的 `CLAUDE.md` 都读一遍——没读过的细则不会自己出现。
+
+| 文件 | 细则 |
+|---|---|
+| `bpf/CLAUDE.md` | vmlinux.h 的来源与 kfunc 声明、CO-RE 可移植性；算法名、ABI 版本号、`cong_control` 签名、struct_ops 双变体的完整约束 |
+| `crates/CLAUDE.md` | 全局 sysctl 的写入顺序与写入者、guard 的不变量、控制面语义（绝对覆盖；双槽 + 配置序号 + 每连接副本） |
+| `config/CLAUDE.md` | guest 配置的 `[rack_tuning]` 必须整段注释；`tc_interface` 的默认值与 `install.sh` 的改写规则 |
+| `packaging/CLAUDE.md` | 安装路径、`RuntimeDirectory=` / `checkpath` 与 `socket_path` 的耦合 |
+| `infra/CLAUDE.md` | 开机脚本与全局 sysctl、随产物发布的脚本、CO-RE 可移植性脚本 |
+| `docs/CLAUDE.md` | 文档地图：每份文档的读者与内容 |
+
+细则只写在它所属目录的 `CLAUDE.md` 里；本文件对每条只留一句摘要和指向，两处不一致时以目录里的为准，并把摘要改对。
 
 ## 项目性质
 
@@ -28,44 +41,23 @@ make test                         # 实验框架的 Python 单测 + cargo test -
 skyline-speederd --config config/speeder.toml --validate-only --verify-bpf
 ```
 
-`make bpf` 默认从**本机** `/sys/kernel/btf/vmlinux` 读取类型信息；也可以用
-`make VMLINUX_BTF=<路径> bpf` 指定另一份 BTF，或用
-`make PREBUILT_VMLINUX_H=<路径> bpf` 直接提供已生成好的头（这条路径**不需要
-bpftool，也不需要 /sys/kernel/btf/vmlinux**，供容器/发布流水线使用）。
-`bpf/include/vmlinux.h` 是构建产物，**不提交**。
-
-本机生成的 vmlinux.h 编译时带 `-DBPF_NO_KFUNC_PROTOTYPES`：bpftool 7.5 起把运行内核导出的每个
-kfunc 原型都写进头里，其中一个与发行版 libbpf 的 `bpf_helpers.h` 对不上就编不过（Fedora 43：
-6.17 内核的 `bpf_stream_vprintk` 五个参数，libbpf 1.6.1 声明四个）。所以 **BPF 源码调用的 kfunc
-必须自己声明**（见 `skyline_cc.bpf.c` 顶部），不能靠 vmlinux.h。`PREBUILT_VMLINUX_H` 路径不带
-这个宏，发布产物逐字节不变。
-
-vmlinux.h 只需要**定义**代码用到的类型，不必来自最终运行的那个内核，但**不能比它新**：bpftool
-生成的头带 `preserve_access_index`，每处字段访问都生成 CO-RE 重定位记录，偏移由 libbpf 在
-加载时按运行内核的 BTF 修正；运行内核没有的字段，CO-RE 补不出来，用较新内核的头编出的对象可能
-在 6.12 上加载失败——发布因此固定用 6.12 参考头编译（`release.yml`）。实测过的是 6.12 的头：
-在 6.12.63 上编、在 6.19.14 上加载，以及在 6.19.14 上用 6.12 的头编、在 6.12.63 上加载
-（`CHANGELOG.md` 0.1.0 的 *Verified*）。复现脚本见 `infra/kernel/core-portability.sh`。
-**改动数据面后若要依赖这条性质，必须重跑该脚本**——CO-RE 能修偏移，修不了字段改名或删除。
+`bpf/include/vmlinux.h` 是构建产物，**不提交**。`make bpf` 从哪里取 BTF、`PREBUILT_VMLINUX_H`、为什么 kfunc 必须
+自己声明、vmlinux.h 为什么不能比运行内核新（改动数据面后要重跑 `infra/kernel/core-portability.sh`），见
+`bpf/CLAUDE.md`。
 
 ## 硬性不变量
 
-| 标识符 | 位置 | 约束 |
-|---|---|---|
-| 算法名 `"skyline_cc"` | `bpf/skyline_cc.bpf.c`（两张 struct_ops map 的 `.name`）、`bpf/skyline_policy.bpf.c`（`TCP_CONGESTION` setsockopt）、`bpf/skyline_tc.bpf.c`（`skyline_runs_skyline_cc()`）、`crates/skyline-common` 的 `SKYLINE_CC_NAME`，以及 `infra/boot-enable.sh`、`infra/boot-disable.sh`、`infra/apply-guest-profile.sh`、`install.sh` 里的字面量 | 算法注册名，**≤ 15 字符**（`TCP_CA_NAME_MAX` 为 16 含 NUL），各处一字不差。daemon 写 sysctl 时对不上会报错；policy 与 tc 两处对不上则静默失效（setsockopt 的返回值被忽略；首轮冗余只剩 SYN-ACK）。struct_ops 的 map 名是另一个命名空间 |
-| `SKYLINE_ABI_VERSION` 及另外三个 ABI 版本号 | `bpf/include/skyline_abi.h` 与 `crates/skyline-common/src/lib.rs` | 布局变更必须递增管这段结构的版本号，两侧一起改：`SKYLINE_ABI_VERSION` 管 `struct skyline_config`、`skyline_flow_state`、`skyline_metrics`，`SKYLINE_RTO_TUNING_ABI_VERSION`、`SKYLINE_RETRANSMIT_DSCP_ABI_VERSION`、`SKYLINE_REDUNDANCY_ABI_VERSION` 各管自己那段（`docs/02-interface-reference.md` 第 5 节）。加载时**没有**谁拒绝不匹配的一对。`SKYLINE_ABI_VERSION` 不一致时每条连接复制配置（`skyline_adopt_config()`）都失败：此后新建的连接，`skyline_cong_control` 在每个 ACK 上直接返回——cwnd 停在内核的初始窗口（RTO 之后停在 `tcp_enter_loss()` 留下的大小），也没有谁设 pacing；`cong_control` 已经取代了内核自己的增长逻辑，所以这不是交还给内核。不报错，也没有计数器：`ssctl status --json` 里 `active_flows` 在涨、`metrics.ack_events` 不动。`struct skyline_config` 大小变了的话，daemon 写配置槽时就会报错。它也管 `struct skyline_metrics`：Rust 侧按布局读计数器，大小不符时计数器全是 0。DSCP 标记与首轮冗余的版本不符时跳过并递增各自的 `abi_mismatch`。递增版本号，是让半新半旧的组合停摆，而不是误读结构体 |
-| `cong_control` 4 参数签名 | `bpf/skyline_cc.bpf.c` | `(sk, ack, flag, rs)`，内核 >= 6.10 才有 |
-| struct_ops 双变体 `skyline_cc` / `skyline_cc_txs` | `bpf/skyline_cc.bpf.c` | 两张 map 挂**同一组回调**，只有 TX_START 的入口不同（`cwnd_event` / 7.1 起的 `cwnd_event_tx_start`）；daemon 按内核 BTF 只创建其中一张。**给一张加回调，另一张也要加**，否则行为随内核版本悄悄不同 |
-| 安装路径 `/opt|/etc|/run/skyline-speeder` | 配置、unit（含 `packaging/openrc/` 的两个 OpenRC 脚本）、脚本 | 三处必须一致 |
-| `RuntimeDirectory=skyline-speeder` | `packaging/skyline-speederd.service` | **必须是 `socket_path`（及 `events_path`、`state_path`）的父目录**：unit 带 `ProtectSystem=strict`，`/run` 下只有这个目录对 daemon 可写 |
-| `checkpath -d /run/skyline-speeder` | `packaging/openrc/skyline-speederd` | OpenRC 下的 `RuntimeDirectory=`：同样**必须是 `socket_path`（及 `events_path`、`state_path`）的父目录**，daemon 启动先打开的就是那里的事件日志 |
+"约束"一列是摘要；完整约束、失效时的表现与理由在"细则"一列指向的文件里，改动任何一项之前先读它。
 
-> `RuntimeDirectory` 与 `socket_path` 的耦合是历史上真实踩过的坑：一次批量重命名
-> 把 `RuntimeDirectory` 改成了 `skyline` 而配置里是 `/run/skyline-speeder/`，
-> 当时 daemon 起来但控制 socket 永远不出现。现在的 daemon 自己创建事件日志、socket、状态文件
-> 的父目录（`main.rs` 的 `Daemon::new`、`serve`、`persist_state`），而 `ProtectSystem=strict`
-> 让 `/run` 除 `RuntimeDirectory=` 之外只读，所以按 unit 与代码推断，同样的错配今天表现为 daemon
-> 打开事件日志时失败、被 systemd 反复重启——不变量不变，症状变了。改动任一侧务必对照另一侧。
+| 标识符 | 位置 | 约束 | 细则 |
+|---|---|---|---|
+| 算法名 `"skyline_cc"` | `bpf/` 的三个程序、`crates/skyline-common` 的 `SKYLINE_CC_NAME`，以及 `infra/` 三个脚本与 `install.sh` 里的字面量 | 算法注册名，**≤ 15 字符**（`TCP_CA_NAME_MAX` 为 16 含 NUL），各处一字不差；policy 与 tc 两处对不上时静默失效 | `bpf/CLAUDE.md` |
+| `SKYLINE_ABI_VERSION` 及另外三个 ABI 版本号 | `bpf/include/skyline_abi.h` 与 `crates/skyline-common/src/lib.rs` | 布局变更必须递增管这段结构的版本号，两侧一起改。加载时**没有**谁拒绝不匹配的一对，不一致时静默停摆、不报错 | `bpf/CLAUDE.md` |
+| `cong_control` 4 参数签名 | `bpf/skyline_cc.bpf.c` | `(sk, ack, flag, rs)`，内核 >= 6.10 才有 | `bpf/CLAUDE.md` |
+| struct_ops 双变体 `skyline_cc` / `skyline_cc_txs` | `bpf/skyline_cc.bpf.c` | 两张 map 挂**同一组回调**：**给一张加回调，另一张也要加**，否则行为随内核版本悄悄不同 | `bpf/CLAUDE.md` |
+| 安装路径 `/opt|/etc|/run/skyline-speeder` | 配置、unit（含 `packaging/openrc/` 的两个 OpenRC 脚本）、脚本 | 三处必须一致 | `packaging/CLAUDE.md` |
+| `RuntimeDirectory=skyline-speeder` | `packaging/skyline-speederd.service` | **必须是 `socket_path`（及 `events_path`、`state_path`）的父目录** | `packaging/CLAUDE.md` |
+| `checkpath -d /run/skyline-speeder` | `packaging/openrc/skyline-speederd` | OpenRC 下的 `RuntimeDirectory=`：同样必须是这几个路径的父目录 | `packaging/CLAUDE.md` |
 
 ## 命名雷区
 
@@ -86,70 +78,21 @@ vmlinux.h 只需要**定义**代码用到的类型，不必来自最终运行的
    静默失效而存在——**不要以"install-guest.sh 里没启用它"为由删除它**，那是刻意的：
    挂载会改变全机新连接的拥塞控制，属于运维决策，由 `install.sh` 显式启用。
 
-   `ssctl enable` 自己就是全机生效的：附加 struct_ops 成功后它会把
-   `net.ipv4.tcp_congestion_control` 写成 `skyline_cc`。**sysctl 的写入顺序是不变量**——
-   `enable` 必须在附加之后写（内核拒绝未注册的算法名），`drain` 必须在注销之前写回
-   `fallback_cc`（否则会出现"注销一个正被当作默认算法的 struct_ops"）。daemon 里这个 sysctl
-   只有一个写入点：`crates/skyline-speederd/src/main.rs` 的 `set_default_congestion_control`
-   （`BpfRuntime::load` 附加前写 `fallback_cc` 作基线、`enable`、guard、`drain`），从 `enable`
-   到 `drain` 只有 daemon 写它。这之外有三个写入者，各有前提：`infra/boot-disable.sh` 先 drain，
-   之后只在默认仍是 `skyline_cc` 时才写，是 daemon 已死时的兜底，不是重复（它若抢在 drain 之前写，
-   仍处于 armed 的 guard 会把 `skyline_cc` 写回去）；实验矩阵的 `infra/apply-guest-profile.sh` 在
-   `drain --timeout 0` 之后写自己要的算法；`install.sh --uninstall` 在 drain 并移除 daemon 之后写回
-   bbr（或 `--restore-pre-install` 的安装前值）。`infra/boot-enable.sh` 刻意不写任何 sysctl。
+   `ssctl enable` 自己就是全机生效的，**sysctl 的写入顺序与写入者是不变量**；挂载之后被"一键 BBR"悄悄改回同样是
+   静默失效，所以从 `enable` 到 `drain` 由 guard 守住默认拥塞控制、`net.core.default_qdisc` 与出口网卡的根 qdisc。
+   **daemon 停止不写任何 sysctl**，`infra/boot-enable.sh` 也不写——都不要加。完整的顺序、各写入者的前提与 guard 的
+   不变量见 `crates/CLAUDE.md`。
 
-   **挂载之后被悄悄改回，同样是静默失效**：VPS 上"一键 BBR"脚本留在 `/etc/sysctl.d`
-   的 `bbr` 一旦被 `sysctl --system` 重新应用，新连接就全部绕开 `skyline_cc`，不报任何错。
-   所以从 `enable` 到 `drain`，guard（`crates/skyline-speederd/src/guard.rs`，配置
-   `[guard]`）守住三项：默认拥塞控制，以及 `[guard] qdisc = true`（默认）时的
-   `net.core.default_qdisc = fq` 与 `runtime.tc_interface` 的根 qdisc（`fq`，多队列网卡上
-   是子队列全为 `fq` 的 `mq`；它是根为 `noqueue` 的 VLAN/bond/网桥时，改为它下面有
-   `device` 链接的物理网卡，tap/veth 从不碰）。从 `enable` 到 `drain`，这三项同样只有 daemon
-   一个写入者（drain 之后 `apply-guest-profile.sh` 与 `install.sh --uninstall` 会设自己的
-   qdisc）——`boot-enable.sh` 过去开机时写一次 `default_qdisc=fq`，现在不写了，**不要加回去**
-   （它改不到网卡已有的根 qdisc，还会和 daemon 各说各话）。相关不变量：
-   - `enable` 写完 `skyline_cc` 之后才武装 guard；`drain` 先解除武装，并在**仍持有 guard
-     的锁**时写回 `fallback_cc`，否则一次周期检查可能在 drain 写回之后又把 `skyline_cc`
-     写回去。drain 超时报错也保持解除（实验矩阵 `drain --timeout 0` 后自己设 qdisc）。
-   - daemon 停止时先停掉并 join guard 线程，再让 `BpfRuntime` drop 注销 struct_ops
-     （`impl Drop for Daemon`），否则已武装的检查会去写一个内核已不认识的 `skyline_cc`。
-   - **daemon 停止不写任何 sysctl。** 维护者明确不要"停止时写回 `fallback_cc`"，不要加；
-     写回由 `drain` 和 enable unit 的 `ExecStop` 负责。
-   - guard 只替换没有配置值得保留的 qdisc（`pfifo_fast`/`fq_codel`/未整形的 `cake`/`fq_pie`
-     等），`htb`/`tbf`/`netem`/`mqprio` 等分类、整形、卸载类、设了带宽或 `autorate-ingress`
-     的 `cake`、`noqueue` 和不认识的种类一律不动——替换它们会悄悄毁掉运维的整形配置。
+3. **`tc_interface` 指向错误网卡**：`config/speeder-guest.toml` 的默认值 `data0` 是测试床的接口名，真实主机上
+   几乎必然不匹配；指错了，`skyline_tc` 挂不到真正的出口网卡，guard 还会把被指到的那块网卡的根 qdisc 换成 `fq`。
+   `install.sh` 何时改写它，见 `config/CLAUDE.md`。
 
-3. **`tc_interface` 指向错误网卡**：`config/speeder-guest.toml` 的默认值 `data0` 是测试床的
-   接口名，真实主机上几乎必然不匹配。`install.sh` 每次运行（安装与升级都算），只要配置里还是
-   `tc_interface = "data0"` 这一行，就改写成默认路由（先 IPv4、再 IPv6）上的第一块以太网网卡；
-   已经是别的值（运维改过）就不动。默认路由只走 WireGuard/tun 这类隧道时不改写，保留模板值并
-   告警——`skyline_tc` 只挂在以太网设备上。
-   guard 维护的也是这块网卡的根 qdisc：指错了，真正的出口网卡保持原来的 qdisc，而被指到
-   的那块网卡被换成 `fq`。
+## 控制面语义与 guest 配置
 
-## 控制面语义
-
-- `set-module-config` / `set-rack-rto` / `set-retransmit-dscp` / `set-redundancy` 都是**绝对覆盖**
-  语义：每次调用发送完整字段集合，不是增量更新。对应的 `reset-*` 恢复配置文件默认值。
-- 配置切换走**双槽 + 配置序号 + 每连接副本**：daemon 把第 N 份配置写进
-  `config_slots[N & 1]`，**写完才**把 `config_seq` 改成 N。每条连接在开始时复制一次（完成握手的
-  那个 ACK 先经过 `cong_control`，`init` 再复制一次并从头开始）；还没有副本的连接每个 ACK 都再试；
-  已有副本的连接只在新一轮开始、且序号变了时才复制。一轮不是一个 RTT：`skyline_new_round()` 在
-  `prior_delivered` 追上本轮开始时的 `delivered + packets_out` 时结束一轮，窗口打满的流约两个 RTT
-  （开始或配置切换后的第一轮约一个）。复制前后序号变了就丢掉这份副本；此后每个 ACK 只读自己的
-  副本。所以一轮之内读到的不会新旧混杂，连续两次下发也一样。
-  **修改配置下发路径时必须维持这两条**：先写槽、后写序号；BPF 只读自己的副本。
-  否则会出现撕裂读（0.4.x 没有副本和序号，一个 RTT 内连续下发两次就会改写仍有连接在读的槽）。
-
-## guest 配置的强约束
-
-`config/speeder-guest.toml` 中 `[rack_tuning]` **必须整段保持注释**。该配置由实验
-矩阵（`infra/apply-guest-profile.sh`）逐 case 精确控制 `tcp_recovery` /
-`tcp_reordering` / `tcp_early_retrans`；若 `skyline-speederd` 在此接管这几个全局 sysctl，
-daemon 重启会把 per-case 精确值悄悄覆盖回默认值。
-
-`crates/skyline-common/src/lib.rs` 有 `guest_config_never_owns_global_sysctls`
-测试守护这条约束——**不要为了让某个用例通过而删改它**。
+- `set-*` 都是**绝对覆盖**语义；配置切换**先写槽、后写序号**，BPF 只读每条连接自己的副本。完整规则见
+  `crates/CLAUDE.md`「控制面语义」——修改配置下发路径时必须维持。
+- `config/speeder-guest.toml` 中 `[rack_tuning]` **必须整段保持注释**，`guest_config_never_owns_global_sysctls`
+  测试守护这条约束——**不要为了让某个用例通过而删改它**。原因见 `config/CLAUDE.md`。
 
 ## 不要提交的内容
 
@@ -160,23 +103,12 @@ daemon 重启会把 per-case 精确值悄悄覆盖回默认值。
 - 渲染后的 `user-data`（含运维真实 SSH 公钥），只提交 `user-data.template`
 - `known_hosts`、密钥、填好的实验室清单
 - 任何 `/home/<用户名>` 形式的绝对路径
-
-## 文档地图
-
-| 文档 | 读者与内容 |
-|---|---|
-| `README.md` / `README.zh.md` | 用户，按上手顺序：这是什么 → 内核版本要求 → 快速开始 → 原理与三者的设计差别 → 配置（默认运行的功能总表、每个功能一节、逐行解释 `ssctl status` / `ssctl flows`）→ 仓库结构 → 从源码构建 → 文档 → 实测性能 → 参与贡献 → 许可（中英内容必须一致） |
-| `DEPLOY.md` | **唯一的部署与运维手册**，面向自动化 agent，人也照它操作：前置条件、安装器的每一步、验证门禁、cgroup、guard、升级、卸载、排障 |
-| `docs/usage.md` | 新手：每个开关与参数、四档配方、动态 RTO、DSCP、连接卡顿排查 |
-| `docs/02-interface-reference.md` | `ssctl` 命令、线协议、状态字段与计数器、配置字段、事件码、guard 规则 |
-| `docs/03-design.md` | 各模块的机制、取舍与开放问题 |
-| `docs/04-performance-report.md` | 双 VM 测试床的数据、有效性边界与局限 |
-| `research/experiments/README.md` | 实验框架与复现方法 |
-| `research/experiments/single-ended/README.md`、`RESULTS.md` | 单条公网链路上 bbr / tcp-brutal / skyline_cc 的现场对比：方法、逐轮数据、原始记录与复现脚本；README「实测性能」的图与数字出自这里。不是测试床数据，不进 `docs/04-performance-report.md` |
-| `CHANGELOG.md` | 每个版本的变化与 *Upgrading from ...* 升级注意事项 |
-| `CONTRIBUTING.md` | 本文件约定的英文版，面向外部贡献者 |
+- 只属于一台机器或一个人的 agent 文件：`.claude/` 与任何一级的 `CLAUDE.local.md`（本文件和各目录的 `CLAUDE.md`
+  是公开的，里面同样不写主机地址、账号、令牌或个人路径）
 
 ## 文档同步要求
+
+每份文档的读者与内容见 `docs/CLAUDE.md` 的文档地图。
 
 | 改动 | 需同步 |
 |---|---|
@@ -186,7 +118,7 @@ daemon 重启会把 per-case 精确值悄悄覆盖回默认值。
 | 安装流程 | `DEPLOY.md` + `install.sh` + `scripts/bootstrap.sh`（面向用户的部分还有两份 README 与 `docs/usage.md`） |
 | README 里任何面向用户的内容 | **`README.md`（英文）和 `README.zh.md`（中文）必须同时改** |
 | 新增功能、改默认值，或改 `ssctl status` / `ssctl flows` 的报告文字（`crates/ssctl/src/view.rs`） | 两份 README「配置」开头的功能总表、该功能的小节，以及末尾逐行解释两份报告的两张表（`cargo test -p ssctl -- --nocapture renders_for_review` 打印两份报告） |
-| 硬性不变量 / 贡献流程 | `CONTRIBUTING.md`（本文件的不变量表在那里有一份面向外部贡献者的英文版）+ `.github/PULL_REQUEST_TEMPLATE.md` 的 Invariants 清单 |
+| 硬性不变量 / 贡献流程 | 不变量所属目录的 `CLAUDE.md`（本文件只留摘要）+ `CONTRIBUTING.md`（这些约定面向外部贡献者的英文版）+ `.github/PULL_REQUEST_TEMPLATE.md` 的 Invariants 清单 |
 | 算法行为 | `docs/03-design.md`，性能声明须有 `docs/04-performance-report.md` 数据支撑 |
 | 发版（打 `v*` tag） | `Cargo.toml` 的 `[workspace.package] version` + `Cargo.lock` 里三个 workspace crate 的版本（CI、发版与 musl 构建都带 `--locked`，对不上就构建失败）+ `CHANGELOG.md` 的 `## [<版本>] - <日期>` 小节（没有 `[Unreleased]` 小节，直接写版本小节）与文末的对比链接——`release.yml` 校验 tag 恰为 `v<版本>` 且该小节存在，否则拒绝构建 |
 
@@ -206,6 +138,8 @@ glibc 低于 2.38、musl 低于 1.2.5，或 musl 主机上最新 release 没有 
 | `bpf/`、`crates/`、`config/speeder-guest.toml`、`packaging/`（systemd unit 与 OpenRC 脚本）、`release.yml` 打进产物的 `infra/*.sh` | **要** | 它们就在产物里，不发版默认安装的用户拿不到（OpenRC 脚本自 v0.4.1 进产物，Alpine 默认装 musl 版产物，安装器优先用产物里的那两个） |
 | `install.sh`、`scripts/bootstrap.sh` | 通常不要 | 一键安装每次都从 `main`（引导脚本的 `--ref`）取安装器，合并即对之后的一键安装生效；但已装主机上留着的那份不会自己更新：`bootstrap.sh --uninstall` 在 `/usr/local/src/skyline-speeder` 已有源码树时直接执行树里的 `install.sh`，照安装结束时的提示用树里的 `install.sh` 升级或卸载也一样。新安装器依赖产物里还没有的东西时除外，那就先发版 |
 | 文档、实验框架、CI、只影响源码构建的部分 | 不要 | 不进产物 |
+
+各目录的 `CLAUDE.md` 不进产物（`release.yml` 按文件名逐个打包），只改它们不需要发版。
 
 要发版时，合并后按上表"发版"一行走（版本号 + CHANGELOG 小节 + 打 `v*` tag），改过数据面的
 先重跑 `infra/kernel/core-portability.sh`。可以攒几个 PR 一起发，但 PR 里要写明"随下一版发布"，

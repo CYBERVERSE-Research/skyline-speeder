@@ -42,7 +42,7 @@ Kernel it ran on: `uname -r` =
 - [ ] Algorithm behaviour → `docs/03-design.md`
 - [ ] User-facing README change → **both** `README.md` and `README.zh.md`
 - [ ] New feature, changed default or `ssctl` report wording → both READMEs' feature table, the feature's subsection, and the key to `ssctl status` / `ssctl flows`
-- [ ] Invariant or contribution process → `CLAUDE.md` + `CONTRIBUTING.md` + this template
+- [ ] Invariant or contribution process → the directory's `CLAUDE.md` (and its summary in the root `CLAUDE.md`) + `CONTRIBUTING.md` + this template
 - [ ] Release → `Cargo.toml` version + `Cargo.lock` + a `CHANGELOG.md` section and its compare link
 
 ## Prebuilt release

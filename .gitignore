@@ -94,6 +94,10 @@ venv/
 
 # ---------------------------------------------------------------------------
 # Editor / OS / agent session state
+#
+# The CLAUDE.md files (the repository root and bpf/, crates/, config/, docs/,
+# infra/, packaging/) are public and committed. What an agent keeps for one
+# machine or one person -- .claude/ and CLAUDE.local.md at any level -- is not.
 # ---------------------------------------------------------------------------
 .vscode/
 .idea/
@@ -102,3 +106,4 @@ venv/
 .DS_Store
 Thumbs.db
 .claude/
+CLAUDE.local.md
