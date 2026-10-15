@@ -873,20 +873,20 @@ def write_report(
     )
     table_effect_field = f"effect_vs_{table_effect_key}_pct"
     lines = [
-        "# Skyline Speeder 实验统计报告",
+        "# Skyline Speeder experiment statistics report",
         "",
-        f"- 执行类别：`{execution_class}`",
-        f"- 性能结论有效：`{str(performance_valid).lower()}`",
-        f"- 总运行数：{len(rows)}",
-        f"- 有效运行数：{len(rows) - len(invalid)}",
-        f"- 无效运行数：{len(invalid)}",
+        f"- Execution class: `{execution_class}`",
+        f"- Performance conclusions valid: `{str(performance_valid).lower()}`",
+        f"- Total runs: {len(rows)}",
+        f"- Valid runs: {len(rows) - len(invalid)}",
+        f"- Invalid runs: {len(invalid)}",
     ]
     if performance_valid:
         lines.extend(
             [
-                f"- 变异系数超限组：{len(cv_failures)}",
+                f"- Groups over the coefficient-of-variation limit: {len(cv_failures)}",
                 "",
-                "## B1/B2 中性底座门槛",
+                "## B1/B2 neutral baseline gate",
                 "",
             ]
         )
@@ -894,12 +894,14 @@ def write_report(
         lines.extend(
             [
                 "",
-                "> 本结果来自 QEMU TCG 集成验证，不代表 KVM、裸机或生产环境性能。",
-                "> Goodput、RTT、CPU、置信区间和相对差异仅作诊断展示，未应用性能门槛。",
+                "> These results come from QEMU TCG integration validation and do not represent KVM, bare-metal or production performance.",
+                "> Goodput, RTT, CPU, confidence intervals and relative differences are shown for diagnosis only; no performance thresholds were applied.",
                 "",
-                "## 集成有效性",
+                "## Integration validity",
                 "",
-                "集成验证通过。" if not invalid else "存在无效运行，集成验证未完全通过。",
+                "Integration validation passed."
+                if not invalid
+                else "There are invalid runs; integration validation did not fully pass.",
                 "",
             ]
         )
@@ -908,12 +910,12 @@ def write_report(
             for row in invalid:
                 failure_counts[row["failure_class"] or "UNKNOWN"] += 1
             lines.append(
-                "失败分类："
-                + "、".join(
+                "Failure classes: "
+                + ", ".join(
                     f"{name}={count}"
                     for name, count in sorted(failure_counts.items())
                 )
-                + "。"
+                + "."
             )
             lines.append("")
 
@@ -929,12 +931,12 @@ def write_report(
         candidate_label = _profile_shorthand(parity_candidate_profile)
         reference_label = _profile_shorthand(parity_reference_profile)
         scenario_label = (
-            "线速" if parity_scenario == "line-rate" else parity_scenario
+            "line rate" if parity_scenario == "line-rate" else parity_scenario
         )
         lines.append(
-            f"{candidate_label} 在{scenario_label}场景相对 {reference_label} 的 "
-            f"goodput 差异为 {format_number(effect)}%，"
-            f"P95 RTT 差异为 {format_number(rtt_effect)}%。"
+            f"{candidate_label} relative to {reference_label} in the {scenario_label} scenario: "
+            f"the goodput difference is {format_number(effect)}%, "
+            f"the P95 RTT difference is {format_number(rtt_effect)}%."
         )
         parity_ok = (
             math.isfinite(effect)
@@ -943,20 +945,20 @@ def write_report(
             and abs(rtt_effect) <= 10
         )
         lines.append(
-            "通过 goodput ±3% 与 P95 RTT ±10% 门槛。"
+            "Passes the goodput ±3% and P95 RTT ±10% thresholds."
             if parity_ok
-            else "未通过中性底座门槛，停止解释可选模块结果。"
+            else "Fails the neutral baseline gate; stop interpreting the optional module results."
         )
     elif performance_valid:
         candidate_label = _profile_shorthand(parity_candidate_profile)
         reference_label = _profile_shorthand(parity_reference_profile)
         lines.append(
-            f"缺少 {parity_scenario} 场景的 {reference_label}/{candidate_label} 有效数据。"
+            f"No valid {reference_label}/{candidate_label} data for the {parity_scenario} scenario."
         )
     lines.extend(
         [
             "",
-            "## 分组结果",
+            "## Results by group",
             "",
             f"| Profile | Scenario | n | Goodput mean | 95% CI | CV | vs {table_effect_key.upper()} | P95 RTT |",
             "|---|---|---:|---:|---:|---:|---:|---:|",

@@ -1,179 +1,203 @@
-# Skyline Speeder 性能验证报告
+# Skyline Speeder Performance Validation Report
 
-**本报告只呈现单一构建版本的验证结果，全篇结果均来自附录 A 列出的构建
-指纹（BPF 对象 SHA-256）。** 这不是性能对比之外任何其他结论的来源——不做
-公平性评估，不做穷举系数扫描，不是网格密度意义上的"完整"矩阵，只回答一
-个问题：这套构建在目标部署环境和护栏场景下，相对内核默认 BBR 表现如何。
-模块全关路径的中性性属于正确性检查、不是性能对比，不在本报告内，见
-`docs/03-design.md` 第 4 节。
+**This report presents validation results for a single build only; every result in it comes from the
+build fingerprint (BPF object SHA-256) listed in Appendix A.** It is not the source of any conclusion
+other than the performance comparison — it does not assess fairness, does not sweep coefficients
+exhaustively, and is not a "complete" matrix in the sense of grid density. It answers one question
+only: how this build performs relative to the kernel's default BBR in the target deployment
+environment and in the guardrail scenarios. The neutrality of the all-modules-off path is a
+correctness check, not a performance comparison, and is not in this report; see section 4 of
+`docs/03-design.md`.
 
-> **本报告测的不是当前的出厂默认系数。** 全篇的 `skyline-best` 用的是报告测量
-> 时的默认值（第 3.4 节列出），它现在以「高随机丢包档」的名字保留在
-> `docs/usage.md` 里；实验矩阵自身的系数默认值（`research/experiments/
-> matrix_lib.py`）也钉在这一组上，所以本报告仍可复现。当前出厂默认值是后来
-> 在生产部署上调出来的另一组（见 `docs/03-design.md` 第 12 节），**没有在这套
-> 测试台矩阵上重跑过，本报告的任何数字都不适用于它**。
+> **This report does not measure the current shipped default coefficients.** Throughout,
+> `skyline-best` uses the defaults at the time the report was measured (listed in section 3.4), which
+> are now kept in `docs/usage.md` under the name "high random loss" preset; the experiment matrix's own
+> coefficient defaults (`research/experiments/matrix_lib.py`) are also pinned to this set, so this
+> report remains reproducible. The current shipped defaults are a different set, tuned later on
+> production deployments (see section 12 of `docs/03-design.md`); **they have not been rerun on this
+> test-bed matrix, and none of the numbers in this report apply to them**.
 
-## 1. 摘要与主要结论
+## 1. Summary and main conclusions
 
-1. **目标环境全 9 点网格上，`skyline-best` 反超默认 BBR**（第 4.1 节），
-   且都远超"至少领先 5%"这一验收判据。
-2. **`reorder-dsack`（不在目标环境范围内）是唯一 Skyline Speeder 不如 BBR 的场景**
-   （第 5 节，比 BBR 低约 13%），差距明确不是调优目标。
-3. **队列时延/ECN 护栏的自保护降速（`guardrail_gain=0.8`）代价有限**：对比
-   `guardrail_gain=0.0`（钳位到中性 1.0，不主动降速）的对照配置，七个场景的吞吐差异
-   在 0 到 -3.7% 之间，这是自保护降速预期的代价（第 6.1 节；其中
-   `intercontinental-clean` 的 `guardrail_hits` 用的是 0.5.0 之前的合计口径，主要是 cwnd
-   顶到上限的计数，并不说明护栏在那里频繁触发）。
-4. **M1 tier-2（RTO 下限与上限）有直接实测证据**：打开 tier-2 的配置在强制 RTO
-   场景下 3/3 全部存活，`max_rto_ms` 在 902-1129ms；关掉 tier-2 的对照只有 1/3 存活，
-   纯内核默认的 BBR 曾实测到 RTO 被顶到约 101 秒，逼近内核 120 秒默认上限（第 6.2
-   节）。样本 `n=3`，且对照切换的是整个 tier-2，不能单独归给上限。
-5. **链路波动场景下两个 Skyline Speeder 变体依然反超默认 BBR**（第 6.3
-   节），但吞吐的运行间变异系数明显高于静态场景，与"拥塞证据触发次数"的
-   波动相关。
-6. **重传包 DSCP 标记在 IPv4/IPv6 下均正确工作，零误标记**（第 6.4 节）。
-7. **内核版本适配性**：验证支持 6.12 LTS 及以后版本；`6.1.x`/`6.6.x` 因
-   内核 struct_ops 接口签名差异明确不支持（第 7 节）。
+1. **On the full 9-point grid of the target environment, `skyline-best` outperforms the default BBR**
+   (section 4.1), in every case far beyond the acceptance criterion of "a lead of at least 5%".
+2. **`reorder-dsack` (outside the target environment) is the only scenario where Skyline Speeder does
+   worse than BBR** (section 5, about 13% below BBR); the gap is explicitly not a tuning target.
+3. **The self-protective slowdown of the queue-delay/ECN guardrail (`guardrail_gain=0.8`) has a limited
+   cost**: compared with the control configuration `guardrail_gain=0.0` (clamped to a neutral 1.0, no
+   active slowdown), the throughput difference across the seven scenarios is between 0 and -3.7%, which
+   is the expected cost of a self-protective slowdown (section 6.1; the `guardrail_hits` for
+   `intercontinental-clean` use the combined pre-0.5.0 accounting, are mainly counts of cwnd hitting its
+   cap, and do not show that the guardrail fires often there).
+4. **M1 tier-2 (RTO floor and ceiling) has direct measured evidence**: the configuration with tier-2 on
+   survived 3/3 runs in the forced-RTO scenario, with `max_rto_ms` at 902-1129ms; the control with
+   tier-2 off survived only 1/3, and plain kernel-default BBR was once measured with its RTO pushed to
+   about 101 seconds, close to the kernel's 120-second default ceiling (section 6.2). The sample is
+   `n=3`, and the control toggles the whole of tier-2, so the result cannot be attributed to the
+   ceiling alone.
+5. **In the link-fluctuation scenario both Skyline Speeder variants still outperform the default BBR**
+   (section 6.3), but the run-to-run coefficient of variation of throughput is markedly higher than in
+   the static scenarios, and correlates with the fluctuation in the "congestion-evidence trigger
+   count".
+6. **DSCP marking of retransmitted packets works correctly over both IPv4 and IPv6, with zero
+   mismarks** (section 6.4).
+7. **Kernel version compatibility**: support is verified for 6.12 LTS and later; `6.1.x`/`6.6.x` are
+   explicitly unsupported because of a difference in the kernel's struct_ops interface signature
+   (section 7).
 
-## 2. 测试环境与有效性边界
+## 2. Test environment and validity bounds
 
-### 2.1 测试床拓扑
+### 2.1 Test-bed topology
 
 ```mermaid
 flowchart LR
-    Server["Server VM<br/>加载 Skyline Speeder"] <-->|数据网卡| Router["单 netns 路由器<br/>HTB 限速 + NetEm 时延/丢包/重排序"]
-    Router <-->|数据网卡| Client["Client VM<br/>保持原生内核 TCP"]
-    Server -.管理网络.-> Host["宿主机"]
-    Client -.管理网络.-> Host
+    Server["Server VM<br/>loads Skyline Speeder"] <-->|data NIC| Router["single-netns router<br/>HTB rate limit + NetEm delay/loss/reordering"]
+    Router <-->|data NIC| Client["Client VM<br/>keeps native kernel TCP"]
+    Server -. management network .-> Host["Host machine"]
+    Client -. management network .-> Host
 ```
 
-两台 4 vCPU KVM guest + 单 netns 路由器；Server 端加载 Skyline Speeder，Client 端保持
-原生内核 TCP，对客户端完全透明。
+Two 4-vCPU KVM guests + a single-netns router; the Server side loads Skyline Speeder, the Client side
+keeps native kernel TCP, and the whole thing is fully transparent to the client.
 
-### 2.2 被测构建
+### 2.2 Build under test
 
-见附录 A 的完整构建指纹表。第 4-6 节的目标环境/护栏/机制验证数据来自同一
-次构建；第 6.4 节的 DSCP 标记验证和第 7 节的内核适配性验证各自使用独立的
-构建（BPF 源码逐字节相同，仅编译目标内核不同），指纹分别列在对应小节。
+See Appendix A for the full build fingerprint table. The target-environment, guardrail and mechanism
+validation data in sections 4-6 come from one and the same build; the DSCP marking validation in
+section 6.4 and the kernel compatibility validation in section 7 each used a separate build
+(byte-identical BPF source, differing only in the target kernel compiled for), with the fingerprints
+listed in the corresponding subsections.
 
-发布前额外用当前最新构建（即本文档发布时的代码状态）在目标环境代表性场景
-（`rtt200-loss15`）上做过一次小规模复核（`n=2`）：不加速的中性对照（模块全关的
-`b2-skyline-base`）两次复核数值与原始主运行几乎完全一致——这个对照在该场景的数值
-不在本报告的表格里，原始运行数据也不随报告交付（见附录 A），这一点本报告无法让读者
-自行核对；`skyline-best` 复核数值比第 4.1 节主数据低约 6.5%，两组置信区间不重叠。
-核对确认 `skyline_cc.bpf.c`（拥塞控制决策代码本身）在两次构建之间逐字节未变，
-不加速的对照在两次运行之间又高度一致，判断这个差异更可能是小样本（`n=2`）下的
-运行间噪声，而不是代码变化导致的真实回归——但没有更大样本量的数据能完全排除存在
-一个小的真实差异。这次复核用的构建与场景见附录 A。
+Before publication, a small additional re-check (`n=2`) was run with the latest build at the time (the
+state of the code when this document was published) on a representative scenario of the target
+environment (`rtt200-loss15`): the two re-check values of the non-accelerating neutral control
+(`b2-skyline-base`, all modules off) were almost exactly the same as in the original main run — this
+control's values for that scenario are not in this report's tables, and the raw run data does not ship
+with the report (see Appendix A), so on this point the report cannot let readers check for themselves;
+the `skyline-best` re-check values were about 6.5% below the main data in section 4.1, and the
+confidence intervals of the two groups do not overlap. Checks confirmed that `skyline_cc.bpf.c` (the
+congestion-control decision code itself) was byte-for-byte unchanged between the two builds, and the
+non-accelerating control agreed closely between the two runs, so the difference is judged more likely
+to be run-to-run noise at a small sample size (`n=2`) than a real regression caused by a code change —
+but without data from a larger sample, a small real difference cannot be completely ruled out. The
+build and scenario used for this re-check are in Appendix A.
 
-### 2.3 有效性边界
+### 2.3 Validity bounds
 
-- **带宽轴上限**：`offload=off` 才能产生真正的逐包独立随机丢包（否则
-  NetEm 会把丢包聚合成偶发整帧丢弃，丢包模型失真），这把测试台吞吐天花板
-  压到约 100-150 Mbit/s，目标环境场景统一 `rate_mbit=100`；"数百 Mbps"是
-  已声明的外推，未在测试台上直接验证。
-- **BBR 无法调参**：这套内核构建的 BBRv1 实现全部内部参数都是编译期常量，
-  没有任何运行时可调接口，本报告的对比对象始终是默认配置的 `bbr-fq`。
-- **目标环境外场景的丢包与重排序是按 GSO 大帧发生的**：第 3.2 节那些场景
-  （第 5、6.1 节的数据）跑在 `offload=on` 下（多数是 500/1000 Mbit，测试台
-  只有这样才跑得到），Server 的 TSO 大帧原样到达路由器，NetEm 每次丢掉或
-  重排的是一整个大帧，而不是一个包。在一台 6.12 主机上按同样拓扑（发送端 →
-  netns 路由器上的 NetEm → 接收端）搭的复刻里，0.5% 的 NetEm 随机丢包每次
-  平均丢掉 8.4 个报文段，丢包事件只有配置值的约七分之一；关掉发送端 offload
-  后每次正好 1 个。这些场景里各 profile 面对的是同一个丢包过程，"没有退化"
-  这个用途不受影响，但其中的数字不能当作表中所写的逐包随机丢包下的表现来
-  引用。
-- **`offload=off` 时 TC 钩子仍看到 `gso_segs>1`（已查明）**：TCP 不管网卡的
-  offload 怎么设都先组 GSO 大帧——`sk_setup_caps()`（`net/core/sock.c`）给
-  每个 TCP socket 都加上 `NETIF_F_GSO`——等离开 qdisc、交给网卡时才由软件
-  分段（`validate_xmit_skb()`）。所以 Server 自己的 TC 钩子和 qdisc 看到的
-  是大帧，网卡发出去的、抓包里看到的、到达路由器 NetEm 的都是 MTU 大小的
-  包。NetEm 在路由器这台另外的设备上，`offload=off` 时它是逐包丢的：上面
-  那个复刻里每次丢包正好对应 1 个报文段；同一个 NetEm 若放在发送端自己的
-  出口上，`offload=off` 时每次丢包仍是 3-4 个报文段。目标环境网格的逐包随机
-  丢包因此成立。
+- **Upper end of the bandwidth axis**: only `offload=off` produces truly independent per-packet random
+  loss (otherwise NetEm aggregates loss into occasional whole-frame drops, distorting the loss model),
+  and this pushes the test bed's throughput ceiling down to about 100-150 Mbit/s; the
+  target-environment scenarios all use `rate_mbit=100`. "Hundreds of Mbps" is a declared
+  extrapolation, not directly validated on the test bed.
+- **BBR cannot be tuned**: every internal parameter of the BBRv1 implementation in this kernel build is
+  a compile-time constant, with no runtime tuning interface at all; the comparison target throughout
+  this report is `bbr-fq` in its default configuration.
+- **Loss and reordering in the out-of-target scenarios happen per large GSO frame**: the scenarios of
+  section 3.2 (the data in sections 5 and 6.1) run with `offload=on` (most at 500/1000 Mbit, which the
+  test bed can only reach this way), so the Server's large TSO frames reach the router intact, and what
+  NetEm drops or reorders each time is a whole large frame, not a single packet. In a replica built
+  with the same topology on a 6.12 host (sender → NetEm on a netns router → receiver), 0.5% NetEm
+  random loss dropped 8.4 segments on average each time, with only about one seventh as many loss
+  events as configured; with offload turned off on the sender, each drop was exactly 1 segment. In
+  these scenarios every profile faces the same loss process, so their use for showing "no regression"
+  is unaffected, but their numbers cannot be quoted as performance under the per-packet random loss
+  written in the tables.
+- **With `offload=off` the TC hook still sees `gso_segs>1` (cause identified)**: whatever the NIC's
+  offload settings, TCP first builds large GSO frames — `sk_setup_caps()` (`net/core/sock.c`) adds
+  `NETIF_F_GSO` to every TCP socket — and they are segmented in software only after leaving the qdisc,
+  on the way to the NIC (`validate_xmit_skb()`). So the Server's own TC hook and qdisc see large frames,
+  while what the NIC sends, what packet captures show, and what reaches NetEm on the router are all
+  MTU-sized packets. NetEm sits on a separate device, the router, and with `offload=off` it drops per
+  packet: in the replica above each drop corresponded to exactly 1 segment; the same NetEm placed on the
+  sender's own egress still drops 3-4 segments per loss with `offload=off`. The per-packet random loss
+  of the target-environment grid therefore holds.
 
-### 2.4 验收判据定义
+### 2.4 Acceptance criteria definitions
 
-**主判据**：`median(skyline-best) ≥ 1.05 × median(bbr-fq)`。
+**Primary criterion**: `median(skyline-best) ≥ 1.05 × median(bbr-fq)`.
 
-**稳健性判据**：`min_over_runs(skyline-best) > max_over_runs(bbr-fq 各次)`——
-BBR 在部分场景呈双峰分布，小样本下用它的中位数做门槛不稳，改用"Skyline Speeder 的最
-小值仍大于对方任何一次跑出来的最大值"这种不受抽样运气影响的判据。
+**Robustness criterion**: `min_over_runs(skyline-best) > max_over_runs(bbr-fq, every run)` — BBR is
+bimodal in some scenarios, so with small samples its median is an unstable threshold; instead the
+criterion is "Skyline Speeder's minimum is still greater than the maximum of any single run of the
+other side", which is not affected by sampling luck.
 
-不达标的点如实记录，不隐藏、不为了让某一项通过而重跑挑数据。
+Points that fail are recorded as they are: nothing is hidden, and nothing is rerun to cherry-pick data
+so that some item passes.
 
-## 3. 场景与 Profile 定义
+## 3. Scenario and Profile definitions
 
-### 3.1 目标环境场景网格
+### 3.1 Target-environment scenario grid
 
-`rtt_ms ∈ {100,200,300} × loss_pct ∈ {10,15,20}%`，统一 `rate_mbit=100`、
-`queue_bdp=1.0`、`loss_model="random"`、`offload="off"`，共 9 个场景，ID 形
-如 `rtt200-loss15`。
+`rtt_ms ∈ {100,200,300} × loss_pct ∈ {10,15,20}%`, all with `rate_mbit=100`, `queue_bdp=1.0`,
+`loss_model="random"` and `offload="off"`: 9 scenarios in total, with IDs of the form
+`rtt200-loss15`.
 
-带宽敏感性场景：同一 `rtt200-loss15`，`rate_mbit` 取 10/20/30/60/100 五点。
+Bandwidth-sensitivity scenarios: the same `rtt200-loss15`, with `rate_mbit` at five points:
+10/20/30/60/100.
 
-### 3.2 目标环境外的护栏场景
+### 3.2 Out-of-target guardrail scenarios
 
-以下场景不在目标部署环境范围内，只用于确认没有在非目标场景上产生退化，
-不是调优目标：
+The following scenarios are outside the target deployment environment. They are used only to confirm
+that nothing regresses in non-target scenarios, and are not tuning targets:
 
-| 场景 ID | rtt_ms | rate_mbit | 丢包 | 重排序 | 定位 |
+| Scenario ID | rtt_ms | rate_mbit | Loss | Reordering | Role |
 |---|---:|---:|---|---|---|
-| `line-rate` | 20 | 1000 | 0% | — | 无损高速；模块全关中性性门槛（见 `docs/03-design.md` 第 4 节） |
-| `light-loss` | 80 | 500 | 0.1% random | — | 轻度随机丢包 |
-| `primary` | 150 | 500 | 0.5% random | — | 中等距离中等丢包 |
-| `heavy-loss` | 250 | 100 | 2.0% random | — | 重丢包 |
-| `burst-loss` | 150 | 500 | 0.5% gemodel，突发长度 5 | — | 突发（成簇）丢包 |
-| `reorder-dsack` | 100 | 500 | 0% | 25%，相关性 25% | 纯重排序 |
-| `intercontinental-clean` | 400 | 1000 | 0% | — | 跨国无损对照 |
+| `line-rate` | 20 | 1000 | 0% | — | Lossless high speed; neutrality gate for the all-modules-off path (see section 4 of `docs/03-design.md`) |
+| `light-loss` | 80 | 500 | 0.1% random | — | Light random loss |
+| `primary` | 150 | 500 | 0.5% random | — | Medium distance, medium loss |
+| `heavy-loss` | 250 | 100 | 2.0% random | — | Heavy loss |
+| `burst-loss` | 150 | 500 | 0.5% gemodel, burst length 5 | — | Burst (clustered) loss |
+| `reorder-dsack` | 100 | 500 | 0% | 25%, correlation 25% | Pure reordering |
+| `intercontinental-clean` | 400 | 1000 | 0% | — | Lossless intercontinental control |
 
-这些场景都是 `offload=on`，表中的丢包与重排序按 GSO 大帧发生，不是逐包的，见
-2.3 节。
+All of these scenarios use `offload=on`: the loss and reordering in the table happen per large GSO
+frame, not per packet; see section 2.3.
 
-### 3.3 链路波动场景
+### 3.3 Link-fluctuation scenario
 
-单个 case 内实时热更新路由器 NetEm/HTB 参数（`tc ... change`，不中断连接、
-不清零 qdisc 计数器）：`volatile-bandwidth-cliff`（`rtt_ms=300`，全程带 gemodel
-突发丢包、突发长度 220）分四段——`[0,20)s` 平稳 `rate=100Mbit`、丢包 0.5%；
-`[20,35)s` 骤降到 `rate=15Mbit`（队列包数锁定，让排队时延真实放大），丢包仍是
-0.5%；`[35,43)s` 同样低带宽下丢包升到 8%，一次真实的丢包突发；`[43,59)s` 恢复到
-`rate=100Mbit`、丢包 0.5%。（manifest 的注释写着 `[20,35)s` 不引入丢包，但它的
-配置、也就是实际运行的条件，是 0.5%。）
+The router's NetEm/HTB parameters are hot-updated live within a single case (`tc ... change`, without
+interrupting connections or zeroing the qdisc counters): `volatile-bandwidth-cliff` (`rtt_ms=300`,
+with gemodel burst loss throughout, burst length 220) has four segments — `[0,20)s` steady at
+`rate=100Mbit` with 0.5% loss; `[20,35)s` a sudden drop to `rate=15Mbit` (queue length in packets held
+fixed, so the queueing delay really grows), loss still 0.5%; `[35,43)s` at the same low bandwidth,
+loss rises to 8%, a real loss burst; `[43,59)s` back to `rate=100Mbit` with 0.5% loss. (The manifest's
+comment says `[20,35)s` introduces no loss, but its configuration, that is, the condition actually
+run, is 0.5%.)
 
-### 3.4 Profile 定义
+### 3.4 Profile definitions
 
-| Profile ID | `cc` | 说明 |
+| Profile ID | `cc` | Description |
 |---|---|---|
-| `bbr-fq` | `bbr` | 业界标准对照 |
-| `b2-skyline-base` | `skyline_cc` | Skyline Speeder 框架但四个可选模块全关，中性基线（中性性验证见 `docs/03-design.md` 第 4 节） |
-| `skyline-best` | `skyline_cc` | 全部模块开启，报告测量时的默认系数：`cruise_inflight_gain` 2.0 / `cruise_pacing_gain` 1.1 / `loss_inflation_max_ratio` 0.5 / 护栏 100ms·1.0× / `min_rtt_window_s` 10 / `bw_window_rtts` 10 / STARTUP 退出 3 轮·25%（**不是**当前出厂默认值，见文首说明） |
+| `bbr-fq` | `bbr` | Industry-standard baseline |
+| `b2-skyline-base` | `skyline_cc` | The Skyline Speeder framework with all four optional modules off; the neutral baseline (neutrality validation in section 4 of `docs/03-design.md`) |
+| `skyline-best` | `skyline_cc` | All modules on, with the default coefficients at the time the report was measured: `cruise_inflight_gain` 2.0 / `cruise_pacing_gain` 1.1 / `loss_inflation_max_ratio` 0.5 / guardrail 100ms·1.0× / `min_rtt_window_s` 10 / `bw_window_rtts` 10 / STARTUP exit 3 rounds·25% (**not** the current shipped defaults; see the note at the top) |
 
-实验 manifest（`research/experiments/manifests/`）里还定义了其他内核原生算法的
-基线 profile；本报告只与 `bbr-fq` 对比，不列出它们。
+The experiment manifests (`research/experiments/manifests/`) also define baseline profiles for other
+kernel-native algorithms; this report compares only with `bbr-fq` and does not list them.
 
-以下是围绕 `skyline-best` 的对照用配置变体，用来隔离某一项设置的影响（`skyline-guardrail-neutral` 与
-`skyline-relaxed-congestion-ratio` 只改一个系数，`skyline-rto-baseline` 去掉的是整段 `[rack_rto]`）：
+Below are control variants of `skyline-best`, used to isolate the effect of one setting
+(`skyline-guardrail-neutral` and `skyline-relaxed-congestion-ratio` change only one coefficient;
+`skyline-rto-baseline` removes the whole `[rack_rto]` section):
 
-| Profile ID | 与 `skyline-best` 的差异 |
+| Profile ID | Difference from `skyline-best` |
 |---|---|
-| `skyline-guardrail-neutral` | `guardrail_gain=0.0`（护栏只取消加速，不主动降速） |
-| `skyline-rto-baseline` | 完全省略 `[rack_rto]`：实验框架因此下发 `ssctl reset-rack-rto`，回到 guest 配置的"关闭"，M1 tier-2 的下限与上限两半都不生效（`skyline-best` 两半都开：下限 `srtt_permille` 1100、`floor_us` 20000，上限 3x/6x） |
-| `skyline-relaxed-congestion-ratio` | `rto_max_congestion_ratio_permille=1500`（拥塞证据判定阈值从默认 2x 放宽到 1.5x） |
+| `skyline-guardrail-neutral` | `guardrail_gain=0.0` (the guardrail only cancels acceleration and does not actively slow down) |
+| `skyline-rto-baseline` | Omits `[rack_rto]` entirely: the experiment harness therefore sends `ssctl reset-rack-rto`, returning to the guest configuration's "off", so neither half of M1 tier-2, floor or ceiling, takes effect (`skyline-best` has both halves on: floor `srtt_permille` 1100, `floor_us` 20000; ceiling 3x/6x) |
+| `skyline-relaxed-congestion-ratio` | `rto_max_congestion_ratio_permille=1500` (the congestion-evidence threshold relaxed from the default 2x to 1.5x) |
 
-`cruise_inflight_gain`（2.0）/`cruise_pacing_gain`（1.1）的选定依据：cwnd
-增益刻意比 pacing 增益更宽松（cwnd 只需不成为限制因素，真正的限速器是
-pacing），具体数值在目标环境网格上按吞吐与自伤风险权衡选定，完整系数说
-明见 `docs/03-design.md` 第 12 节。
+Why `cruise_inflight_gain` (2.0) / `cruise_pacing_gain` (1.1) were chosen: the cwnd gain is
+deliberately looser than the pacing gain (cwnd only needs not to be the limiting factor; the real rate
+limiter is pacing), and the exact values were chosen on the target-environment grid by weighing
+throughput against the risk of self-harm; the full explanation of the coefficients is in section 12 of
+`docs/03-design.md`.
 
-## 4. 目标环境结果
+## 4. Target-environment results
 
-### 4.1 9 点网格
+### 4.1 9-point grid
 
-（单位 Mbit/s，`n=2`，`median`/`min`）
+(Unit Mbit/s, `n=2`, `median`/`min`)
 
-| 场景 | bbr 中位数 | bbr 最小值 | skyline 中位数 | skyline 最小值 | vs bbr |
+| Scenario | bbr median | bbr min | skyline median | skyline min | vs bbr |
 |---|---:|---:|---:|---:|---:|
 | `rtt100-loss10` | 84.28 | 84.14 | 95.36 | 94.75 | 113% |
 | `rtt100-loss15` | 79.61 | 79.10 | 95.74 | 95.00 | 120% |
@@ -185,46 +209,50 @@ pacing），具体数值在目标环境网格上按吞吐与自伤风险权衡�
 | `rtt300-loss15` | 10.88 | 10.11 | 79.44 | 74.91 | 730% |
 | `rtt300-loss20` | 3.48 | 3.10 | 79.92 | 77.43 | 2296% |
 
-**9/9 点主判据与稳健性判据全部通过。**
+**All 9/9 points pass both the primary criterion and the robustness criterion.**
 
-### 4.2 高 RTT 端加样本（`n=5`）
+### 4.2 More samples at the high-RTT end (`n=5`)
 
-对目标环境里 RTT 最高的三个点补充样本以收紧置信区间：
+Additional samples for the three highest-RTT points of the target environment, to tighten the
+confidence intervals:
 
-| 场景 | skyline 中位数（`n=5`） | bbr 中位数 | 比值 | skyline 最小值 | bbr 最大值（各次） | 稳健性 | skyline CV% |
+| Scenario | skyline median (`n=5`) | bbr median | Ratio | skyline min | bbr max (any run) | Robustness | skyline CV% |
 |---|---:|---:|---:|---:|---:|---|---:|
-| `rtt300-loss10` | 90.01 | 81.41 | 1.11x | 88.46 | 82.63 | 通过 | 3.2% |
-| `rtt300-loss15` | 83.80 | 4.32（中位数）/75.46（单次最高） | 19.4x | 80.61 | 75.46 | 通过 | 3.7% |
-| `rtt300-loss20` | 75.75 | 2.06（中位数）/48.23（单次最高） | 36.9x | 73.57 | 48.23 | 通过 | 2.6% |
+| `rtt300-loss10` | 90.01 | 81.41 | 1.11x | 88.46 | 82.63 | Pass | 3.2% |
+| `rtt300-loss15` | 83.80 | 4.32 (median)/75.46 (best single run) | 19.4x | 80.61 | 75.46 | Pass | 3.7% |
+| `rtt300-loss20` | 75.75 | 2.06 (median)/48.23 (best single run) | 36.9x | 73.57 | 48.23 | Pass | 2.6% |
 
-`rtt300-loss15`/`-loss20` 的 BBR 中位数远低于其单次最高值，是 BBR 在
-这两点上双峰分布的直接体现；即便用更保守的"跟 BBR 历史最高单次比"这
-个稳健性判据，Skyline Speeder 仍全部通过。`n=5` 下 Skyline Speeder 自身 CV 都在 4% 以内。
+BBR's median at `rtt300-loss15`/`-loss20` is far below its best single run, a direct sign of BBR's
+bimodal distribution at these two points; even under the more conservative robustness criterion of
+"compare with BBR's best single run ever", Skyline Speeder passes at every point. At `n=5`, Skyline
+Speeder's own CV is within 4% everywhere.
 
-### 4.3 带宽敏感性
+### 4.3 Bandwidth sensitivity
 
-（`rtt200-loss15`，`rate_mbit` 五点，单位 Mbit/s）
+(`rtt200-loss15`, five `rate_mbit` points, unit Mbit/s)
 
-| 带宽 | bbr 中位数（range） | skyline 中位数（range） |
+| Bandwidth | bbr median (range) | skyline median (range) |
 |---:|---:|---:|
-| 10 Mbit | 4.3（0.8-7.8） | **9.4**（9.26-9.47） |
-| 20 Mbit | 15.6（15.5-15.7） | **18.6**（18.0-19.2） |
-| 30 Mbit | 6.5（2.7-10.4） | **28.3**（28.2-28.4） |
-| 60 Mbit | 5.9（2.7-9.2） | **56.5**（55.7-57.3） |
-| 100 Mbit | 76.9（75.7-78.1） | **95.7**（95.7-95.8） |
+| 10 Mbit | 4.3 (0.8-7.8) | **9.4** (9.26-9.47) |
+| 20 Mbit | 15.6 (15.5-15.7) | **18.6** (18.0-19.2) |
+| 30 Mbit | 6.5 (2.7-10.4) | **28.3** (28.2-28.4) |
+| 60 Mbit | 5.9 (2.7-9.2) | **56.5** (55.7-57.3) |
+| 100 Mbit | 76.9 (75.7-78.1) | **95.7** (95.7-95.8) |
 
-Skyline Speeder 在全部 5 个带宽点稳定跑赢 BBR、且方差远小于 BBR（BBR 在 10/30/60
-Mbit 三点上都是双峰分布，单次运行可以差 3-4 倍）。10/20 Mbit 低端点上 Skyline Speeder
-有小幅欠冲（比标称带宽低 2-10%，`initial_cwnd_packets=100` 在这么低带宽下
-已经超过 BDP），如实记录这个已知的小幅限制。
+Skyline Speeder consistently beats BBR at all 5 bandwidth points, with far less variance than BBR (BBR
+is bimodal at the three points 10/30/60 Mbit, and single runs can differ by a factor of 3-4). At the
+low end, 10/20 Mbit, Skyline Speeder undershoots slightly (2-10% below the nominal bandwidth; at
+bandwidths this low `initial_cwnd_packets=100` already exceeds the BDP); this known small limitation is
+recorded as it is.
 
-## 5. 目标环境外场景的回归护栏
+## 5. Regression guardrail in out-of-target scenarios
 
-以下场景不在目标部署环境范围内，仅用于确认未在非目标场景上产生退化：
+The following scenarios are outside the target deployment environment and are used only to confirm
+that nothing regresses in non-target scenarios:
 
-（`n=3`，中位数，单位 Mbit/s）
+(`n=3`, median, unit Mbit/s)
 
-| 场景 | bbr | skyline-best |
+| Scenario | bbr | skyline-best |
 |---|---:|---:|
 | `intercontinental-clean` | 432.50 | 884.34 |
 | `line-rate` | 935.09 | 956.41 |
@@ -234,23 +262,25 @@ Mbit 三点上都是双峰分布，单次运行可以差 3-4 倍）。10/20 Mbit
 | `burst-loss` | 458.86 | 467.49 |
 | `reorder-dsack` | 459.77 | 397.76 |
 
-**`reorder-dsack` 是唯一 Skyline Speeder 不如 BBR 的场景**（比 BBR 低约
-13%）——这是纯重排序场景，不在目标环境范围内，如实记录，不作调优目标。
-其余场景 Skyline Speeder 均反超或持平 BBR。
+**`reorder-dsack` is the only scenario where Skyline Speeder does worse than BBR** (about 13% below
+BBR) — it is a pure-reordering scenario outside the target environment; it is recorded as it is and is
+not a tuning target. In every other scenario Skyline Speeder outperforms or matches BBR.
 
-## 6. 机制层验证
+## 6. Mechanism-level validation
 
-### 6.1 队列时延/ECN 护栏的自保护降速
+### 6.1 Self-protective slowdown of the queue-delay/ECN guardrail
 
-**机制**：护栏触发（队列时延超过阈值，或出现新鲜 ECN CE 标记）时，把该
-轮的 cwnd 目标增益和 pacing 增益都钳位到 `guardrail_gain`（默认 0.8：pacing 降到
-测得带宽的 80%；cwnd 目标之后仍乘 M3 的丢包补偿系数，见 `docs/03-design.md`
-第 6 节）；`0.0` 表示只取消加速、不主动降速。每轮从零重新判定，不是粘性状态。
+**Mechanism**: when the guardrail fires (queueing delay above the threshold, or a fresh ECN CE mark),
+both the cwnd target gain and the pacing gain for that round are clamped to `guardrail_gain` (default
+0.8: pacing drops to 80% of the measured bandwidth; the cwnd target is afterwards still multiplied by
+M3's loss-compensation factor, see section 6 of `docs/03-design.md`); `0.0` means only cancelling
+acceleration, without actively slowing down. The decision is made afresh every round; it is not a
+sticky state.
 
-**验证**（`{skyline-best, skyline-guardrail-neutral}` × 7 个历史高频触发场景 ×
-`n=3`，单位 Mbit/s，中位数）：
+**Validation** (`{skyline-best, skyline-guardrail-neutral}` × 7 scenarios that historically triggered
+it often × `n=3`, unit Mbit/s, median):
 
-| 场景 | skyline-best | skyline-guardrail-neutral | 差异 | guardrail_hits（3 轮合计，best/neutral，0.5.0 之前的合计口径） |
+| Scenario | skyline-best | skyline-guardrail-neutral | Difference | guardrail_hits (sum of the 3 runs, best/neutral, combined pre-0.5.0 accounting) |
 |---|---:|---:|---:|---:|
 | `intercontinental-clean` | 884.34 | 884.35 | <0.01% | 207811 / 207907 |
 | `line-rate` | 956.41 | 956.41 | 0% | 4 / 11 |
@@ -260,177 +290,201 @@ Mbit 三点上都是双峰分布，单次运行可以差 3-4 倍）。10/20 Mbit
 | `burst-loss` | 467.49 | 478.22 | -2.2% | 35 / 27 |
 | `reorder-dsack` | 397.76 | 413.24 | -3.7% | 84 / 95 |
 
-`intercontinental-clean` 的 20.8 万次 `guardrail_hits` 几乎都不是护栏触发：这组数据采集时，
-这个计数器还在 cwnd 顶到 `max_cwnd_packets` 时**每个 ACK** 记一次（0.5.0 起这部分单独记在
-`cwnd_cap_hits` 里，护栏触发按轮记在 `guardrail_hits` 里，见 `docs/02-interface-reference.md`
-第 4 节）。400 ms × 1000 Mbit/s 的 BDP 约 3.5 万包，乘 2.0 的 inflight 增益超过 5 万包的
-上限，cwnd 一直贴着上限；而队列时延/ECN 护栏每轮至多记一次，45 秒的 case 每次运行
-不到 115 轮，3 次合计至多约 340 次。两者差异 <0.01%：这条流被 cwnd 上限和链路带宽
-钳在满速附近，护栏增益几乎没有作用的机会，这一行不能说明护栏触发得频繁。其余
-场景的小幅下降（2-4%）是护栏真正生效时"自保护降速"这一设计本身预期的代
-价（用一点吞吐换队列时延/ECN 安全边际），不是缺陷。
+Almost none of the 208,000 `guardrail_hits` in `intercontinental-clean` are guardrail firings: when
+this data was collected, the counter was still incremented on **every ACK** while cwnd sat at
+`max_cwnd_packets` (from 0.5.0 this part is counted separately in `cwnd_cap_hits`, and guardrail
+firings are counted per round in `guardrail_hits`; see section 4 of
+`docs/02-interface-reference.md`). The BDP of 400 ms × 1000 Mbit/s is about 35,000 packets; multiplied
+by the inflight gain of 2.0 it exceeds the cap of 50,000 packets, so cwnd stays pinned at the cap. The
+queue-delay/ECN guardrail, on the other hand, counts at most once per round: a 45-second case has fewer
+than 115 rounds per run, so at most about 340 over the 3 runs combined. The two profiles differ by
+<0.01%: this flow is held near full speed by the cwnd cap and the link bandwidth, the guardrail gain has
+almost no chance to act, and this row does not show that the guardrail fires often. The small drops in
+the other scenarios (2-4%) are the expected cost of the "self-protective slowdown" design itself when
+the guardrail really takes effect (trading a little throughput for a queueing-delay/ECN safety margin),
+not a defect.
 
-### 6.2 M1 tier-2：`TCP_RTO_MAX_MS` 上限调节
+### 6.2 M1 tier-2: `TCP_RTO_MAX_MS` ceiling adjustment
 
-**机制**：`ceiling = clamp(k × base_rtt, 1000ms, 120000ms)`，无拥塞证据
-时 `k=rto_max_normal_permille`（本实验配置 3x），检测到真实拥塞证据（新鲜 CE 标
-记，或 srtt 相对 min_rtt 明显增长）后切换到 `rto_max_congested_permille`
-（本实验配置 6x），不回退内核 120 秒默认值。代码与随附模板里两者默认为 0，即上限
-关闭；这个选项需要内核 ≥ 6.15（本报告用的是 6.18.40）。
+**Mechanism**: `ceiling = clamp(k × base_rtt, 1000ms, 120000ms)`; without congestion evidence
+`k=rto_max_normal_permille` (3x in this experiment's configuration), and once real congestion evidence
+is detected (a fresh CE mark, or srtt growing clearly relative to min_rtt) it switches to
+`rto_max_congested_permille` (6x in this experiment's configuration), without falling back to the
+kernel's 120-second default. In the code and the bundled templates both default to 0, that is, the
+ceiling is off; this option needs kernel ≥ 6.15 (this report used 6.18.40).
 
-**强制超时场景实测**（`forced-rto-burst-rtt300`：`rtt_ms=300`、
-`rate_mbit=15`、Gilbert-Elliott 突发丢包 8%）：
+**Measured in the forced-timeout scenario** (`forced-rto-burst-rtt300`: `rtt_ms=300`,
+`rate_mbit=15`, 8% Gilbert-Elliott burst loss):
 
-| profile | 有效/总 | `rack_rto_max_applied`（每轮） | `rack_rto_max_rejected` | `max_rto_ms`（各轮） |
+| profile | Valid/total | `rack_rto_max_applied` (per run) | `rack_rto_max_rejected` | `max_rto_ms` (per run) |
 |---|---:|---:|---:|---:|
-| `skyline-best`（上限开） | 3/3 | 12-15 | 0 | 902 / 1086 / 1129 |
-| `skyline-rto-baseline`（tier-2 关） | 1/3 | — | — | 902（唯一有效样本） |
-| `bbr-fq`（无 Skyline Speeder，内核原生） | 3/3 | — | — | 902 / 4016 / **100992** |
+| `skyline-best` (ceiling on) | 3/3 | 12-15 | 0 | 902 / 1086 / 1129 |
+| `skyline-rto-baseline` (tier-2 off) | 1/3 | — | — | 902 (the only valid sample) |
+| `bbr-fq` (no Skyline Speeder, kernel native) | 3/3 | — | — | 902 / 4016 / **100992** |
 
-`skyline-best` 的 3 个有效样本 `max_rto_ms` 为 902-1129ms，`rack_rto_max_rejected`
-全部为 0（机制被调用且内核接受）。按公式，上限是 `clamp(3 × base_rtt, 1000ms, 120000ms)`：
-RTT 300ms 时至少是 1000ms，srtt 被排队抬高或出现拥塞证据时更大，所以 902ms 这类最大值
-本身并没有碰到上限（没有上限的两组也各有一次 902ms）。对照的 `bbr-fq`（完全没有 Skyline Speeder、纯内核默认行为）三次运行
-的 `max_rto_ms` 波动极大，其中一次采样到 **100992ms**（约 101 秒，逼近内
-核 `TCP_RTO_MAX` 120 秒默认上限）；`skyline-rto-baseline`（tier-2 整体关闭，
-没有上限也没有下限）在这个场景下有效率只有 33%——大多数运行直接被拖入内核默认
-的级联超时、被超时保护提前判为无效样本。`n=3` 能支持的是"打开 tier-2 的 3 次运行都
-没有出现数秒级的 RTO"；这组对照切换的是整个 tier-2（下限与上限），存活率的差异不能
-单独归给上限。
+The 3 valid samples of `skyline-best` have `max_rto_ms` of 902-1129ms, with `rack_rto_max_rejected` 0
+in every one (the mechanism was invoked and the kernel accepted it). By the formula, the ceiling is
+`clamp(3 × base_rtt, 1000ms, 120000ms)`: at an RTT of 300ms it is at least 1000ms, and larger when
+queueing pushes srtt up or congestion evidence appears, so a maximum such as 902ms did not itself touch
+the ceiling (the two groups without a ceiling also each had one 902ms). For the control `bbr-fq` (no
+Skyline Speeder at all, pure kernel default behaviour), `max_rto_ms` varied enormously across the three
+runs, and one of them sampled **100992ms** (about 101 seconds, approaching the kernel's `TCP_RTO_MAX`
+default ceiling of 120 seconds); `skyline-rto-baseline` (tier-2 entirely off, neither ceiling nor
+floor) had a valid rate of only 33% in this scenario — most runs were dragged straight into the
+kernel's default cascading timeouts and were marked invalid early by the timeout protection. What
+`n=3` can support is "none of the 3 runs with tier-2 on had an RTO of several seconds"; this control
+toggles the whole of tier-2 (floor and ceiling), so the difference in survival rate cannot be
+attributed to the ceiling alone.
 
-**链路波动场景下的拥塞证据分支**（`volatile-bandwidth-cliff`，`n=3`）：
+**The congestion-evidence branch in the link-fluctuation scenario** (`volatile-bandwidth-cliff`,
+`n=3`):
 
-| profile | `rack_rto_max_applied`（各轮） | `rack_rto_max_rejected` | `rack_rto_max_congested`（各轮） | `max_rto_ms`（各轮） |
+| profile | `rack_rto_max_applied` (per run) | `rack_rto_max_rejected` | `rack_rto_max_congested` (per run) | `max_rto_ms` (per run) |
 |---|---|---:|---|---|
-| `skyline-best`（阈值 2x 默认） | 21 / 22 / 10 | 0 / 0 / 0 | 2 / 2 / 0 | 4812 / 3677 / 1359 |
-| `skyline-relaxed-congestion-ratio`（阈值 1.5x） | 22 / 18 / 20 | 0 / 0 / 0 | 11 / 13 / 14 | 3850 / 4334 / 2559 |
+| `skyline-best` (threshold 2x, the default) | 21 / 22 / 10 | 0 / 0 / 0 | 2 / 2 / 0 | 4812 / 3677 / 1359 |
+| `skyline-relaxed-congestion-ratio` (threshold 1.5x) | 22 / 18 / 20 | 0 / 0 / 0 | 11 / 13 / 14 | 3850 / 4334 / 2559 |
 
-`rack_rto_max_applied>0` 且 `rack_rto_max_rejected==0` 在全部 6 个 case 里
-成立。把拥塞证据判定阈值从默认 2x 放宽到 1.5x 后，`rack_rto_max_congested`
-触发次数从平均约 1.3 次/轮跳到约 12.7 次/轮，稳定跨 3 次独立运行都是数量
-级差异，确认了阈值本身是限制这条分支触发频率的主要因素。`max_rto_ms` 普
-遍远高于按标称 `base_rtt=300ms` 算出的 900/1800ms 标称值——这是预期内的：
-ceiling 公式里的 `base_rtt` 在骤降+丢包窗口里本身被真实抬高到数秒量级，
-6x 乘在这个已经膨胀的 base 上，不是乘在标称 300ms 上。
+`rack_rto_max_applied>0` and `rack_rto_max_rejected==0` hold in all 6 cases. With the
+congestion-evidence threshold relaxed from the default 2x to 1.5x, the number of
+`rack_rto_max_congested` triggers jumped from about 1.3 per run on average to about 12.7 per run, an
+order-of-magnitude difference that holds consistently across 3 independent runs, confirming that the
+threshold itself is the main factor limiting how often this branch fires. `max_rto_ms` is generally
+far above the nominal 900/1800ms computed from the nominal `base_rtt=300ms` — this is expected: the
+`base_rtt` in the ceiling formula is itself genuinely pushed up to the order of several seconds during
+the drop-plus-loss window, and the 6x multiplies this already inflated base, not the nominal 300ms.
 
-**仍未直接证实的一点**：`rack_rto_max_congested` 计数器在每一次 RTT 回调
-只要证据成立就自增，跟"是否真的发生了一次 RTO 超时"没有逐事件级别的直接
-对应关系——现有数据能证实"证据成立的整体频率"和"实测 `max_rto_ms`"方向一
-致，但不是"某一次具体 RTO 超时发生时，ceiling 确实用的是 6x 而不是 3x"这
-种逐事件级别的直接证据。
+**One point still not directly confirmed**: the `rack_rto_max_congested` counter increments on every
+RTT callback in which the evidence holds, and has no direct event-by-event correspondence with
+"whether an RTO timeout actually occurred" — the existing data confirm that "the overall frequency with
+which the evidence holds" and "the measured `max_rto_ms`" move in the same direction, but they are not
+event-level direct evidence of the kind "when one specific RTO timeout occurred, the ceiling really
+used 6x and not 3x".
 
-### 6.3 链路波动场景下的整体表现
+### 6.3 Overall performance in the link-fluctuation scenario
 
-（`volatile-bandwidth-cliff`，整案例吞吐，`n=3`，中位数，单位 Mbit/s——这
-是全程四个 segment 混合平均后的数字）：
+(`volatile-bandwidth-cliff`, whole-case throughput, `n=3`, median, unit Mbit/s — this is the number
+averaged over all four segments of the run combined):
 
-| profile | 中位数 | CV | vs bbr |
+| profile | Median | CV | vs bbr |
 |---|---:|---:|---:|
 | `bbr-fq` | 51.92 | 5.1% | — |
 | `skyline-best` | 54.43 | 36.1% | +4.8% |
 | `skyline-relaxed-congestion-ratio` | 57.79 | 2.2% | +11.3% |
 
-两个 Skyline Speeder 变体仍反超 BBR，但 `skyline-best` 自身的运行间变异系数达
-36.1%，与拥塞证据触发次数的波动方向一致（触发 0 次的那一轮 `max_rto_ms`
-仅 1359ms，触发 2 次的那两轮达到 3677-4812ms，吞吐随之波动）——`n=3` 下不
-足以把两者的关系量化，只能如实指出相关性。`skyline-relaxed-congestion-ratio`
-（CV 仅 2.2%）在这个波动场景下表现更稳定、吞吐也更高，是否应该调低默认
-阈值是一个值得后续更大样本验证的方向，本报告不直接改默认值。
+Both Skyline Speeder variants still outperform BBR, but `skyline-best`'s own run-to-run coefficient of
+variation reaches 36.1%, moving in the same direction as the fluctuation in the congestion-evidence
+trigger count (the run with 0 triggers had a `max_rto_ms` of only 1359ms, the two runs with 2 triggers
+reached 3677-4812ms, and throughput fluctuated with them) — `n=3` is not enough to quantify the
+relationship between the two, so the correlation can only be pointed out as it is.
+`skyline-relaxed-congestion-ratio` (CV only 2.2%) is more stable and has higher throughput in this
+fluctuating scenario; whether the default threshold should be lowered is a direction worth validating
+later with larger samples, and this report does not change the default directly.
 
-**分段吞吐的测量局限**：按 segment 时间边界拆分 iperf3 的 0.5 秒采样窗口
-后发现，Skyline Speeder 系列 profile 的分段均值和中位数差距悬殊（Skyline Speeder 的 pacing 发送
-本身是突发式的，0.5 秒窗口经常整个落在两次突发之间报 0，偶尔一次窗口接住
-一次真实 RTO 后的补发突发能报出远超限速的瞬时值）——这是发送模式本身的真
-实特征，不是统计代码问题，但意味着分段吞吐的均值对 Skyline Speeder 系列 profile 不能
-直接采信，只能参考中位数。本节 6.3 的整案例吞吐（来自 iperf3 自己的整段
-汇总）不受这个问题影响，是本报告链路波动场景下唯一采信的吞吐指标。
+**Measurement limitation of per-segment throughput**: splitting iperf3's 0.5-second sampling windows at
+the segment time boundaries showed a wide gap between the per-segment mean and median for the Skyline
+Speeder profiles (Skyline Speeder's paced sending is itself bursty: a 0.5-second window often falls
+entirely between two bursts and reports 0, and occasionally a window catches the resend burst after a
+real RTO and reports an instantaneous value far above the rate limit) — this is a real characteristic
+of the sending pattern, not a problem in the statistics code, but it means the per-segment mean
+throughput cannot be taken at face value for the Skyline Speeder profiles; only the median can be used
+as a reference. The whole-case throughput in this section 6.3 (from iperf3's own whole-run summary) is
+not affected by this problem, and is the only throughput metric this report accepts for the
+link-fluctuation scenario.
 
-### 6.4 重传包 DSCP 标记（IPv4/IPv6）
+### 6.4 DSCP marking of retransmitted packets (IPv4/IPv6)
 
-**机制**：`skyline_tc.bpf.c` 在发送网卡出方向检测重传的 TCP 段（比较包自己的
-序列号和 `bpf_tcp_sock(sk)->snd_nxt`），命中则打上配置好的 DSCP 编码。接
-口级挂载，不分 cgroup，对该接口上全部 TCP 流一致生效，不区分用的是哪种拥
-塞控制算法。
+**Mechanism**: `skyline_tc.bpf.c` detects retransmitted TCP segments on the egress of the sending NIC
+(comparing the packet's own sequence number with `bpf_tcp_sock(sk)->snd_nxt`), and on a match sets the
+configured DSCP code point. It is attached at the interface level, regardless of cgroup, and applies
+uniformly to every TCP flow on that interface, whichever congestion control algorithm the flow uses.
 
-**验证**（真实抓包核对，`retransmit_capture_marked`=抓包确认打上标记的重
-传段数，`retransmit_capture_false_positives`=错误标记的非重传段数）：
+**Validation** (checked against real packet captures; `retransmit_capture_marked` = number of
+retransmitted segments the capture confirms as marked, `retransmit_capture_false_positives` = number of
+non-retransmitted segments marked by mistake):
 
-| 地址族 | 场景组合 | 覆盖的 profile | 抓包确认标记数 | 误标记数 |
+| Address family | Scenario mix | Profiles covered | Marks confirmed by capture | Mismarks |
 |---|---|---|---:|---:|
-| IPv4 | 有丢包机制场景 + 零丢包对照 | 内核原生算法基线（`bbr-fq` 等，含 DSCP 关闭/自定义编码对照）/`skyline-best` | 累计约 5 万次 | **0** |
-| IPv6 | 同上（v6 扩展头解析路径） | 同上 | 累计约 4.7 万次 | **0** |
+| IPv4 | Scenarios with a loss mechanism + zero-loss control | Kernel-native algorithm baselines (`bbr-fq` etc., including DSCP-off / custom-code-point controls) / `skyline-best` | About 50,000 in total | **0** |
+| IPv6 | Same as above (v6 extension-header parsing path) | Same as above | About 47,000 in total | **0** |
 
-**12 个 IPv4 case + 12 个 IPv6 case 全部有效，零误标记。** DSCP 关闭
-（`bbr-fq-dscp-off`）时标记数恒为 0，确认开关本身正确生效；不同 DSCP 编码
-值（`bbr-fq-dscp46`）下标记行为一致，确认编码值是纯粹的可配置占位参数，
-不影响标记机制本身。IPv6 路径的扩展头遍历（有界展开，遇到分片/认证头/未
-知扩展头一律放行不处理）在这组验证里没有产生任何误标记。
+**All 12 IPv4 cases + 12 IPv6 cases are valid, with zero mismarks.** With DSCP off
+(`bbr-fq-dscp-off`) the mark count is always 0, confirming that the switch itself works correctly; with
+a different DSCP code point (`bbr-fq-dscp46`) the marking behaves the same, confirming that the code
+point is purely a configurable placeholder parameter and does not affect the marking mechanism itself.
+The IPv6 path's extension-header walk (bounded unrolling; fragment headers, authentication headers and
+unknown extension headers are all passed through unprocessed) produced no mismarks in this validation.
 
-## 7. 内核版本适配性
+## 7. Kernel version compatibility
 
-对 `6.1.180`/`6.6.148`/`6.12.101`/`6.18.42`/`7.1.6` 五个内核版本做过适配
-性冒烟验证（正确性/兼容性为主，不是本报告前述章节的性能验证口径）：
+Compatibility smoke validation was run on five kernel versions, `6.1.180`/`6.6.148`/`6.12.101`/`6.18.42`/`7.1.6`
+(mainly for correctness/compatibility, not to the performance-validation standard of the preceding
+sections of this report):
 
-| 版本 | 结果 |
+| Version | Result |
 |---|---|
-| `6.1.180` | 不支持——见下方根因 |
-| `6.6.148` | 不支持——见下方根因 |
-| `6.12.101` | 通过，含 IPv4/IPv6 数据面冒烟 |
-| `6.18.42` | 通过，含 IPv4/IPv6 数据面冒烟 |
-| `7.1.6` | 通过，含 IPv4/IPv6 数据面冒烟 |
+| `6.1.180` | Unsupported — see the root cause below |
+| `6.6.148` | Unsupported — see the root cause below |
+| `6.12.101` | Pass, including an IPv4/IPv6 data-plane smoke test |
+| `6.18.42` | Pass, including an IPv4/IPv6 data-plane smoke test |
+| `7.1.6` | Pass, including an IPv4/IPv6 data-plane smoke test |
 
-**根因（对照本地内核源码树 + 上游内核标签核实，非猜测）**：`skyline_cc.bpf.c`
-挂在 `struct tcp_congestion_ops.cong_control` 上的回调用 4 个参数声明
-（`sk, ack, flag, rs`）。这个签名是内核从版本 6.10 才开始使用的——6.9 及
-更早版本的 `cong_control` 函数指针类型只有 2 个参数（`sk, rs`），BPF 验证
-器加载时直接拒绝，报错明确指向参数个数不匹配。`6.1.x`/`6.6.x` 都在这个
-版本边界之前。`skyline_tc`（重传 DSCP 标记）和 `skyline_policy`（M1 tier-2 动态
-RTO）不碰 `cong_control`，不受影响。
+**Root cause (verified against a local kernel source tree + upstream kernel tags, not a guess)**: the
+callback that `skyline_cc.bpf.c` attaches to `struct tcp_congestion_ops.cong_control` is declared with
+4 parameters (`sk, ack, flag, rs`). The kernel only started using this signature in version 6.10 — in
+6.9 and earlier the `cong_control` function-pointer type has only 2 parameters (`sk, rs`), and the BPF
+verifier rejects the program outright at load time, with an error that points clearly at the
+mismatched parameter count. `6.1.x`/`6.6.x` both predate this version boundary. `skyline_tc`
+(retransmission DSCP marking) and `skyline_policy` (M1 tier-2 dynamic RTO) do not touch
+`cong_control` and are unaffected.
 
-**支持范围**：精确 ABI 下限是内核 6.10（含）以上；`6.10`/`6.11` 满足 ABI
-但不是 LTS、支持周期太短，不建议依赖；已验证并承诺支持的下限是 **6.12
-LTS**。
+**Supported range**: the exact ABI floor is kernel 6.10 (inclusive) and later; `6.10`/`6.11` satisfy
+the ABI but are not LTS and have too short a support period, so relying on them is not recommended; the
+verified and committed floor of support is **6.12 LTS**.
 
-## 8. 局限性与未覆盖项
+## 8. Limitations and what is not covered
 
-- **完全不响应丢包是有代价的**：在真实**拥塞型**瓶颈（而非随机丢包）上，
-  Skyline Speeder 会持续加压、自伤并影响同路径其他流；队列时延/ECN 护栏（含 6.1 节的
-  自保护降速）是唯一的自保护手段，在目标环境（随机丢包为主）内足够，但不
-  是通用安全网。部署前需要评估目标链路的丢包成因是否确实以随机丢包为主。
-- **带宽只验证到 100 Mbit/s**：`offload=off` 是测试台的结构性上限；"数百
-  Mbps"是外推，未直接测量。
-- **公平性未测量，且明确不是本报告的目标**。
-- **`reorder-dsack` 场景 BBR 仍小幅领先**，这个场景不在目标环境范
-  围内，不作调优目标。
-- **BBR 无法调参**：这套内核构建的 BBRv1 没有任何运行时可调接口，对比对
-  象始终是默认配置的 BBR。
-- **M1 tier-2 下限调节在高 RTT 链路上的结构性限制**：`TCP_BPF_RTO_MIN` 的
-  目标值受内核 `TCP_RTO_MIN`（200ms）约束；这条限制不影响上限调节（两者
-  是独立机制）。
-- **`guardrail_gain`/`rto_max` 的具体数值均未经过候选对比矩阵验证**：验证
-  确认了两者真正激活后方向正确、没有引入回归，但 0.8/3x/6x 这三个数字本
-  身仍是直接选定的初始值。
-- **M1 tier-2 `rto_max` 的"拥塞证据"分支与真实 RTO 超时的逐事件级别同时性
-  仍未直接证实**（见 6.2 节）——现有数据是整案例计数器/整案例最大值级别
-  的相关性证据，不是逐事件级别的直接证据。
-- **链路波动场景的分段吞吐均值对 Skyline Speeder 系列 profile 不可靠**（见 6.3 节），
-  只能用中位数，且每段采样点数不算大（16-30 个）。
-- **单一测试床**：全部结果来自单一 KVM 测试床（两台 4 vCPU guest + 单
-  netns 路由器），未在不同硬件/虚拟化方案上复现。
-- **目标环境外场景的丢包模型**：第 3.2 节的场景跑在 `offload=on` 下，丢包
-  和重排序按 GSO 大帧发生，比表中写的更成簇（见 2.3 节）。目标环境网格用的
-  `offload=off` 是逐包丢包；TC 钩子在那里看到 `gso_segs>1` 的原因已查明，
-  同见 2.3 节。
+- **Not responding to loss at all has a cost**: on a real **congestion-type** bottleneck (as opposed to
+  random loss), Skyline Speeder keeps pushing, harms itself and affects other flows on the same path;
+  the queue-delay/ECN guardrail (including the self-protective slowdown of section 6.1) is the only
+  means of self-protection, which is enough within the target environment (mainly random loss) but is
+  not a general safety net. Before deploying, assess whether the loss on the target link really is
+  mainly random loss.
+- **Bandwidth validated only up to 100 Mbit/s**: `offload=off` is a structural ceiling of the test bed;
+  "hundreds of Mbps" is an extrapolation, not directly measured.
+- **Fairness was not measured, and is explicitly not a goal of this report**.
+- **BBR still leads slightly in the `reorder-dsack` scenario**; this scenario is outside the target
+  environment and is not a tuning target.
+- **BBR cannot be tuned**: the BBRv1 in this kernel build has no runtime tuning interface at all; the
+  comparison target is always BBR in its default configuration.
+- **Structural limit of the M1 tier-2 floor adjustment on high-RTT links**: the target value of
+  `TCP_BPF_RTO_MIN` is constrained by the kernel's `TCP_RTO_MIN` (200ms); this limit does not affect the
+  ceiling adjustment (the two are independent mechanisms).
+- **The specific values of `guardrail_gain`/`rto_max` have not been validated with a matrix comparing
+  candidates**: the validation confirmed that once really active, both act in the right direction and
+  introduce no regression, but the three numbers 0.8/3x/6x themselves are still initial values chosen
+  directly.
+- **The event-by-event coincidence of the "congestion evidence" branch of M1 tier-2 `rto_max` with real
+  RTO timeouts is still not directly confirmed** (see section 6.2) — the existing data are correlational
+  evidence at the level of whole-case counters/whole-case maxima, not event-level direct evidence.
+- **Per-segment mean throughput in the link-fluctuation scenario is unreliable for the Skyline Speeder
+  profiles** (see section 6.3); only the median can be used, and the number of samples per segment is
+  not large (16-30).
+- **Single test bed**: all results come from a single KVM test bed (two 4-vCPU guests + a single-netns
+  router) and have not been reproduced on different hardware or virtualization setups.
+- **Loss model of the out-of-target scenarios**: the scenarios of section 3.2 run with `offload=on`, so
+  loss and reordering happen per large GSO frame and are more clustered than the tables say (see
+  section 2.3). The `offload=off` used by the target-environment grid gives per-packet loss; the reason
+  the TC hook sees `gso_segs>1` there has been identified, also in section 2.3.
 
-## 附录 A：数据来源与构建指纹
+## Appendix A: Data sources and build fingerprints
 
-| 章节 | 数据来源（manifest） | 内核版本 | `skyline_cc.bpf.o` SHA-256（前 12 位） |
+| Section | Data source (manifest) | Kernel version | `skyline_cc.bpf.o` SHA-256 (first 12 characters) |
 |---|---|---|---|
-| 第 4/5/6.1/6.2/6.3 节 | 目标环境网格、带宽敏感性、护栏 A/B、RTO 上限验证、链路波动 | 6.18.40 | `1cb1d581c4f7` |
-| 第 6.4 节（IPv4） | 重传 DSCP 机制验证（v4） | 6.18.40 | 独立构建，见运行目录 `environment.json` |
-| 第 6.4 节（IPv6） | 重传 DSCP 机制验证（v6） | 6.18.40 | 独立构建，见运行目录 `environment.json` |
-| 第 7 节 | 5 版本内核适配性冒烟 | 见表格 | 各版本独立构建，见各自运行目录 |
-| 发布前复核（2.2 节） | 当前最新构建，`rtt200-loss15`（2.2 节报告的场景），`n=2` | 6.18.40 | 当前 HEAD 构建 |
+| Sections 4/5/6.1/6.2/6.3 | Target-environment grid, bandwidth sensitivity, guardrail A/B, RTO ceiling validation, link fluctuation | 6.18.40 | `1cb1d581c4f7` |
+| Section 6.4 (IPv4) | Retransmission DSCP mechanism validation (v4) | 6.18.40 | Separate build; see `environment.json` in the run directory |
+| Section 6.4 (IPv6) | Retransmission DSCP mechanism validation (v6) | 6.18.40 | Separate build; see `environment.json` in the run directory |
+| Section 7 | 5-version kernel compatibility smoke test | See the table | A separate build per version; see each one's run directory |
+| Pre-publication re-check (section 2.2) | Latest build at the time, `rtt200-loss15` (the scenario reported in section 2.2), `n=2` | 6.18.40 | Build of the then-current HEAD |
 
-完整原始运行数据（`runs.csv`/`summary.csv`/逐 case 详情）不随本报告交付，
-复现方法见 `research/experiments/README.md`。
+The full raw run data (`runs.csv`/`summary.csv`/per-case details) does not ship with this report; for
+how to reproduce it, see `research/experiments/README.md`.

@@ -1,9 +1,9 @@
-# rtt300 三点加样本——rtt300-loss10/loss20 两点在 n=2 下 Skyline Speeder/BBR
-# 中位数比值和 Skyline Speeder 自身 CV 都不够稳。跟 target-box.toml 用完全相同的
-# profile 定义（含 rack_rto/guardrail_gain），只是把这 3 个场景的 runs
-# 从 2 提到 5，比给全部 9 点都加样本便宜得多。
+# Extra samples for the three rtt300 points: at n=2, for the two points rtt300-loss10/loss20, neither the Skyline Speeder/BBR
+# median ratio nor Skyline Speeder's own CV is stable enough. Uses exactly the same
+# profile definitions as target-box.toml (including rack_rto/guardrail_gain), only raising the runs of these 3 scenarios
+# from 2 to 5, which is far cheaper than adding samples to all 9 points.
 #
-# 5 profile × 3 场景 × runs=5 = 75 case，约 65 分钟。
+# 5 profiles × 3 scenarios × runs=5 = 75 cases, about 65 minutes.
 name = "target-box-rtt300-samples"
 execution_class = "formal-kvm"
 performance_valid = true

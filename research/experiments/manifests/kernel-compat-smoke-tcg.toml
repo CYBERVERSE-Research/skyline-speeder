@@ -1,9 +1,9 @@
-# 多内核版本适配性冒烟——TCG 形态。跟 kernel-compat-smoke.toml 逐字段
-# 一致，只有 execution_class/performance_valid 两个字段不同（TCG 下吞吐/
-# RTT/CPU 等一切数字只作诊断，不得写成算法收益结论——本身就不做性能
-# 结论，这条约束跟这份 manifest 天然一致）。用于资源不足以起嵌套 KVM、
-# 只能用 TCG 加速器跑冒烟的环境，见 infra/kernel/run-compat-pipeline.sh
-# 的 `--accel tcg`。
+# Multi-kernel-version compatibility smoke test: TCG form. Identical field by field to kernel-compat-smoke.toml;
+# only the two fields execution_class/performance_valid differ (under TCG every number, throughput/
+# RTT/CPU and so on, is diagnostic only and may not be written up as a conclusion about algorithm gains; this manifest draws no
+# performance conclusions in the first place, so the constraint fits it naturally). For environments without enough resources to start nested KVM,
+# which can only run the smoke test on the TCG accelerator; see `--accel tcg` in
+# infra/kernel/run-compat-pipeline.sh.
 name = "kernel-compat-smoke-tcg"
 execution_class = "tcg-validation"
 performance_valid = false

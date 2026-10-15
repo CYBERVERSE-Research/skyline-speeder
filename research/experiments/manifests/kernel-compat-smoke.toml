@@ -1,20 +1,20 @@
-# 多内核版本适配性冒烟——KVM 形态。正确性/适配性为主，不是性能验证：
-# 不做吞吐/goodput 对比、不做 CV 门槛、不做 B1/B2 中性性、不做多 CC 性能矩
-# 阵、不做超参 sweep、也不是目标环境网格级别的验证。
-# `performance_valid=true` 只是 formal-kvm 这个 execution_class 的 schema
-# 约束（matrix_lib.py 的 validate_manifest 强制要求），这份 manifest 的
-# 任何数字都不得写成算法收益结论。
+# Multi-kernel-version compatibility smoke test: KVM form. Mainly correctness/compatibility, not a performance validation:
+# no throughput/goodput comparison, no CV threshold, no B1/B2 neutrality, no multi-CC performance
+# matrix, no hyperparameter sweep, and not a validation at the level of the target environment grid either.
+# `performance_valid=true` is only a schema constraint of the formal-kvm execution_class
+# (enforced by validate_manifest in matrix_lib.py); no number from this manifest
+# may be written up as a conclusion about algorithm gains.
 #
-# 场景形状复制自 retransmit-dscp-mechanism.toml 已经验证过的机制冒烟口径
-# （rtt_ms=100/rate_mbit=50/loss_pct=5%/offload=off，warmup/duration 短），
-# 分 v4/v6 各一份，2 profile × 2 scenario = 4 case，几分钟内跑完：
-#   - compat-cubic-marked：同时开 retransmit_dscp（覆盖 TC 重传标记）和
-#     rack_rto（覆盖 sockops RTO 调整生效性——floor_us 设得明显高于该路径
-#     自然 RTO，在 ss -tin 的 rto: 字段上应该能直接看出来），modules=[]
-#     不碰 struct_ops，隔离验证"不用 skyline_cc 时这两个机制本身能不能在这
-#     个内核上工作"。
-#   - compat-skyline-full：开全部 4 个模块，验证 struct_ops CC 在真实负载下
-#     持续挂载（不是只过一次 --verify-bpf 就 detach）。
+# The scenario shape is copied from the already-validated mechanism smoke setup of retransmit-dscp-mechanism.toml
+# (rtt_ms=100/rate_mbit=50/loss_pct=5%/offload=off, short warmup/duration),
+# one each for v4/v6, 2 profiles × 2 scenarios = 4 cases, finishing within a few minutes:
+#   - compat-cubic-marked: turns on both retransmit_dscp (covers TC retransmission marking) and
+#     rack_rto (covers whether the sockops RTO adjustment takes effect: floor_us is set clearly above that path's
+#     natural RTO, which should be directly visible in the rto: field of ss -tin), modules=[]
+#     does not touch struct_ops, isolating "whether these two mechanisms themselves work on this
+#     kernel without skyline_cc".
+#   - compat-skyline-full: turns on all 4 modules, verifying that the struct_ops CC stays
+#     attached under real load (not just passing --verify-bpf once and then detaching).
 name = "kernel-compat-smoke"
 execution_class = "formal-kvm"
 performance_valid = true

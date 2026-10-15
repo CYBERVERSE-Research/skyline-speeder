@@ -1,60 +1,60 @@
-# 链路状况波动场景——用到 Segment（单个 case 内实时切换链路参数）能力，
-# 覆盖两个目标环境网格覆盖不到的点：
+# Link volatility scenario: uses the Segment capability (switching link parameters live within a single case),
+# covering two points that the target environment grid cannot cover:
 #
-# 1. 目标环境网格里 RTT/带宽/丢包率在单个 case 内全程固定，没有任何场景
-#    模拟"链路状况在测试过程中变化"（移动网络切换基站、链路拥塞来了又走）。
-# 2. M1 tier-2 rto_max 的"拥塞证据"分支（rack_rto_max_congested 计数器）
-#    在其它 manifest 里经常非零，但这个计数器只反映"每次 RTT 回调时证据
-#    是否成立"，从没有一次专门验证过"6x 档在一次真实 RTO 超时事件发生的
-#    同一时刻确实生效"。
+# 1. In the target environment grid, RTT/bandwidth/loss rate are fixed for the whole of a single case; no scenario
+#    simulates "link conditions changing during the test" (a mobile network switching base stations, link congestion coming and going).
+# 2. The "congestion evidence" branch of M1 tier-2 rto_max (the rack_rto_max_congested counter)
+#    is often non-zero in other manifests, but this counter only reflects "whether the evidence held at each RTT
+#    callback"; it has never once been specifically verified that "the 6x level really takes effect at the same moment
+#    a real RTO timeout event happens".
 #
-# 场景设计：先让排队时延真实涨起来（不掺丢包，让证据干净地立住），再在证
-# 据已经成立的窗口内叠加一次真实丢包突发（逼一次真实 RTO），时间窗口上跟
-# "拥塞证据"重叠，比任何静态场景更有把握同时验证这两件事。
+# Scenario design: first let the queueing delay really rise (no loss mixed in, so the evidence is established cleanly), then, within the window
+# where the evidence already holds, superimpose one real loss burst (forcing one real RTO), overlapping in time with
+# the "congestion evidence"; this is more certain than any static scenario to verify both things at once.
 #
-# 关键实现约束（都已在 infra/configure-path.sh 手工验证过，不是假设）：
-# - 排队时延 = queue_bdp × rtt_ms，跟 rate_mbit 无关（QUEUE_PACKETS 的推导
-#   公式代入化简后 rate 项直接消掉）——单纯把带宽从 100 降到 15 Mbit 不会
-#   让排队时延变化，必须把 segment 1/2 的 queue_packets 锁定在骤降前的绝
-#   对值（2500，= 100Mbit×300ms×1.0 BDP 的推导结果），让同样的包数在更低
-#   带宽下排更久的队。
-# - segment 用 `tc ... change`（不是 replace）热更新，不中断连接、不清零
-#   qdisc 计数器；每次热更新内核都会重置 netem 的丢包 PRNG，所以每个
-#   segment 用独立派生的种子（case.seed + 1_000_000×index，run_matrix.py
-#   自动处理，manifest 不需要关心）。
-# - segment 2 的丢包突发复用 rto-max-validation.toml 已验证安全的参数
-#   （burst_length=220，短窗口），不用更激进的组合——更大的 burst_length/
-#   duration_s 会让没有 rack_rto 上限的 profile 大概率触发内核
-#   rto_max=120s×retries2=15 级联超时死循环。
+# Key implementation constraints (all verified by hand in infra/configure-path.sh, not assumptions):
+# - Queueing delay = queue_bdp × rtt_ms, independent of rate_mbit (after substituting and simplifying the formula that derives
+#   QUEUE_PACKETS, the rate term cancels out): merely lowering the bandwidth from 100 to 15 Mbit does not
+#   change the queueing delay; the queue_packets of segments 1/2 must be locked at the absolute value before the drop
+#   (2500, = the derived result for 100Mbit×300ms×1.0 BDP), so the same number of packets queues longer at the lower
+#   bandwidth.
+# - Segments are hot-updated with `tc ... change` (not replace), which does not interrupt the connection or zero the
+#   qdisc counters; every hot update makes the kernel reset netem's loss PRNG, so each
+#   segment uses an independently derived seed (case.seed + 1_000_000×index, handled automatically by run_matrix.py;
+#   the manifest need not care).
+# - The loss burst of segment 2 reuses the parameters already verified as safe in rto-max-validation.toml
+#   (burst_length=220, a short window), not a more aggressive combination: a larger burst_length/
+#   duration_s would very likely make profiles without a rack_rto cap trigger the kernel's
+#   rto_max=120s×retries2=15 cascading-timeout loop.
 #
-# Segment 时间线（offset_s 相对 client 进程启动，含 warmup）：
-#   [0, 20)   segment 0（scenario 本身）：rate=100Mbit，queue=1.0 BDP
-#             (≈2500 包)，loss=gemodel 0.5%——平稳基线，建立 min_rtt。
-#   [20, 35)  segment 1：rate 骤降到 15Mbit，queue_packets 锁定 2500（不
-#             随新带宽重算）——2500 包在 15Mbit 下排队时延≈2s，
-#             srtt/min_rtt 比值可达 ~7-8x，远超 tier-2 默认 2x 门槛；本意是这一
-#             段不引入丢包，让排队证据先干净地立住，也给 Skyline Speeder 自己的
-#             10s 窗口 base_rtt（M2 护栏用）留时间往上飘、跟内核 min_rtt
-#             （tier-2 用，窗口长得多）产生"护栏放松但 tier-2 仍判定拥塞"
-#             的错位（这正是能观察到真实效果的窗口，不是缺陷）。注意：下面
-#             这一段的配置——也就是实际跑过的条件——仍是 0.5% gemodel 丢包。
-#   [35, 43)  segment 2：rate/queue 不变，loss 换成 gemodel 8%（复用已验
-#             证安全的 burst_length=220）——在已经成立的排队证据上叠加一
-#             次真实丢包突发，逼一次真实 RTO。
-#   [43, 59)  segment 3：恢复 rate=100Mbit/queue 默认推导/loss=0.5%——4 个
-#             profile 真正可比的吞吐/恢复速度落在这一段。
+# Segment timeline (offset_s relative to the start of the client process, including warmup):
+#   [0, 20)   segment 0 (the scenario itself): rate=100Mbit, queue=1.0 BDP
+#             (≈2500 packets), loss=gemodel 0.5%: a steady baseline that establishes min_rtt.
+#   [20, 35)  segment 1: rate drops sharply to 15Mbit, queue_packets locked at 2500 (not
+#             recomputed for the new bandwidth): 2500 packets at 15Mbit give a queueing delay of ≈2s,
+#             and the srtt/min_rtt ratio can reach ~7-8x, far above the tier-2 default 2x threshold; the intent is that this
+#             segment introduces no loss, so the queueing evidence is established cleanly first, and that Skyline Speeder's own
+#             10s-window base_rtt (used by the M2 guardrail) has time to drift upward and diverge from the kernel's min_rtt
+#             (used by tier-2, with a much longer window), producing a "guardrail relaxes but tier-2 still judges congestion"
+#             mismatch (this is exactly the window where a real effect can be observed, not a defect). Note: the configuration of
+#             this segment below, i.e. the condition that was actually run, still has 0.5% gemodel loss.
+#   [35, 43)  segment 2: rate/queue unchanged, loss switched to gemodel 8% (reusing the burst_length=220
+#             already verified as safe): superimposes one real loss burst on the queueing evidence that
+#             already holds, forcing one real RTO.
+#   [43, 59)  segment 3: restores rate=100Mbit/the default derived queue/loss=0.5%: the truly comparable throughput/recovery
+#             speed of the 4 profiles falls in this segment.
 #
-# Profile：b0/b1/bbr-fq 是硬性对照要求（用户明确要求跟默认 CUBIC/BBR 比）；
-# skyline-best 是本轮真正的测试对象；skyline-relaxed-congestion-ratio 跟 skyline-best
-# 唯一差异是 rack_rto.rto_max_congestion_ratio_permille=1500（默认走
-# BPF 侧 SKYLINE_RTO_MAX_DEFAULT_CONGESTION_RATIO_PERMILLE=2000‰=2x，这里放宽
-# 到 1.5x）——如果 skyline-best 那份还是测不到 congested 分支，靠这份 A/B 隔离
-# "测试床做不出足够的排队时延"和"阈值刚好卡在 M2 护栏自己防守的同一个数值
-# 上"这两种可能，零新代码，复用现有字段。
+# Profiles: b0/b1/bbr-fq are a hard control requirement (the user explicitly asked for a comparison with the default CUBIC/BBR);
+# skyline-best is the real test subject of this round; skyline-relaxed-congestion-ratio differs from skyline-best
+# only in rack_rto.rto_max_congestion_ratio_permille=1500 (the default goes to
+# SKYLINE_RTO_MAX_DEFAULT_CONGESTION_RATIO_PERMILLE=2000‰=2x on the BPF side; here it is relaxed
+# to 1.5x): if the skyline-best one still cannot reach the congested branch, this A/B isolates the two possibilities
+# "the test bed cannot produce enough queueing delay" and "the threshold sits exactly on the same value that the M2 guardrail
+# itself defends", with zero new code, reusing existing fields.
 #
-# 5 profile × 1 场景 × runs=3 = 15 case。首次执行按"排查跑"对待：先
-# runs=1 跑一遍确认没有级联超时、segment-timeline.json 记录的切换时间点符
-# 合预期，再补到 runs=3。
+# 5 profiles × 1 scenario × runs=3 = 15 cases. The first execution is treated as a "diagnostic run": first
+# run once with runs=1 to confirm there is no cascading timeout and the switch times recorded in segment-timeline.json match
+# expectations, then fill up to runs=3.
 name = "volatile-link"
 execution_class = "formal-kvm"
 performance_valid = true

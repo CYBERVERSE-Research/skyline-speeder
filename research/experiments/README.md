@@ -1,69 +1,69 @@
-# 性能测试复现指南
+# Performance test reproduction guide
 
-本目录承载 Skyline Speeder 性能测试的完整工具链：manifest 驱动的 matrix 框架
-（`matrix_lib.py` 展开、`run_matrix.py` 执行、`analyze_results.py` 分析），
-以及多内核版本适配性验证流水线的报告渲染工具。`run_matrix.py --execute`
-会通过 SSH 配置两台 guest 并驱动 iperf3/tc/ss，同时调用宿主机
-`infra/configure-path.sh` 调整测试 namespace 的 qdisc。
+This directory holds the complete toolchain for Skyline Speeder's performance tests: the manifest-driven matrix framework
+(`matrix_lib.py` expands, `run_matrix.py` executes, `analyze_results.py` analyzes),
+plus the report renderer for the multi-kernel-version compatibility validation pipeline. `run_matrix.py --execute`
+configures the two guests over SSH and drives iperf3/tc/ss, and also calls the host's
+`infra/configure-path.sh` to adjust the qdisc of the test namespace.
 
-复现 `docs/04-performance-report.md` 里的结果需要一套双 VM KVM 测试床
-（服务器 VM + 客户端 VM，通过 tap 网卡桥接管理网与数据网）。正式性能数据
-只应来自满足下文"资源门槛"的环境。
+Reproducing the results in `docs/04-performance-report.md` requires a two-VM KVM test bed
+(a server VM + a client VM, with tap interfaces bridging the management network and the data network). Formal performance data
+should only come from an environment that meets the "resource threshold" below.
 
-## 工具链
+## Toolchain
 
-- `matrix_lib.py`：manifest 展开与校验的核心库（`load_manifest()` /
-  `expand_runs()` / `validate_manifest()`），被其余脚本共享。manifest 是
-  profiles × scenarios × runs 的笛卡尔积。
-- `generate_matrix.py`：dry-run 展开 manifest 为 case 列表 + CSV 骨架，不
-  下发任何配置，用于在正式跑之前核对 case 数量与命名。
-- `run_matrix.py`：默认 dry-run（只展开并校验）；显式传入 `--execute` 后
-  逐个 case 创建新连接并采集 `iperf3`/`ss`/`tc` 的 JSON/JSONL 原始数据。
-  输出目录必须是新目录，脚本拒绝覆盖已有结果。
-- `analyze_results.py`：读取 `run_matrix.py` 的输出，产出逐轮 CSV、
-  bootstrap 95% 置信区间、变异系数（CV），以及相对参照 profile 的效应量；
-  同时汇总 `rack_rto`（M1 tier-2）的 applied/rejected 计数增量与
-  `ss -ti` 的 `rto:` 中位数。
-- `render_kernel_compat_report.py`：读取多内核版本适配性流水线（见下文）
-  产出的 `state.json` 集合，渲染 `report.md`/`summary.json`。纯函数，不
-  build/deploy/SSH。
-- `run_netns_lab.sh` / `plot_results.py`：单机 network namespace 本地
-  快速冒烟（见下文"本地快速冒烟"），不依赖双 VM 测试床，也不产出性能
-  结论。
+- `matrix_lib.py`: the core library for expanding and validating manifests (`load_manifest()` /
+  `expand_runs()` / `validate_manifest()`), shared by the other scripts. A manifest is the
+  Cartesian product profiles × scenarios × runs.
+- `generate_matrix.py`: dry-run expansion of a manifest into a case list + a CSV skeleton; it pushes
+  no configuration and is used to check the case count and naming before a formal run.
+- `run_matrix.py`: dry-run by default (only expands and validates); with an explicit `--execute`
+  it opens fresh connections case by case and collects the raw `iperf3`/`ss`/`tc` JSON/JSONL data.
+  The output directory must be a new directory; the script refuses to overwrite existing results.
+- `analyze_results.py`: reads the output of `run_matrix.py` and produces a per-run CSV,
+  bootstrap 95% confidence intervals, the coefficient of variation (CV), and effect sizes relative to the reference profile;
+  it also summarizes the applied/rejected counter deltas of `rack_rto` (M1 tier-2) and
+  the median `rto:` of `ss -ti`.
+- `render_kernel_compat_report.py`: reads the set of `state.json` files produced by the multi-kernel-version compatibility pipeline (see below)
+  and renders `report.md`/`summary.json`. Pure functions; it does not
+  build/deploy/SSH.
+- `run_netns_lab.sh` / `plot_results.py`: a quick local single-machine network namespace
+  smoke test (see "Local quick smoke test" below); it does not depend on the two-VM test bed and does not produce performance
+  conclusions.
 
-## Manifest 清单
+## Manifest list
 
-所有 manifest 都用 `execution_class = "formal-kvm"`（真实性能数据）或
-`"tcg-validation"`（TCG 加速下的正确性/适配性验证，数字不代表 KVM 或裸机
-性能）标记自己的性质，`matrix_lib.py` 的 `validate_manifest()` 会强制校验
-这条约束与 `performance_valid` 字段一致。
+Every manifest marks its nature with `execution_class = "formal-kvm"` (real performance data) or
+`"tcg-validation"` (correctness/compatibility validation under TCG acceleration; the numbers do not represent KVM or bare-metal
+performance), and `validate_manifest()` in `matrix_lib.py` enforces that
+this constraint is consistent with the `performance_valid` field.
 
-场景的 `offload` 决定路由器上的 NetEm 拿到什么：`"off"` 时 Server 数据网卡
-关掉 TSO/GSO/GRO，到达路由器的是一个个的包，`loss_pct`/`reorder_pct` 逐包
-生效；`"on"`（默认）时 Server 的 TSO 大帧原样到达路由器，NetEm 每次丢掉或
-重排一整个大帧。要逐包随机丢包就写 `"off"`，代价是吞吐上限约
-100-150 Mbit/s（见 `docs/04-performance-report.md` 第 2.3 节）。
+A scenario's `offload` decides what NetEm on the router receives: with `"off"` the Server's data NIC
+turns off TSO/GSO/GRO, individual packets reach the router, and `loss_pct`/`reorder_pct` apply
+per packet; with `"on"` (the default) the Server's large TSO frames reach the router as they are, and NetEm drops or
+reorders a whole large frame each time. Write `"off"` for random per-packet loss; the cost is a throughput ceiling of about
+100-150 Mbit/s (see section 2.3 of `docs/04-performance-report.md`).
 
-| Manifest | 用途 |
+| Manifest | Purpose |
 |---|---|
-| `smoke.toml` | 最小正确性冒烟 |
-| `target-box.toml` | 目标部署环境网格（核心性能结果来源） |
-| `target-box-rtt300-samples.toml` | 高 RTT 点加样本，提升该点的统计置信度 |
-| `bandwidth-sweep.toml` | 带宽敏感性 |
-| `neutrality.toml` | 中性性检查：模块全关（`b2-skyline-base`）对内核 CUBIC（`b1-controlled-cubic`），另有模块全开的 `skyline-best` 作参照；门槛只看 `line-rate`（`analyze_results.py` 的 `parity_scenario`）；`dc-lowrtt` 一并报告但不作门槛，另有 `light-loss`（0.1%）与 `primary`（0.5%）两个轻丢包场景 |
-| `guardrail-gain-ab.toml` | 隔离验证 `guardrail_gain` 系数的作用 |
-| `rto-max-validation.toml` | 隔离验证 M1 tier-2 RTO 上限机制的作用 |
-| `rto-max-smoke.toml` | RTO 上限机制端到端冒烟 |
-| `volatile-link.toml` | 链路波动场景（mid-case 网络条件分段切换） |
-| `retransmit-dscp-mechanism.toml` / `-v6.toml` | 重传包 DSCP 标记机制验证（IPv4/IPv6） |
-| `retransmit-dscp-neutrality.toml` | DSCP 标记开关的中性性 |
-| `kernel-compat-smoke.toml` / `kernel-compat-smoke-tcg.toml` | 多内核版本适配性冒烟，KVM/TCG 两种加速器形态 |
+| `smoke.toml` | Minimal correctness smoke test |
+| `target-box.toml` | Target deployment environment grid (source of the core performance results) |
+| `target-box-rtt300-samples.toml` | Extra samples at the high-RTT point, raising the statistical confidence at that point |
+| `bandwidth-sweep.toml` | Bandwidth sensitivity |
+| `neutrality.toml` | Neutrality check: all modules off (`b2-skyline-base`) against kernel CUBIC (`b1-controlled-cubic`), with all modules on in `skyline-best` as a reference; the gate looks only at `line-rate` (`parity_scenario` in `analyze_results.py`); `dc-lowrtt` is reported as well but is not a gate, and there are also two light-loss scenarios, `light-loss` (0.1%) and `primary` (0.5%) |
+| `guardrail-gain-ab.toml` | Isolates the effect of the `guardrail_gain` coefficient |
+| `rto-max-validation.toml` | Isolates the effect of the M1 tier-2 RTO cap mechanism |
+| `rto-max-smoke.toml` | End-to-end smoke test of the RTO cap mechanism |
+| `volatile-link.toml` | Link volatility scenarios (network conditions switch in segments mid-case) |
+| `retransmit-dscp-mechanism.toml` / `-v6.toml` | Validation of the DSCP marking mechanism for retransmitted packets (IPv4/IPv6) |
+| `retransmit-dscp-neutrality.toml` | Neutrality of the DSCP marking switch |
+| `kernel-compat-smoke.toml` / `kernel-compat-smoke-tcg.toml` | Multi-kernel-version compatibility smoke test, in both KVM and TCG accelerator forms |
 
-## 资源门槛与环境搭建
+## Resource threshold and environment setup
 
-正式数据要求嵌套 KVM 可用、宿主机有足够 CPU/内存支撑双 VM 并行跑满整个
-矩阵。资源不足的机器只能用于代码/verifier 检查和短时冒烟，不得据此得出
-性能结论。
+Formal data requires usable nested KVM and a host with enough CPU/memory to run both VMs in parallel through the whole
+matrix. A machine without enough resources is good only for code/verifier checks and short smoke runs, and must not be used to draw
+performance conclusions.
 
 ```bash
 infra/preflight.sh formal
@@ -77,10 +77,10 @@ infra/wait-for-guests.sh
 infra/kernel/fetch-source.sh
 infra/kernel/build.sh
 infra/kernel/deploy.sh build/kernel --confirm-install-kernel
-# 两台 guest 重启并确认 uname -r 满足 DEPLOY.md 第 1.3 节
-# 的内核版本要求后，在宿主仓库根目录（不是 guest 上——cloud-init 镜像本身
-# 不包含仓库 checkout，infra/install-guest.sh 要求在运行它的机器本地就是
-# 仓库根目录，这个前提在这套测试床上不成立）：
+# After both guests reboot and you confirm that uname -r meets the kernel version
+# requirement in section 1.3 of DEPLOY.md, run this in the repository root on the host (not on a guest: the cloud-init image itself
+# contains no repository checkout, and infra/install-guest.sh requires the machine it runs on to be
+# the repository root locally, a precondition that does not hold on this test bed):
 VMLINUX_BTF="$PWD/build/kernel/out-6.18.40/vmlinux" \
   infra/deploy-guest.sh --confirm-install
 ssh -p 2222 skyline@127.0.0.1 sudo systemctl enable --now skyline-speederd.service
@@ -88,33 +88,33 @@ ssh -p 2222 skyline@127.0.0.1 \
   timeout 30 sh -c 'until sudo test -S /run/skyline-speeder/speeder.sock; do sleep 1; done'
 ```
 
-`infra/kernel/build.sh` 会用 `make bindeb-pkg` 连带生成一个不会被部署到
-guest 的 `linux-image-<version>-dbg` 调试符号包（体积可达 1GiB+，压缩阶段
-可能占整个内核构建耗时的三分之一以上且长时间没有新日志输出，属正常现象，
-不是构建卡死）；`infra/kernel/deploy.sh` 只会把常规 image/headers 包发给
-guest，这部分调试包属于本机审计产物。
+`infra/kernel/build.sh` uses `make bindeb-pkg`, which also produces a `linux-image-<version>-dbg` debug-symbol package that is
+not deployed to the guests (it can reach 1GiB+, and its compression stage
+may take more than a third of the whole kernel build time with no new log output for a long while; this is normal,
+not a hung build); `infra/kernel/deploy.sh` sends only the regular image/headers packages to the
+guests, and this debug package is a local audit artifact.
 
-`infra/deploy-guest.sh` 在宿主上构建、只通过 SSH 修改 server guest，两端都
-保留完整的 staging 目录和 SHA-256 校验记录，不需要把仓库复制进 guest。
-`systemctl enable --now` 之后 `skyline-speederd.service` 的控制 socket 需要几秒钟才会
-出现（没有 systemd readiness 通知），上面的 `timeout 30 sh -c ...` 步骤是
-必需的，跳过它直接调用 `ssctl` 可能会随机遇到
-`connect to /run/skyline-speeder/speeder.sock: No such file or directory`。
+`infra/deploy-guest.sh` builds on the host and modifies the server guest only over SSH; both ends
+keep the complete staging directory and SHA-256 checksum records, and the repository does not need to be copied into the guest.
+After `systemctl enable --now`, the control socket of `skyline-speederd.service` takes a few seconds to
+appear (there is no systemd readiness notification), so the `timeout 30 sh -c ...` step above is
+required; skipping it and calling `ssctl` directly may randomly hit
+`connect to /run/skyline-speeder/speeder.sock: No such file or directory`.
 
-`infra/run-vms.sh` 也支持 `--accel tcg`（不依赖嵌套 KVM，仅用于集成/
-适配性验证，不产出性能结论）。VM 停止用
-`infra/run-vms.sh stop --accel <kvm|tcg> --confirm-stop`；网络拓扑清理由
-`sudo infra/topology.sh down --confirm-down` 单独确认。
+`infra/run-vms.sh` also supports `--accel tcg` (it does not depend on nested KVM, is used only for integration/
+compatibility validation, and does not produce performance conclusions). Stop the VMs with
+`infra/run-vms.sh stop --accel <kvm|tcg> --confirm-stop`; tearing down the network topology is confirmed separately with
+`sudo infra/topology.sh down --confirm-down`.
 
-Ubuntu 24.04 自带的 iproute2 6.1 不支持 NetEm 固定随机种子，带丢包的正式
-矩阵会主动拒绝运行。可构建与目标内核同代的仓库本地 `tc`：
+The iproute2 6.1 shipped with Ubuntu 24.04 does not support a fixed NetEm random seed, and a formal matrix with loss
+actively refuses to run. You can build a repository-local `tc` of the same generation as the target kernel:
 
 ```bash
 infra/build-iproute2.sh
 export SKYLINE_TC="$PWD/build/tools/tc-iproute2-6.18.0"
 ```
 
-## 运行矩阵与分析结果
+## Running the matrix and analyzing the results
 
 ```bash
 .venv/bin/python research/experiments/generate_matrix.py \
@@ -129,22 +129,22 @@ export SKYLINE_TC="$PWD/build/tools/tc-iproute2-6.18.0"
   research/experiments/analysis/target-box
 ```
 
-`run_matrix.py` 支持 `--keep-going`（单个 case 失败不中止整组）和
-`--resume`（要求 manifest、执行类别与镜像路径完全一致；已成功的 case 会
-被跳过，失败或不完整的 case 写入新的 `attemptNN` 目录）。
+`run_matrix.py` supports `--keep-going` (one failed case does not abort the whole set) and
+`--resume` (requires the manifest, the execution class and the image paths to be exactly the same; cases that already succeeded are
+skipped, and failed or incomplete cases are written to a new `attemptNN` directory).
 
-每个 case 结束时会在标记为有效之前检查该 case 期间的内核日志
-（panic/Oops/soft lockup 等），一旦命中会立即终止整个 campaign——即使加了
-`--keep-going` 也不例外，因为测试床一旦出现这类问题，之后所有 case 共享
-同一个已经不可信的 guest，继续跑只会浪费时间产出不能用的数据。终止后需要
-重启/恢复 guest 快照，再用 `--resume` 续跑。
+At the end of each case, before marking it valid, the runner checks the kernel log for the duration of that case
+(panic/Oops/soft lockup and the like); a hit immediately terminates the whole campaign, even with
+`--keep-going`, because once the test bed shows a problem of this kind, every later case shares
+the same guest, which can no longer be trusted, and carrying on only wastes time producing unusable data. After termination,
+reboot/restore the guest snapshot, then continue with `--resume`.
 
-`analyze_results.py` 会对已经落盘的 case 做更严格的二次判定（同样的内核
-健康检查，加上重传抓包假阳性等），可能把 runner 自己认为有效的 case 又
-判成无效。`--resume` 本身看的是 runner 自己写的 `status.json`，不知道这
-层二次判定，因此补不全这些 case——用
-`--retry-analysis-invalid=<analysis/runs.csv>`（配合 `--resume`）让这些
-case 也重新跑一次，不需要手工改写或删除原始 `status.json`：
+`analyze_results.py` applies a stricter second judgement to the cases already written to disk (the same kernel
+health check, plus retransmission-capture false positives and the like), and may judge cases that the runner itself considered valid
+to be invalid. `--resume` itself looks at the `status.json` the runner wrote and does not know about this
+second judgement, so it cannot fill in these cases; use
+`--retry-analysis-invalid=<analysis/runs.csv>` (together with `--resume`) to rerun these
+cases too, without manually rewriting or deleting the original `status.json`:
 
 ```bash
 .venv/bin/python research/experiments/run_matrix.py \
@@ -153,21 +153,21 @@ case 也重新跑一次，不需要手工改写或删除原始 `status.json`：
   --retry-analysis-invalid=research/experiments/analysis/target-box/runs.csv
 ```
 
-## 多内核版本适配性验证流水线
+## Multi-kernel-version compatibility validation pipeline
 
 ```bash
 infra/kernel/run-compat-pipeline.sh all research/experiments/runs/kernel-compat \
   --versions 6.12.101,6.18.42,7.1.6
 ```
 
-`plan|build|test|report` 四个子命令可以分开单独运行；`build` 只拉取/编译
-各版本内核的 `.deb` 包，不接触任何 VM；`test` 逐版本 fork 子 overlay、
-安装内核、跑冒烟检查、拆除；`report` 读取已有的 `state.json` 渲染报告，
-可在部分/失败的运行之后安全重跑。完整参数说明见脚本自身的头部注释。
+The four subcommands `plan|build|test|report` can each be run separately; `build` only fetches/compiles
+the `.deb` packages of each kernel version and touches no VM; `test` forks a child overlay per version,
+installs the kernel, runs the smoke checks and tears down; `report` reads the existing `state.json` files to render the report
+and can safely be rerun after partial/failed runs. For a full description of the parameters, see the script's own header comment.
 
-## 本地快速冒烟
+## Local quick smoke test
 
-不需要起完整双 VM 测试床，用于验证工具链本身能跑通，不产出性能结论：
+This does not need the full two-VM test bed; it is used to verify that the toolchain itself runs end to end, and does not produce performance conclusions:
 
 ```bash
 research/experiments/run_netns_lab.sh \
@@ -180,16 +180,16 @@ MPLCONFIGDIR=/tmp/matplotlib-serverspeeder \
   /tmp/skyline-local-smoke.csv /tmp/skyline-local-smoke-plots
 ```
 
-脚本拒绝未知的拥塞控制算法名称。结果文件不存在时写入表头，存在时追加；
-每轮新的本地测试应指向新的输出文件，避免混合不同内核或工具版本的数据。
+The script rejects unknown congestion control algorithm names. When the result file does not exist it writes the header, and when it exists it appends;
+each new round of local tests should point at a new output file, to avoid mixing data from different kernel or tool versions.
 
-要求本机内核允许无特权 user namespace，并安装 `ip`、`tc`、`iperf3`、`jq`、
-Python 3 与 Matplotlib。
+The local kernel must allow unprivileged user namespaces, and `ip`, `tc`, `iperf3`, `jq`,
+Python 3 and Matplotlib must be installed.
 
-## 安全约束
+## Safety constraints
 
-- 不在宿主机加载来源不明的内核模块或加速二进制。
-- 黑盒对比实验必须在离线、可销毁快照的 VM 中进行，并先记录样本来源、
-  许可证和 SHA-256。
-- 不把未授权的二进制、许可证或绕过授权的脚本复制进本仓库。
-- 正式公网实验必须设置带宽上限和停止条件，避免激进重传影响第三方流量。
+- Do not load kernel modules or acceleration binaries of unknown origin on the host.
+- Black-box comparison experiments must be done in offline VMs whose snapshots can be destroyed, after first recording the sample's origin,
+  license and SHA-256.
+- Do not copy unauthorized binaries, licenses, or scripts that bypass authorization into this repository.
+- Formal public-internet experiments must set a bandwidth cap and stop conditions, to keep aggressive retransmission from affecting third-party traffic.

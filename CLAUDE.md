@@ -166,6 +166,9 @@ smoke runs only, and **must not be used to draw performance conclusions**.
 
 ## Style
 
+- **Language (a hard rule): `README.zh.md` is the only Chinese file in the repository.** Everything else is
+  English -- documents, the `CLAUDE.md` files, config and code comments, script and report output, test strings,
+  commit messages and PRs. `README.zh.md` is the Chinese twin of `README.md`, and the two change together.
 - Rust: `cargo fmt` is mandatory; `make check` enforces it.
 - BPF C: four-space indentation.
 - Shell: `set -euo pipefail`; the POSIX sh scripts (`scripts/bootstrap.sh`, `infra/boot-enable.sh`) use `set -eu`,

@@ -180,7 +180,7 @@ Seventeen parameters change online with `ssctl set-module-config`, no restart. E
 > [!CAUTION]
 > `set-module-config` is **absolute-overwrite**, not incremental: every parameter you leave out is reset to the CLI's built-in default, not to the value in your config file. Read the current values under *PARAMETERS IN FORCE* first and pass every one you want to keep; `ssctl reset-module-config` goes back to the config file.
 
-[docs/usage.md](docs/usage.md) (Chinese) has each parameter's permitted range and four ready-made presets, including a "high random loss" preset for links that really do lose 10-20% at random.
+[docs/usage.md](docs/usage.md) has each parameter's permitted range and four ready-made presets, including a "high random loss" preset for links that really do lose 10-20% at random.
 
 ### First-flight redundancy
 
@@ -372,7 +372,7 @@ On a Debian 12 host running a 6.12 kernel from `bookworm-backports`, `libelf-dev
 
 ## Documentation
 
-The documents under `docs/` and DEPLOY.md are in Chinese.
+The documents below are in English; only this README has a Chinese version, [README.zh.md](README.zh.md).
 
 | Document | Contents |
 |---|---|

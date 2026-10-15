@@ -208,13 +208,13 @@ class KernelCompatReportTests(unittest.TestCase):
             ],
         }
         report = render_report(summary)
-        self.assertIn("通过: 1", report)
-        self.assertIn("失败: 1", report)
-        self.assertIn("进行中: 1", report)
+        self.assertIn("passed: 1", report)
+        self.assertIn("failed: 1", report)
+        self.assertIn("in progress: 1", report)
 
     def test_render_report_states_non_performance_banner(self):
         report = render_report({"campaign": {}, "versions": []})
-        self.assertIn("不是性能验证", report)
+        self.assertIn("not a performance validation", report)
 
 
 if __name__ == "__main__":

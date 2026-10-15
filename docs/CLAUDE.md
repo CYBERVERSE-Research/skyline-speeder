@@ -7,8 +7,8 @@ change must also update is in the root `CLAUDE.md`, "Documentation sync"; the ba
 | Document | Reader and content |
 |---|---|
 | `README.md` / `README.zh.md` | Users, in the order a newcomer needs it: what it is → the kernel requirement → quick start → how it works and how the three algorithms differ → configuration (what a default install runs, a subsection per feature, and what every line of `ssctl status` and `ssctl flows` means) → layout → building from source → documentation → measured performance → contributing → license. The English and Chinese READMEs say the same thing |
-| `DEPLOY.md` | **The one deployment and operations manual** (Chinese), written for automation agents and followed by people: prerequisites, every installer step, verification gates, the cgroup, the guard, upgrades, removal, troubleshooting |
-| `docs/usage.md` | Newcomers (Chinese): every switch and parameter, four presets, dynamic RTO, DSCP, finding the cause of a stalled connection |
+| `DEPLOY.md` | **The one deployment and operations manual**, written for automation agents and followed by people: prerequisites, every installer step, verification gates, the cgroup, the guard, upgrades, removal, troubleshooting |
+| `docs/usage.md` | Newcomers: every switch and parameter, four presets, dynamic RTO, DSCP, finding the cause of a stalled connection |
 | `docs/02-interface-reference.md` | `ssctl` commands, the wire protocol, status fields and counters, ABI versions, configuration fields, event codes, guard rules |
 | `docs/03-design.md` | How each module works, the trade-offs, open questions |
 | `docs/04-performance-report.md` | The two-VM test bed's data, what it does and does not show, its limits |

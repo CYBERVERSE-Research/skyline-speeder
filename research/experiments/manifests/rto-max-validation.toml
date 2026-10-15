@@ -1,36 +1,36 @@
-# RTO 上限机制专项验证。bpf/skyline_policy.bpf.c 的 SKYLINE_RTO_MAX_FLOOR_MS=1000
-# （毫秒）会把 base_rtt<=~167ms 时算出来的 ceiling 一律钳成 1000ms——
-# rto_max_normal_permille(3000=3x) 和 rto_max_congested_permille(6000=6x)
-# 在 rtt_ms<=150 的场景里算出来的目标值本来就不到 1000ms，两档在数值上
-# 完全无法区分，这个机制的核心设计（拥塞证据出现时换更大倍数）需要一个
-# 更高 RTT 的场景才能真正测到。
+# Dedicated validation of the RTO cap mechanism. SKYLINE_RTO_MAX_FLOOR_MS=1000 in bpf/skyline_policy.bpf.c
+# (milliseconds) clamps the ceiling computed when base_rtt<=~167ms to 1000ms across the board:
+# rto_max_normal_permille(3000=3x) and rto_max_congested_permille(6000=6x)
+# compute targets below 1000ms anyway in scenarios with rtt_ms<=150, so the two levels are
+# numerically indistinguishable, and the core design of this mechanism (switch to a larger multiplier when congestion evidence appears) needs a
+# higher-RTT scenario to be really measured.
 #
-# 这里专门设计一个 rtt_ms=300 的强制 RTO 场景：base_rtt≈300ms 时
-# 3x=900ms、6x=1800ms，才能真正分开、不会被 1000ms 下限钳成同一个数。
-# 场景本身沿用 rto-max-smoke.toml 的思路（Gilbert-Elliott 突发丢包 + 低
-# 带宽压小飞行窗口，保证坏状态持续时间稳定超过一整个 RTT，可靠触发真实
-# RTO 超时，而不是被 RACK 提前接管），沿用 smoke 版本已验证过不会失控的
-# burst_length=220/duration_s=20/warmup_s=5，只把 rtt_ms 从 150 改到 300
-# ——更激进的丢包强度参数（更大的 burst_length/duration_s）会让没有
-# rack_rto 上限的 profile（stock cubic/bbr/skyline-rto-baseline）大概率触发
-# 内核默认 rto_max=120s×tcp_retries2=15 档的级联超时死循环，实际卡住的
-# 时间远超测试自身的 wall-clock 预算，因此保持这组更保守的取值。
+# So this designs a dedicated forced-RTO scenario with rtt_ms=300: at base_rtt≈300ms,
+# 3x=900ms and 6x=1800ms, which really separate and are not clamped to the same number by the 1000ms floor.
+# The scenario itself follows the approach of rto-max-smoke.toml (Gilbert-Elliott burst loss + low
+# bandwidth to shrink the flight window, so the bad state reliably lasts longer than a whole RTT and reliably triggers real
+# RTO timeouts instead of RACK taking over early), and keeps the smoke version's
+# burst_length=220/duration_s=20/warmup_s=5, already verified not to run out of control, only changing rtt_ms from 150 to 300.
+# More aggressive loss-intensity parameters (a larger burst_length/duration_s) would very likely make the profiles without
+# a rack_rto cap (stock cubic/bbr/skyline-rto-baseline) trigger
+# the cascading-timeout loop of the kernel default rto_max=120s×tcp_retries2=15, actually stalling for
+# far longer than the test's own wall-clock budget, so this more conservative set of values is kept.
 #
-# skyline-rto-baseline 跟 skyline-best 完全一致，只是省略 [profiles.rack_rto]——
-# 等价于 M1 tier-2 全程未激活的状态。skyline-best 减 skyline-rto-baseline 的差异
-# 就是这个机制本身的边际效果。
+# skyline-rto-baseline is identical to skyline-best except that it omits [profiles.rack_rto],
+# equivalent to M1 tier-2 never being activated. The difference skyline-best minus skyline-rto-baseline
+# is the marginal effect of this mechanism itself.
 #
-# 验证重点不是 goodput 好不好看（这个机制本来就是小概率事件才生效，对
-# 整体吞吐影响可能很小），而是机制本身是否按设计运行——检查
-# analyze_results.py 已有的现成列，不需要新代码：
-#   rack_rto_applied>0、rack_rto_max_applied>0（真的被调用且下发成功）；
-#   rack_rto_max_rejected==0（没被内核拒绝）；
-#   rack_rto_max_congested>0（这个场景下确实观测到过"拥塞证据"分支）；
-#   max_rto_ms 明显小于内核 120000ms 默认值，且 skyline-best 与
-#   skyline-rto-baseline 之间有可辨的差异。
+# The point of the validation is not whether goodput looks good (this mechanism only takes effect in low-probability events in the first place, and its
+# effect on overall throughput may be small), but whether the mechanism itself runs as designed. Check
+# the existing columns that analyze_results.py already has; no new code is needed:
+#   rack_rto_applied>0, rack_rto_max_applied>0 (really called and pushed successfully);
+#   rack_rto_max_rejected==0 (not rejected by the kernel);
+#   rack_rto_max_congested>0 (the "congestion evidence" branch was indeed observed in this scenario);
+#   max_rto_ms clearly below the kernel's 120000ms default, and a discernible difference between skyline-best and
+#   skyline-rto-baseline.
 #
-# 4 profile（b1-controlled-cubic/bbr-fq/skyline-rto-baseline/skyline-best）×
-# 1 场景 × runs=3 = 12 case，~15-20 分钟。
+# 4 profiles (b1-controlled-cubic/bbr-fq/skyline-rto-baseline/skyline-best) ×
+# 1 scenario × runs=3 = 12 cases, ~15-20 minutes.
 name = "rto-max-validation"
 execution_class = "formal-kvm"
 performance_valid = true
