@@ -163,8 +163,10 @@ dscp_value = 0
 # price: a response that fits in first_kib is sent twice; a bulk transfer
 # pays for its first first_kib only. The copy is held back by the fq qdisc
 # (kept at the root by [guard]); two copies a few milliseconds apart are lost
-# together far less often than two back to back (delay_ms = 0). Connections
-# that do not run skyline_cc are never copied, and nothing is copied before
+# together far less often than two back to back (delay_ms = 0). Data segments
+# and SYNs of connections that do not run skyline_cc are never copied; a
+# SYN-ACK is, whatever its connection will run, since it leaves before the
+# connection has a congestion control. Nothing is copied before
 # `ssctl enable` or after `ssctl drain`. Omitting the table keeps it on with
 # these values; `ssctl set-redundancy` / `reset-redundancy` change it live.
 [redundancy]

@@ -292,9 +292,12 @@ BPF 侧的四段配置各自独立维护自己的 ABI 版本号，互不联动�
 各段配置的版本校验行为并不完全一致：
 
 - M2/M3/M4（`SKYLINE_ABI_VERSION`）：每条连接复制配置时（`skyline_adopt_config()`）校验
-  版本号，不匹配就不复制，这条连接就没有配置：`skyline_cong_control` 直接返回，不再为任何
-  连接调整 cwnd 与 pacing，也没有对应的计数器记录这件事。`metrics` 按布局读取，大小对不上的
-  每 CPU 值被跳过，计数器全是 0。加载时没有谁拒绝不匹配的一对。
+  版本号，不匹配就不复制，这条连接就没有配置：`skyline_cong_control` 在每个 ACK 上直接返回。
+  这不是交还给内核——`cong_control` 已经取代了内核自己的增长逻辑——所以 cwnd 停在内核的初始
+  窗口（RTO 之后停在 `tcp_enter_loss()` 留下的大小），也没有谁设 pacing；没有对应的计数器记录
+  这件事（`active_flows` 在涨、`metrics.ack_events` 不动）。`struct skyline_config` 大小变了的
+  话，daemon 写配置槽时就会报错。`metrics` 按布局读取，大小对不上的每 CPU 值被跳过，计数器全是 0。
+  加载时没有谁拒绝不匹配的一对。
 - DSCP 标记（`SKYLINE_RETRANSMIT_DSCP_ABI_VERSION`）：版本不匹配时跳过标记逻辑
   （相当于功能关闭），并递增 `retransmit_dscp.stats` 里的 `abi_mismatch`
   计数器。
@@ -511,7 +514,9 @@ qdisc：网卡的根 qdisc 往往在这个 sysctl 生效前就建好了（一台
 **所有权。** 从一次成功的 `enable` 到下一次 `drain`，下面几项只有 `skyline-speederd` 一个
 写入者：
 
-- `net.ipv4.tcp_congestion_control` = `skyline_cc`（它本来就是这个 sysctl 的唯一所有者）；
+- `net.ipv4.tcp_congestion_control` = `skyline_cc`（daemon 对这个 sysctl 的每次写入都经过同一个函数；
+  `enable` 之前与 `drain` 之后，`infra/boot-disable.sh` 的兜底、实验矩阵的 `apply-guest-profile.sh` 与
+  `install.sh --uninstall` 也会写它）；
 - `net.core.default_qdisc` = `fq`，以及受管网卡（通常就是 `runtime.tc_interface`，见下文
   "受管网卡"）的根 qdisc = `fq`（多队列网卡上是每个子队列都为 `fq` 的 `mq`）——仅当
   `[guard] qdisc = true`。`infra/boot-enable.sh` 过去在开机时写一次 `default_qdisc=fq`，
