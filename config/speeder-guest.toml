@@ -21,10 +21,11 @@ initial_cwnd_packets = 100
 # See config/speeder.toml's comment: floor under M2's cwnd target.
 min_cwnd_packets = 32
 
-# 这两段的默认值可能被实验矩阵通过 `ssctl set-module-config`（见
-# research/experiments/run_matrix.py 的 apply_module_config()）逐 case 覆盖；
-# 不像 [rack_tuning] 那样有"guest 必须整段省略"的强约束，因为这里走的是
-# skyline-speederd 自己管理的内存态配置，不存在被外部 sysctl 写入绕过的风险。
+# The experiment matrix may override the defaults of these two sections per
+# case with `ssctl set-module-config` (apply_module_config() in
+# research/experiments/run_matrix.py). Unlike [rack_tuning] they carry no
+# "the guest must leave the whole section out" rule: they are in-memory state
+# skyline-speederd owns, which no outside sysctl write can bypass.
 # See config/speeder.toml's comment for the full rationale. On an installed
 # host these are the live defaults: both install paths ship this file as
 # /etc/skyline-speeder/speeder.toml. In the experiment matrix they only matter
@@ -46,15 +47,17 @@ guardrail_gain = 0.8
 # See config/speeder.toml's comment: single loss-rate compensation factor.
 loss_inflation_max_ratio = 0.10
 
-# [rack_tuning] 必须整段保持注释：这台 guest 由实验矩阵
-# （infra/apply-guest-profile.sh）逐 case 精确控制 tcp_recovery/
-# tcp_reordering/tcp_early_retrans。skyline-speederd 绝不能在这里接管这几个 sysctl，
-# 否则 daemon 重启会把 per-case 精确值悄悄覆盖回默认值——见
-# crates/skyline-common/src/lib.rs 的 guest_config_never_owns_global_sysctls 测试。
+# [rack_tuning] must stay commented out in its entirety: on this guest the
+# experiment matrix (infra/apply-guest-profile.sh) sets tcp_recovery,
+# tcp_reordering and tcp_early_retrans exactly, per case. skyline-speederd must
+# never take those sysctls over here, or a daemon restart would silently put the
+# per-case values back to the defaults -- see the
+# guest_config_never_owns_global_sysctls test in crates/skyline-common/src/lib.rs.
 
-# [rack_rto] per-case 数值由实验矩阵通过 `ssctl set-rack-rto` 下发（见
-# research/experiments/run_matrix.py 的 apply_profile()），这里同样保持默认
-# 关闭（enabled=false），不在配置文件里设置具体数值。
+# [rack_rto]: the experiment matrix sends its per-case values with
+# `ssctl set-rack-rto` (apply_profile() in research/experiments/run_matrix.py),
+# so here it likewise stays at its default, off (enabled = false), with no
+# values set in this file.
 
 # First-flight redundancy: while skyline_cc is enabled, every SYN-ACK, every
 # SYN of a skyline_cc socket and every segment in the first first_kib KiB a
