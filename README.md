@@ -80,7 +80,7 @@ The installer uses the distribution's own package manager and service manager �
 The published release needs no toolchain, only `curl`, `tar` and `iproute2` (the installer installs them): the objects are CO-RE, compiled against a pinned 6.12 header and relocated against this kernel when they load. The prebuilt daemon comes in two builds: one built on Ubuntu 24.04, which needs glibc 2.38 or newer with `libelf.so.1` and `libz.so.1` (Debian 13, Ubuntu 24.04, Fedora 43, Rocky Linux 10 and later), and, from v0.4.1, one built in Alpine 3.21 against musl, which Alpine 3.21 and later install together with `libelf`, `zlib`, `zstd-libs` and `libgcc`. On older userspace the default install builds from source by itself, and `--source` does so anywhere. `--release <tag>` pins a version, and `SKYLINE_ARTIFACT_URL=/path/to/tarball sudo -E ./install.sh --prebuilt` installs a copied artifact on a host with no route to GitHub. What gets installed is a published release, which can be older than this README and than `main`: a change merged after the latest release reaches the one-line install only with the next one. A release that predates a feature described here (the v0.2.0 release has no qdisc guard, for one) is named as such by the installer.
 
 > [!IMPORTANT]
-> **Upgrading:** run the installer again. Once the new objects pass the kernel verifier it restarts `skyline-speederd` itself, draining live flows for up to 60 seconds, and attaches `skyline_cc` again, also on a host where it was attached by hand with `ssctl enable`. Settings changed with `ssctl` do not survive the restart. A host that was built from source moves to the published release unless you pass `--source` again — on Alpine too, from v0.4.1. Details: [CHANGELOG.md](CHANGELOG.md), *Upgrading from 0.4.0*.
+> **Upgrading:** run the installer again. Once the new objects pass the kernel verifier it restarts `skyline-speederd` itself, draining live flows for up to 60 seconds, and attaches `skyline_cc` again, also on a host where it was attached by hand with `ssctl enable`. Settings changed with `ssctl` do not survive the restart. A host that was built from source moves to the published release unless you pass `--source` again — on Alpine too, from v0.4.1. Details: [DEPLOY.md](DEPLOY.md) §10.
 
 Day-to-day:
 
@@ -340,7 +340,6 @@ skyline-speeder/
 ├── infra/                        install helpers, cgroup wrapper, two-VM test bed
 ├── research/experiments/         test manifests, runner, analysis, field measurements
 ├── docs/                         usage guide, interface reference, design, performance report
-├── CHANGELOG.md                  release notes and upgrade instructions
 ├── DEPLOY.md                     deployment and operations manual, written for automation agents
 └── CONTRIBUTING.md               invariants a change must not break
 ```

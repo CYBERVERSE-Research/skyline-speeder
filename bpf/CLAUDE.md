@@ -28,8 +28,8 @@ but it **must not be newer** than that kernel: bpftool generates it with `preser
 carries a CO-RE relocation that libbpf fixes against the running kernel's BTF at load time, and CO-RE cannot supply a
 field the running kernel lacks -- objects built against a newer kernel's header can fail to load on 6.12, which is why
 releases build against the 6.12 reference header (`release.yml`). What has been verified is a 6.12 header: objects
-built against it under 6.12.63 load on 6.19.14, and built against it under 6.19.14 load on 6.12.63 (`CHANGELOG.md`
-0.1.0, *Verified*). `infra/kernel/core-portability.sh` reproduces this. **After a data-plane change, rerun that script
+built against it under 6.12.63 load on 6.19.14, and built against it under 6.19.14 load on 6.12.63;
+`infra/kernel/core-portability.sh` reproduces this. **After a data-plane change, rerun that script
 before relying on this property** -- CO-RE fixes offsets, not a field that was renamed or removed.
 
 ## Hard invariants (full constraints)

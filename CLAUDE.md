@@ -86,10 +86,9 @@ The `CLAUDE.md` files are public: no host addresses, account names, tokens or pe
   `bpf/`, `crates/`, `config/speeder-guest.toml`, `packaging/` or a shipped `infra/*.sh` reaches users only with a
   release; `install.sh` and `scripts/bootstrap.sh` usually take effect on merge; docs, CI and the harness never need
   one. Several PRs may share a release, but each PR says so.
-- **Releasing:** bump `[workspace.package] version` and the three crates in `Cargo.lock` (builds run `--locked`), add
-  `## [<version>] - <date>` to `CHANGELOG.md` with its compare link (there is no `[Unreleased]` section), then tag
-  `v<version>`; `release.yml` refuses a mismatch. If the data plane changed, rerun `infra/kernel/core-portability.sh`
-  first.
+- **Releasing:** bump `[workspace.package] version` and the three crates in `Cargo.lock` (builds run `--locked`), then
+  tag `v<version>`; `release.yml` refuses a mismatch. **No changelog:** the repository keeps none -- never add
+  `CHANGELOG.md` or a release-notes file. If the data plane changed, rerun `infra/kernel/core-portability.sh` first.
 - **Performance numbers** in docs come only from a two-VM test bed that passes `infra/preflight.sh formal`; smaller
   machines are for code, verifier and smoke checks, never for performance conclusions.
 
