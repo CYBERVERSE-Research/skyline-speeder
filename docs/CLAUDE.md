@@ -1,8 +1,9 @@
 # docs/CLAUDE.md
 
 The documentation map. Claude Code loads this file once it reads or edits a file in this directory. Which documents a
-change must also update is in the root `CLAUDE.md`, "Documentation sync"; the bar for performance numbers is in its
-"Performance-claim discipline".
+change must also update, and the bar for performance numbers, are in the root `CLAUDE.md`, "Every change" ("Docs to
+update", "Performance numbers"); the full table is in `CONTRIBUTING.md`, "Documentation you must update with your
+change".
 
 | Document | Reader and content |
 |---|---|

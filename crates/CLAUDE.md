@@ -28,8 +28,8 @@ congestion control and, with `[guard] qdisc = true` (the default), `net.core.def
 `runtime.tc_interface` (`fq`, or `mq` over `fq` on a multi-queue NIC; when that is a VLAN, bond or bridge whose root
 is `noqueue`, the NICs with a `device` link under it instead, never a tap or veth). From `enable` to `drain` the daemon
 is the only writer of all three (after a drain, `apply-guest-profile.sh` and `install.sh --uninstall` set qdiscs of
-their own). `boot-enable.sh` used to write `default_qdisc=fq` once at boot and no longer does -- **do not add it back**:
-it cannot change a NIC's existing root qdisc, and two writers of one setting drift apart. Related invariants:
+their own). `boot-enable.sh` **writes no `default_qdisc` either**: a boot-time write cannot change a NIC's existing
+root qdisc, and two writers of one setting drift apart. Related invariants:
 
 - `enable` arms the guard only after it has written `skyline_cc`. `drain` disarms it first and writes `fallback_cc`
   **while still holding the guard's lock**; otherwise a periodic check could write `skyline_cc` back after the drain.
@@ -60,8 +60,8 @@ in `config/CLAUDE.md`.
   for a flow that keeps its window full (about one right after a start or a switch). A copy taken while `config_seq`
   moved is discarded, and every ACK reads only the flow's own copy. So no flow reads a mix of old and new values
   within a round, however quickly updates follow each other. **Any change to the config delivery path must keep both
-  halves** -- slot first, sequence number second; BPF reads only the copy -- or you get torn reads (0.4.x had neither,
-  and two updates within one RTT rewrote a slot live flows were reading).
+  halves** -- slot first, sequence number second; BPF reads only the copy -- or you get torn reads (a second update
+  within one RTT rewrites a slot that live flows are still reading).
 
 ## The test that guards the guest config
 

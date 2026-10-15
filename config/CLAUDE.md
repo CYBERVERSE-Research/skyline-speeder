@@ -2,7 +2,7 @@
 
 Details for the configuration templates. Claude Code loads this file once it reads or edits a file in this directory;
 the repository-wide conventions are in the root `CLAUDE.md` (a config field change also updates `config/*.toml` and
-`docs/02-interface-reference.md` section 6, per its documentation sync table).
+`docs/02-interface-reference.md` section 6, per its "Docs to update" rule).
 
 ## The guest config constraint
 
