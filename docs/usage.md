@@ -48,7 +48,7 @@ The default state after a one-line install:
 | Dynamic RTO adjustment | **Off** | Turn it on by hand; see section 5 |
 | DSCP marking of retransmitted packets | **Off, and the value is 0** | ⚠️ See section 6; **you must ask your network administrator before turning it on** |
 | First-flight redundancy | **On**: the handshake packets and the first 64 KiB of each connection are sent twice, the second copy 10 ms later | On a lossy line, short requests (web pages, APIs) do not sit waiting for loss recovery; the cost is about 64 KiB extra per connection, more when lost packets are retransmitted. To turn it off: `sudo ssctl set-redundancy --disable`; to go back to the config file's value: `sudo ssctl reset-redundancy`; to keep it off across restarts, write `[redundancy]` `enabled = false` in the config file |
-| Fallback algorithm after detaching (`fallback_cc`) | The machine's default algorithm at boot (picked automatically at install, usually `bbr`; `cubic` when none can be picked) | New connections use it after `drain` detaches |
+| Fallback algorithm after detaching (`fallback_cc`) | The machine's default algorithm at boot (picked automatically at install, and again at every upgrade or reinstall unless you changed it yourself; usually `bbr`, `cubic` when none can be picked) | New connections use it after `drain` detaches |
 | Congestion control and qdisc guard | **On**, checking every 5 seconds | If another script switches things back to bbr / cake, they are switched back automatically; see section 7 |
 
 When the installer finishes it prints a summary: the congestion control and qdisc before and after the change, the

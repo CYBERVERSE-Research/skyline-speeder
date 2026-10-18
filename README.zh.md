@@ -288,7 +288,7 @@ sudo systemctl restart skyline-speederd    # 挂载服务随之重新挂载 skyl
 | 首行 | 正在运行的 daemon 的版本（升级后、daemon 重启之前，`ssctl --version` 可能与它不同）和结论：`ACCELERATING`，已挂载且是全机默认；`ATTACHED, NOT DEFAULT`，之后有东西改了默认算法，新连接绕开了 skyline_cc，执行 `ssctl enable`；`DRAINING`，一次 drain 已经把新连接交给 `fallback_cc`，skyline_cc 只服务它还剩的连接（通过 SSH 执行的 drain 总是停在这里；`ssctl enable` 把主机接管回来）；`STANDBY`，没有挂载，执行 `ssctl enable` |
 | skyline_cc struct_ops | 是否已挂载，挂载了多久 |
 | host default cc | `net.ipv4.tcp_congestion_control`：新连接用什么算法 |
-| fallback on drain | `fallback_cc`：`ssctl drain` 之后新连接用什么算法；全新安装时，如果主机的 sysctl 文件在开机时指定了一个本内核有的算法，就设为它 |
+| fallback on drain | `fallback_cc`：`ssctl drain` 之后新连接用什么算法；如果主机的 sysctl 文件在开机时指定了一个本内核有的算法，安装脚本就把它设为该算法——全新安装时如此，之后每次升级或重装也会重新设置，除非你自己改过它 |
 | modules | M1-M4；打勾表示此刻正作用于流量，所以没挂载时一个都不打勾 |
 | live connections | 此刻跑在 skyline_cc 上的连接数 |
 | DRIFT GUARD | 见[拥塞控制与 qdisc 守护](#拥塞控制与-qdisc-守护) |

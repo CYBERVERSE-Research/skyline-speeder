@@ -19,9 +19,10 @@ auto_pacing_enabled = true
 # unit's ExecStop write it on the way out. It must be registered
 # (/proc/sys/net/ipv4/tcp_available_congestion_control) or a module tcp_<name>
 # the kernel loads when the sysctl is written -- xanmod builds cubic that way.
-# install.sh replaces cubic in a config it creates with the algorithm the
-# host's sysctl configuration selects at boot (bbr on most VPS images), so
-# detaching leaves the host on what it ran; an existing file is never rewritten.
+# install.sh replaces cubic with the algorithm the host's sysctl configuration
+# selects at boot (bbr on most VPS images), so detaching leaves the host on
+# what it ran: in a config it creates, and on every later run while the value
+# is still its own choice. A value set by hand is never rewritten.
 fallback_cc = "cubic"
 max_pacing_mbps = 1200
 max_cwnd_packets = 50000

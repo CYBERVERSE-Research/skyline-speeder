@@ -217,7 +217,7 @@ the same configuration template.
 | `--source` | Builds from this source tree unconditionally |
 | `--prebuilt` | Installs only the published artifact: when this host cannot run it, aborts before the first step with `error --prebuilt/--release cannot install here: <reason>` and does not switch to a build |
 | `--release <tag>` | Like `--prebuilt`, pinned to that version (also the way to go back to an older version, section 10.3) |
-| `--check` | Only runs the prerequisite checks and changes nothing: reports which path would be taken (`would install the published release` / `would build from source: <reason>`), whether the packages can be installed, the current congestion control and qdiscs (including the NICs the guard would maintain), the relevant settings systemd-sysctl will write at boot, the settings in `/etc/sysctl.conf` that only `sysctl -p`/`sysctl --system` apply, and the `fallback_cc` a newly created configuration would get. With `SKYLINE_ARTIFACT_URL` set, it reports that it would install that |
+| `--check` | Only runs the prerequisite checks and changes nothing: reports which path would be taken (`would install the published release` / `would build from source: <reason>`), whether the packages can be installed, the current congestion control and qdiscs (including the NICs the guard would maintain), the relevant settings systemd-sysctl will write at boot, the settings in `/etc/sysctl.conf` that only `sysctl -p`/`sysctl --system` apply, and the `fallback_cc` the configuration would get (a new one, or an existing one whose value is still the installer's own choice). With `SKYLINE_ARTIFACT_URL` set, it reports that it would install that |
 | `--no-enable` | Installs or upgrades and starts the daemon, but does not newly attach `skyline_cc`: it does not enable `skyline-speeder-enable.service`, and does not disable it if it was already enabled; if `skyline_cc` was attached with a bare `ssctl enable` before the upgrade, it runs `ssctl enable` once more after the restart (still a manual attach, not attached automatically at boot). At the end it reports the actual attach state from the new daemon's `enabled` and the current default congestion control, and gives the command to attach |
 | `--verbose` | Draws no progress bar; the output of every subcommand also goes to the screen; the environment variable `SKYLINE_VERBOSE=1` does the same |
 | `--uninstall` | Uninstalls, switches to bbr + fq, and removes the packages the install added (section 11.3) |
@@ -273,7 +273,7 @@ reach the default install only with the next release.
 | Preparing the Rust toolchain / Building the BPF objects / Building the Rust control plane | Source-build path: rustup (version pinned by `rust-toolchain.toml`), `make bpf`, `cargo build --release` |
 | Running the kernel verifier | Before any file is replaced, runs `--validate-only --verify-bpf` (section 4) with the **new** daemon and the new objects: with the installed configuration, or the template on a first install, and `bpf_dir` pointing at the new objects; the daemon is first placed at `/usr/local/sbin/.skyline-speederd.new` (`/tmp` may be noexec). A failure aborts the install, leaving the installed files and the running daemon untouched |
 | Installing files | The prebuilt path copies the files from the artifact directly (the daemon is the very file the verifier ran, renamed into place); the source-build path runs `infra/install-guest.sh`. The file list is in section 2.5 |
-| Configuring speeder.toml | Creates the configuration from the template only when it does not exist; rewrites the egress NIC and `fallback_cc` (see below). These changes do not affect the conclusion of the verifier step above: `tc_interface` plays no part in validation, and `fallback_cc` is only ever changed to an algorithm this host's kernel has |
+| Configuring speeder.toml | Creates the configuration from the template only when it does not exist; rewrites the egress NIC and `fallback_cc` while they still hold what the installer put there (see below). These changes do not affect the conclusion of the verifier step above: `tc_interface` plays no part in validation, and `fallback_cc` is only ever changed to an algorithm this host's kernel has |
 | Starting skyline-speederd | On an upgrade it is `Draining live flows (up to 60 s), restarting skyline-speederd` (section 10) |
 | Attaching skyline_cc | `systemctl enable --now skyline-speeder-enable.service` (skipped with `--no-enable`) |
 | Verifying | Confirms with the new daemon that `enabled` is `true` (and, for versions with the guard, `armed`), and that the default congestion control really is `skyline_cc`; if not, restarts the enable unit once and checks again, and if it still does not hold, fails and points to `ssctl enable` and the enable unit's log |
@@ -315,16 +315,25 @@ as WireGuard/WARP, tun, gre or ppp, the template value is kept and the installer
 packets by their Ethernet header, and the daemon refuses to attach it to a non-Ethernet device; on such a host,
 set it by hand to the physical NIC that carries the tunnel traffic (section 8.1).
 
-**`fallback_cc`.** Likewise rewritten only when this run creates the configuration file. It is the algorithm
-new connections use when `skyline_cc` is not there (section 8.1), and the template value is `cubic`; the
-installer uses instead the algorithm the boot-time sysctl configuration selects (finding the effective file by
-systemd-sysctl's rules, for example `bbr` in the `/etc/sysctl.d/99-bbr.conf` left by a "one-click BBR"
-script): that is the algorithm this host runs without Skyline Speeder, and also an algorithm that is certain to
-be registered before `skyline-speederd` starts on every boot — systemd-sysctl (on OpenRC, the sysctl service)
-writes it before then, and the kernel loads its module along the way. When the boot-time configuration sets
-nothing, sets `skyline_cc`, or sets an algorithm this host has not registered at the moment, `cubic` is kept.
-The choice (`fallback_cc set to …` / `fallback_cc left at …`) is written to the install log, and also to the
-screen with `--verbose`; `--check` reports which value a newly created configuration would get.
+**`fallback_cc`.** Chosen when this run creates the configuration file, and again on every later run (an
+upgrade, or a reinstall after `--uninstall`, which keeps the file) for as long as the value is still the
+installer's own choice. It is the algorithm new connections use when `skyline_cc` is not there (section 8.1),
+and the template value is `cubic`; the installer uses instead the algorithm the boot-time sysctl configuration
+selects (finding the effective file by systemd-sysctl's rules, for example `bbr` in the
+`/etc/sysctl.d/99-bbr.conf` left by a "one-click BBR" script): that is the algorithm this host runs without
+Skyline Speeder, and also an algorithm that is certain to be registered before `skyline-speederd` starts on
+every boot — systemd-sysctl (on OpenRC, the sysctl service) writes it before then, and the kernel loads its
+module along the way. When the boot-time configuration sets nothing, sets `skyline_cc`, or sets an algorithm
+this host has not registered at the moment, the value is kept (`cubic` in a new file).
+
+The installer records its choice in `/etc/skyline-speeder/installer-fallback-cc` (section 2.5). A
+`fallback_cc` that differs from the recorded name was set by the operator and is never rewritten; one that
+matches follows the boot configuration, so a host that moves from cubic to bbr — before a reinstall, say —
+gets `bbr` at the installer's next run. A configuration written by an installer from before this record
+existed has none: then only the template's `cubic` counts as the installer's choice, and any other value as
+the operator's. The choice (`fallback_cc set to …` / `changed from … to …` / `left at …` /
+`left as configured …`) is written to the install log, and also to the screen with `--verbose`; `--check`
+reports which value the configuration would get.
 
 **Pre-install record.** Before changing anything, the installer records the current congestion control,
 `net.core.default_qdisc`, and the root qdisc of every NIC the guard will maintain, in
@@ -351,7 +360,8 @@ values of a few common parameters and where to tune them, and how many packages 
 | `/opt/skyline-speeder/bpf/*.bpf.o` | The three BPF objects |
 | `/opt/skyline-speeder/infra/*.sh` | `boot-enable.sh`/`boot-disable.sh`, which the enable unit calls, `run-in-skyline-cgroup.sh` from section 7, and `apply-guest-profile.sh`, `collect-guest-metrics.sh`, `snapshot-skyline-events.sh` |
 | `/etc/systemd/system/skyline-speederd.service`, `skyline-speeder-enable.service` | The two systemd units; on OpenRC hosts, `/etc/init.d/skyline-speederd` and `/etc/init.d/skyline-speeder-enable` (section 12) |
-| `/etc/skyline-speeder/speeder.toml` | The configuration; created from the template only when it does not exist, never overwritten by later installs and upgrades |
+| `/etc/skyline-speeder/speeder.toml` | The configuration; created from the template only when it does not exist, never overwritten by later installs and upgrades, which change in it only a placeholder `tc_interface` and their own choice of `fallback_cc` (section 2.4) |
+| `/etc/skyline-speeder/installer-fallback-cc` | The `fallback_cc` the installer last chose for `speeder.toml`, one name: while the configuration still holds it, every run chooses again from the boot configuration (section 2.4) |
 | `/etc/skyline-speeder/pre-install-state` | The pre-install snapshot: `PRE_INSTALL_CC`, `PRE_INSTALL_QDISC`, and `PRE_INSTALL_QDISC_DEV`/`PRE_INSTALL_ROOT_QDISC` (two space-separated lists, of NICs and of root-qdisc summaries, matching one to one; empty when the NIC is not known). Written only once; a snapshot written by 0.2.0 lacks the last two keys, which an upgrade adds |
 | `/etc/skyline-speeder/added-packages`, `added-rustup` | The packages and rustup this install added to the host (section 11.3 uninstalls based on them) |
 | `/var/log/skyline-speeder-install.log` | The install log |

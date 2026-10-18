@@ -95,6 +95,13 @@ case "${SKYLINE_VERBOSE:-0}" in 1|yes|true) VERBOSE=1 ;; *) VERBOSE=0 ;; esac
 LOG=/var/log/skyline-speeder-install.log
 CFG=/etc/skyline-speeder/speeder.toml
 STATE=/etc/skyline-speeder/pre-install-state
+# The fallback_cc an install last chose for $CFG, one name: how a later run --
+# an upgrade, or a reinstall after --uninstall, which keeps $CFG -- tells its
+# own choice, which follows the host's boot configuration, from a value the
+# operator wrote (fallback_plan). TEMPLATE_FALLBACK is the value the templates
+# (config/speeder.toml, config/speeder-guest.toml) ship: a sync point.
+FALLBACK_REC=/etc/skyline-speeder/installer-fallback-cc
+TEMPLATE_FALLBACK=cubic
 # What an install added to this host, so --uninstall can take exactly that
 # away again and nothing else. Separate files, not more keys in $STATE: that
 # one is written once and then closed forever (it must never record
@@ -893,8 +900,9 @@ conf_sysctl_settings() {
     sysctl_key_settings /etc/sysctl.conf
 }
 
-# boot_fallback_cc: "name|file" for the fallback_cc a new speeder.toml gets, or
-# nothing to keep the template's. fallback_cc is what new connections get
+# boot_fallback_cc: "name|file" for the fallback_cc the installer chooses (in
+# a new speeder.toml, or one still holding its earlier choice: fallback_plan),
+# or nothing to keep the value there. fallback_cc is what new connections get
 # whenever skyline_cc is not attached -- `ssctl drain`, the enable unit's
 # ExecStop, and briefly every enable, which writes it before the attach -- so
 # the template's cubic took a host that boots into bbr off bbr each time. The
@@ -917,6 +925,40 @@ boot_fallback_cc() {
         esac
         return 0
     done <<<"$BOOT_SETTINGS"
+}
+
+# fallback_plan: what this run does with fallback_cc in $CFG. FB_NOW is the
+# value there (the template's while there is no $CFG yet; empty without a
+# plain `fallback_cc = "<name>"` line), FB_REC the one $FALLBACK_REC says an
+# earlier run chose, FB_MINE 1 when FB_NOW is the installer's to choose, and
+# FB_NEW / FB_FROM the algorithm it then gets and the boot file that selects
+# it -- both empty when it keeps FB_NOW.
+# The installer's own: a $CFG this run creates, and FB_NOW equal to FB_REC.
+# Without a record, $CFG predates it: the installers before it chose only in a
+# file they created and left the template's value there when no boot setting
+# chose, so that value is taken as their choice too. Each run then chooses
+# again, as for a new file, so a host that moved to bbr after an --uninstall
+# (which keeps $CFG) does not keep the first install's cubic through the
+# reinstall (issue #40). Any other value is the operator's and is never
+# rewritten.
+fallback_plan() {
+    local choice
+    FB_NOW=$TEMPLATE_FALLBACK FB_REC= FB_MINE=0 FB_NEW= FB_FROM=
+    if [ -e "$CFG" ]; then
+        FB_NOW=$(sed -n 's/^fallback_cc = "\([^"]*\)"$/\1/p' "$CFG" 2>/dev/null || true)
+    fi
+    FB_REC=$(sed -n 1p "$FALLBACK_REC" 2>/dev/null || true)
+    case "$FB_REC" in *[!A-Za-z0-9_]*) FB_REC= ;; esac
+    if [ -z "$FB_NOW" ]; then
+        return 0
+    elif [ "$CFG_FRESH" -eq 1 ] || [ "$FB_NOW" = "${FB_REC:-$TEMPLATE_FALLBACK}" ]; then
+        FB_MINE=1
+    else
+        return 0
+    fi
+    choice=$(boot_fallback_cc)
+    [ -n "$choice" ] || return 0
+    FB_NEW=${choice%%|*} FB_FROM=${choice#*|}
 }
 
 # `ssctl status --json` pretty-prints one "key": value per line. awk rather than a
@@ -2260,7 +2302,9 @@ log "before: tcp_congestion_control=$BEFORE_CC default_qdisc=$BEFORE_DQ egress: 
 [ -z "$CONF_SETTINGS" ] || log "set in /etc/sysctl.conf, not read at boot (key|value|file):" "$CONF_SETTINGS"
 # Whether this run writes speeder.toml from the template, which section 8 then
 # adapts to the host. An existing one belongs to its operator -- also when an
-# earlier run left it behind by failing -- and is never rewritten.
+# earlier run left it behind by failing: section 8 rewrites in it only what the
+# installer itself put there, the placeholder tc_interface and its own choice
+# of fallback_cc.
 CFG_FRESH=1
 [ ! -e "$CFG" ] || CFG_FRESH=0
 
@@ -2594,12 +2638,19 @@ if [ "$MODE" = check ]; then
         [ -n "$key" ] || continue
         info "set in $file (by sysctl -p / sysctl --system, not at boot): ${key##*.} = $value"
     done <<<"$CONF_SETTINGS"
-    if [ "$CFG_FRESH" -eq 0 ]; then
-        info "$CFG exists and is kept as it is"
-    elif REPLY=$(boot_fallback_cc) && [ -n "$REPLY" ]; then
-        info "a new $CFG would get fallback_cc = ${REPLY%%|*}, which ${REPLY#*|} selects at boot"
-    else
+    fallback_plan
+    if [ "$CFG_FRESH" -eq 1 ] && [ -n "$FB_NEW" ]; then
+        info "a new $CFG would get fallback_cc = $FB_NEW, which $FB_FROM selects at boot"
+    elif [ "$CFG_FRESH" -eq 1 ]; then
         info "a new $CFG would keep the template's fallback_cc: no boot setting selects a congestion control this kernel has"
+    elif [ "$FB_MINE" -eq 0 ]; then
+        info "$CFG exists and is kept as it is; its fallback_cc ${FB_NOW:+($FB_NOW) }is not one this installer chose"
+    elif [ -z "$FB_NEW" ]; then
+        info "$CFG exists and is kept as it is; fallback_cc stays $FB_NOW: no boot setting selects a congestion control this kernel has"
+    elif [ "$FB_NEW" = "$FB_NOW" ]; then
+        info "$CFG exists and is kept as it is; fallback_cc is $FB_NOW, which $FB_FROM selects at boot"
+    else
+        info "$CFG exists and is kept as it is, but for fallback_cc, still this installer's choice: $FB_NOW would become $FB_NEW, which $FB_FROM selects at boot"
     fi
     info "preflight complete"
     printf '\n' >&3
@@ -3038,18 +3089,28 @@ elif [ -n "$TC_TYPE" ] && [ "$TC_TYPE" != 1 ]; then
     warn "runtime.tc_interface $DEV is not an Ethernet device (type $TC_TYPE, e.g. a tunnel): skyline-speederd does not attach skyline_tc to it, and the qdisc guard does not reach the NIC that carries its traffic. Point it at the NIC: $TC_FIX"
 fi
 # fallback_cc: the algorithm this host boots into (boot_fallback_cc says why),
-# on first install only, as above.
-if [ "$CFG_FRESH" -eq 1 ]; then
-    FALLBACK_BOOT=$(boot_fallback_cc)
-    FALLBACK_NOW=$(sed -n 's/^fallback_cc = "\([^"]*\)"$/\1/p' "$CFG" 2>/dev/null || true)
-    if [ -z "$FALLBACK_BOOT" ]; then
-        ok "fallback_cc left at ${FALLBACK_NOW:-the template value}: no boot setting selects a congestion control this kernel has"
-    elif [ "${FALLBACK_BOOT%%|*}" = "$FALLBACK_NOW" ]; then
-        ok "fallback_cc is $FALLBACK_NOW, which ${FALLBACK_BOOT#*|} selects at boot"
-    elif [ -n "$FALLBACK_NOW" ]; then
-        sed -i "s|^fallback_cc = \"$FALLBACK_NOW\"\$|fallback_cc = \"${FALLBACK_BOOT%%|*}\"|" "$CFG"
-        ok "fallback_cc set to ${FALLBACK_BOOT%%|*}, which ${FALLBACK_BOOT#*|} selects at boot"
+# as long as the value there is the installer's own choice (fallback_plan says
+# which are) -- like the placeholder above, a value the operator set is never
+# rewritten. The record names what $CFG holds now, so the next run can tell.
+fallback_plan
+if [ "$FB_MINE" -eq 0 ]; then
+    ok "fallback_cc left as configured${FB_NOW:+ ($FB_NOW)}: not a value this installer chose"
+elif [ -z "$FB_NEW" ]; then
+    ok "fallback_cc left at $FB_NOW: no boot setting selects a congestion control this kernel has"
+elif [ "$FB_NEW" = "$FB_NOW" ]; then
+    ok "fallback_cc is $FB_NOW, which $FB_FROM selects at boot"
+else
+    sed -i "s|^fallback_cc = \"$FB_NOW\"\$|fallback_cc = \"$FB_NEW\"|" "$CFG"
+    if [ "$CFG_FRESH" -eq 1 ]; then
+        ok "fallback_cc set to $FB_NEW, which $FB_FROM selects at boot"
+    else
+        ok "fallback_cc changed from $FB_NOW to $FB_NEW, which $FB_FROM selects at boot"
     fi
+    FB_NOW=$FB_NEW
+fi
+if [ "$FB_MINE" -eq 1 ]; then
+    { printf '%s\n' "$FB_NOW" >"$FALLBACK_REC"; } 2>/dev/null \
+        || warn "could not write $FALLBACK_REC, the fallback_cc this installer chose ($FB_NOW)"
 fi
 
 # --- 9. record what was there, then start -----------------------------------

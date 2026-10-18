@@ -8,8 +8,8 @@ prr_pacing_enabled = true
 # when M4 is off, same independent-switch shape as prr_pacing_enabled.
 auto_pacing_enabled = true
 # See config/speeder.toml's comment: what new connections get while
-# skyline_cc is detached. install.sh sets it, in a config it creates, to the
-# algorithm the host boots into.
+# skyline_cc is detached. install.sh sets it to the algorithm the host boots
+# into, and again on later runs unless it was set by hand.
 fallback_cc = "cubic"
 max_pacing_mbps = 1200
 max_cwnd_packets = 50000

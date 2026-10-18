@@ -286,7 +286,7 @@ From 0.5.0, a misspelt key or one in the wrong section fails `--validate-only`, 
 | top line | The running daemon's version (after an upgrade, `ssctl --version` can differ until the daemon restarts) and the verdict: `ACCELERATING`, attached and the host default; `ATTACHED, NOT DEFAULT`, something changed the default since and new connections bypass skyline_cc, so run `ssctl enable`; `DRAINING`, a drain has moved new connections to `fallback_cc` and skyline_cc only serves the connections it still has (one run over SSH always ends here; `ssctl enable` takes the host back); `STANDBY`, not attached, so run `ssctl enable` |
 | skyline_cc struct_ops | attached, and how long ago |
 | host default cc | `net.ipv4.tcp_congestion_control`: what new connections get |
-| fallback on drain | `fallback_cc`: what new connections get after `ssctl drain`; a fresh install sets it to the one the host's sysctl files select at boot, when this kernel has it |
+| fallback on drain | `fallback_cc`: what new connections get after `ssctl drain`; the installer sets it to the one the host's sysctl files select at boot, when this kernel has it -- on a fresh install, and again on every upgrade or reinstall unless you set it yourself |
 | modules | M1-M4; a tick means acting on traffic now, so nothing is ticked while detached |
 | live connections | connections on skyline_cc now |
 | DRIFT GUARD | see [Drift guard](#drift-guard) |
