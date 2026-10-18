@@ -102,9 +102,17 @@ STATE=/etc/skyline-speeder/pre-install-state
 # (config/speeder.toml, config/speeder-guest.toml) ship: a sync point.
 FALLBACK_REC=/etc/skyline-speeder/installer-fallback-cc
 TEMPLATE_FALLBACK=cubic
+# The files an installation puts in place outside /etc/skyline-speeder, the
+# ones --uninstall removes: any of them still there means an installation is
+# (install_in_place).
+INSTALL_PATHS=(/etc/systemd/system/skyline-speederd.service
+               /etc/systemd/system/skyline-speeder-enable.service
+               /etc/init.d/skyline-speederd /etc/init.d/skyline-speeder-enable
+               /usr/local/sbin/skyline-speederd /usr/local/bin/ssctl
+               /opt/skyline-speeder)
 # What an install added to this host, so --uninstall can take exactly that
 # away again and nothing else. Separate files, not more keys in $STATE: that
-# one is written once and then closed forever (it must never record
+# one is written once per installation and then closed (it must never record
 # skyline_cc as the "original"), while a later upgrade run can add packages.
 ADDED_PKGS=/etc/skyline-speeder/added-packages
 ADDED_RUSTUP=/etc/skyline-speeder/added-rustup
@@ -959,6 +967,17 @@ fallback_plan() {
     choice=$(boot_fallback_cc)
     [ -n "$choice" ] || return 0
     FB_NEW=${choice%%|*} FB_FROM=${choice#*|}
+}
+
+# install_in_place: whether anything of INSTALL_PATHS is there -- units,
+# binaries, the objects. /etc/skyline-speeder alone does not count: --uninstall
+# keeps it, and a configuration directory changes nothing about the network.
+install_in_place() {
+    local path
+    for path in "${INSTALL_PATHS[@]}"; do
+        [ ! -e "$path" ] || return 0
+    done
+    return 1
 }
 
 # `ssctl status --json` pretty-prints one "key": value per line. awk rather than a
@@ -2055,13 +2074,9 @@ if [ "$MODE" = uninstall ]; then
     # finished install leaves packages recorded there that must still be
     # removable.
     ACTIVE=0
-    for path in /etc/systemd/system/skyline-speederd.service \
-                /etc/systemd/system/skyline-speeder-enable.service \
-                /etc/init.d/skyline-speederd /etc/init.d/skyline-speeder-enable \
-                /usr/local/sbin/skyline-speederd /usr/local/bin/ssctl \
-                /opt/skyline-speeder; do
-        [ ! -e "$path" ] || { ACTIVE=1; break; }
-    done
+    if install_in_place; then
+        ACTIVE=1
+    fi
     if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" = skyline_cc ]; then
         ACTIVE=1
     fi
@@ -2307,6 +2322,18 @@ log "before: tcp_congestion_control=$BEFORE_CC default_qdisc=$BEFORE_DQ egress: 
 # of fallback_cc.
 CFG_FRESH=1
 [ ! -e "$CFG" ] || CFG_FRESH=0
+# Whether $STATE describes an installation that is gone: --uninstall removes
+# everything but /etc/skyline-speeder, the snapshot included. The host has run
+# without Skyline Speeder since, so what it runs now is what came before THIS
+# install, and section 9 replaces the snapshot with it -- the summary's "was"
+# and --restore-pre-install then name the same thing, not the first install's
+# cubic after a move to bbr in between. Kept while anything of an installation
+# is in place (an upgrade, whose skyline_cc and guarded fq are no "original"),
+# and while skyline_cc is still the default.
+STATE_SPENT=0
+if [ -e "$STATE" ] && ! install_in_place && [ "$BEFORE_CC" != skyline_cc ]; then
+    STATE_SPENT=1
+fi
 
 # --- 5. packages -----------------------------------------------------------
 export DEBIAN_FRONTEND=noninteractive
@@ -2651,6 +2678,9 @@ if [ "$MODE" = check ]; then
         info "$CFG exists and is kept as it is; fallback_cc is $FB_NOW, which $FB_FROM selects at boot"
     else
         info "$CFG exists and is kept as it is, but for fallback_cc, still this installer's choice: $FB_NOW would become $FB_NEW, which $FB_FROM selects at boot"
+    fi
+    if [ "$STATE_SPENT" -eq 1 ]; then
+        info "$STATE describes an installation that was removed: an install would replace it with what this host runs now"
     fi
     info "preflight complete"
     printf '\n' >&3
@@ -3116,7 +3146,8 @@ fi
 # --- 9. record what was there, then start -----------------------------------
 # Snapshot before anything starts changing sysctls: the daemon writes
 # fallback_cc on load and `ssctl enable` writes skyline_cc after it attaches.
-# Only written once -- a reinstall must not record skyline_cc as the "original".
+# Written once per installation -- an upgrade must not record skyline_cc as the
+# "original" -- and replaced when the one it described was removed (STATE_SPENT).
 # The root qdiscs are those of the devices the guard will manage: two
 # parallel, space-separated lists (one device: just its name and summary).
 ROOTS_SEEN=
@@ -3129,7 +3160,7 @@ if [ ! -e "$STATE" ] && [ "$BEFORE_CC" = skyline_cc ]; then
     # known any more, and this run's view -- skyline_cc, and the guard's fq --
     # recorded as the "original" would be what --restore-pre-install puts back.
     log "no pre-install snapshot written: skyline_cc is already the default, so what came before it is not known"
-elif [ ! -e "$STATE" ]; then
+elif [ ! -e "$STATE" ] || [ "$STATE_SPENT" -eq 1 ]; then
     install -d /etc/skyline-speeder
     cat > "$STATE" <<EOF
 PRE_INSTALL_CC=$BEFORE_CC
@@ -3141,7 +3172,11 @@ EOF
     # "original".
     printf 'PRE_INSTALL_QDISC_DEV=%q\nPRE_INSTALL_ROOT_QDISC=%q\n' \
         "${BEFORE_DEVS[*]}" "${BEFORE_ROOTS[*]}" >>"$STATE"
-    ok "recorded pre-install state: cc=$BEFORE_CC qdisc=$BEFORE_DQ root: ${ROOTS_SEEN:-none}"
+    if [ "$STATE_SPENT" -eq 1 ]; then
+        ok "replaced the pre-install snapshot of the removed installation: cc=$BEFORE_CC qdisc=$BEFORE_DQ root: ${ROOTS_SEEN:-none}"
+    else
+        ok "recorded pre-install state: cc=$BEFORE_CC qdisc=$BEFORE_DQ root: ${ROOTS_SEEN:-none}"
+    fi
 elif ! grep -q '^PRE_INSTALL_ROOT_QDISC=' "$STATE"; then
     # Only a snapshot from before the guard existed (0.2.0) has no such line
     # at all. Those versions never touched a root qdisc, so what is there now
@@ -3584,9 +3619,9 @@ fi
 # bug rather than as the truth.
 #
 # Read from $STATE, in a subshell, because that is the file the restore itself
-# reads -- and on a reinstall it holds the FIRST install's values, which are not
-# what this run sees now. Without a snapshot yet, this run's own observation is
-# what is about to be written into one.
+# reads -- and on an upgrade it holds the values from before the first install,
+# which are not what this run sees now. Without a snapshot yet, this run's own
+# observation is what is about to be written into one.
 RESTORE_DESC=$(
     if [ ! -r "$STATE" ] && [ "$BEFORE_CC" = skyline_cc ]; then
         # No snapshot was written; see "record what was there".
