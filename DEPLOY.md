@@ -338,8 +338,11 @@ reports which value the configuration would get.
 **Pre-install record.** Before changing anything, the installer records the current congestion control,
 `net.core.default_qdisc`, and the root qdisc of every NIC the guard will maintain, in
 `/etc/skyline-speeder/pre-install-state` (section 2.5), for the before/after comparison at the end and for
-`--uninstall --restore-pre-install`. This snapshot is written only once, so a reinstall cannot record
-`skyline_cc` as the "original value" by mistake.
+`--uninstall --restore-pre-install`. This snapshot is written once per installation: an upgrade keeps it, so
+a run cannot record `skyline_cc` as the "original value" by mistake. A reinstall after `--uninstall` — nothing
+of the earlier installation is left but `/etc/skyline-speeder`, and `skyline_cc` is not the default — replaces
+it with what the host runs at that point, so the summary's `was` and `--restore-pre-install` describe the same
+state, not the one from before the first install. `--check` says when a run would replace it.
 
 **Final summary.** A before/after comparison of the congestion control and qdiscs (such as
 `skyline_cc (was bbr)`, `mq/fq on eth0 (was cake), default fq (was cake)`; one line per NIC for something like
@@ -362,7 +365,7 @@ values of a few common parameters and where to tune them, and how many packages 
 | `/etc/systemd/system/skyline-speederd.service`, `skyline-speeder-enable.service` | The two systemd units; on OpenRC hosts, `/etc/init.d/skyline-speederd` and `/etc/init.d/skyline-speeder-enable` (section 12) |
 | `/etc/skyline-speeder/speeder.toml` | The configuration; created from the template only when it does not exist, never overwritten by later installs and upgrades, which change in it only a placeholder `tc_interface` and their own choice of `fallback_cc` (section 2.4) |
 | `/etc/skyline-speeder/installer-fallback-cc` | The `fallback_cc` the installer last chose for `speeder.toml`, one name: while the configuration still holds it, every run chooses again from the boot configuration (section 2.4) |
-| `/etc/skyline-speeder/pre-install-state` | The pre-install snapshot: `PRE_INSTALL_CC`, `PRE_INSTALL_QDISC`, and `PRE_INSTALL_QDISC_DEV`/`PRE_INSTALL_ROOT_QDISC` (two space-separated lists, of NICs and of root-qdisc summaries, matching one to one; empty when the NIC is not known). Written only once; a snapshot written by 0.2.0 lacks the last two keys, which an upgrade adds |
+| `/etc/skyline-speeder/pre-install-state` | The pre-install snapshot: `PRE_INSTALL_CC`, `PRE_INSTALL_QDISC`, and `PRE_INSTALL_QDISC_DEV`/`PRE_INSTALL_ROOT_QDISC` (two space-separated lists, of NICs and of root-qdisc summaries, matching one to one; empty when the NIC is not known). Written once per installation: an upgrade keeps it, a reinstall after `--uninstall` replaces it (section 2.4); a snapshot written by 0.2.0 lacks the last two keys, which an upgrade adds |
 | `/etc/skyline-speeder/added-packages`, `added-rustup` | The packages and rustup this install added to the host (section 11.3 uninstalls based on them) |
 | `/var/log/skyline-speeder-install.log` | The install log |
 | `/usr/local/src/skyline-speeder` | The source tree, when installed through the bootstrap script |
@@ -1023,7 +1026,8 @@ restored. To restore `mq/<kind>`, it temporarily sets `default_qdisc` to that ki
 `mq` the guard left, built by `tc`, is a no-op); only when the delete fails (the kernel's own `mq` with
 handle 0) does it run `tc qdisc replace dev <nic> root mq`; then it sets `default_qdisc` back and reads
 everything again to check. Without a snapshot (a manually installed host) it only warns, and the cc and qdiscs
-stay as they are.
+stay as they are. The snapshot belongs to the current installation: after an earlier `--uninstall` and a
+reinstall, it describes the host as it was just before that reinstall (section 2.4).
 
 ### 11.5 Uninstalling without the installer
 
