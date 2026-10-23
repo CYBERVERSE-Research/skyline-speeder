@@ -81,9 +81,29 @@ CALLER_LOCALE=${LC_ALL:-${LC_CTYPE:-${LANG:-}}}
 # real messages are not buried.
 export LC_ALL=C.UTF-8 LANG=C.UTF-8 LANGUAGE=
 
+# What this script writes as root by redirection or mkdir -- /etc/skyline-speeder
+# and the records in it that a later run sources, the install log -- takes the
+# caller's umask, and a shell with 000 or 002 made them writable by others:
+# code for the next run as root. Group and other never get write; a stricter
+# umask is kept.
+umask "$(printf '%04o' $(( 8#$(umask) | 8#022 )))"
+
+# Every curl below starts with -q, which only works as the first argument: it
+# skips ~/.curlrc. Under `sudo -E`, or a sudo that keeps HOME, that is the
+# caller's file, and an `insecure` or a `proxy` line in it would decide what
+# this script downloads and then runs as root.
+
 # Piped in (curl ... | bash) there is no file and BASH_SOURCE is empty, which
-# set -u turned into an "unbound variable" error on every such run.
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# set -u turned into an "unbound variable" error on every such run. There is no
+# source tree then either: REPO_ROOT stays empty instead of naming the working
+# directory, whose Makefile, cargo configuration and scripts a source build
+# would otherwise run as root -- from wherever the operator happened to be,
+# /tmp included.
+if [ -f "${BASH_SOURCE[0]:-}" ]; then
+    REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+else
+    REPO_ROOT=
+fi
 KVER="$(uname -r)"
 MODE=install
 ENABLE=1
@@ -1989,7 +2009,7 @@ release_lacks_musl() {
     local json api="https://api.github.com/repos/${REPO_SLUG}/releases/latest" rc=1
     json=$(mktemp)
     if { command -v curl >/dev/null 2>&1 \
-             && curl -fsSL --proto '=https' --tlsv1.2 --max-time 30 -o "$json" "$api" 2>/dev/null; } \
+             && curl -q -fsSL --proto '=https' --tlsv1.2 --max-time 30 -o "$json" "$api" 2>/dev/null; } \
        || { command -v wget >/dev/null 2>&1 && wget -q -T 30 -O "$json" "$api" 2>/dev/null; }; then
         if [ -s "$json" ] && ! grep -q "skyline-speeder-[^\"]*-$(uname -m)-musl\.tar\.gz" "$json"; then
             REPLY=$(awk 'match($0, /"tag_name": *"[^"]*"/) {
@@ -2035,6 +2055,13 @@ while [ "$#" -gt 0 ]; do
         *) die "unknown argument: $1 (see --help)" ;;
     esac
 done
+
+# Both go into the release API's URL, and curl resolves a ../ in it: a tag of
+# ../../../<owner>/<name>/releases/latest fetched another repository's release.
+[[ "$REPO_SLUG" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && [[ "$REPO_SLUG" != *..* ]] \
+    || die "SKYLINE_REPO must be <owner>/<name>: $REPO_SLUG"
+[ -z "$RELEASE_TAG" ] || { [[ "$RELEASE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] && [[ "$RELEASE_TAG" != *..* ]]; } \
+    || die "not a release tag: $RELEASE_TAG"
 
 if [ "$(id -u)" -ne 0 ]; then
     # Before detect_platform, which is what sets SUDO for every other hint.
@@ -2216,6 +2243,12 @@ case "$SOURCE" in
    Build from source instead: ${SUDO}$SELF --source"
         ;;
 esac
+# A source build runs the tree's Makefile, cargo and scripts as root, and piped
+# in there is no tree (see REPO_ROOT): stop before anything is installed.
+if [ "$MODE" = install ] && [ "$SOURCE" = build ] && [ -z "$REPO_ROOT" ]; then
+    die "building from source${SOURCE_REASON:+ ($SOURCE_REASON)} needs the source tree, and this install.sh was piped in without one.
+   Run scripts/bootstrap.sh, the one-line install, which fetches the tree first, or install.sh from a clone."
+fi
 
 if [ "$MODE" = install ]; then
     QUIET=$((1 - VERBOSE))
@@ -2223,7 +2256,11 @@ if [ "$MODE" = install ]; then
     # one-line-per-step output instead of a smeared bar.
     if [ "$TTY" -eq 1 ] && [ "$VERBOSE" -eq 0 ] && [ "${TERM:-}" != dumb ]; then BAR=1; fi
     WORK=$(mktemp -d)
-    : >"$LOG" || die "cannot write $LOG"
+    # A new file, never one that is there: on Ubuntu /var/log is group-writable
+    # by syslog, and a symlink left at this name had root truncate whatever it
+    # pointed at. noclobber creates it O_EXCL, so one put back in between fails.
+    rm -f -- "$LOG"
+    (set -C; : >"$LOG") || die "cannot create $LOG"
     LOG_READY=1
     log "Skyline Speeder install, $(date '+%F %T %z'), source=$SOURCE${RELEASE_TAG:+ release=$RELEASE_TAG} enable=$ENABLE"
     # The one fallback worth interrupting the progress line for: the operator
@@ -2821,12 +2858,18 @@ if [ "$SOURCE" = build ]; then
 step "Preparing the Rust toolchain"
 # rust-toolchain.toml pins the channel; rustup honours it automatically inside
 # the repo, so only the rustup installation itself is handled here.
+# The toolchain lives under HOME, and `sudo -E` (or a sudo that keeps HOME)
+# leaves that the caller's: a cargo another user can replace would then build
+# and run as root, and so would whatever rustup installed there.
+[ "$(stat -c %u -- "${HOME:-}" 2>/dev/null)" = 0 ] \
+    || die "HOME (${HOME:-unset}) is not owned by root, and the Rust toolchain would be run from it as root.
+   Run the installer with root's HOME: sudo -H, or without -E."
 if ! command -v cargo >/dev/null 2>&1; then
     if [ -x "$HOME/.cargo/bin/cargo" ]; then
         PATH="$HOME/.cargo/bin:$PATH"
     else
         info "installing the Rust toolchain via rustup"
-        run bash -c "set -euo pipefail; curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        run bash -c "set -euo pipefail; curl -q --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --component rustfmt" \
             || die "installing the Rust toolchain via rustup failed"
         PATH="$HOME/.cargo/bin:$PATH"
@@ -2856,7 +2899,9 @@ step "Building the BPF objects"
 run make -C "$REPO_ROOT" bpf || die "building the BPF objects failed"
 
 step "Building the Rust control plane"
-run "${IN_TREE[@]}" cargo build --workspace --release \
+# --locked, as CI and the release build: exactly the dependency versions
+# Cargo.lock records, never ones crates.io serves on the day of the install.
+run "${IN_TREE[@]}" cargo build --workspace --release --locked \
     || die "building the Rust control plane failed"
 fi
 
@@ -2900,7 +2945,7 @@ fetch_prebuilt() {
     fi
 
     info "resolving release from ${REPO_SLUG}"
-    run curl -fsSL --proto '=https' --tlsv1.2 -o "$staging/release.json" "$api" \
+    run curl -q -fsSL --proto '=https' --tlsv1.2 -o "$staging/release.json" "$api" \
         || die "cannot reach the release API. Check network access, or use the
    source build (drop --prebuilt), or pass --release <tag>."
 
@@ -2908,9 +2953,16 @@ fetch_prebuilt() {
     # minimal server image, and needing one to install would undercut the
     # point of a toolchain-free path. `|| true`: no match makes grep, and
     # under pipefail the assignment, fail, and set -e would then exit here
-    # before the one message that says why.
-    url=$(grep -o "https://[^\"]*skyline-speeder-[^\"]*-${arch}${flavour}\.tar\.gz" \
-          "$staging/release.json" | head -1) || true
+    # before the one message that says why. Only an asset's download URL, and
+    # only one under this repository's releases: the reply also carries text
+    # the release's author wrote (its name, its notes), and the first matching
+    # https URL anywhere in it used to be what was downloaded and run as root.
+    # Compared without case, as GitHub compares owner and name.
+    url=$(grep -o '"browser_download_url": *"[^"]*"' "$staging/release.json" \
+          | sed 's/^"browser_download_url": *"//; s/"$//' \
+          | awk -v prefix="https://github.com/${REPO_SLUG}/releases/download/" \
+                'index(tolower($0), tolower(prefix)) == 1' \
+          | grep -E "/skyline-speeder-[^/]*-${arch}${flavour}\.tar\.gz\$" | head -1) || true
     if [ -z "$url" ] && [ "$libc" = musl ]; then
         die "no prebuilt musl artifact for $arch in that release: releases publish one
    from v0.4.1 on. Build from source instead: ${SUDO}$SELF --source"
@@ -2930,9 +2982,9 @@ fetch_prebuilt() {
             && cp -- "${local_artifact}.sha256" "$staging/artifact.sha256"
     else
         info "downloading $(basename -- "$url")"
-        run curl -fsSL --proto '=https' --tlsv1.2 -o "$staging/artifact.tar.gz" "$url" \
+        run curl -q -fsSL --proto '=https' --tlsv1.2 -o "$staging/artifact.tar.gz" "$url" \
             || die "artifact download failed"
-        run curl -fsSL --proto '=https' --tlsv1.2 -o "$staging/artifact.sha256" \
+        run curl -q -fsSL --proto '=https' --tlsv1.2 -o "$staging/artifact.sha256" \
             "${url}.sha256" || rm -f "$staging/artifact.sha256"
     fi
 
@@ -2952,7 +3004,12 @@ fetch_prebuilt() {
         # No TLS was involved in a file copied over by hand.
         warn "no ${local_artifact}.sha256 beside the local artifact, so its integrity was not checked"
     else
-        warn "no published .sha256 beside the artifact; trusting TLS alone"
+        # Every release has published one beside each artifact. A download
+        # without one -- a mirror that left it out, an answer that is not the
+        # artifact -- is not unpacked and run as root on TLS alone.
+        die "no ${url}.sha256 could be downloaded, so the artifact cannot be checked.
+   Publish the .sha256 beside it (sha256sum <artifact> > <artifact>.sha256), or copy both
+   to this host and point SKYLINE_ARTIFACT_URL at the local file."
     fi
 
     run tar -xzf "$staging/artifact.tar.gz" -C "$staging" || die "artifact did not unpack"
@@ -3000,7 +3057,7 @@ install_prebuilt_files() {
         # artifact has the systemd units only; then they come from this
         # installer's own tree, the two a source build installs.
         local openrc=$root/packaging/openrc
-        [ -r "$openrc/skyline-speederd" ] || openrc=$REPO_ROOT/packaging/openrc
+        [ -r "$openrc/skyline-speederd" ] || [ -z "$REPO_ROOT" ] || openrc=$REPO_ROOT/packaging/openrc
         [ -r "$openrc/skyline-speederd" ] \
             || die "no packaging/openrc/ in the artifact or beside this install.sh: run it from a Skyline Speeder source tree"
         install -m 0755 "$openrc/skyline-speederd" /etc/init.d/skyline-speederd
@@ -3078,6 +3135,14 @@ fi
 step "Configuring speeder.toml"
 ROUTE_DEV=$(default_route_interface)
 ETH_DEV=$(ethernet_route_interface)
+# The name goes into sed's replacement below, and Linux takes almost any byte
+# in one: a | ends the s command and GNU sed runs what follows (e executes a
+# command). A name outside the usual alphabet is left for the operator.
+case "$ETH_DEV" in
+    *[!A-Za-z0-9_.-]*)
+        warn "the egress interface name '$ETH_DEV' has characters this installer does not write into speeder.toml; set runtime.tc_interface by hand"
+        ETH_DEV= ;;
+esac
 PLACEHOLDER=0
 if grep -q '^tc_interface = "data0"' "$CFG" 2>/dev/null; then PLACEHOLDER=1; fi
 if [ "$PLACEHOLDER" -eq 1 ] && [ -n "$ETH_DEV" ]; then
@@ -3607,7 +3672,7 @@ STATUS_WHAT="is it attached, is it the host default, kernel support"
 # operator can paste. scripts/bootstrap.sh leaves the tree in
 # /usr/local/src/skyline-speeder; somebody who piped this file straight into
 # bash has no tree at all and is told that is what it takes.
-if [ -r "$REPO_ROOT/install.sh" ]; then
+if [ -n "$REPO_ROOT" ] && [ -r "$REPO_ROOT/install.sh" ]; then
     UNINSTALL_CMD="${SUDO}$REPO_ROOT/install.sh --uninstall"
 else
     UNINSTALL_CMD="${SUDO}<a Skyline Speeder source tree>/install.sh --uninstall"

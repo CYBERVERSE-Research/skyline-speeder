@@ -2043,12 +2043,17 @@ fn serve(mut daemon: Daemon) -> Result<()> {
         fs::create_dir_all(parent)
             .with_context(|| format!("create socket directory {}", parent.display()))?;
     }
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("bind Unix socket {}", socket_path.display()))?;
     // Whoever can connect can drain, enable, stop the daemon and have it
     // write files as root. Not left to the umask: under systemd's 0022 only
     // root could connect, but a daemon started by hand with 0000 took
-    // requests from every local user.
+    // requests from every local user. Created 0600, not chmod'ed to it after
+    // bind(): a connection made in between stayed queued, and was served.
+    // SAFETY: umask(2) only swaps the process's file mode mask; it cannot fail.
+    let umask = unsafe { libc::umask(0o177) };
+    let bound = UnixListener::bind(&socket_path);
+    // SAFETY: as above, restoring the mask the process had.
+    unsafe { libc::umask(umask) };
+    let listener = bound.with_context(|| format!("bind Unix socket {}", socket_path.display()))?;
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("restrict Unix socket {}", socket_path.display()))?;
     daemon.persist_state()?;

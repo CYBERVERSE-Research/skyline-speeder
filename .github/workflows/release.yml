@@ -27,6 +27,11 @@ on:
         description: 'Tag to build and publish'
         required: true
 
+# Write access to this repository's releases, and every action below runs with
+# it. So each is pinned to a commit, not to a tag its owner can move: a tag
+# moved onto a hostile commit would upload whatever it liked as the artifacts
+# install.sh downloads and runs as root. To update one, look the new tag's
+# commit up and replace both the hash and the comment.
 permissions:
   contents: write
 
@@ -35,7 +40,7 @@ jobs:
     name: Build and publish artifacts
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
 
@@ -177,7 +182,7 @@ jobs:
           echo "glibc=${GLIBC}" >> "$GITHUB_OUTPUT"
           echo "musl=${MUSL}" >> "$GITHUB_OUTPUT"
 
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
