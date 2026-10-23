@@ -46,7 +46,7 @@ fi
 
 cd "$REPOSITORY_ROOT"
 make bpf
-cargo build --workspace --release
+cargo build --workspace --release --locked
 
 install -d /opt/skyline-speeder/bpf /opt/skyline-speeder/infra /etc/skyline-speeder /run/skyline-speeder /sys/fs/bpf/skyline-speeder \
     /usr/local/sbin /usr/local/bin

@@ -57,6 +57,11 @@ set -eu
 # has not generated, and apt/perl bury the real output under locale warnings.
 export LC_ALL=C.UTF-8 LANG=C.UTF-8 LANGUAGE=
 
+# See install.sh: nothing written as root here -- the tree install.sh is then
+# run from, as root -- is left writable by group or other, whatever the
+# caller's umask. A stricter one is kept.
+umask "$(printf '%04o' $(( 0$(umask) | 022 )))"
+
 main() {
     REPO="${SKYLINE_REPO:-CYBERVERSE-Research/skyline-speeder}"
     REF="${SKYLINE_REF:-main}"
@@ -105,6 +110,16 @@ main() {
     # this, --repo fetched that repository's installer, which then installed
     # the default repository's release.
     export SKYLINE_REPO="$REPO"
+    # Both go into the download URL, where curl resolves a ../ -- into another
+    # repository's tree. A ref may be a branch with a / in it.
+    case "$REPO" in
+        */*/*|*..*|/*|*/|*[!A-Za-z0-9_./-]*) die "--repo must be <owner>/<name>: $REPO" ;;
+        */*) ;;
+        *) die "--repo must be <owner>/<name>: $REPO" ;;
+    esac
+    case "$REF" in
+        ''|-*|/*|*..*|*[!A-Za-z0-9_./-]*) die "not a git ref: $REF" ;;
+    esac
 
     [ "$(id -u)" -eq 0 ] || die "must run as root (pipe into 'sudo bash', not 'bash'; on Alpine, run it as root)"
     # The commands printed at the end carry sudo only where there is one.
@@ -174,13 +189,15 @@ main() {
     # --- download -----------------------------------------------------------
     URL="https://codeload.github.com/${REPO}/tar.gz/${REF}"
     info "fetching ${REPO}@${REF}"
-    curl -fsSL --proto '=https' --tlsv1.2 -o "$TMP/src.tar.gz" "$URL" \
+    # -q first: not the caller's ~/.curlrc (see install.sh).
+    curl -q -fsSL --proto '=https' --tlsv1.2 -o "$TMP/src.tar.gz" "$URL" \
         || die "download failed: $URL
    Check the repository and ref exist, and that this host can reach github.com."
 
     # Optional integrity pin. Publish the digest alongside a release tag and
-    # operators can verify what they are about to build and run as root:
-    #   SKYLINE_SHA256=<digest> curl ... | sudo -E bash
+    # operators can verify what they are about to build and run as root. The
+    # variable goes to the shell sudo starts, not to curl:
+    #   curl ... | sudo SKYLINE_SHA256=<digest> bash -s -- --ref <tag>
     if [ -n "${SKYLINE_SHA256:-}" ]; then
         GOT="$(sha256sum "$TMP/src.tar.gz" | awk '{print $1}')"
         [ "$GOT" = "$SKYLINE_SHA256" ] \
@@ -193,6 +210,10 @@ main() {
     fi
 
     tar -xzf "$TMP/src.tar.gz" -C "$TMP" || die "extract failed"
+    # Unpacking as root keeps the archive's modes, and GitHub's tarballs make
+    # files group-writable (git archive's tar.umask 0002): not for a tree whose
+    # install.sh, Makefile and scripts root runs again at every upgrade.
+    chmod -R go-w "$TMP"
     UNPACKED="$(find "$TMP" -mindepth 1 -maxdepth 1 -type d | head -1)"
     if [ -z "$UNPACKED" ] || [ ! -x "$UNPACKED/install.sh" ]; then
         die "unexpected tarball layout: no executable install.sh at the top level"

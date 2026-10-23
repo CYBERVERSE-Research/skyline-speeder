@@ -12,7 +12,9 @@ gives a success condition a machine can check, and what to do about the known fa
 **Conventions**
 
 - All commands run as root. As an ordinary user, prefix them with `sudo`; pipe the bootstrap script into
-  `| sudo bash`, and use `sudo -E` when environment variables have to be passed through.
+  `| sudo bash`, and hand environment variables to sudo itself: `sudo VAR=value ./install.sh`,
+  `| sudo VAR=value bash`. Not `sudo -E`, which also gives root your `HOME`: a source build refuses a `HOME` that
+  root does not own, since it would run the Rust toolchain from there.
 - A non-zero exit code is a failure: do not go on to the next step. The exceptions are stated where they occur:
   an `ssctl drain` timeout (section 11.1) and the warnings of `--check` (section 2.2).
 - Commands are written for systemd; for the OpenRC (Alpine) equivalents see the table in section 12.
@@ -204,7 +206,7 @@ musl build (v0.4.0 and earlier), it likewise switches to a source build.
 | The target host needs | No toolchain at all; the installer installs only runtime dependencies (the package lists in section 2.4) | A build toolchain (clang/LLVM, bpftool, libbpf/libelf/zlib development packages, Rust), which the installer installs and records automatically and `--uninstall` removes again |
 | What gets installed | The latest release (or the one `--release` names): changes merged into `main` after it are not included | The source tree being run (for the one-line install, `--ref`, default `main`) |
 | Where the BPF objects' types come from | The 6.12 LTS reference header pinned by the release pipeline; at load time CO-RE fixes field offsets against this host's kernel BTF | This host's `/sys/kernel/btf/vmlinux` |
-| Integrity check | The `.sha256` next to the artifact must match; when no `.sha256` can be fetched, it warns: a downloaded artifact is then trusted on TLS alone, and a local file is not checked | The source tree itself (`scripts/bootstrap.sh` can pin the tarball's digest with `SKYLINE_SHA256`) |
+| Integrity check | The `.sha256` next to the artifact must match; a downloaded artifact without one is not installed, and a local file without one is installed unchecked, with a warning | The source tree itself (`scripts/bootstrap.sh` can pin the tarball's digest with `SKYLINE_SHA256`) |
 
 All other steps are identical: the same verifier pass, the same services (systemd units or OpenRC scripts) and
 the same configuration template.
@@ -231,15 +233,16 @@ stderr as well.
 
 | Environment variable | Effect |
 |---|---|
-| `SKYLINE_ARTIFACT_URL` | Skips the release lookup and uses an https URL (a mirror, an internal artifact repository) or a local file path directly as the artifact; takes precedence over `--release`, and when both are given it warns that `--release` was not used; `<URL or path>.sha256` is checked when it exists (section 2.3). When the install switches to a source build (the host cannot run the artifact, or `--source`), it has no effect, and the installer likewise warns |
+| `SKYLINE_ARTIFACT_URL` | Skips the release lookup and uses an https URL (a mirror, an internal artifact repository) or a local file path directly as the artifact; takes precedence over `--release`, and when both are given it warns that `--release` was not used; `<URL>.sha256` must be there and match, `<path>.sha256` is checked when it exists (section 2.3). When the install switches to a source build (the host cannot run the artifact, or `--source`), it has no effect, and the installer likewise warns |
 | `SKYLINE_VERBOSE=1` | Same as `--verbose` |
 | `SKYLINE_REPO` | The repository releases are looked up in, default `CYBERVERSE-Research/skyline-speeder` |
 
 The arguments of `scripts/bootstrap.sh` itself: `--ref <git ref>` (environment variable `SKYLINE_REF`, default
 `main`), `--repo <owner/name>` (`SKYLINE_REPO`, the repository the source is taken from), `--src-dir <path>`
 (`SKYLINE_SRC_DIR`, default `/usr/local/src/skyline-speeder`); `SKYLINE_SHA256=<digest>` pins the downloaded
-source tarball (pass it in with `sudo -E`). `--repo` only decides where the source comes from; to make the
-installer take releases from that repository too, set the environment variable `SKYLINE_REPO`.
+source tarball (give it to sudo, not to curl: `curl ... | sudo SKYLINE_SHA256=<digest> bash -s -- --ref <tag>`).
+`--repo` only decides where the source comes from; to make the installer take releases from that repository too,
+set the environment variable `SKYLINE_REPO`.
 
 ### 2.3 Artifact source and checksum
 
@@ -253,12 +256,12 @@ SKYLINE_ARTIFACT_URL=/path/to/skyline-speeder-<tag>-x86_64.tar.gz ./install.sh -
 ```
 
 The `<artifact>.sha256` published next to the artifact must match the downloaded (or copied) tarball, or the
-install aborts; when a local file has no `.sha256` next to it, the installer warns that it is unchecked. The
-`MANIFEST` in the tarball records the tag, the commit, the reference header's digest, `libc=`, and the SHA-256
-of every binary and object: the full content goes into the install log, and the summary shows one line of
-provenance (artifact name, commit, whether the sha256 was checked). An artifact whose `libc=` does not match
-this host's C library (for example, `SKYLINE_ARTIFACT_URL` pointing at the wrong file) is rejected before the
-verifier, with a note on which one to use.
+install aborts; it aborts too when a downloaded artifact has none, and when a local file has no `.sha256` next to
+it, the installer warns that it is unchecked. The `MANIFEST` in the tarball records the tag, the commit, the
+reference header's digest, `libc=`, and the SHA-256 of every binary and object: the full content goes into the
+install log, and the summary shows one line of provenance (artifact name, commit, whether the sha256 was checked).
+An artifact whose `libc=` does not match this host's C library (for example, `SKYLINE_ARTIFACT_URL` pointing at the
+wrong file) is rejected before the verifier, with a note on which one to use.
 
 What is installed is a published release, not `main`: changes merged into `main` after the latest release
 reach the default install only with the next release.
