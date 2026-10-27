@@ -26,6 +26,8 @@ Kernel it ran on: `uname -r` =
 - [ ] Install paths `/opt`, `/etc`, `/run/skyline-speeder` still agree across config, units and scripts
 - [ ] `RuntimeDirectory=` still matches the parent directory of `socket_path`
 - [ ] `checkpath -d /run/skyline-speeder` in `packaging/openrc/skyline-speederd` still matches it too
+- [ ] `StateDirectory=` and `checkpath -d /var/lib/skyline-speeder` are still the parent of `DAEMON_REPORTS_DIR`
+- [ ] Error reports are still sent only on a `y` typed on a terminal or `SKYLINE_FEEDBACK=yes`, scrubbed first, never by the daemon; the DSN is still only sealed, its two copies agree, and no plain DSN or Sentry auth token is in the diff
 - [ ] Config delivery still writes the slot before `config_seq`, and BPF still reads only each flow's own copy (no torn reads)
 - [ ] Sysctl order unchanged: `enable` writes `skyline_cc` after the attach and arms the guard after that; `drain` disarms the guard and writes `fallback_cc` under its lock before it unregisters; a stop of the daemon joins the guard before `BpfRuntime` drops and writes no sysctl
 - [ ] `skyline-speeder-enable` (the systemd unit and the OpenRC script) still exists, and `infra/boot-enable.sh` still writes no sysctl

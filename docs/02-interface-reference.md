@@ -108,6 +108,26 @@ section 6.9). On by default.
 | `ssctl set-redundancy [--first-kib <1-1024>] [--delay-ms <0-100>] [--disable]` | Overwrites `[redundancy]` as a whole: parameters not given take the built-in defaults (`64`/`10`), not "unchanged"; `--disable` turns it off. Takes effect immediately when skyline_cc is enabled, otherwise at the next `ssctl enable` |
 | `ssctl reset-redundancy` | Restores the `[redundancy]` declared in the configuration file (on, with `64`/`10`, when the section is omitted entirely) |
 
+### 2.7 Error reports
+
+After its own output, `ssctl` may ask `Send it? [y/N, v to view it first]` and sends an error report to the
+developers only on `y` (`DEPLOY.md` section 13.6 has what a report holds and what is removed from it). It asks
+about:
+
+- a refused `enable` (the daemon's error message);
+- a daemon it cannot reach, when the service manager has given up on skyline-speederd (`failed`, OpenRC's
+  `crashed`), or the daemon left a report (below) -- not a daemon somebody stopped or one still starting;
+- a reply it cannot read or decode;
+- every report skyline-speederd left in `/var/lib/skyline-speeder/reports/` (`DAEMON_REPORTS_DIR`): one JSON
+  object per file, `{"version", "kind": "exited" | "panicked", "message", "first_seen", "last_seen", "count"}`
+  (times in Unix seconds), written when `main` returns an error or any thread panics, outside `--validate-only`.
+  Each is removed once it is sent or declined.
+
+Other refusals -- a drain that timed out, a value out of range -- are the command working as documented and ask
+nothing. It asks only when it runs as root, without `--json`, with stdin and stderr on a terminal. As root, the
+environment variable `SKYLINE_FEEDBACK` decides in advance: `no` never asks, `yes` sends without asking (with no
+terminal too), `ask` (or unset) is the default. The exit status does not change with the answer.
+
 ## 3. Unix socket wire protocol
 
 The transport format is a single-line JSON request plus a single-line JSON response, exchanged over a Unix domain

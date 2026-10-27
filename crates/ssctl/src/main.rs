@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (c) 2026 CYBERVERSE LLC
+mod feedback;
 mod style;
 mod view;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use feedback::Feedback;
 use skyline_common::{
     Module, ModuleTuningConfig, RackRtoConfig, RedundancyConfig, Request, Response,
     RetransmitDscpConfig,
@@ -350,15 +352,39 @@ fn request(command: Command) -> Request {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
     let arguments = Arguments::parse();
     let theme = Theme::detect(arguments.color);
-    let mut stream = UnixStream::connect(&arguments.socket).with_context(|| {
-        format!(
-            "connect to {} (is skyline-speederd running?)",
-            arguments.socket.display()
-        )
-    })?;
+    let feedback = Feedback::detect(arguments.json);
+    let code = run(arguments, &theme, &feedback).unwrap_or_else(|error| {
+        // What `fn main() -> Result<()>` printed before, word for word.
+        eprintln!("Error: {error:?}");
+        feedback.offer_error(&theme, "ssctl failed", &format!("{error:#}"));
+        1
+    });
+    std::process::exit(code);
+}
+
+/// The exit status; an error asks about a report in `main`. Each other way
+/// out asks here, after the command's own output: whether a report is worth
+/// offering depends on how it failed (see `Feedback`).
+fn run(arguments: Arguments, theme: &Theme, feedback: &Feedback) -> Result<i32> {
+    let mut stream = match UnixStream::connect(&arguments.socket) {
+        Ok(stream) => stream,
+        Err(error) => {
+            let error = anyhow::Error::new(error).context(format!(
+                "connect to {} (is skyline-speederd running?)",
+                arguments.socket.display()
+            ));
+            eprintln!("Error: {error:?}");
+            feedback.offer_unreachable(theme, &format!("{error:#}"));
+            return Ok(1);
+        }
+    };
+    // A refused enable is the one refusal worth a report: the others --
+    // a drain that timed out, a value out of range -- are the command
+    // working as documented.
+    let enable = matches!(arguments.command, Command::Enable { .. });
     let request = request(arguments.command);
     let wants = View::of(&request);
     serde_json::to_writer(&mut stream, &request)?;
@@ -375,17 +401,23 @@ fn main() -> Result<()> {
         // only to a terminal -- see `stderr_is_terminal`.
         emit(&format!("{}\n", serde_json::to_string_pretty(&response)?))?;
         if theme.stderr_is_terminal() {
-            eprintln!("{}", view::sponsor(&theme));
+            eprintln!("{}", view::sponsor(theme));
         }
     } else {
-        emit(&wants.render(&theme, &response))?;
+        emit(&wants.render(theme, &response))?;
     }
     if response.ok {
-        Ok(())
+        feedback.offer_recorded(theme);
+        Ok(0)
     } else {
         // The message is already on screen in both modes; repeating it as
         // the process error would print it twice.
-        std::process::exit(1);
+        if enable {
+            feedback.offer_error(theme, "enable failed", &response.message);
+        } else {
+            feedback.offer_recorded(theme);
+        }
+        Ok(1)
     }
 }
 

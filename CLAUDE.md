@@ -45,8 +45,10 @@ skyline-speederd --config config/speeder.toml --validate-only --verify-bpf   # v
 - **`cong_control`** keeps its 4-argument `(sk, ack, flag, rs)` signature (kernel >= 6.10). → `bpf/CLAUDE.md`
 - **struct_ops maps `skyline_cc` / `skyline_cc_txs`** set the same callbacks: a callback goes into both. → `bpf/CLAUDE.md`
 - **Install paths** `/opt`, `/etc`, `/run/skyline-speeder` agree across config, units, OpenRC scripts and scripts;
-  `RuntimeDirectory=` and OpenRC's `checkpath -d` are the parent of `socket_path`, `events_path` and `state_path`.
-  → `packaging/CLAUDE.md`
+  `RuntimeDirectory=` and OpenRC's `checkpath -d` are the parent of `socket_path`, `events_path` and `state_path`;
+  `StateDirectory=` and the second `checkpath` are the parent of `DAEMON_REPORTS_DIR`. → `packaging/CLAUDE.md`
+- **Error reports** are sent only on a `y` typed on a terminal (or `SKYLINE_FEEDBACK=yes`), scrubbed first; the daemon
+  only records. The DSN is in the tree only sealed, by `infra/seal-feedback-dsn.py`, in two copies. → `crates/CLAUDE.md`
 - **`PRR-SSRB`** in `bpf/skyline_cc.bpf.c` is RFC 6937 terminology, not the project's old name SSR: never rename it, and
   protect it with word boundaries in a bulk rename.
 - **Configuration plane:** every `set-*` command is an absolute overwrite; a switch writes the slot before the sequence
@@ -68,7 +70,8 @@ skyline-speederd --config config/speeder.toml --validate-only --verify-bpf   # v
 ## Never commit
 
 `bpf/include/vmlinux.h`, `target/`, `build/`, `*.bpf.o`, a rendered `user-data` (commit `user-data.template`),
-`known_hosts`, keys, filled-in lab inventories, any `/home/<user>` path, `.claude/` and `CLAUDE.local.md` at any level.
+`known_hosts`, keys, filled-in lab inventories, any `/home/<user>` path, `.claude/` and `CLAUDE.local.md` at any level,
+a plain Sentry DSN or a Sentry auth token (seal the DSN with `infra/seal-feedback-dsn.py`).
 The `CLAUDE.md` files are public: no host addresses, account names, tokens or personal paths.
 
 ## Every change

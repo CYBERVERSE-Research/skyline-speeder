@@ -73,7 +73,7 @@ sudo ./install.sh --uninstall --restore-pre-install   # ... but put back the
                                #   congestion control and qdisc from before the install
 ```
 
-The installer uses the distribution's own package manager and service manager — apt, dnf or apk; systemd, or OpenRC on Alpine, where `rc-service skyline-speederd restart` stands in for `systemctl restart skyline-speederd` in these docs. It checks the kernel, builds or downloads the three BPF objects and the daemon, points the TC program at the default-route interface (IPv4 or IPv6; when that route leaves through a tunnel such as WireGuard, it asks you to name the NIC), runs every object through the kernel verifier, then starts the daemon, attaches `skyline_cc` and enables both at boot. It shows one progress line and keeps every command's output in `/var/log/skyline-speeder-install.log`; when it finishes it prints the congestion control and qdisc before and after, then a short guide to `ssctl`, tuning and uninstalling. **It installs no proxy and opens no port.**
+The installer uses the distribution's own package manager and service manager — apt, dnf or apk; systemd, or OpenRC on Alpine, where `rc-service skyline-speederd restart` stands in for `systemctl restart skyline-speederd` in these docs. It checks the kernel, builds or downloads the three BPF objects and the daemon, points the TC program at the default-route interface (IPv4 or IPv6; when that route leaves through a tunnel such as WireGuard, it asks you to name the NIC), runs every object through the kernel verifier, then starts the daemon, attaches `skyline_cc` and enables both at boot. It shows one progress line and keeps every command's output in `/var/log/skyline-speeder-install.log`; when it finishes it prints the congestion control and qdisc before and after, then a short guide to `ssctl`, tuning and uninstalling. **It installs no proxy and opens no port.** If it fails, it asks whether to send an error report, and sends one only if you answer `y` ([Error reports](#error-reports)).
 
 `--uninstall` drains live flows, removes the two services (systemd units, or the OpenRC scripts on Alpine), binaries and BPF objects, puts the host on **bbr + fq**, and removes the packages the install added. It records which packages those were (`/etc/skyline-speeder/added-packages`) and removes only those: never `iproute2` (`iproute` and `iproute-tc` on Fedora/RHEL), `curl`, `ca-certificates` or `tar` (or `bash` on Alpine), never anything one of those still needs (keeping `curl` while removing the library under it is not something apt can do), and never anything dpkg calls *required* or *important* or dnf protects. The removal is planned first (by apt, or `rpm -e --test`; apk never removes what something still needs): a package something else on the host now needs is kept and named, and the rest is removed; only when no reduced plan stays inside the recorded list is nothing removed at all, and the command to do it by hand is printed instead. A rustup toolchain is removed only if the installer is the one that installed it. `bbr` and `fq` are set for that boot; no file under `/etc/sysctl.d` is written or edited, so those files decide again after a reboot. `--restore-pre-install` puts back the congestion control and qdiscs the host ran before instead — it also records those, including the egress interface's root qdisc. `/etc/skyline-speeder` is kept either way, so a reinstall keeps your settings.
 
@@ -138,6 +138,7 @@ The shipped defaults are tuned values; **most deployments should change nothing.
 | [Retransmit DSCP marking](#retransmit-dscp-marking) | off | marks retransmissions for the network upstream | `ssctl set-retransmit-dscp` |
 | [Global loss-detection sysctls](#global-loss-detection-sysctls) | the host's own | three `net.ipv4` sysctls the daemon can set at start | `[rack_tuning]` |
 | [Event log](#event-log) | on, rotated at 8 MiB | one line per mode switch, loss event and guardrail trip | `[runtime] events_max_mib` |
+| [Error reports](#error-reports) | asked after an error; sent only on `y` | an error report to the developers when an install, upgrade or the daemon fails | the question; `SKYLINE_FEEDBACK` |
 
 An `ssctl set-*` command takes effect at once and lasts until the daemon restarts; [Keeping a change](#keeping-a-change-across-restarts) makes it permanent. Every line of `ssctl status` and `ssctl flows` is explained [at the end of this section](#reading-ssctl-status-and-ssctl-flows).
 
@@ -265,6 +266,20 @@ The host's own values by default. A `[rack_tuning]` section in the config makes 
 ### Event log
 
 On by default. The mode switches, loss events, guardrail trips, window undos and configuration switches of every skyline_cc connection go into `/run/skyline-speeder/events.jsonl`, one JSON line each, keyed by socket cookie. `/run` lives in memory, so past `events_max_mib` (8 MiB, under `[runtime]`) the file is rotated to `events.jsonl.1`, replacing the one before, so the log never takes much more than twice that; 0 turns the log off, and a change needs a daemon restart. The event codes are in [docs/02-interface-reference.md](docs/02-interface-reference.md) §8 (Chinese); guardrail trips are type 9, which `ssctl flows` points to under *guardrail trips*.
+
+### Error reports
+
+Asked, never assumed. When an install, an upgrade or an uninstall fails, `install.sh` asks once whether to send an error report to the developers. So does `ssctl` when `enable` is refused, when the daemon cannot be reached because it failed, and when skyline-speederd stopped on an error or panicked: the daemon has no terminal to ask on, so it records the error in `/var/lib/skyline-speeder/reports` and the next `sudo ssctl` run on a terminal asks. **Nothing is sent unless you answer `y`**; `v` shows first exactly what would be sent. With no terminal to ask on (a pipeline, cloud-init, cron, `--json`), nothing is asked and nothing is sent.
+
+A report holds the error, the step that failed, the Skyline Speeder version, the distribution, kernel, architecture, C library and service manager, and the last 40 lines of the failing step's install log or of the daemon's log. IPv4, IPv6 and MAC addresses, e-mail addresses, credentials in URLs, tokens, home directories, the host name and your user name are removed before it is shown or sent. It goes over HTTPS, through `curl`, to the project's Sentry; the address it goes to is in the code only encrypted.
+
+Cost: nothing until something fails, then one question. To never be asked, set `SKYLINE_FEEDBACK=no`; `SKYLINE_FEEDBACK=yes` sends without asking, for automation that wants its failures reported:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo SKYLINE_FEEDBACK=no bash
+```
+
+A report you decline is discarded, and `--uninstall` removes `/var/lib/skyline-speeder`. No line of `ssctl status` or `ssctl flows` shows it: the question comes right after the error.
 
 ### Keeping a change across restarts
 

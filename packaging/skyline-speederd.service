@@ -13,6 +13,12 @@ RestartSec=2
 NoNewPrivileges=false
 ProtectSystem=strict
 RuntimeDirectory=skyline-speeder
+# /var/lib/skyline-speeder: where the daemon records an error it stops on, for
+# the next ssctl on a terminal to offer as an error report (DAEMON_REPORTS_DIR
+# in skyline-common). Unlike RuntimeDirectory= it outlives a failed start --
+# the very failure worth a report -- and a reboot.
+StateDirectory=skyline-speeder
+StateDirectoryMode=0700
 ReadWritePaths=-/sys/fs/bpf/skyline-speeder -/sys/fs/cgroup/skyline-speeder
 PrivateTmp=true
 
