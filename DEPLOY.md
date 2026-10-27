@@ -101,6 +101,10 @@ install (section 2.2), which by design does not attach.
   (`--check` and `--uninstall` do not write it). When a step fails, the installer prints `error <reason>`, at
   most the last 25 lines of that step in the log, and the log path, and exits non-zero. Interrupted with
   Ctrl-C, it exits with 130, and background build processes end with it.
+- After a failed install, upgrade or uninstall, the installer asks on the terminal (`/dev/tty`) whether to send
+  an error report, and sends one only on `y` (section 13.6). **A run with no controlling terminal -- an agent, CI,
+  cloud-init -- is never asked and sends nothing**; the exit code is the same either way. `SKYLINE_FEEDBACK=yes`
+  sends without asking, `SKYLINE_FEEDBACK=no` never asks.
 - Duration: a prebuilt install usually takes under a minute, plus up to 60 seconds of drain on an upgrade
   (section 10); a source build takes 5–10 minutes on a 1-vCPU host, longer on Alpine. Allow generous timeouts.
 
@@ -235,6 +239,7 @@ stderr as well.
 |---|---|
 | `SKYLINE_ARTIFACT_URL` | Skips the release lookup and uses an https URL (a mirror, an internal artifact repository) or a local file path directly as the artifact; takes precedence over `--release`, and when both are given it warns that `--release` was not used; `<URL>.sha256` must be there and match, `<path>.sha256` is checked when it exists (section 2.3). When the install switches to a source build (the host cannot run the artifact, or `--source`), it has no effect, and the installer likewise warns |
 | `SKYLINE_VERBOSE=1` | Same as `--verbose` |
+| `SKYLINE_FEEDBACK` | After a failure: unset or `ask` asks on the terminal whether to send an error report, `yes` sends one without asking, `no` never asks (section 13.6). `ssctl` reads it too |
 | `SKYLINE_REPO` | The repository releases are looked up in, default `CYBERVERSE-Research/skyline-speeder` |
 
 The arguments of `scripts/bootstrap.sh` itself: `--ref <git ref>` (environment variable `SKYLINE_REF`, default
@@ -373,6 +378,7 @@ values of a few common parameters and where to tune them, and how many packages 
 | `/var/log/skyline-speeder-install.log` | The install log |
 | `/usr/local/src/skyline-speeder` | The source tree, when installed through the bootstrap script |
 | `/run/skyline-speeder/` | Runtime: the control socket `speeder.sock`, the event log `events.jsonl`, `state.json` (section 13) |
+| `/var/lib/skyline-speeder/reports/` | The errors skyline-speederd stopped on, waiting for the next `ssctl` on a terminal to offer them as an error report (section 13.6); `StateDirectory=` in the unit (`checkpath` under OpenRC), mode 0700 |
 | `/sys/fs/cgroup/skyline-speeder`, `/sys/fs/bpf/skyline-speeder` | The cgroup of section 7; the directory under bpffs |
 
 ### 2.6 Releases older than the guard
@@ -964,8 +970,8 @@ nothing is attached at boot).
 ```
 
 It first drains (disarming the guard as well; when the enable unit is active, the unit's ExecStop drains as it
-stops, without a second wait), disables and deletes the two units (or the two OpenRC scripts), the binaries and
-`/opt/skyline-speeder`,
+stops, without a second wait), disables and deletes the two units (or the two OpenRC scripts), the binaries,
+`/opt/skyline-speeder` and `/var/lib/skyline-speeder` (the error reports waiting there, section 13.6),
 **keeps** `/etc/skyline-speeder` (so the configuration is still there on a reinstall), the install log, the
 bootstrap script's source tree and `/sys/fs/{cgroup,bpf}/skyline-speeder`, and then:
 
@@ -1112,7 +1118,8 @@ The one-line install applies as usual; these are the only differences:
 
 | Symptom | Look first at |
 |---|---|
-| The install fails at some step | The `error` line on screen and the tail of the log; the full output is in `/var/log/skyline-speeder-install.log` (section 0.3) |
+| The install fails at some step | The `error` line on screen and the tail of the log; the full output is in `/var/log/skyline-speeder-install.log` (section 0.3). It then asks whether to send an error report (section 13.6) |
+| `Help us fix this? Send an error report ...` after an `ssctl` command | skyline-speederd recorded an error it stopped on, or the command failed in a way worth reporting (section 13.6) |
 | `Error: configured fallback congestion control is unavailable` | Section 13.4 |
 | The verifier rejects `skyline_cc` with an error pointing at the argument count | The kernel is an old branch such as 6.1/6.6, which is unsupported (section 1.3) |
 | `ssctl` reports `connect to /run/skyline-speeder/speeder.sock` | The daemon did not come up or is still starting (section 5.1); `journalctl -u skyline-speederd.service` |
@@ -1179,6 +1186,47 @@ reboot cubic is not loaded, so the automatic attach at boot fails.
 IPv4 connections on a dual-stack listening socket appear as IPv4-mapped `AF_INET6` (`::ffff:a.b.c.d`), not as
 plain `AF_INET` — this is normal for most services that do not bind an address family explicitly, not an
 anomaly. Skyline Speeder's address-family checks accept both forms.
+
+### 13.6 Error reports
+
+Nothing is ever sent without a `y`. The question comes after these, once each:
+
+| Where | When |
+|---|---|
+| `install.sh` | An install, upgrade or `--uninstall` fails (not `--check`, not a refusal before anything ran such as "must run as root", not Ctrl-C) |
+| `ssctl` | `enable` is refused; the daemon cannot be reached and its service manager has given up on it (`failed`, OpenRC's `crashed`); a reply does not decode |
+| `ssctl` | skyline-speederd recorded an error it stopped on (`main` returned an error) or a panic in any thread, in `/var/lib/skyline-speeder/reports/` -- asked about after the command's own output, on the next `ssctl` run on a terminal |
+
+It is asked only on a terminal: `install.sh` asks on `/dev/tty`, `ssctl` only when it runs as root without
+`--json` and both stdin and stderr are terminals. Answers: `y` sends, `v` shows every field that would be sent and
+asks again, anything else (or five minutes without an answer) sends nothing. A daemon report is removed once it
+is sent or declined, so it is asked about once; one that could not be sent stays for the next time. A report
+`install.sh` offers takes the daemon's reports along with it. The daemon records at most 10 distinct reports; the
+same failure on every restart adds to one report's `count`.
+
+`SKYLINE_FEEDBACK` decides in advance, for both tools (`ssctl` only as root): `no` never asks, `yes` sends without
+asking (also with no terminal), unset or `ask` asks. Through sudo: `sudo SKYLINE_FEEDBACK=no ./install.sh`.
+
+A report is one Sentry event per error, sent with `curl` over HTTPS (TLS 1.2 or newer). It carries: the error and
+its causes, the failing step (install) or the command (`ssctl`), the version, `ID`, `VERSION_ID` and `PRETTY_NAME`
+from `/etc/os-release`, the kernel release, the architecture, the C library, the package and service manager, the
+service state, and the last 40 lines of the failing step's install log or of the daemon's log (`journalctl -u
+skyline-speederd.service -o cat`, or its lines in `/var/log/messages` under OpenRC). Before it is shown or sent,
+IPv4, IPv6 and MAC addresses, e-mail addresses, credentials in URLs, GitHub and Sentry tokens, the values of
+`token=`, `secret=` and `password=` pairs, `/home/<user>`, the host name and the invoking user's name are replaced
+by placeholders such as `<ipv4>` and `<host>`; it errs towards removing too much (a four-part version number reads
+as an address). No host name, machine ID or user identity is sent.
+
+The Sentry DSN is compiled into `ssctl` and written into `install.sh` only encrypted (ChaCha20). The key is in the
+same code, as it has to be for the tools to use the DSN, so this keeps the DSN away from scanners rather than
+secret; a DSN can only submit events. `infra/seal-feedback-dsn.py` seals a new one; with none sealed, nothing asks
+and nothing is sent.
+
+A daemon report, `/var/lib/skyline-speeder/reports/<hash>.json`, one JSON object:
+
+```json
+{"version":"<skyline-speederd version>","kind":"exited","message":"<error with its causes>","first_seen":1793000000,"last_seen":1793000100,"count":4}
+```
 
 ---
 

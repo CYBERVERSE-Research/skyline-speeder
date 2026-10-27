@@ -10,6 +10,7 @@ directory; the repository-wide conventions are in the root `CLAUDE.md`.
 | Install paths `/opt`, `/etc`, `/run/skyline-speeder` | config, units (the two OpenRC scripts in `packaging/openrc/` included), scripts | All three must agree |
 | `RuntimeDirectory=skyline-speeder` | `packaging/skyline-speederd.service` | **Must be the parent directory of `socket_path`** (and of `events_path`, `state_path`): the unit sets `ProtectSystem=strict`, under which this is the one directory in `/run` the daemon can write |
 | `checkpath -d /run/skyline-speeder` | `packaging/openrc/skyline-speederd` | OpenRC's `RuntimeDirectory=`: **must be the parent directory of `socket_path`** (and of `events_path`, `state_path`), where the daemon opens its event log first |
+| `StateDirectory=skyline-speeder`, `checkpath -d /var/lib/skyline-speeder` | `packaging/skyline-speederd.service`, `packaging/openrc/skyline-speederd` | **Must be the parent directory of `DAEMON_REPORTS_DIR`** (`/var/lib/skyline-speeder/reports`, `crates/skyline-common`), which `ssctl` and `install.sh` (`FEEDBACK_DAEMON_REPORTS`, and `--uninstall`, which removes it) read too: under `ProtectSystem=strict` it is the one directory under `/var/lib` the daemon can write, and a mismatch only costs a line on stderr when a report cannot be written -- the error report is silently lost |
 
 > A bulk rename is the usual way to break the `RuntimeDirectory` / `socket_path` coupling (say,
 > `RuntimeDirectory=skyline` while the config still says `/run/skyline-speeder/`). The daemon creates the parent

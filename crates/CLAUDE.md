@@ -63,6 +63,24 @@ in `config/CLAUDE.md`.
   halves** -- slot first, sequence number second; BPF reads only the copy -- or you get torn reads (a second update
   within one RTT rewrites a slot that live flows are still reading).
 
+## Error reports
+
+`ssctl` (`src/feedback.rs`) and `install.sh` ("error reports") offer an error report after a failure and send one
+only on a `y` typed on a terminal, or with `SKYLINE_FEEDBACK=yes`; with no terminal nothing is asked or sent.
+skyline-speederd has no terminal and **never sends**: `src/reports.rs` records an error `main` returns and every panic
+in `DAEMON_REPORTS_DIR`, and the next `ssctl` on a terminal asks. Keep the two senders in step -- what a report holds,
+what `scrub` / `feedback_scrub` remove, the question -- and keep every path that sends behind the question. `ssctl`
+asks only for failures that are not the command working as documented (a refused `enable`, a failed daemon, an
+unreadable reply), never for a drain timeout or a value out of range. Sending goes through `curl` with its
+configuration on stdin, so no binary here links a TLS stack and no command line carries the DSN.
+
+The DSN is in the tree only sealed (ChaCha20 under a key that is in the same files -- it keeps the DSN from scanners,
+not secret). `infra/seal-feedback-dsn.py` writes both copies, `crates/ssctl/src/feedback-dsn.sealed` and
+`FEEDBACK_SEALED` in `install.sh`; `cargo test -p ssctl` fails when they, or the key and nonce, disagree, and runs the
+shell's ChaCha20 against the Rust one and both scrubs over one text (`install_sh_scrubs_like_ssctl`: the sed once let
+`sntrys_` / `sntryu_` tokens through while `scrub` caught them). Empty means reports are off. Never commit a plain DSN
+or a Sentry auth token.
+
 ## The test that guards the guest config
 
 `guest_config_never_owns_global_sysctls` in `crates/skyline-common/src/lib.rs` guards the rule in `config/CLAUDE.md`

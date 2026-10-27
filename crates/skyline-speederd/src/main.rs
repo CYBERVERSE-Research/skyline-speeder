@@ -2,6 +2,7 @@
 // Copyright (c) 2026 CYBERVERSE LLC
 mod flows;
 mod guard;
+mod reports;
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytemuck::{bytes_of, try_from_bytes, try_pod_read_unaligned};
@@ -2213,6 +2214,21 @@ fn spawn_shutdown_signal_watcher(socket_path: PathBuf) -> Result<JoinHandle<()>>
 
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
+    // A daemon that stops on an error or panics leaves a report for the next
+    // `ssctl` on a terminal to offer (see `reports`). Not for --validate-only:
+    // whoever runs that sees the error, and install.sh offers its own report.
+    if arguments.validate_only {
+        return run(&arguments);
+    }
+    reports::record_panics();
+    let result = run(&arguments);
+    if let Err(error) = &result {
+        reports::record("exited", &format!("{error:#}"));
+    }
+    result
+}
+
+fn run(arguments: &Arguments) -> Result<()> {
     let config = SkylineConfig::load(&arguments.config)?;
     let daemon = Daemon::new(config)?;
     if arguments.validate_only {

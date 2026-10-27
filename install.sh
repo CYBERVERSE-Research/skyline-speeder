@@ -37,6 +37,13 @@
 # /var/log/skyline-speeder-install.log, which is kept; if a step fails, its
 # last lines are shown together with that path.
 #
+# A failed install, upgrade or uninstall then asks whether to send an error
+# report to the developers, and sends one only if you answer y (v shows it
+# first). It holds the error, the step, versions, distribution, kernel and the
+# failing step's last log lines, with addresses, the host name and user names
+# removed. With no terminal to ask on, nothing is sent. SKYLINE_FEEDBACK=yes
+# sends without asking; SKYLINE_FEEDBACK=no never asks.
+#
 # --uninstall removes the build toolchain it installed (clang, LLVM, bpftool,
 # rustup and what came with them) and nothing else: only packages recorded as
 # added by an install of this host, never iproute2 (iproute on Fedora/RHEL),
@@ -203,7 +210,7 @@ BAR=0           # 1: the redrawn progress line is in use (QUIET on a terminal)
 LOG_READY=0     # 1: $LOG has been started for this run
 BAR_SHOWN=0     # 1: the progress line is on screen and must be cleared first
 STEP_NO=0 STEP_TOTAL=0 STEP_NAME= STEP_T0=0 STEP_OPEN=0 STEP_RAN=0 STEP_LOG_LINE=0
-SPIN_I=0 COLS=80 BG_PID= WORK= FAILED=0 INTERRUPTED=0 APT_SIM=
+SPIN_I=0 COLS=80 BG_PID= WORK= FAILED=0 FAIL_MESSAGE= INTERRUPTED=0 APT_SIM=
 # The new daemon, put beside the installed one to be verified before it
 # replaces it; see "Running the kernel verifier". on_exit removes what is left.
 STAGED_DAEMON=
@@ -235,7 +242,7 @@ die() {
 
 # fail_report <message> <show-log-tail: 0|1>
 fail_report() {
-    FAILED=1
+    FAILED=1 FAIL_MESSAGE=$1
     bar_clear
     printf '%serror%s %s\n' "$RED" "$RST" "$1" >&4
     [ "$LOG_READY" -eq 1 ] || return 0
@@ -373,6 +380,263 @@ quietly() {
     if [ "$VERBOSE" -eq 1 ]; then "$@"; else "$@" >>"$LOG" 2>&1; fi
 }
 
+# --- error reports -------------------------------------------------------------
+# A failed install, upgrade or uninstall asks, once, whether to send an error
+# report to the developers, and sends one only when the answer is y. Nothing
+# is sent otherwise: not on any other answer, not after five minutes without
+# one, not when there is no terminal to ask on (a pipeline, cloud-init, CI).
+# SKYLINE_FEEDBACK=yes answers y in advance, for automation that wants its
+# failures reported; SKYLINE_FEEDBACK=no never asks. A refusal before anything
+# ran (not root, an unknown argument), --check, which exists to say what a
+# host lacks, and an interrupt ask nothing. ssctl asks the same way about
+# runtime errors (crates/ssctl/src/feedback.rs): keep the two in step -- what
+# a report holds, what is scrubbed from it, the question.
+#
+# The reports go to a Sentry project, whose DSN is sealed: ChaCha20 under the
+# key and nonce below, which are public, as they must be for this script to
+# open it. Sealing keeps the DSN out of plain text -- out of secret scanners
+# and of a grep for the ingest host -- and nothing more; a DSN can only submit
+# events. infra/seal-feedback-dsn.py writes FEEDBACK_SEALED, and the copy ssctl
+# compiles in; `cargo test -p ssctl` checks the two agree and runs
+# feedback_chacha against the Rust implementation. Empty: reports are off.
+FEEDBACK_SEAL_KEY=9a505fc64734e2f2c801a1c0e3d031c5ff2f5662cd1ba51624c75dac9555de1a
+FEEDBACK_SEAL_NONCE=a482acf480d0928b3c37c730
+FEEDBACK_SEALED=0b3e66e80afc3e71da442d2fc2e1d3fb4d2ab7dc54af25af4d7e43ea395f3983406754d3aed5c0f1c1c1103080f52fa26529a7c855bf36888fd7415fa62f81e8e11217
+case "${SKYLINE_FEEDBACK:-ask}" in
+    1|y|yes|true) FEEDBACK=yes ;;
+    0|n|no|false|never) FEEDBACK=no ;;
+    *) FEEDBACK=ask ;;
+esac
+# The ssctl this script runs never asks on its own: a failure of one of its
+# steps is this script's report to offer.
+export SKYLINE_FEEDBACK=no
+FEEDBACK_ARMED=0  # 1 once a failure is worth a report (after the root check)
+# What skyline-speederd records when it stops on an error or panics, for the
+# next interactive ssctl to offer (StateDirectory= in the unit). A report
+# offered here takes them along, so the same failure is not asked about twice.
+FEEDBACK_DAEMON_REPORTS=/var/lib/skyline-speeder/reports
+
+# feedback_qr <a> <b> <c> <d>: one ChaCha20 quarter round on the caller's x.
+feedback_qr() {
+    local t
+    x[$1]=$(( (x[$1] + x[$2]) & 0xffffffff )); t=$(( x[$4] ^ x[$1] ))
+    x[$4]=$(( ((t << 16) | (t >> 16)) & 0xffffffff ))
+    x[$3]=$(( (x[$3] + x[$4]) & 0xffffffff )); t=$(( x[$2] ^ x[$3] ))
+    x[$2]=$(( ((t << 12) | (t >> 20)) & 0xffffffff ))
+    x[$1]=$(( (x[$1] + x[$2]) & 0xffffffff )); t=$(( x[$4] ^ x[$1] ))
+    x[$4]=$(( ((t << 8) | (t >> 24)) & 0xffffffff ))
+    x[$3]=$(( (x[$3] + x[$4]) & 0xffffffff )); t=$(( x[$2] ^ x[$3] ))
+    x[$2]=$(( ((t << 7) | (t >> 25)) & 0xffffffff ))
+}
+
+# feedback_chacha <key hex> <nonce hex> <data hex>: ChaCha20 (RFC 8439, the
+# block counter from 1) over the data, as hex into REPLY; it seals and opens
+# alike. Pure bash, no openssl: a minimal image has none.
+feedback_chacha() {
+    local key=$1 nonce=$2 data=$3 out= stream i n t
+    local -a init x
+    init=(1634760805 857760878 2036477234 1797285236)  # "expand 32-byte k"
+    for ((i = 0; i < 8; i++)); do
+        init[4 + i]=$(( 16#${key:i*8+6:2}${key:i*8+4:2}${key:i*8+2:2}${key:i*8:2} ))
+    done
+    for ((i = 0; i < 3; i++)); do
+        init[13 + i]=$(( 16#${nonce:i*8+6:2}${nonce:i*8+4:2}${nonce:i*8+2:2}${nonce:i*8:2} ))
+    done
+    for ((n = 0; n < ${#data} / 2; n += 64)); do
+        init[12]=$(( n / 64 + 1 ))
+        x=("${init[@]}")
+        for ((i = 0; i < 10; i++)); do
+            feedback_qr 0 4 8 12; feedback_qr 1 5 9 13; feedback_qr 2 6 10 14; feedback_qr 3 7 11 15
+            feedback_qr 0 5 10 15; feedback_qr 1 6 11 12; feedback_qr 2 7 8 13; feedback_qr 3 4 9 14
+        done
+        stream=
+        for ((i = 0; i < 16; i++)); do
+            t=$(( (x[i] + init[i]) & 0xffffffff ))
+            printf -v stream '%s%02x%02x%02x%02x' "$stream" \
+                $((t & 255)) $((t >> 8 & 255)) $((t >> 16 & 255)) $((t >> 24 & 255))
+        done
+        for ((i = 0; i < 64 && n + i < ${#data} / 2; i++)); do
+            printf -v out '%s%02x' "$out" $(( 16#${data:(n+i)*2:2} ^ 16#${stream:i*2:2} ))
+        done
+    done
+    REPLY=$out
+}
+
+# feedback_dsn: FEEDBACK_SEALED opened into FEEDBACK_PUBLIC (the DSN's public
+# key) and FEEDBACK_URL (its envelope endpoint). Fails when none is sealed or
+# it does not open to an https DSN.
+feedback_dsn() {
+    local dsn= i
+    [ -n "$FEEDBACK_SEALED" ] || return 1
+    feedback_chacha "$FEEDBACK_SEAL_KEY" "$FEEDBACK_SEAL_NONCE" "$FEEDBACK_SEALED"
+    for ((i = 0; i < ${#REPLY}; i += 2)); do dsn+="\\x${REPLY:i:2}"; done
+    printf -v dsn '%b' "$dsn"
+    [[ "$dsn" =~ ^https://([0-9a-f]{32})@([A-Za-z0-9.-]+(:[0-9]+)?)((/[A-Za-z0-9._-]+)*)/([0-9]+)$ ]] \
+        || return 1
+    FEEDBACK_PUBLIC=${BASH_REMATCH[1]}
+    FEEDBACK_URL="https://${BASH_REMATCH[2]}${BASH_REMATCH[4]}/api/${BASH_REMATCH[6]}/envelope/"
+}
+
+# feedback_scrub: stdin to stdout without what names this host, its network or
+# its people: IPv4 and IPv6 addresses, MAC addresses, e-mail addresses,
+# credentials in URLs, tokens, home directories, the host name, the invoking
+# user. Errs on the side of removing too much: a version with four parts
+# reads as an address. ssctl's scrub() removes the same things, and
+# `cargo test -p ssctl` runs both over one text. Tokens: the prefixes GitHub
+# and Sentry issue (sntrys_ organization, sntryu_ user, sntrs_ older), not
+# after a word character, with + / = in the body -- an organization token is
+# sntrys_<base64>_<secret>, and a body that stopped at the base64's = left the
+# secret in the report.
+feedback_scrub() {
+    local text host name
+    text=$(sed -E \
+        -e 's#://[^/@[:space:]]+@#://<credentials>@#g' \
+        -e 's#[[:alnum:]._%+-]+@[[:alnum:]-]+(\.[[:alnum:]-]+)*\.[[:alpha:]]{2,}#<email>#g' \
+        -e 's#(^|[^[:alnum:]_])(gh[pousr]|github_pat|sntry[su]|sntrs)_[[:alnum:]_+/=-]{16,}#\1<token>#g' \
+        -e 's#(([Tt]oken|TOKEN|[Ss]ecret|SECRET|[Pp]ass(wd|word)|PASS(WD|WORD))[=:])[^[:space:]]+#\1<redacted>#g' \
+        -e 's#[0-9]{1,3}(\.[0-9]{1,3}){3}#<ipv4>#g' \
+        -e 's#([0-9A-Fa-f]{1,4}:){3,7}[0-9A-Fa-f]{1,4}#<ipv6-or-mac>#g' \
+        -e 's#([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}#<mac>#g' \
+        -e ':v6' \
+        -e 's#(^|[^[:alnum:]_:])[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{1,4})*::[0-9A-Fa-f:]*($|[^[:alnum:]_:])#\1<ipv6>\3#' \
+        -e 'tv6' \
+        -e 's#/home/[^/[:space:]]+#/home/<user>#g' 2>/dev/null) || text=
+    # Not `hostname -f`: that asks the resolver, which on a host with broken
+    # DNS -- one reason an install fails -- hangs.
+    host=$(cat /proc/sys/kernel/hostname 2>/dev/null || true)
+    for name in "$host" "${host%%.*}"; do
+        [ "${#name}" -lt 3 ] || text=${text//"$name"/<host>}
+    done
+    for name in "${SUDO_USER:-}" "${LOGNAME:-}"; do
+        [ "${#name}" -lt 3 ] || [ "$name" = root ] || text=${text//"$name"/<user>}
+    done
+    printf '%s' "$text"
+}
+
+# feedback_json <text>: the text as a JSON string, quotes included, into REPLY.
+feedback_json() {
+    local s
+    s=$(printf '%s' "$1" | LC_ALL=C tr -d '\001-\010\013-\037\177')
+    s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/\\n}; s=${s//$'\t'/\\t}
+    REPLY="\"$s\""
+}
+
+# feedback_build: the report on this run's failure, as a Sentry event into
+# FEEDBACK_EVENT and as the lines `v` shows into FEEDBACK_VIEW. Built from the
+# same values, so what is shown is what would be sent.
+feedback_build() {
+    local kind=$MODE message tail= daemon= os_id os_version os_name libc arch fields json f
+    [ "$MODE" != install ] || [ "${UPGRADE:-0}" -eq 0 ] || kind=upgrade
+    message=$(printf '%s' "$FAIL_MESSAGE" | feedback_scrub)
+    if [ "$LOG_READY" -eq 1 ] && [ -r "$LOG" ]; then
+        tail=$(tail -n +"$((STEP_LOG_LINE + 1))" "$LOG" 2>/dev/null | tail -n 40 | feedback_scrub)
+    fi
+    if [ -d "$FEEDBACK_DAEMON_REPORTS" ]; then
+        daemon=$(cat "$FEEDBACK_DAEMON_REPORTS"/*.json 2>/dev/null | feedback_scrub)
+    fi
+    os_id=$( . /etc/os-release 2>/dev/null; printf '%s' "${ID:-unknown}")
+    os_version=$( . /etc/os-release 2>/dev/null; printf '%s' "${VERSION_ID:-}")
+    os_name=$( . /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-${ID:-unknown}}")
+    if host_is_musl; then libc="musl $(musl_version 2>/dev/null || true)"
+    else libc="glibc $(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}' || true)"; fi
+    arch=$(uname -m)
+    # name=value pairs, the tags Sentry filters by; none of them names the host.
+    fields=("component=install.sh" "mode=$kind" "os=$os_id" "os_version=$os_version"
+            "kernel=$KVER" "arch=$arch" "libc=$libc" "package_manager=${PKG:-none}"
+            "init=${INIT:-none}" "source=$SOURCE" "release_asked=${RELEASE_TAG:-latest}"
+            "from_version=${OLD_VERSION:-}")
+    json=
+    for f in "${fields[@]}"; do
+        feedback_json "${f#*=}"; json+=",\"${f%%=*}\":$REPLY"
+    done
+    FEEDBACK_EVENT_ID=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    FEEDBACK_EVENT="{\"event_id\":\"$FEEDBACK_EVENT_ID\",\"timestamp\":$(date -u +%s)"
+    FEEDBACK_EVENT+=",\"platform\":\"other\",\"level\":\"error\",\"logger\":\"install.sh\""
+    FEEDBACK_EVENT+=",\"environment\":\"production\",\"tags\":{${json#,}}"
+    feedback_json "$message"
+    FEEDBACK_EVENT+=",\"exception\":{\"values\":[{\"type\":\"$kind failed\",\"value\":$REPLY}]}"
+    feedback_json "$os_name"
+    FEEDBACK_EVENT+=",\"contexts\":{\"os\":{\"name\":$REPLY"
+    feedback_json "$KVER"
+    FEEDBACK_EVENT+=",\"kernel_version\":$REPLY}}"
+    # Grouped by where it failed and what it said, numbers aside.
+    feedback_json "$STEP_NAME"; f=$REPLY
+    feedback_json "$(printf '%s' "$message" | head -n 1 | sed -E 's/[0-9]+/0/g')"
+    FEEDBACK_EVENT+=",\"fingerprint\":[\"install.sh\",\"$kind\",$f,$REPLY]"
+    feedback_json "$STEP_NO/$STEP_TOTAL $STEP_NAME"
+    FEEDBACK_EVENT+=",\"extra\":{\"step\":$REPLY"
+    feedback_json "$tail"
+    FEEDBACK_EVENT+=",\"log_tail\":$REPLY"
+    feedback_json "$daemon"
+    FEEDBACK_EVENT+=",\"daemon_reports\":$REPLY}}"
+
+    FEEDBACK_VIEW=$(
+        printf '   error    %s\n' "$kind failed: $message"
+        [ "$STEP_TOTAL" -eq 0 ] || printf '   step     %s\n' "$STEP_NO/$STEP_TOTAL $STEP_NAME"
+        printf '   host     %s\n' "$os_name, kernel $KVER, $arch, $libc, ${PKG:-none}, ${INIT:-none}"
+        printf '   tags     %s\n' "${fields[*]}"
+        [ -z "$tail" ] || { printf '   log      the last lines of the failing step:\n'; printf '%s\n' "$tail" | sed 's/^/     | /'; }
+        [ -z "$daemon" ] || { printf '   daemon   what skyline-speederd recorded when it stopped:\n'; printf '%s\n' "$daemon" | sed 's/^/     | /'; }
+    )
+}
+
+# feedback_send: FEEDBACK_EVENT to the DSN's project. Everything curl needs
+# that names the project -- the URL, the key -- goes in a configuration on its
+# stdin (-K -), so none of it is on a command line `ps` shows; -q first, as
+# everywhere in this script, so no ~/.curlrc takes part.
+feedback_send() {
+    local envelope
+    command -v curl >/dev/null 2>&1 || { FEEDBACK_ERROR="curl is not installed"; return 1; }
+    envelope="{\"event_id\":\"$FEEDBACK_EVENT_ID\",\"sent_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
+    envelope+=$'\n{"type":"event"}\n'"$FEEDBACK_EVENT"$'\n'
+    # A quoted value in a curl configuration takes \\, \" and \n.
+    envelope=${envelope//\\/\\\\}; envelope=${envelope//\"/\\\"}; envelope=${envelope//$'\n'/\\n}
+    FEEDBACK_ERROR=$(printf '%s\n' \
+        "url = \"$FEEDBACK_URL\"" \
+        "header = \"X-Sentry-Auth: Sentry sentry_version=7, sentry_client=skyline-speeder-install/1, sentry_key=$FEEDBACK_PUBLIC\"" \
+        "header = \"Content-Type: application/x-sentry-envelope\"" \
+        "data-binary = \"$envelope\"" \
+        | curl -q -fsS --proto '=https' --tlsv1.2 --max-time 20 -o /dev/null -K - 2>&1) \
+        || { FEEDBACK_ERROR=${FEEDBACK_ERROR:-curl failed}; return 1; }
+}
+
+# feedback_offer: the question, after the error has been reported. Its own
+# output goes to the terminal it asks on, which is not always fd 4.
+feedback_offer() {
+    local answer
+    [ "$FEEDBACK_ARMED" -eq 1 ] && [ "$FEEDBACK" != no ] && [ "$INTERRUPTED" -eq 0 ] || return 0
+    feedback_dsn || return 0
+    feedback_build
+    if [ "$FEEDBACK" = ask ]; then
+        { exec 5<>/dev/tty; } 2>/dev/null || return 0
+        printf '\n %sHelp us fix this?%s Send an error report to the Skyline Speeder developers.\n' "$BLD" "$RST" >&5
+        printf '%s\n' \
+            "   It holds the error above, the step, the versions, the distribution, the" \
+            "   kernel and the last lines of the failing step's log, with IP, MAC and" \
+            "   e-mail addresses, the host name and user names removed. Nothing is sent" \
+            "   unless you answer y." >&5
+        while :; do
+            printf '   Send it? [y/N, v to view it first] ' >&5
+            answer=
+            read -r -t 300 -u 5 answer || printf '\n' >&5
+            case "$answer" in
+                v|V) printf '%s\n' "$FEEDBACK_VIEW" >&5 ;;
+                y|Y|yes|YES|Yes) break ;;
+                *) printf '   not sent\n' >&5; rm -f "$FEEDBACK_DAEMON_REPORTS"/*.json 2>/dev/null; exec 5>&-; return 0 ;;
+            esac
+        done
+    else
+        exec 5>&4
+    fi
+    if feedback_send; then
+        printf '   %s  sent (report %s), thank you\n' "${GRN}ok${RST}" "${FEEDBACK_EVENT_ID:0:8}" >&5
+        rm -f "$FEEDBACK_DAEMON_REPORTS"/*.json 2>/dev/null
+    else
+        printf '   %s the report could not be sent: %s\n' "${YLW}warn${RST}" "$FEEDBACK_ERROR" >&5
+    fi
+    exec 5>&-
+}
+
 on_interrupt() {
     trap - INT TERM
     if [ -n "$BG_PID" ]; then
@@ -408,6 +672,9 @@ on_exit() {
     [ -z "$WORK" ] || rm -rf "$WORK"
     [ -z "$APT_SIM" ] || rm -f "$APT_SIM"
     [ -z "$STAGED_DAEMON" ] || rm -f "$STAGED_DAEMON"
+    # Last: the cleanup above is done whatever the answer, and a Ctrl-C at the
+    # question (on_interrupt) skips nothing.
+    [ "$FAILED" -eq 0 ] || feedback_offer
 }
 trap on_exit EXIT
 trap on_interrupt INT TERM
@@ -2075,6 +2342,9 @@ if [ "$(id -u)" -ne 0 ]; then
     die "must run as root: pipe it into bash from a root shell instead"
 fi
 detect_platform
+# From here on a failure is worth a report (see "error reports"); --check
+# failing is it doing its job.
+[ "$MODE" = check ] || FEEDBACK_ARMED=1
 
 printf '\n %sSkyline Speeder%s\n' "$BLD" "$RST" >&3
 sponsor '--'
@@ -2141,7 +2411,9 @@ if [ "$MODE" = uninstall ]; then
           /etc/systemd/system/skyline-speeder-enable.service \
           /etc/init.d/skyline-speederd /etc/init.d/skyline-speeder-enable \
           /usr/local/sbin/skyline-speederd /usr/local/bin/ssctl
-    rm -rf /opt/skyline-speeder
+    # /var/lib/skyline-speeder holds only the error reports skyline-speederd
+    # recorded (StateDirectory=): nobody is left to offer them.
+    rm -rf /opt/skyline-speeder /var/lib/skyline-speeder
     [ "$INIT" != systemd ] || systemctl daemon-reload
 
     # Counted HERE, before the toolchain goes: bpftool is one of the packages an

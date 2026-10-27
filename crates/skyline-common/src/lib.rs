@@ -1611,6 +1611,36 @@ pub struct Response {
     pub flows: Option<FlowReport>,
 }
 
+/// Where skyline-speederd records an error it stops on, and a panic, for the
+/// next `ssctl` run on a terminal to offer as an error report: the daemon has
+/// no terminal to ask on, and sends nothing itself. `StateDirectory=` in the
+/// systemd unit and `checkpath` in the OpenRC script create its parent, the
+/// one directory under `/var/lib` that `ProtectSystem=strict` lets it write;
+/// `install.sh` reads it too, and `--uninstall` removes it.
+pub const DAEMON_REPORTS_DIR: &str = "/var/lib/skyline-speeder/reports";
+
+/// At most this many distinct reports wait in `DAEMON_REPORTS_DIR`: a daemon
+/// that fails the same way on every restart adds to one report's `count`,
+/// and one that fails a new way each time stops recording at this many.
+pub const DAEMON_REPORTS_MAX: usize = 10;
+
+/// One file in `DAEMON_REPORTS_DIR`, named after a hash of `kind` and
+/// `message` with the digits taken out, so the same failure repeated is one
+/// report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonReport {
+    /// The skyline-speederd version that recorded it.
+    pub version: String,
+    /// "exited" (main returned an error) or "panicked".
+    pub kind: String,
+    /// The error with its causes (`{:#}`), or the panic message and location.
+    pub message: String,
+    /// Unix seconds.
+    pub first_seen: u64,
+    pub last_seen: u64,
+    pub count: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read configuration {0}: {1}")]

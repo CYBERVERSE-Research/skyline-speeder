@@ -75,7 +75,7 @@ sudo ./install.sh --uninstall --restore-pre-install   # 同上，但还原成
                                #   安装前那台机器用的拥塞控制与 qdisc
 ```
 
-安装器使用发行版自己的包管理器和服务管理器——apt、dnf 或 apk；systemd，Alpine 上是 OpenRC（本文档里的 `systemctl restart skyline-speederd` 在 Alpine 上对应 `rc-service skyline-speederd restart`）。它会检查内核，构建或下载三个 BPF 对象和 daemon，把 TC 程序指向默认路由所在的网卡（IPv4 或 IPv6；默认路由走 WireGuard 这类隧道时，它会请你自己指定网卡），让每个对象过一遍内核验证器，然后启动 daemon、挂载 `skyline_cc`，并把两者设为开机自启。安装过程中终端只显示一行进度，所有命令的输出都保存在 `/var/log/skyline-speeder-install.log`；装完会列出拥塞控制与 qdisc 改动前后的值，再给出 `ssctl` 用法、调参与卸载方法的简短指南。**不安装任何代理，不监听任何端口。**
+安装器使用发行版自己的包管理器和服务管理器——apt、dnf 或 apk；systemd，Alpine 上是 OpenRC（本文档里的 `systemctl restart skyline-speederd` 在 Alpine 上对应 `rc-service skyline-speederd restart`）。它会检查内核，构建或下载三个 BPF 对象和 daemon，把 TC 程序指向默认路由所在的网卡（IPv4 或 IPv6；默认路由走 WireGuard 这类隧道时，它会请你自己指定网卡），让每个对象过一遍内核验证器，然后启动 daemon、挂载 `skyline_cc`，并把两者设为开机自启。安装过程中终端只显示一行进度，所有命令的输出都保存在 `/var/log/skyline-speeder-install.log`；装完会列出拥塞控制与 qdisc 改动前后的值，再给出 `ssctl` 用法、调参与卸载方法的简短指南。**不安装任何代理，不监听任何端口。**安装失败时，它会询问是否发送错误报告，只有你回答 `y` 才发送（见[错误报告](#错误报告)）。
 
 `--uninstall` 会先 drain 掉存量连接，删除两个服务（systemd 单元，Alpine 上是 OpenRC 脚本）、二进制和 BPF 对象，把本机切到 **bbr + fq**，并卸掉安装时装上的包。装了哪些包是记录下来的（`/etc/skyline-speeder/added-packages`），也只卸这些：不碰 `iproute2`（Fedora/RHEL 上是 `iproute` 与 `iproute-tc`）、`curl`、`ca-certificates`、`tar`（Alpine 上还有 `bash`），不碰这几个包**仍然依赖**的东西（保留 `curl` 却删掉它底下的库，apt 根本做不到），也不碰 dpkg 标为 *required*/*important* 或 dnf 保护的包。卸之前先出计划（apt 自己出，dnf 用 `rpm -e --test`；apk 本来就不会删还被依赖的包）：计划里如果要连带删掉主机上别的东西，就把造成这件事的那个包单独留下并说明，其余照卸；只有在怎么缩减都无法得到一个不越界的计划时，才一个都不卸、改为打印手工命令。rustup 工具链只在确实是安装器装的情况下才移除。`bbr` 与 `fq` 只在本次运行时生效——不写也不改 `/etc/sysctl.d` 下的任何文件，所以重启后仍由那些文件决定。加 `--restore-pre-install` 则还原成安装前那台机器用的拥塞控制与 qdisc（包括出口网卡的根 qdisc，安装时一并记录）。两种方式都保留 `/etc/skyline-speeder`，重装时你的配置还在。
 
@@ -140,6 +140,7 @@ Rust 编写的 `skyline-speederd` 加载 BPF 程序（都要过内核验证器�
 | [重传包 DSCP 标记](#重传包-dscp-标记) | 关 | 给重传包打标记，供上游网络区别对待 | `ssctl set-retransmit-dscp` |
 | [全局丢包检测 sysctl](#全局丢包检测-sysctl) | 用主机自己的值 | daemon 启动时可以代为写入的三个 `net.ipv4` sysctl | `[rack_tuning]` |
 | [事件日志](#事件日志) | 开，超过 8 MiB 轮转 | 模式切换、丢包事件、护栏触发各记一行 | `[runtime] events_max_mib` |
+| [错误报告](#错误报告) | 出错后询问；回答 `y` 才发送 | 安装、升级或 daemon 出错时，把错误报告发给开发者 | 那一问；`SKYLINE_FEEDBACK` |
 
 `ssctl set-*` 命令立即生效，保持到 daemon 重启为止；要长期生效，见[让修改重启后仍然生效](#让修改重启后仍然生效)。`ssctl status` 和 `ssctl flows` 每一行的含义见[本节末尾](#看懂-ssctl-status-与-ssctl-flows)。
 
@@ -267,6 +268,20 @@ sudo ssctl reset-retransmit-dscp                   # 回到配置文件里的 [r
 ### 事件日志
 
 默认开启。每条 skyline_cc 连接的模式切换、丢包事件、护栏触发、撤销降窗和配置切换都写进 `/run/skyline-speeder/events.jsonl`，每条一行 JSON，以 socket cookie 区分连接。`/run` 在内存里，所以文件超过 `[runtime]` 的 `events_max_mib`（8 MiB）后会轮转成 `events.jsonl.1`（覆盖上一个），所以最多占用约两倍；设为 0 关闭日志，改动需要重启 daemon。事件码见 [docs/02-interface-reference.md](docs/02-interface-reference.md) 第 8 节；护栏触发是 type 9，`ssctl flows` 在 *guardrail trips* 下面会注明。
+
+### 错误报告
+
+先问，绝不默认发送。安装、升级或卸载失败时，`install.sh` 会问一次是否把错误报告发给开发者。`ssctl` 也会在这几种情况下询问：`enable` 被拒绝；daemon 因为出错而连不上；skyline-speederd 因出错退出或 panic。daemon 没有终端可以询问，所以它把错误记在 `/var/lib/skyline-speeder/reports`，下一次在终端里运行 `sudo ssctl` 时再问。**只有你回答 `y` 才会发送**；回答 `v` 可以先看要发送的完整内容。没有终端可以询问时（管道、cloud-init、cron、`--json`），既不询问也不发送。
+
+报告包含：错误信息、出错的步骤、Skyline Speeder 版本、发行版、内核、架构、C 库和服务管理器，以及出错步骤的安装日志或 daemon 日志的最后 40 行。IPv4、IPv6 和 MAC 地址、邮箱地址、URL 里的账号密码、令牌、家目录、主机名和你的用户名，在显示或发送之前都会被去掉。报告经 HTTPS、由 `curl` 发到本项目的 Sentry；代码里的上报地址只以加密形式存在。
+
+代价：不出错就没有任何代价，出错时多一个问题。不想被问，设 `SKYLINE_FEEDBACK=no`；`SKYLINE_FEEDBACK=yes` 不问直接发送，适合希望自动上报故障的自动化部署：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo SKYLINE_FEEDBACK=no bash
+```
+
+你拒绝发送的报告会被丢弃；`--uninstall` 会删除 `/var/lib/skyline-speeder`。`ssctl status` 和 `ssctl flows` 里没有对应的行：错误一出现，问题就紧跟在后面。
 
 ### 让修改重启后仍然生效
 
