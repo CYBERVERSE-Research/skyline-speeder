@@ -401,7 +401,7 @@ quietly() {
 # feedback_chacha against the Rust implementation. Empty: reports are off.
 FEEDBACK_SEAL_KEY=9a505fc64734e2f2c801a1c0e3d031c5ff2f5662cd1ba51624c75dac9555de1a
 FEEDBACK_SEAL_NONCE=a482acf480d0928b3c37c730
-FEEDBACK_SEALED=
+FEEDBACK_SEALED=0b3e66e80afc3e71da442d2fc2e1d3fb4d2ab7dc54af25af4d7e43ea395f3983406754d3aed5c0f1c1c1103080f52fa26529a7c855bf36888fd7415fa62f81e8e11217
 case "${SKYLINE_FEEDBACK:-ask}" in
     1|y|yes|true) FEEDBACK=yes ;;
     0|n|no|false|never) FEEDBACK=no ;;
