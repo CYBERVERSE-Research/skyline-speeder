@@ -481,13 +481,18 @@ feedback_dsn() {
 # its people: IPv4 and IPv6 addresses, MAC addresses, e-mail addresses,
 # credentials in URLs, tokens, home directories, the host name, the invoking
 # user. Errs on the side of removing too much: a version with four parts
-# reads as an address. ssctl's scrub() removes the same things.
+# reads as an address. ssctl's scrub() removes the same things, and
+# `cargo test -p ssctl` runs both over one text. Tokens: the prefixes GitHub
+# and Sentry issue (sntrys_ organization, sntryu_ user, sntrs_ older), not
+# after a word character, with + / = in the body -- an organization token is
+# sntrys_<base64>_<secret>, and a body that stopped at the base64's = left the
+# secret in the report.
 feedback_scrub() {
     local text host name
     text=$(sed -E \
         -e 's#://[^/@[:space:]]+@#://<credentials>@#g' \
         -e 's#[[:alnum:]._%+-]+@[[:alnum:]-]+(\.[[:alnum:]-]+)*\.[[:alpha:]]{2,}#<email>#g' \
-        -e 's#(gh[pousr]|github_pat|sntr[ysu])_[[:alnum:]_]{16,}#<token>#g' \
+        -e 's#(^|[^[:alnum:]_])(gh[pousr]|github_pat|sntry[su]|sntrs)_[[:alnum:]_+/=-]{16,}#\1<token>#g' \
         -e 's#(([Tt]oken|TOKEN|[Ss]ecret|SECRET|[Pp]ass(wd|word)|PASS(WD|WORD))[=:])[^[:space:]]+#\1<redacted>#g' \
         -e 's#[0-9]{1,3}(\.[0-9]{1,3}){3}#<ipv4>#g' \
         -e 's#([0-9A-Fa-f]{1,4}:){3,7}[0-9A-Fa-f]{1,4}#<ipv6-or-mac>#g' \

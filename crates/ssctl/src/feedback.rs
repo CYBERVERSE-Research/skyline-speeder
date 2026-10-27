@@ -759,6 +759,10 @@ fn scrub_tokens(text: &str) -> String {
         "sntryu_",
         "sntrs_",
     ];
+    // An organization token is sntrys_<base64>_<secret>, and standard base64
+    // holds + / =: a body of word characters alone stopped at the first of
+    // them and left the secret after it in the report.
+    let body_byte = |b: u8| is_word(b) || b"+/=-".contains(&b);
     let bytes = text.as_bytes();
     let mut ranges = Vec::new();
     let mut i = 0;
@@ -769,7 +773,7 @@ fn scrub_tokens(text: &str) -> String {
         if let Some(prefix) = prefix {
             let body = bytes[i + prefix.len()..]
                 .iter()
-                .take_while(|&&b| is_word(b))
+                .take_while(|&&b| body_byte(b))
                 .count();
             if body >= 16 {
                 ranges.push((i, i + prefix.len() + body, "<token>"));
@@ -1026,6 +1030,60 @@ mod tests {
             String::from_utf8_lossy(&out.stdout),
             "0123456789abcdef0123456789abcdef https://o0.ingest.example.invalid/api/42/envelope/"
         );
+    }
+
+    #[test]
+    fn install_sh_scrubs_like_ssctl() {
+        // Both senders over one text: install.sh's sed missed sntrys_ and
+        // sntryu_ (it matched sntr[ysu]_) while this file caught them, and
+        // nothing compared the two. Same environment for both, so the host
+        // and user names each takes from /proc and SUDO_USER / LOGNAME agree.
+        let token = |prefix: &str, body: &str| format!("{prefix}{body}");
+        let text = format!(
+            "bind 192.0.2.20:8080 fe80::1%eth0 ::1 [::]:443 2001:db8:0:0:1:0:0:1 failed\n\
+             use std::io::Write; anyhow::Result at 12:34:56 mac 52:54:00:12:34:56 aa-bb-cc-dd-ee-ff\n\
+             git clone https://user:hunter2@github.com/x/y, mail ops+alerts@mail.example.org,\n\
+             token=abc123 Secret: s3 PASSWORD=p cd {}\n\
+             {} {} {}\n\
+             org {} user {} not x{}\n",
+            ["", "home", "alice", "src"].join("/"),
+            token("ghp_", "ABCDEFGHIJKLMNOPQRSTUVWX1234"),
+            token("github_pat_", "11ABCDEFG0123456789_abcdefghijklmnop"),
+            token("sntrs_", "0123456789abcdef0123"),
+            token("sntrys_", "eyJpYXQiOjE3MDAwMDAwMDAuMH0=_Zm9vYmFyYmF6cXV4cXV1eA/+ab"),
+            token("sntryu_", &"0123456789abcdef".repeat(4)),
+            token("ghp_", "ABCDEFGHIJKLMNOPQRSTUVWX1234"),
+        );
+        let start = INSTALL_SH.find("# --- error reports").expect("section");
+        let end = start + INSTALL_SH[start..].find("\non_interrupt() {").expect("end");
+        let script = format!("{}\nfeedback_scrub", &INSTALL_SH[start..end]);
+        let mut child = Command::new("bash")
+            .args(["-euc", &script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("bash");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(text.as_bytes())
+            .expect("write");
+        let out = child.wait_with_output().expect("bash");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let rust = scrub(&text);
+        // $(...) in the shell drops the trailing newline.
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            rust.trim_end_matches('\n')
+        );
+        assert!(!rust.contains("sntry") && !rust.contains("Zm9v") && !rust.contains("eyJp"));
+        assert!(rust.contains("not xghp_"), "{rust}");
     }
 
     #[test]

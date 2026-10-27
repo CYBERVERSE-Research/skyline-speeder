@@ -77,7 +77,9 @@ configuration on stdin, so no binary here links a TLS stack and no command line 
 The DSN is in the tree only sealed (ChaCha20 under a key that is in the same files -- it keeps the DSN from scanners,
 not secret). `infra/seal-feedback-dsn.py` writes both copies, `crates/ssctl/src/feedback-dsn.sealed` and
 `FEEDBACK_SEALED` in `install.sh`; `cargo test -p ssctl` fails when they, or the key and nonce, disagree, and runs the
-shell's ChaCha20 against the Rust one. Empty means reports are off. Never commit a plain DSN or a Sentry auth token.
+shell's ChaCha20 against the Rust one and both scrubs over one text (`install_sh_scrubs_like_ssctl`: the sed once let
+`sntrys_` / `sntryu_` tokens through while `scrub` caught them). Empty means reports are off. Never commit a plain DSN
+or a Sentry auth token.
 
 ## The test that guards the guest config
 
