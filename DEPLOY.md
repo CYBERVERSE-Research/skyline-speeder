@@ -158,9 +158,11 @@ data-plane loss. For the other known validity boundaries and limitations see
 | Kernel BTF | `test -r /sys/kernel/btf/vmlinux` | Present (`CONFIG_DEBUG_INFO_BTF=y`) |
 | cgroup v2 | `test -e /sys/fs/cgroup/cgroup.controllers` | Mounted unified at `/sys/fs/cgroup` (on OpenRC hosts the `cgroups` service mounts it, and the installer starts that service) |
 | `fq` qdisc | `modprobe sch_fq` | Built in or loadable |
+| Root of the host | `cat /proc/self/uid_map`, `grep CapEff /proc/self/status` | The map is `0 0 4294967295` and the capabilities include `CAP_NET_ADMIN` and `CAP_SYS_ADMIN` (or `CAP_BPF` with `CAP_PERFMON`). An **unprivileged container** (LXC and Proxmox CTs by default, rootless Docker and Podman) cannot load BPF programs at all — the kernel answers `Operation not permitted` — and the installer refuses it at the first step |
+| The host's network namespace | `test -e /proc/sys/net/core/default_qdisc` | Present. A container with a network namespace of its own — a privileged one too — can load and register `skyline_cc` but may not make it the default: the kernel lets only the initial network namespace select a congestion control that is not on its allowed list, and `net.core.default_qdisc` does not exist anywhere else. **Skyline Speeder runs on a host or in a virtual machine, not in a container**; the installer refuses at the first step |
 | struct_ops | `struct_ops` in the capability report of section 4 | `true` |
 | `fallback_cc` | `fallback_cc_available` in the capability report of section 4 | `true` (section 8.1) |
-| bpffs | `mount \| grep -q ' /sys/fs/bpf '` | Mounted (when it is not, the installer fails at the step that creates `/sys/fs/bpf/skyline-speeder`; `bpffs` in the capability report only checks that the directory `/sys/fs/bpf` exists — it exists even when bpffs is not mounted — so it cannot stand in for this check) |
+| bpffs | `mount \| grep -q ' /sys/fs/bpf '` | Mounted (when it is not, the installer refuses at the first step; `bpffs` in the capability report only checks that the directory `/sys/fs/bpf` exists — it exists even when bpffs is not mounted — so it cannot stand in for this check) |
 | Distribution | `cat /etc/os-release` | Debian/Ubuntu (apt + systemd), Fedora and the RHEL family — Rocky Linux, AlmaLinux, CentOS Stream (dnf + systemd), Alpine (apk + OpenRC); other distributions are rejected at the first step with a non-zero exit code |
 
 What the daemon itself enforces are six items of the capability report: `btf`, `bpffs`, `cgroup_v2`,
@@ -275,7 +277,7 @@ reach the default install only with the next release.
 
 | Step (its name in the output) | What it does |
 |---|---|
-| Checking the system | The distribution and its package manager, the service manager; kernel ≥ 6.12, BTF, cgroup v2 mounted at `/sys/fs/cgroup` (on an OpenRC host where it is not mounted yet, starts the `cgroups` service); whether this host can run the released binaries |
+| Checking the system | The distribution and its package manager, the service manager; kernel ≥ 6.12, BTF, that this is the host's root in the host's network namespace (not a container: section 1.3), that `fq` is available and bpffs is mounted, cgroup v2 mounted at `/sys/fs/cgroup` (on an OpenRC host where it is not mounted yet, starts the `cgroups` service); whether this host can run the released binaries |
 | Installing packages | See the package lists and planning rules below |
 | Downloading the release artifact | Prebuilt path: fetches the artifact, checks the sha256 and the `MANIFEST` |
 | Preparing the Rust toolchain / Building the BPF objects / Building the Rust control plane | Source-build path: rustup (version pinned by `rust-toolchain.toml`), `make bpf`, `cargo build --release` |
