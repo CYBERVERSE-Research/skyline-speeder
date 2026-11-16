@@ -30,6 +30,8 @@ Skyline Speeder is single-sided TCP acceleration software. It runs as eBPF progr
 
 **Linux 6.12 LTS or newer**, with `/sys/kernel/btf/vmlinux` present. `skyline_cc` implements the four-argument `cong_control(sk, ack, flag, rs)` callback, which exists only from 6.10; older kernels reject the program at load time. That rules out the 6.1 and 6.6 LTS branches and the stock Debian 12 and Ubuntu 22.04/24.04 kernels.
 
+It runs on a host or in a virtual machine (KVM), not in a container. An unprivileged container — LXC and Proxmox CTs by default — may not load BPF programs, and a privileged one with its own network namespace may not make `skyline_cc` the default congestion control, whatever the kernel; the installer says so at its first step.
+
 Verified: `6.12.101`, `6.18.42` and `7.1.6` pass, including IPv4/IPv6 data-path smoke tests. `6.1.180` and `6.6.148` fail to load, by design.
 
 **Distributions:** Debian and Ubuntu (apt, systemd), Fedora and the RHEL family — Rocky Linux, AlmaLinux, CentOS Stream (dnf, systemd) — and Alpine (apk, OpenRC), on a kernel that meets the line above. The one-line install has been run end to end on Debian 13, Fedora 43, Rocky Linux 10.2 and Alpine 3.23.
@@ -269,9 +271,9 @@ On by default. The mode switches, loss events, guardrail trips, window undos and
 
 ### Error reports
 
-Asked, never assumed. When an install, an upgrade or an uninstall fails, `install.sh` asks once whether to send an error report to the developers. So does `ssctl` when `enable` is refused, when the daemon cannot be reached because it failed, and when skyline-speederd stopped on an error or panicked: the daemon has no terminal to ask on, so it records the error in `/var/lib/skyline-speeder/reports` and the next `sudo ssctl` run on a terminal asks. **Nothing is sent unless you answer `y`**; `v` shows first exactly what would be sent. With no terminal to ask on (a pipeline, cloud-init, cron, `--json`), nothing is asked and nothing is sent. A host the installer refuses because it does not meet the requirements above — an older kernel, another distribution — is told why and asked nothing: that is the installer working.
+Asked, never assumed. When an install, an upgrade or an uninstall fails, `install.sh` asks once whether to send an error report to the developers. So does `ssctl` when `enable` is refused, when the daemon cannot be reached because it failed, and when skyline-speederd stopped on an error or panicked: the daemon has no terminal to ask on, so it records the error in `/var/lib/skyline-speeder/reports` and the next `sudo ssctl` run on a terminal asks. **Nothing is sent unless you answer `y`**; `v` shows first exactly what would be sent. With no terminal to ask on (a pipeline, cloud-init, cron, `--json`), nothing is asked and nothing is sent. A host the installer refuses because it does not meet the requirements above — an older kernel, another distribution, a container, too little free disk space — is told why and asked nothing: that is the installer working.
 
-A report holds the error, the step that failed, the Skyline Speeder version, the distribution, kernel, architecture, C library and service manager, and the last 40 lines of the failing step's install log or of the daemon's log. IPv4, IPv6 and MAC addresses, e-mail addresses, credentials in URLs, tokens, home directories, the host name and your user name are removed before it is shown or sent. It goes over HTTPS, through `curl`, to the project's Sentry; the address it goes to is in the code only encrypted.
+A report holds the error, the step that failed, the Skyline Speeder version, the distribution, kernel, architecture, C library and service manager, and the last 40 lines of the failing step's install log (with its first error lines, when they are further up) or of the daemon's log. IPv4, IPv6 and MAC addresses, e-mail addresses, credentials in URLs, tokens, home directories, the host name and your user name are removed before it is shown or sent. It goes over HTTPS, through `curl`, to the project's Sentry; the address it goes to is in the code only encrypted.
 
 Cost: nothing until something fails, then one question. To never be asked, set `SKYLINE_FEEDBACK=no`; `SKYLINE_FEEDBACK=yes` sends without asking, for automation that wants its failures reported:
 
@@ -366,6 +368,8 @@ skyline-speeder/
 ```bash
 sudo apt-get install -y build-essential pkg-config clang llvm \
     libbpf-dev libelf-dev zlib1g-dev bpftool
+# Ubuntu 22.04 has no bpftool package: linux-tools-generic-hwe-22.04 instead, then
+#   make bpf BPFTOOL="$(ls /usr/lib/linux-tools/*/bpftool | sort -V | tail -n 1)"
 # Fedora / RHEL (libbpf-devel is in CodeReady Builder there: add --enablerepo=crb):
 #   sudo dnf install gcc make pkgconf-pkg-config clang llvm libbpf-devel elfutils-libelf-devel zlib-devel bpftool
 # Alpine (bpftool is in the community repository):

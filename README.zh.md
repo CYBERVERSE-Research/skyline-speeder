@@ -32,6 +32,8 @@ Skyline Speeder 是一套单边 TCP 加速软件：以 eBPF 程序的形式只�
 
 **Linux 6.12 LTS 或更新**，且 `/sys/kernel/btf/vmlinux` 必须存在。`skyline_cc` 实现的是 4 参数的 `cong_control(sk, ack, flag, rs)` 回调，这个签名自 6.10 才有，更旧的内核会在加载时拒绝该程序。因此 6.1、6.6 两个 LTS 分支，以及 Debian 12 与 Ubuntu 22.04/24.04 的原装内核都不行。
 
+它运行在物理机或虚拟机（KVM）上，不能运行在容器里。非特权容器——LXC 和 Proxmox 的 CT 默认就是——不允许加载 BPF 程序；特权容器只要有自己的网络命名空间，也不允许把 `skyline_cc` 设为默认拥塞控制，内核再新也一样。安装器会在第一步直接说明。
+
 已验证：`6.12.101`、`6.18.42`、`7.1.6` 通过（含 IPv4/IPv6 数据路径冒烟测试）；`6.1.180` 和 `6.6.148` 按设计加载失败。
 
 **发行版：** Debian 与 Ubuntu（apt、systemd），Fedora 与 RHEL 系——Rocky Linux、AlmaLinux、CentOS Stream（dnf、systemd），以及 Alpine（apk、OpenRC），内核满足上面的要求即可。一键安装已在 Debian 13、Fedora 43、Rocky Linux 10.2 和 Alpine 3.23 上完整跑通。
@@ -271,9 +273,9 @@ sudo ssctl reset-retransmit-dscp                   # 回到配置文件里的 [r
 
 ### 错误报告
 
-先问，绝不默认发送。安装、升级或卸载失败时，`install.sh` 会问一次是否把错误报告发给开发者。`ssctl` 也会在这几种情况下询问：`enable` 被拒绝；daemon 因为出错而连不上；skyline-speederd 因出错退出或 panic。daemon 没有终端可以询问，所以它把错误记在 `/var/lib/skyline-speeder/reports`，下一次在终端里运行 `sudo ssctl` 时再问。**只有你回答 `y` 才会发送**；回答 `v` 可以先看要发送的完整内容。没有终端可以询问时（管道、cloud-init、cron、`--json`），既不询问也不发送。主机不满足上面的要求（内核太旧、发行版不支持）而被安装器拒绝时，只说明原因、不询问：这是安装器在正常工作。
+先问，绝不默认发送。安装、升级或卸载失败时，`install.sh` 会问一次是否把错误报告发给开发者。`ssctl` 也会在这几种情况下询问：`enable` 被拒绝；daemon 因为出错而连不上；skyline-speederd 因出错退出或 panic。daemon 没有终端可以询问，所以它把错误记在 `/var/lib/skyline-speeder/reports`，下一次在终端里运行 `sudo ssctl` 时再问。**只有你回答 `y` 才会发送**；回答 `v` 可以先看要发送的完整内容。没有终端可以询问时（管道、cloud-init、cron、`--json`），既不询问也不发送。主机不满足上面的要求（内核太旧、发行版不支持、运行在容器里、磁盘空间不足）而被安装器拒绝时，只说明原因、不询问：这是安装器在正常工作。
 
-报告包含：错误信息、出错的步骤、Skyline Speeder 版本、发行版、内核、架构、C 库和服务管理器，以及出错步骤的安装日志或 daemon 日志的最后 40 行。IPv4、IPv6 和 MAC 地址、邮箱地址、URL 里的账号密码、令牌、家目录、主机名和你的用户名，在显示或发送之前都会被去掉。报告经 HTTPS、由 `curl` 发到本项目的 Sentry；代码里的上报地址只以加密形式存在。
+报告包含：错误信息、出错的步骤、Skyline Speeder 版本、发行版、内核、架构、C 库和服务管理器，以及出错步骤的安装日志（最早的几行报错如果在更前面，也一并带上）或 daemon 日志的最后 40 行。IPv4、IPv6 和 MAC 地址、邮箱地址、URL 里的账号密码、令牌、家目录、主机名和你的用户名，在显示或发送之前都会被去掉。报告经 HTTPS、由 `curl` 发到本项目的 Sentry；代码里的上报地址只以加密形式存在。
 
 代价：不出错就没有任何代价，出错时多一个问题。不想被问，设 `SKYLINE_FEEDBACK=no`；`SKYLINE_FEEDBACK=yes` 不问直接发送，适合希望自动上报故障的自动化部署：
 
@@ -368,6 +370,8 @@ skyline-speeder/
 ```bash
 sudo apt-get install -y build-essential pkg-config clang llvm \
     libbpf-dev libelf-dev zlib1g-dev bpftool
+# Ubuntu 22.04 没有 bpftool 这个包：改装 linux-tools-generic-hwe-22.04，然后
+#   make bpf BPFTOOL="$(ls /usr/lib/linux-tools/*/bpftool | sort -V | tail -n 1)"
 # Fedora / RHEL（RHEL 系的 libbpf-devel 在 CodeReady Builder 里：加 --enablerepo=crb）：
 #   sudo dnf install gcc make pkgconf-pkg-config clang llvm libbpf-devel elfutils-libelf-devel zlib-devel bpftool
 # Alpine（bpftool 在 community 仓库）：

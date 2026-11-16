@@ -48,9 +48,31 @@ $(VMLINUX_H): $(VMLINUX_BTF)
 	mv $@.part $@
 endif
 
-$(BPF_DIR)/%.bpf.o: bpf/%.bpf.c bpf/include/skyline_abi.h $(VMLINUX_H)
+# The helpers the sources call are declared by libbpf's bpf_helper_defs.h, and
+# an old one does not have them all: libbpf 0.5.0, what Ubuntu 22.04 ships as
+# libbpf-dev, has no bpf_skb_set_tstamp (helper 192, Linux 5.18). clang 14
+# there took the call for an implicitly declared function, warned, and wrote an
+# object with an extern no kernel resolves -- skyline_tc then failed in the
+# verifier step with "failed to find BTF for extern 'bpf_skb_set_tstamp'".
+# Such a header gets the missing declaration from skyline_old_libbpf.h, by
+# -include, so the sources and their line numbers stay what a release builds;
+# with any newer libbpf nothing here is passed and the objects are byte for
+# byte what they were. An undeclared helper is an error from now on, with
+# every clang, instead of a warning and a broken object.
+LIBBPF_HELPER_DEFS ?= /usr/include/bpf/bpf_helper_defs.h
+COMPAT_CFLAGS :=
+COMPAT_HEADER :=
+ifneq ($(wildcard $(LIBBPF_HELPER_DEFS)),)
+ifeq ($(shell grep -c bpf_skb_set_tstamp $(LIBBPF_HELPER_DEFS)),0)
+COMPAT_HEADER := bpf/include/skyline_old_libbpf.h
+COMPAT_CFLAGS := -include $(COMPAT_HEADER)
+endif
+endif
+
+$(BPF_DIR)/%.bpf.o: bpf/%.bpf.c bpf/include/skyline_abi.h $(VMLINUX_H) $(COMPAT_HEADER)
 	@mkdir -p $(BPF_DIR)
-	$(BPF_CLANG) $(BPF_CFLAGS) $(VMLINUX_CFLAGS) -I bpf/include -c $< -o $@
+	$(BPF_CLANG) $(BPF_CFLAGS) $(VMLINUX_CFLAGS) $(COMPAT_CFLAGS) -Werror=implicit-function-declaration \
+		-I bpf/include -c $< -o $@
 
 bpf: $(BPF_OBJECTS)
 
