@@ -30,6 +30,8 @@ Skyline Speeder is single-sided TCP acceleration software. It runs as eBPF progr
 
 **Linux 6.12 LTS or newer**, with `/sys/kernel/btf/vmlinux` present. `skyline_cc` implements the four-argument `cong_control(sk, ack, flag, rs)` callback, which exists only from 6.10; older kernels reject the program at load time. That rules out the 6.1 and 6.6 LTS branches and the stock Debian 12 and Ubuntu 22.04/24.04 kernels.
 
+It runs on a host or in a virtual machine (KVM), not in a container. An unprivileged container — LXC and Proxmox CTs by default — may not load BPF programs, and a privileged one with its own network namespace may not make `skyline_cc` the default congestion control, whatever the kernel; the installer says so at its first step.
+
 Verified: `6.12.101`, `6.18.42` and `7.1.6` pass, including IPv4/IPv6 data-path smoke tests. `6.1.180` and `6.6.148` fail to load, by design.
 
 **Distributions:** Debian and Ubuntu (apt, systemd), Fedora and the RHEL family — Rocky Linux, AlmaLinux, CentOS Stream (dnf, systemd) — and Alpine (apk, OpenRC), on a kernel that meets the line above. The one-line install has been run end to end on Debian 13, Fedora 43, Rocky Linux 10.2 and Alpine 3.23.

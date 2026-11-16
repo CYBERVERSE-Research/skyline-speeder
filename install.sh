@@ -797,6 +797,77 @@ version_older() {
     [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | awk 'NR == 1')" = "$1" ]
 }
 
+# --- where this runs -----------------------------------------------------------
+# The three questions "Checking the system" asks about the place itself, before
+# anything is installed: is this a container, is its root the host's root, and
+# does that root hold what loading skyline_cc takes.
+
+# container_kind: lxc, docker, podman, systemd-nspawn ... when this is a
+# container, nothing otherwise. systemd's own answer where there is one; the
+# `container` variable a container manager gives PID 1 (the convention
+# systemd-detect-virt reads too) on Alpine, which has no such tool.
+container_kind() {
+    local kind=
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        kind=$(systemd-detect-virt --container 2>/dev/null || true)
+        [ "$kind" != none ] || kind=
+    fi
+    if [ -z "$kind" ] && [ -r /proc/1/environ ]; then
+        kind=$(tr '\0' '\n' </proc/1/environ 2>/dev/null \
+            | awk -F= '$1 == "container" && !n++ { print $2 }' || true)
+    fi
+    if [ -z "$kind" ] && [ -e /.dockerenv ]; then kind=docker; fi
+    printf '%s' "$kind"
+}
+
+# userns_root: whether this root is root of a user namespace only -- an
+# unprivileged container (LXC and Proxmox CTs by default, rootless Docker and
+# Podman). The host's root sees the identity map, one line "0 0 4294967295";
+# anything else maps this uid 0 onto some other uid of the host. Inside, the
+# capability sets read as full (they are, over the namespace), so they cannot
+# answer this: the kernel checks bpf() against the initial namespace.
+userns_root() {
+    local inside outside count
+    [ -r /proc/self/uid_map ] || return 1
+    read -r inside outside count </proc/self/uid_map || return 1
+    ! { [ "$inside" = 0 ] && [ "$outside" = 0 ] && [ "$count" = 4294967295 ]; }
+}
+
+# missing_capabilities: the capabilities this shell lacks of those the install
+# and the daemon need, by name, or nothing. CAP_NET_ADMIN (12) for the sysctls,
+# tc and attaching to the network stack; CAP_SYS_ADMIN (21), or CAP_BPF (39)
+# with CAP_PERFMON (38), for loading the programs. Docker's default set has
+# neither of the last two.
+missing_capabilities() {
+    local hex cap missing=
+    hex=$(awk '$1 == "CapEff:" { print $2 }' /proc/self/status 2>/dev/null || true)
+    case "$hex" in ''|*[!0-9a-fA-F]*) return 0 ;; esac
+    cap=$((16#$hex))
+    (( (cap >> 12) & 1 )) || missing="CAP_NET_ADMIN"
+    if ! (( (cap >> 21) & 1 )) && ! { (( (cap >> 39) & 1 )) && (( (cap >> 38) & 1 )); }; then
+        missing="${missing:+$missing and }CAP_SYS_ADMIN (or CAP_BPF with CAP_PERFMON)"
+    fi
+    printf '%s' "$missing"
+}
+
+# fq_available: whether this kernel has the fq qdisc or can get it -- the
+# question skyline-speederd's capability report answers as fq_available
+# (fq_is_available in crates/skyline-speederd/src/main.rs; keep the two in
+# step), asked here before anything is installed. Loaded, the default qdisc
+# already, built in, or a module this kernel can load: read from the module
+# index, not modinfo -- busybox's says yes to sch_fq whether the kernel has it
+# or not. A container has no /lib/modules of the host's kernel and may not load
+# modules, so there it is the first two only.
+fq_available() {
+    local dir=/lib/modules/$KVER
+    if grep -q '^sch_fq ' /proc/modules 2>/dev/null; then return 0; fi
+    if [ "$(cat /proc/sys/net/core/default_qdisc 2>/dev/null || true)" = fq ]; then return 0; fi
+    if grep -Eq '(^|/)sch[-_]fq\.ko$' "$dir/modules.builtin" 2>/dev/null; then return 0; fi
+    if [ "$(cat /proc/sys/kernel/modules_disabled 2>/dev/null || true)" = 1 ]; then return 1; fi
+    if grep -Eq '(^|/)sch[-_]fq\.ko[^:/]*:' "$dir/modules.dep" 2>/dev/null; then return 0; fi
+    grep -Eq '^alias[[:space:]]+sch[-_]fq[[:space:]]' "$dir/modules.alias" 2>/dev/null
+}
+
 # find_bpftool: a bpftool that runs, into REPLY. Ubuntu's /usr/sbin/bpftool is
 # a wrapper (linux-tools-common) that execs /usr/lib/linux-tools/$(uname -r)/
 # bpftool and fails when no tools package matches the running kernel -- the
@@ -2640,6 +2711,67 @@ ok "kernel: $KVER"
 [ -r /sys/kernel/btf/vmlinux ] || die "/sys/kernel/btf/vmlinux is missing.
    CO-RE needs kernel BTF; rebuild the kernel with CONFIG_DEBUG_INFO_BTF=y."
 ok "kernel BTF present"
+
+# Whether this is a place skyline_cc can be loaded and made the default in at
+# all. These are properties of where the installer runs, not of anything it
+# could install, and each used to surface only steps later -- after the
+# packages, the download or a whole build:
+#   - root of a user namespace: the verifier step, as libbpf's "Operation not
+#     permitted ... Make sure your kernel supports BPF", which sends the
+#     operator looking at the kernel;
+#   - a network namespace of its own: "Attaching skyline_cc", the last step
+#     but one, as "set default congestion control to skyline_cc: Operation not
+#     permitted" -- with skyline_cc by then registered in the host's kernel;
+#   - no fq: the verifier step, "sch_fq is unavailable";
+#   - no bpffs: "Installing files", as install(1) failing to create a directory.
+# A container is the usual cause of all four, so it is named.
+CONTAINER=$(container_kind)
+WHERE="this ${CONTAINER:+$CONTAINER }container"
+ELSEWHERE="Install Skyline Speeder on the host itself or in a virtual machine (KVM)"
+if userns_root; then
+    die "$WHERE is unprivileged: its root is not the host's root, and the kernel lets
+   only the host's root load BPF programs (bpf() answers \"Operation not permitted\").
+   skyline_cc is a kernel congestion control and cannot be loaded from in here.
+   $ELSEWHERE."
+fi
+REPLY=$(missing_capabilities)
+if [ -n "$REPLY" ]; then
+    [ -n "$CONTAINER" ] || WHERE="this shell"
+    die "root in $WHERE does not hold $REPLY.
+   Without it the kernel refuses to load skyline_cc and to switch the congestion
+   control (\"Operation not permitted\").${CONTAINER:+
+   $ELSEWHERE.}"
+fi
+# net.core.default_qdisc exists in the host's (initial) network namespace
+# only, and only from there may a congestion control that is not on the
+# kernel's allowed list -- any struct_ops one -- be made the default
+# (tcp_set_default_congestion_control). A privileged container passes both
+# checks above, loads and registers skyline_cc, and is then refused the sysctl.
+if [ ! -e /proc/sys/net/core/default_qdisc ]; then
+    die "$WHERE has a network namespace of its own, and the kernel lets only the
+   host's network namespace make skyline_cc the default congestion control or
+   set net.core.default_qdisc (neither is a per-container setting).
+   $ELSEWHERE."
+fi
+if ! fq_available; then
+    if [ -n "$CONTAINER" ]; then
+        die "the fq qdisc (sch_fq) is not loaded, and $WHERE cannot load kernel modules.
+   Load it on the host that runs this container -- modprobe sch_fq, and
+   'sch_fq' in /etc/modules-load.d/ to keep it across reboots -- then run this again."
+    fi
+    die "kernel $KVER has no fq qdisc: sch_fq is neither built in, nor loaded, nor a
+   module that can be loaded (CONFIG_NET_SCH_FQ). Skyline Speeder keeps fq on the
+   egress interface and does not run without it."
+fi
+# Mounted, not merely there: /sys/fs/bpf is a directory of sysfs until bpffs is
+# mounted on it, and nothing can be created in that. systemd and OpenRC's sysfs
+# service mount it at boot on a host; in a container nothing does.
+if ! awk '$2 == "/sys/fs/bpf" && $3 == "bpf" { found = 1 } END { exit !found }' /proc/mounts 2>/dev/null; then
+    die "bpffs is not mounted at /sys/fs/bpf, where skyline-speederd pins its maps.
+   Mount it -- mount -t bpf bpf /sys/fs/bpf -- and have it mounted at boot
+   ('bpf /sys/fs/bpf bpf defaults 0 0' in /etc/fstab), then run this again."
+fi
+ok "BPF, fq and the congestion control sysctl usable"
 
 if [ ! -d /sys/fs/cgroup ] || ! grep -qw cgroup2 /proc/filesystems; then
     die "cgroup v2 is required (the sockops policy attaches to a cgroup v2 path)"
