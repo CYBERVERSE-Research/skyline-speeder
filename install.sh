@@ -2665,6 +2665,66 @@ else
    layout). Boot with the unified hierarchy (systemd.unified_cgroup_hierarchy=1)."
 fi
 
+# Room for what this run is about to put on the disk, asked before any of it
+# is. A source build on a host with no toolchain adds about 3.5 GiB -- measured
+# on Ubuntu 22.04: 1.0 GiB of packages and 0.35 GiB of their downloads, 1.2 GiB
+# of Rust toolchain (more while rustup unpacks it), 0.3 GiB of build output --
+# and a small VPS often does not have that. It used to find out several
+# minutes in, as whatever the tool that hit the limit happened to say: rustup's
+# "failed to extract package: No space left on device", or curl's "(23) Failure
+# writing output to destination" from inside rustup's own installer.
+#
+# Per filesystem, since / and /home, /var or /tmp may be separate ones (a
+# tmpfs /tmp is sized by memory); only for what this host still lacks; and
+# rounded up, because an install that stops half way costs more than one that
+# asks for a little more than it ends up using. A published release is a few
+# megabytes and is asked for too.
+declare -A SPACE_NEED=() SPACE_FREE=() SPACE_FOR=()
+# space_need <path> <MiB> <what for>: add to what the filesystem holding
+# <path> (or its nearest existing parent) has to take.
+space_need() {
+    local p=$1 line free mount
+    while [ ! -e "$p" ] && [ "$p" != / ]; do p=$(dirname "$p"); done
+    # -P: one line per filesystem, whatever the length of the device's name.
+    line=$(df -Pk "$p" 2>/dev/null | awk 'NR == 2 { print $4, $6 }' || true)
+    free=${line%% *} mount=${line#* }
+    case "$free" in ''|*[!0-9]*) return 0 ;; esac
+    SPACE_FREE[$mount]=$((free / 1024))
+    SPACE_NEED[$mount]=$(( ${SPACE_NEED[$mount]:-0} + $2 ))
+    SPACE_FOR[$mount]="${SPACE_FOR[$mount]:+${SPACE_FOR[$mount]}, }$3"
+}
+if [ "$SOURCE" = build ]; then
+    if ! command -v clang >/dev/null 2>&1; then
+        space_need /usr 1200 "the build packages"
+        space_need /var/cache 400 "their downloads"
+    fi
+    if ! command -v cargo >/dev/null 2>&1 && [ ! -x "${HOME:-/root}/.cargo/bin/cargo" ]; then
+        space_need "${RUSTUP_HOME:-${HOME:-/root}/.rustup}" 1500 "the Rust toolchain"
+    fi
+    [ -d "$REPO_ROOT/target/release" ] || space_need "$REPO_ROOT" 400 "the build"
+else
+    space_need /opt 60 "the release"
+fi
+space_need "${TMPDIR:-/tmp}" 100 "temporary files"
+SPACE_SHORT=
+for REPLY in "${!SPACE_NEED[@]}"; do
+    [ "${SPACE_FREE[$REPLY]}" -ge "${SPACE_NEED[$REPLY]}" ] || SPACE_SHORT+="
+   $REPLY has ${SPACE_FREE[$REPLY]} MiB free; about ${SPACE_NEED[$REPLY]} MiB are needed there for ${SPACE_FOR[$REPLY]}"
+done
+if [ -n "$SPACE_SHORT" ]; then
+    if [ "$SOURCE" = build ]; then
+        REPLY="not enough free disk space to build from source${SOURCE_REASON:+ ($SOURCE_REASON)}.$SPACE_SHORT
+   Free that much and run this again; --uninstall removes the toolchain a build
+   installed, and the build output is this tree's target/."
+    else
+        REPLY="not enough free disk space for the install.$SPACE_SHORT"
+    fi
+    # A preflight goes on to say what else it sees.
+    if [ "$MODE" = check ]; then warn "$REPLY"; else die "$REPLY"; fi
+else
+    ok "disk space: enough for this install"
+fi
+
 # --- 4. what the host runs now ---------------------------------------------
 # Recorded before anything changes: the summary reports "was", the pre-install
 # snapshot below is built from it, and --uninstall puts it back.
