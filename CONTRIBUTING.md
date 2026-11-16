@@ -276,10 +276,11 @@ and **must not be used to draw performance conclusions**.
 ## Cutting a release
 
 Release artifacts are built by `.github/workflows/release.yml` when a `v*` tag
-is pushed: one per C library, the glibc build and a musl build for Alpine
-(`skyline-speeder-<tag>-<arch>-musl.tar.gz`, built in an Alpine 3.21
-container by `infra/build-musl.sh`, which needs docker and which CI runs on
-every pull request too), carrying the same BPF objects. Before building anything it checks that the tag is exactly `v`
+is pushed: one per C library, the glibc build (its control plane built in an
+AlmaLinux 9 container by `infra/build-glibc.sh`, against glibc 2.34) and a
+musl build for Alpine (`skyline-speeder-<tag>-<arch>-musl.tar.gz`, built in an
+Alpine 3.21 container by `infra/build-musl.sh`; both scripts need docker, and
+CI runs both on every pull request too), carrying the same BPF objects. Before building anything it checks that the tag is exactly `v`
 followed by the workspace version in `Cargo.toml`; otherwise it stops. So bump
 `[workspace.package] version` in `Cargo.toml` and the three workspace crates'
 entries in `Cargo.lock` (every build runs with `--locked`) before tagging: the
@@ -341,7 +342,7 @@ See `.gitignore`. In particular:
 - Say whether the change needs a new prebuilt release, and why (the "Prebuilt
   release" section of the PR template). The one-line install installs the
   latest release's prebuilt artifact, not `main` (a host that cannot run the
-  published binaries -- not x86_64, glibc older than 2.38, musl older than
+  published binaries -- not x86_64, glibc older than 2.34, musl older than
   1.2.5 -- builds the fetched tree, `main` by default, from source), so a change
   that lives in the artifact reaches those users only with the next release --
   and nothing fails in the meantime; it just is not there:

@@ -159,16 +159,23 @@ ADDED_COUNT=0      # packages recorded in $ADDED_PKGS after this run
 ADDED_REMOVABLE=0  # of those, the ones an uninstall would actually remove
 GUIDE_URL=https://github.com/CYBERVERSE-Research/skyline-speeder/blob/main/docs/usage.md
 # What the published artifacts can run on. release.yml builds them for x86_64
-# only. The glibc build comes off an ubuntu-24.04 runner, and the
-# skyline-speederd in it asks for GLIBC_2.38 (`objdump -T bin/skyline-speederd`).
+# only. The glibc build comes out of an AlmaLinux 9 container
+# (infra/build-glibc.sh), whose glibc is 2.34 -- the oldest among the
+# distributions this installs on, so Debian 12, Ubuntu 22.04 and the RHEL 9
+# family take the release too. Up to v0.5.4 it came off the ubuntu-24.04
+# runner and the skyline-speederd in it asks for GLIBC_2.38
+# (`objdump -T bin/skyline-speederd`): PREBUILT_GLIBC_OLD_MIN, for every
+# release before PREBUILT_GLIBC_OLD_BEFORE.
 # The musl build (-musl, from v0.4.1) comes out of an Alpine 3.21 container
 # (infra/build-musl.sh), whose musl is 1.2.5 -- a binary runs on the musl it
 # was built against and on every later one. All three are a sync point with
-# release.yml: raise a floor when the build environment moves on, and add an
+# release.yml and the two build scripts: raise a floor when the build environment moves on, and add an
 # architecture when a release starts publishing one, or the default install
 # breaks on exactly the hosts it used to fall back for.
 PREBUILT_ARCHES="x86_64"
-PREBUILT_GLIBC_MIN=2.38
+PREBUILT_GLIBC_MIN=2.34
+PREBUILT_GLIBC_OLD_MIN=2.38
+PREBUILT_GLIBC_OLD_BEFORE=0.5.5
 PREBUILT_MUSL_MIN=1.2.5
 
 # `-qq` silences apt but not dpkg, which still prints an unpack line per
@@ -2429,6 +2436,37 @@ release_lacks_musl() {
     return "$rc"
 }
 
+# release_needs_newer_glibc: whether the release this run would install -- the
+# one --release names, the latest otherwise -- is one from before the glibc
+# build moved to an older glibc (PREBUILT_GLIBC_OLD_BEFORE) while this host's
+# glibc is older than those need, with its tag in REPLY. Such a host passes
+# prebuilt_blocker, which knows the releases of today; this install.sh also
+# runs from `main` before the first such release exists, and with --release
+# for an old one, and the old daemon would fail at the verifier step with
+# "version `GLIBC_2.38' not found". As in release_lacks_musl, an unanswered
+# question is not a "no".
+release_needs_newer_glibc() {
+    local glibc tag=$RELEASE_TAG json api="https://api.github.com/repos/${REPO_SLUG}/releases/latest"
+    REPLY=
+    glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}') || true
+    [ -n "$glibc" ] && version_older "$glibc" "$PREBUILT_GLIBC_OLD_MIN" || return 1
+    if [ -z "$tag" ]; then
+        json=$(mktemp)
+        if { command -v curl >/dev/null 2>&1 \
+                 && curl -q -fsSL --proto '=https' --tlsv1.2 --max-time 30 -o "$json" "$api" 2>/dev/null; } \
+           || { command -v wget >/dev/null 2>&1 && wget -q -T 30 -O "$json" "$api" 2>/dev/null; }; then
+            tag=$(awk 'match($0, /"tag_name": *"[^"]*"/) {
+                           t = substr($0, RSTART, RLENGTH); sub(/^"tag_name": *"/, "", t)
+                           sub(/"$/, "", t); print t; exit }' "$json")
+        fi
+        rm -f "$json"
+    fi
+    # Only a tag that reads as a version can be older than one.
+    [[ "$tag" =~ ^v?[0-9]+(\.[0-9]+)+$ ]] || return 1
+    version_older "${tag#v}" "$PREBUILT_GLIBC_OLD_BEFORE" || return 1
+    REPLY=$tag
+}
+
 # The installer as a command to paste back: $0 is "bash" when this file was
 # piped in (curl ... | bash) and a bare "install.sh" after `bash install.sh`,
 # and neither names a file anybody can run. The arguments go with it.
@@ -2639,6 +2677,11 @@ fi
 # download, where an old glibc used to surface.
 BLOCKER=$(prebuilt_blocker)
 SOURCE_REASON=
+# An artifact named by hand (SKYLINE_ARTIFACT_URL) is what the operator chose.
+if [ -z "$BLOCKER" ] && [ "$SOURCE" != build ] && ! host_is_musl && [ -z "${SKYLINE_ARTIFACT_URL:-}" ] \
+   && release_needs_newer_glibc; then
+    BLOCKER="release $REPLY needs glibc $PREBUILT_GLIBC_OLD_MIN (releases from v$PREBUILT_GLIBC_OLD_BEFORE on need $PREBUILT_GLIBC_MIN), and this host has $(getconf GNU_LIBC_VERSION | awk '{print $2}')"
+fi
 case "$SOURCE" in
     auto)
         # An artifact named by hand (SKYLINE_ARTIFACT_URL) is what the operator

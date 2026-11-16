@@ -3,6 +3,9 @@
 # bpftool and no Rust toolchain on the target machine. Two of them, one per C
 # library: the glibc build, and the musl build Alpine takes (-musl). They carry
 # the same BPF objects -- the same files, built once -- and differ in bin/.
+# Neither control plane is built on this runner: each comes out of a container
+# with the oldest C library its artifact is installed on (infra/build-glibc.sh,
+# infra/build-musl.sh), and is run in clean containers before it is published.
 #
 # The objects are compiled against a PINNED REFERENCE HEADER generated from the
 # oldest supported kernel (6.12 LTS), not against whatever kernel this runner
@@ -104,10 +107,15 @@ jobs:
             echo "ok   $object"
           done
 
-      # --locked: build exactly the dependency versions Cargo.lock records. CI
-      # checks and tests with --locked too, so a stale lock fails there first.
-      - name: Build the control plane
-        run: cargo build --workspace --release --locked
+      # In an AlmaLinux 9 container, not on this runner: built here the daemon
+      # asks for this runner's glibc (2.38 up to v0.5.4), and Debian 12, Ubuntu
+      # 22.04 and the RHEL 9 family had to compile it themselves. Then run in
+      # clean containers of those: infra/build-glibc.sh says why each. Both
+      # builds use --locked: exactly the dependency versions Cargo.lock
+      # records. CI checks and tests with --locked too, so a stale lock fails
+      # there first.
+      - name: Build the control plane for glibc (Debian, Ubuntu, Fedora, the RHEL family)
+        run: infra/build-glibc.sh
 
       # The same control plane against musl, in an Alpine 3.21 container, and
       # then run in clean Alpine containers that have only the libraries
@@ -171,8 +179,7 @@ jobs:
 
           GLIBC="skyline-speeder-${TAG}-${ARCH}"
           MUSL="${GLIBC}-musl"
-          assemble "$GLIBC" target/release glibc \
-            "$(. /etc/os-release && echo "$PRETTY_NAME"), glibc $(getconf GNU_LIBC_VERSION | awk '{print $2}'), $(rustc --version)"
+          assemble "$GLIBC" target/glibc/release glibc "$(cat target/glibc/BUILT_IN)"
           assemble "$MUSL" target/musl/release musl "$(cat target/musl/BUILT_IN)"
 
           # One set of objects in both, as the steps above promise.
@@ -201,7 +208,7 @@ jobs:
 
             | Artifact | For | Needs |
             |---|---|---|
-            | `skyline-speeder-${{ github.event.inputs.tag || github.ref_name }}-x86_64.tar.gz` | glibc: Debian, Ubuntu, Fedora, the RHEL family | glibc 2.38 or newer with `libelf.so.1` and `libz.so.1` (Debian 13, Ubuntu 24.04, Fedora 43, Rocky Linux 10 and later); built on Ubuntu 24.04 |
+            | `skyline-speeder-${{ github.event.inputs.tag || github.ref_name }}-x86_64.tar.gz` | glibc: Debian, Ubuntu, Fedora, the RHEL family | glibc 2.34 or newer with `libelf.so.1` and `libz.so.1` (Debian 12, Ubuntu 22.04, Fedora 43, Rocky Linux 9 and AlmaLinux 9, and later); built in AlmaLinux 9 |
             | `skyline-speeder-${{ github.event.inputs.tag || github.ref_name }}-x86_64-musl.tar.gz` | musl: Alpine | Alpine 3.21 or newer (musl 1.2.5) with `libelf`, `zlib`, `zstd-libs` and `libgcc`, which the installer adds; built in Alpine 3.21 |
 
             Both carry the same three BPF objects, byte for byte. They were compiled
@@ -212,7 +219,7 @@ jobs:
             Kernel 6.12 LTS or newer is still required, and `/sys/kernel/btf/vmlinux`
             must be present: CO-RE resolves field offsets against it at load time.
 
-            On older userspace, such as Debian 12 (glibc 2.36) with a backports kernel,
+            On a host these cannot run on (another architecture, an older C library)
             the installer builds from source instead.
 
             Upgrading a host that already runs Skyline Speeder: run the new `install.sh`
