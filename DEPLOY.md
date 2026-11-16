@@ -161,6 +161,7 @@ data-plane loss. For the other known validity boundaries and limitations see
 | struct_ops | `struct_ops` in the capability report of section 4 | `true` |
 | `fallback_cc` | `fallback_cc_available` in the capability report of section 4 | `true` (section 8.1) |
 | bpffs | `mount \| grep -q ' /sys/fs/bpf '` | Mounted (when it is not, the installer fails at the step that creates `/sys/fs/bpf/skyline-speeder`; `bpffs` in the capability report only checks that the directory `/sys/fs/bpf` exists — it exists even when bpffs is not mounted — so it cannot stand in for this check) |
+| Disk space | `df -h / /tmp` | A release install: about 60 MiB under `/opt` and 100 MiB of temporary files. A source build on a host with no toolchain: about 3.5 GiB — 1.2 GiB of packages under `/usr` and 0.4 GiB of their downloads under `/var/cache`, 1.5 GiB of Rust toolchain under root's home, 0.4 GiB of build output in the source tree. The installer adds up what this host still lacks per filesystem and refuses at the first step when one is short |
 | Distribution | `cat /etc/os-release` | Debian/Ubuntu (apt + systemd), Fedora and the RHEL family — Rocky Linux, AlmaLinux, CentOS Stream (dnf + systemd), Alpine (apk + OpenRC); other distributions are rejected at the first step with a non-zero exit code |
 
 What the daemon itself enforces are six items of the capability report: `btf`, `bpffs`, `cgroup_v2`,
@@ -275,7 +276,7 @@ reach the default install only with the next release.
 
 | Step (its name in the output) | What it does |
 |---|---|
-| Checking the system | The distribution and its package manager, the service manager; kernel ≥ 6.12, BTF, cgroup v2 mounted at `/sys/fs/cgroup` (on an OpenRC host where it is not mounted yet, starts the `cgroups` service); whether this host can run the released binaries |
+| Checking the system | The distribution and its package manager, the service manager; kernel ≥ 6.12, BTF, cgroup v2 mounted at `/sys/fs/cgroup` (on an OpenRC host where it is not mounted yet, starts the `cgroups` service), enough free disk space for what this run installs (section 1.3); whether this host can run the released binaries |
 | Installing packages | See the package lists and planning rules below |
 | Downloading the release artifact | Prebuilt path: fetches the artifact, checks the sha256 and the `MANIFEST` |
 | Preparing the Rust toolchain / Building the BPF objects / Building the Rust control plane | Source-build path: rustup (version pinned by `rust-toolchain.toml`), `make bpf`, `cargo build --release` |
