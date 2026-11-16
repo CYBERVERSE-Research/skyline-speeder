@@ -56,7 +56,9 @@ curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder
 wget -qO- https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sh
 ```
 
-`scripts/bootstrap.sh` puts the source tree at `/usr/local/src/skyline-speeder` (an existing old tree is moved
+`scripts/bootstrap.sh` first checks the kernel version (6.12 or newer), so a host that cannot run Skyline Speeder is
+told before anything is installed or downloaded; every other check is `install.sh`'s. It puts the source tree at
+`/usr/local/src/skyline-speeder` (an existing old tree is moved
 to `<dir>.bak-<timestamp>`, not deleted), installs whatever of `curl`, `bash` and `tar` is missing with the
 host's package manager, and then runs the `install.sh` there. Other arguments are passed through unchanged:
 `... | bash -s -- --source` (on Alpine, `... | sh -s -- --source`). The `install.sh` it runs comes from `--ref`
@@ -1193,7 +1195,7 @@ Nothing is ever sent without a `y`. The question comes after these, once each:
 
 | Where | When |
 |---|---|
-| `install.sh` | An install, upgrade or `--uninstall` fails (not `--check`, not a refusal before anything ran such as "must run as root", not Ctrl-C) |
+| `install.sh` | An install, upgrade or `--uninstall` fails (not `--check`, not a refusal before anything ran such as "must run as root", not a host that does not meet the hard prerequisites of section 1.3 — an unsupported kernel or distribution, no BTF, no cgroup v2, a release asked for by name that this host cannot run — and not Ctrl-C) |
 | `ssctl` | `enable` is refused; the daemon cannot be reached and its service manager has given up on it (`failed`, OpenRC's `crashed`); a reply does not decode |
 | `ssctl` | skyline-speederd recorded an error it stopped on (`main` returned an error) or a panic in any thread, in `/var/lib/skyline-speeder/reports/` -- asked about after the command's own output, on the next `ssctl` run on a terminal |
 

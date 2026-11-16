@@ -137,6 +137,29 @@ main() {
         exec "$SRC_DIR/install.sh" "$@"
     fi
 
+    # The kernel floor, before anything is installed or fetched for a host
+    # that cannot use it. The one check of install.sh's that is repeated here
+    # (see "hand off" below): it is the refusal most hosts that are refused
+    # get, it needs nothing but uname, and it is the same for every tree this
+    # script could fetch -- skyline_cc's cong_control has the four arguments
+    # the kernel gives it from 6.10, and 6.12 LTS is the supported floor.
+    # install.sh asks again, for the runs that do not come through here.
+    if [ "$UNINSTALLING" -eq 0 ]; then
+        KVER="$(uname -r)"
+        KMAJ="${KVER%%.*}"; KREST="${KVER#*.}"; KMIN="${KREST%%.*}"
+        case "$KMAJ$KMIN" in
+            ''|*[!0-9]*) ;;     # not a version this can read: install.sh decides
+            *)
+                if [ "$KMAJ" -lt 6 ] || { [ "$KMAJ" -eq 6 ] && [ "$KMIN" -lt 12 ]; }; then
+                    die "kernel $KVER is not supported.
+   Skyline Speeder requires 6.12 LTS or newer (hard ABI floor is 6.10).
+   The 6.1.x and 6.6.x LTS branches use the older 2-argument cong_control
+   signature and the verifier will reject skyline_cc on them.
+   Nothing was downloaded or installed."
+                fi ;;
+        esac
+    fi
+
     TMP="$(mktemp -d)"
     # shellcheck disable=SC2064  # $TMP must expand now, not at trap time
     trap "rm -rf '$TMP'" EXIT
@@ -255,7 +278,9 @@ main() {
     # --- hand off -----------------------------------------------------------
     # install.sh owns every check that matters (distribution, kernel floor, BTF,
     # cgroup v2, verifier pass). Duplicating them here would mean two copies to
-    # keep in sync, so this script deliberately checks none of them.
+    # keep in sync, so this script deliberately checks none of them -- but for
+    # the kernel floor above, which never changes and saves a refused host the
+    # packages and the download.
     info "handing off to install.sh"
     echo
     "$SRC_DIR/install.sh" "$@"

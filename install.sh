@@ -240,6 +240,19 @@ die() {
     exit 1
 }
 
+# unsupported <message>: die, for a host this cannot run on by its documented
+# requirements -- another distribution, an older kernel, no BTF, no cgroup v2,
+# a release that does not fit when one was asked for by name. The installer
+# refusing such a host is it working, like --check saying what a host lacks,
+# so no error report is offered: of the first eleven reports that reached the
+# developers five said "kernel 4.15 is not supported" or "kernel 5.10 is not
+# supported", which the message had already told the one person who can do
+# something about it. Keep `die` for what should not happen on a supported host.
+unsupported() {
+    FEEDBACK_ARMED=0
+    die "$@"
+}
+
 # fail_report <message> <show-log-tail: 0|1>
 fail_report() {
     FAILED=1 FAIL_MESSAGE=$1
@@ -388,7 +401,8 @@ quietly() {
 # SKYLINE_FEEDBACK=yes answers y in advance, for automation that wants its
 # failures reported; SKYLINE_FEEDBACK=no never asks. A refusal before anything
 # ran (not root, an unknown argument), --check, which exists to say what a
-# host lacks, and an interrupt ask nothing. ssctl asks the same way about
+# host lacks, a host that does not meet the documented requirements (an older
+# kernel, another distribution: `unsupported`) and an interrupt ask nothing. ssctl asks the same way about
 # runtime errors (crates/ssctl/src/feedback.rs): keep the two in step -- what
 # a report holds, what is scrubbed from it, the question.
 #
@@ -2511,14 +2525,14 @@ case "$SOURCE" in
         fi
         ;;
     prebuilt)
-        [ -z "$BLOCKER" ] || die "--prebuilt/--release cannot install here: $BLOCKER.
+        [ -z "$BLOCKER" ] || unsupported "--prebuilt/--release cannot install here: $BLOCKER.
    Build from source instead: ${SUDO}$SELF --source"
         ;;
 esac
 # A source build runs the tree's Makefile, cargo and scripts as root, and piped
 # in there is no tree (see REPO_ROOT): stop before anything is installed.
 if [ "$MODE" = install ] && [ "$SOURCE" = build ] && [ -z "$REPO_ROOT" ]; then
-    die "building from source${SOURCE_REASON:+ ($SOURCE_REASON)} needs the source tree, and this install.sh was piped in without one.
+    unsupported "building from source${SOURCE_REASON:+ ($SOURCE_REASON)} needs the source tree, and this install.sh was piped in without one.
    Run scripts/bootstrap.sh, the one-line install, which fetches the tree first, or install.sh from a clone."
 fi
 
@@ -2555,12 +2569,12 @@ if [ "$MODE" = install ]; then
 fi
 
 # --- 1. distribution -------------------------------------------------------
-[ -r /etc/os-release ] || die "/etc/os-release missing; unsupported system"
+[ -r /etc/os-release ] || unsupported "/etc/os-release missing; unsupported system"
 # shellcheck disable=SC1091
 . /etc/os-release
-[ -n "$PKG" ] || die "this installer supports Debian/Ubuntu, Fedora, the RHEL family (Rocky Linux,
+[ -n "$PKG" ] || unsupported "this installer supports Debian/Ubuntu, Fedora, the RHEL family (Rocky Linux,
    AlmaLinux, CentOS Stream) and Alpine (found ID=${ID:-unknown}${ID_LIKE:+, ID_LIKE=$ID_LIKE})"
-[ -n "$INIT" ] || die "neither systemd nor OpenRC runs this host (PID 1 is $(cat /proc/1/comm 2>/dev/null || echo unknown)).
+[ -n "$INIT" ] || unsupported "neither systemd nor OpenRC runs this host (PID 1 is $(cat /proc/1/comm 2>/dev/null || echo unknown)).
    skyline-speederd and the service that attaches skyline_cc need one of them."
 ok "distribution: ${PRETTY_NAME:-$ID} ($PKG, $INIT)"
 
@@ -2571,7 +2585,7 @@ ok "distribution: ${PRETTY_NAME:-$ID} ($PKG, $INIT)"
 # rejects the program outright at load time. 6.12 LTS is the supported floor.
 KMAJ=${KVER%%.*}; KREST=${KVER#*.}; KMIN=${KREST%%.*}
 if [ "$KMAJ" -lt 6 ] || { [ "$KMAJ" -eq 6 ] && [ "$KMIN" -lt 12 ]; }; then
-    die "kernel $KVER is not supported.
+    unsupported "kernel $KVER is not supported.
    Skyline Speeder requires 6.12 LTS or newer (hard ABI floor is 6.10).
    The 6.1.x and 6.6.x LTS branches use the older 2-argument cong_control
    signature and the verifier will reject skyline_cc on them."
@@ -2579,12 +2593,12 @@ fi
 ok "kernel: $KVER"
 
 # --- 3. runtime prerequisites ---------------------------------------------
-[ -r /sys/kernel/btf/vmlinux ] || die "/sys/kernel/btf/vmlinux is missing.
+[ -r /sys/kernel/btf/vmlinux ] || unsupported "/sys/kernel/btf/vmlinux is missing.
    CO-RE needs kernel BTF; rebuild the kernel with CONFIG_DEBUG_INFO_BTF=y."
 ok "kernel BTF present"
 
 if [ ! -d /sys/fs/cgroup ] || ! grep -qw cgroup2 /proc/filesystems; then
-    die "cgroup v2 is required (the sockops policy attaches to a cgroup v2 path)"
+    unsupported "cgroup v2 is required (the sockops policy attaches to a cgroup v2 path)"
 fi
 # Mounted, too, where skyline-speederd looks for it -- the unified hierarchy at
 # /sys/fs/cgroup; it refuses to start otherwise. systemd always mounts it
@@ -2599,11 +2613,11 @@ if [ -e /sys/fs/cgroup/cgroup.controllers ]; then
 elif [ "$INIT" = openrc ] && [ "$MODE" = check ]; then
     ok "cgroup v2 available (not mounted yet: an install starts OpenRC's cgroups service)"
 elif [ "$INIT" = openrc ]; then
-    die "cgroup v2 is not mounted at /sys/fs/cgroup.
+    unsupported "cgroup v2 is not mounted at /sys/fs/cgroup.
    OpenRC mounts it there only in its unified mode: set rc_cgroup_mode=\"unified\"
    in /etc/rc.conf (what an unset one means), then reboot."
 else
-    die "cgroup v2 is not mounted at /sys/fs/cgroup (a hybrid or legacy cgroup
+    unsupported "cgroup v2 is not mounted at /sys/fs/cgroup (a hybrid or legacy cgroup
    layout). Boot with the unified hierarchy (systemd.unified_cgroup_hierarchy=1)."
 fi
 
