@@ -366,6 +366,8 @@ skyline-speeder/
 ```bash
 sudo apt-get install -y build-essential pkg-config clang llvm \
     libbpf-dev libelf-dev zlib1g-dev bpftool
+# Ubuntu 22.04 has no bpftool package: linux-tools-generic-hwe-22.04 instead, then
+#   make bpf BPFTOOL="$(ls /usr/lib/linux-tools/*/bpftool | sort -V | tail -n 1)"
 # Fedora / RHEL (libbpf-devel is in CodeReady Builder there: add --enablerepo=crb):
 #   sudo dnf install gcc make pkgconf-pkg-config clang llvm libbpf-devel elfutils-libelf-devel zlib-devel bpftool
 # Alpine (bpftool is in the community repository):

@@ -306,6 +306,12 @@ NIC's root qdisc.
   not using `-t bookworm-backports`: that would replace 55 packages). If the plan after a version swap would
   remove any package, it **aborts** and lists those packages; when `apt-get update` fails because some
   repository is unreachable, it only warns and continues.
+- Ubuntu 22.04 has no `bpftool` package to install (only a virtual one), so there a source build takes
+  `linux-tools-generic-hwe-22.04` in its place and runs the binary that package brings by its path,
+  `/usr/lib/linux-tools/<version>/bpftool`: the `bpftool` on `PATH` is a wrapper that looks for the tools of the
+  running kernel and fails on any kernel that is not Ubuntu's own. Its `libbpf-dev` (0.5.0) predates one helper
+  `skyline_tc` calls; `make bpf` sees that and supplies the declaration (`bpf/include/skyline_old_libbpf.h`).
+  A `BPFTOOL=<path>` in the installer's environment is used as given.
 - dnf and apk solve the whole request together, installing either everything or nothing, and when it cannot be
   installed the installer relays their own error. dnf does not install weak dependencies. On the RHEL family,
   `libbpf-devel` is in the CodeReady Builder repository, which is disabled by default; a source build adds
@@ -412,6 +418,10 @@ apt-get install -y -qq build-essential pkg-config clang llvm \
 #   dnf install -y gcc make pkgconf-pkg-config clang llvm libbpf-devel elfutils-libelf-devel zlib-devel bpftool curl iproute iproute-tc
 # Alpine (bpftool is in the community repository):
 #   apk add build-base pkgconf clang llvm libbpf-dev elfutils-dev zlib-dev linux-headers bpftool curl iproute2 bash libgcc
+
+# Ubuntu 22.04 has no bpftool package: install linux-tools-generic-hwe-22.04 in its place and build with
+#   make bpf BPFTOOL="$(ls /usr/lib/linux-tools/*/bpftool | sort -V | tail -n 1)"
+# (the bpftool on PATH is a wrapper that fails on a kernel that is not Ubuntu's own).
 
 # Debian 12 + the 6.12 kernel from bookworm-backports: linux-headers-* pulls libelf1 up to 0.192, while bookworm's
 # libelf-dev depends on libelf1 (= 0.188-2.1), so the apt-get above fails with "held broken packages". Swap only

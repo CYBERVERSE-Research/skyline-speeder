@@ -21,6 +21,11 @@ four). So **every kfunc a BPF source calls is declared in that source** (see the
 taken from vmlinux.h. The `PREBUILT_VMLINUX_H` path does not set the macro, and the released objects stay byte for
 byte the same.
 
+`bpf/include/skyline_old_libbpf.h` declares the helpers an old libbpf's `bpf_helper_defs.h` lacks (libbpf 0.5.0 on
+Ubuntu 22.04 has no `bpf_skb_set_tstamp`). **Never `#include` it**: the Makefile passes it with `-include`, only when
+the installed header lacks the helper, so the sources' line numbers and a release's objects do not depend on it. A
+helper the sources start to call that libbpf 0.5.0 does not declare goes into that file and the Makefile's test.
+
 ## CO-RE portability
 
 The header only has to **define** the types the code uses. It need not come from the kernel the objects will run on,
