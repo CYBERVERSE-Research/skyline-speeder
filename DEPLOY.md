@@ -163,6 +163,7 @@ data-plane loss. For the other known validity boundaries and limitations see
 | struct_ops | `struct_ops` in the capability report of section 4 | `true` |
 | `fallback_cc` | `fallback_cc_available` in the capability report of section 4 | `true` (section 8.1) |
 | bpffs | `mount \| grep -q ' /sys/fs/bpf '` | Mounted (when it is not, the installer refuses at the first step; `bpffs` in the capability report only checks that the directory `/sys/fs/bpf` exists — it exists even when bpffs is not mounted — so it cannot stand in for this check) |
+| Disk space | `df -h / /tmp` | A release install: about 60 MiB under `/opt` and 100 MiB of temporary files. A source build on a host with no toolchain: about 3.5 GiB — 1.2 GiB of packages under `/usr` and 0.4 GiB of their downloads under `/var/cache`, 1.5 GiB of Rust toolchain under root's home, 0.4 GiB of build output in the source tree. The installer adds up what this host still lacks per filesystem and refuses at the first step when one is short |
 | Distribution | `cat /etc/os-release` | Debian/Ubuntu (apt + systemd), Fedora and the RHEL family — Rocky Linux, AlmaLinux, CentOS Stream (dnf + systemd), Alpine (apk + OpenRC); other distributions are rejected at the first step with a non-zero exit code |
 
 What the daemon itself enforces are six items of the capability report: `btf`, `bpffs`, `cgroup_v2`,
@@ -277,7 +278,7 @@ reach the default install only with the next release.
 
 | Step (its name in the output) | What it does |
 |---|---|
-| Checking the system | The distribution and its package manager, the service manager; kernel ≥ 6.12, BTF, that this is the host's root in the host's network namespace (not a container: section 1.3), that `fq` is available and bpffs is mounted, cgroup v2 mounted at `/sys/fs/cgroup` (on an OpenRC host where it is not mounted yet, starts the `cgroups` service); whether this host can run the released binaries |
+| Checking the system | The distribution and its package manager, the service manager; kernel ≥ 6.12, BTF, that this is the host's root in the host's network namespace (not a container: section 1.3), that `fq` is available and bpffs is mounted, cgroup v2 mounted at `/sys/fs/cgroup` (on an OpenRC host where it is not mounted yet, starts the `cgroups` service), enough free disk space for what this run installs (section 1.3); whether this host can run the released binaries |
 | Installing packages | See the package lists and planning rules below |
 | Downloading the release artifact | Prebuilt path: fetches the artifact, checks the sha256 and the `MANIFEST` |
 | Preparing the Rust toolchain / Building the BPF objects / Building the Rust control plane | Source-build path: rustup (version pinned by `rust-toolchain.toml`), `make bpf`, `cargo build --release` |
@@ -308,6 +309,12 @@ NIC's root qdisc.
   not using `-t bookworm-backports`: that would replace 55 packages). If the plan after a version swap would
   remove any package, it **aborts** and lists those packages; when `apt-get update` fails because some
   repository is unreachable, it only warns and continues.
+- Ubuntu 22.04 has no `bpftool` package to install (only a virtual one), so there a source build takes
+  `linux-tools-generic-hwe-22.04` in its place and runs the binary that package brings by its path,
+  `/usr/lib/linux-tools/<version>/bpftool`: the `bpftool` on `PATH` is a wrapper that looks for the tools of the
+  running kernel and fails on any kernel that is not Ubuntu's own. Its `libbpf-dev` (0.5.0) predates one helper
+  `skyline_tc` calls; `make bpf` sees that and supplies the declaration (`bpf/include/skyline_old_libbpf.h`).
+  A `BPFTOOL=<path>` in the installer's environment is used as given.
 - dnf and apk solve the whole request together, installing either everything or nothing, and when it cannot be
   installed the installer relays their own error. dnf does not install weak dependencies. On the RHEL family,
   `libbpf-devel` is in the CodeReady Builder repository, which is disabled by default; a source build adds
@@ -414,6 +421,10 @@ apt-get install -y -qq build-essential pkg-config clang llvm \
 #   dnf install -y gcc make pkgconf-pkg-config clang llvm libbpf-devel elfutils-libelf-devel zlib-devel bpftool curl iproute iproute-tc
 # Alpine (bpftool is in the community repository):
 #   apk add build-base pkgconf clang llvm libbpf-dev elfutils-dev zlib-dev linux-headers bpftool curl iproute2 bash libgcc
+
+# Ubuntu 22.04 has no bpftool package: install linux-tools-generic-hwe-22.04 in its place and build with
+#   make bpf BPFTOOL="$(ls /usr/lib/linux-tools/*/bpftool | sort -V | tail -n 1)"
+# (the bpftool on PATH is a wrapper that fails on a kernel that is not Ubuntu's own).
 
 # Debian 12 + the 6.12 kernel from bookworm-backports: linux-headers-* pulls libelf1 up to 0.192, while bookworm's
 # libelf-dev depends on libelf1 (= 0.188-2.1), so the apt-get above fails with "held broken packages". Swap only
@@ -1212,7 +1223,8 @@ asking (also with no terminal), unset or `ask` asks. Through sudo: `sudo SKYLINE
 A report is one Sentry event per error, sent with `curl` over HTTPS (TLS 1.2 or newer). It carries: the error and
 its causes, the failing step (install) or the command (`ssctl`), the version, `ID`, `VERSION_ID` and `PRETTY_NAME`
 from `/etc/os-release`, the kernel release, the architecture, the C library, the package and service manager, the
-service state, and the last 40 lines of the failing step's install log or of the daemon's log (`journalctl -u
+service state, and the last 40 lines of the failing step's install log (and, when they are above those, its first
+error lines: up to 12 lines, each match with the two lines after it) or of the daemon's log (`journalctl -u
 skyline-speederd.service -o cat`, or its lines in `/var/log/messages` under OpenRC). Before it is shown or sent,
 IPv4, IPv6 and MAC addresses, e-mail addresses, credentials in URLs, GitHub and Sentry tokens, the values of
 `token=`, `secret=` and `password=` pairs, `/home/<user>`, the host name and the invoking user's name are replaced

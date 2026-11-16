@@ -35,14 +35,15 @@
 #
 # The terminal shows one progress line. Everything the steps print goes to
 # /var/log/skyline-speeder-install.log, which is kept; if a step fails, its
-# last lines are shown together with that path.
+# first error lines and its last lines are shown together with that path.
 #
 # A failed install, upgrade or uninstall then asks whether to send an error
 # report to the developers, and sends one only if you answer y (v shows it
 # first). It holds the error, the step, versions, distribution, kernel and the
-# failing step's last log lines, with addresses, the host name and user names
-# removed. With no terminal to ask on, nothing is sent. SKYLINE_FEEDBACK=yes
-# sends without asking; SKYLINE_FEEDBACK=no never asks.
+# failing step's first error lines and last log lines, with addresses, the
+# host name and user names removed. With no terminal to ask on, nothing is
+# sent. SKYLINE_FEEDBACK=yes sends without asking; SKYLINE_FEEDBACK=no never
+# asks.
 #
 # --uninstall removes the build toolchain it installed (clang, LLVM, bpftool,
 # rustup and what came with them) and nothing else: only packages recorded as
@@ -240,17 +241,53 @@ die() {
     exit 1
 }
 
+# step_errors <tail>: the first lines of the failing step's log that say what
+# went wrong, each with the two lines after it, at most 12 lines; nothing when
+# there are none outside the last <tail> lines, which are shown anyway.
+#
+# The end of a log is where a failure is reported, not always where it is: a
+# C compiler names the error once and then goes on for a screenful of
+# warnings about the rest of the file, make waits for its other jobs, and
+# cargo prints the panic of the build script last. The first report of a
+# failed build that reached the developers was 40 lines of -Wsign-compare
+# warnings and "make: *** [...] Error 1", from an architecture nobody here
+# had: the line that said why was above them, on one host's disk.
+#
+# A word on its own: not -Werror or -Wno-error in a command line, not a crate
+# called thiserror, and not a warning that merely mentions one.
+step_errors() {
+    [ "$LOG_READY" -eq 1 ] && [ -r "$LOG" ] || return 0
+    awk -v from="$STEP_LOG_LINE" -v keep="$1" '
+        NR > from { line[++n] = $0 }
+        END {
+            last = n - keep
+            for (i = 1; i <= last && shown < 12; i++) {
+                if (line[i] ~ /warning:/) continue
+                if (line[i] !~ /(^|[^A-Za-z0-9_-])(error|Error|ERROR|fatal|FATAL|FAILED|Killed|panicked)([^A-Za-z0-9_-]|$)|No space left on device|[Pp]ermission denied|undefined reference|[Cc]annot (find|open|allocate)|[Oo]ut of memory/) continue
+                if (shown && i > prev + 1) print "..."
+                hi = i + 2; if (hi > last) hi = last
+                for (j = i; j <= hi; j++) { print line[j]; shown++ }
+                prev = hi; i = hi
+            }
+        }' "$LOG" 2>/dev/null || true
+}
+
 # fail_report <message> <show-log-tail: 0|1>
 fail_report() {
     FAILED=1 FAIL_MESSAGE=$1
     bar_clear
     printf '%serror%s %s\n' "$RED" "$RST" "$1" >&4
     [ "$LOG_READY" -eq 1 ] || return 0
-    local lines
+    local lines first
     lines=$(wc -l <"$LOG" 2>/dev/null || echo 0)
     # Only what the failing step itself wrote, and not twice under --verbose,
     # where it has just scrolled past.
     if [ "${2:-0}" -eq 1 ] && [ "$VERBOSE" -eq 0 ] && [ "$lines" -gt "$STEP_LOG_LINE" ]; then
+        first=$(step_errors 25)
+        if [ -n "$first" ]; then
+            printf '\n  first errors in the log:\n' >&4
+            printf '%s\n' "$first" | sed 's/^/    /' >&4
+        fi
         printf '\n  last lines of the log:\n' >&4
         { tail -n +"$((STEP_LOG_LINE + 1))" "$LOG" | tail -n 25 | sed 's/^/    /' >&4; } || true
     fi
@@ -525,11 +562,12 @@ feedback_json() {
 # FEEDBACK_EVENT and as the lines `v` shows into FEEDBACK_VIEW. Built from the
 # same values, so what is shown is what would be sent.
 feedback_build() {
-    local kind=$MODE message tail= daemon= os_id os_version os_name libc arch fields json f
+    local kind=$MODE message tail= first= daemon= os_id os_version os_name libc arch fields json f
     [ "$MODE" != install ] || [ "${UPGRADE:-0}" -eq 0 ] || kind=upgrade
     message=$(printf '%s' "$FAIL_MESSAGE" | feedback_scrub)
     if [ "$LOG_READY" -eq 1 ] && [ -r "$LOG" ]; then
         tail=$(tail -n +"$((STEP_LOG_LINE + 1))" "$LOG" 2>/dev/null | tail -n 40 | feedback_scrub)
+        first=$(step_errors 40 | feedback_scrub)
     fi
     if [ -d "$FEEDBACK_DAEMON_REPORTS" ]; then
         daemon=$(cat "$FEEDBACK_DAEMON_REPORTS"/*.json 2>/dev/null | feedback_scrub)
@@ -565,6 +603,8 @@ feedback_build() {
     FEEDBACK_EVENT+=",\"fingerprint\":[\"install.sh\",\"$kind\",$f,$REPLY]"
     feedback_json "$STEP_NO/$STEP_TOTAL $STEP_NAME"
     FEEDBACK_EVENT+=",\"extra\":{\"step\":$REPLY"
+    feedback_json "$first"
+    FEEDBACK_EVENT+=",\"log_errors\":$REPLY"
     feedback_json "$tail"
     FEEDBACK_EVENT+=",\"log_tail\":$REPLY"
     feedback_json "$daemon"
@@ -575,6 +615,7 @@ feedback_build() {
         [ "$STEP_TOTAL" -eq 0 ] || printf '   step     %s\n' "$STEP_NO/$STEP_TOTAL $STEP_NAME"
         printf '   host     %s\n' "$os_name, kernel $KVER, $arch, $libc, ${PKG:-none}, ${INIT:-none}"
         printf '   tags     %s\n' "${fields[*]}"
+        [ -z "$first" ] || { printf '   errors   the first errors of the failing step:\n'; printf '%s\n' "$first" | sed 's/^/     | /'; }
         [ -z "$tail" ] || { printf '   log      the last lines of the failing step:\n'; printf '%s\n' "$tail" | sed 's/^/     | /'; }
         [ -z "$daemon" ] || { printf '   daemon   what skyline-speederd recorded when it stopped:\n'; printf '%s\n' "$daemon" | sed 's/^/     | /'; }
     )
@@ -612,9 +653,9 @@ feedback_offer() {
         printf '\n %sHelp us fix this?%s Send an error report to the Skyline Speeder developers.\n' "$BLD" "$RST" >&5
         printf '%s\n' \
             "   It holds the error above, the step, the versions, the distribution, the" \
-            "   kernel and the last lines of the failing step's log, with IP, MAC and" \
-            "   e-mail addresses, the host name and user names removed. Nothing is sent" \
-            "   unless you answer y." >&5
+            "   kernel and the first errors and the last lines of the failing step's log," \
+            "   with IP, MAC and e-mail addresses, the host name and user names removed." \
+            "   Nothing is sent unless you answer y." >&5
         while :; do
             printf '   Send it? [y/N, v to view it first] ' >&5
             answer=
@@ -825,6 +866,19 @@ fq_available() {
     if [ "$(cat /proc/sys/kernel/modules_disabled 2>/dev/null || true)" = 1 ]; then return 1; fi
     if grep -Eq '(^|/)sch[-_]fq\.ko[^:/]*:' "$dir/modules.dep" 2>/dev/null; then return 0; fi
     grep -Eq '^alias[[:space:]]+sch[-_]fq[[:space:]]' "$dir/modules.alias" 2>/dev/null
+}
+
+# find_bpftool: a bpftool that runs, into REPLY. Ubuntu's /usr/sbin/bpftool is
+# a wrapper (linux-tools-common) that execs /usr/lib/linux-tools/$(uname -r)/
+# bpftool and fails when no tools package matches the running kernel -- the
+# rule on a host whose kernel is not Ubuntu's own, which is every 22.04 host
+# this project supports. bpftool does not have to match the kernel it reads
+# BTF from, so the newest one the tools packages installed is taken by path.
+find_bpftool() {
+    REPLY=
+    if bpftool version >/dev/null 2>&1; then REPLY=bpftool; return 0; fi
+    REPLY=$(printf '%s\n' /usr/lib/linux-tools/*/bpftool | sort -V | awk 'END { print }')
+    [ -x "$REPLY" ] && "$REPLY" version >/dev/null 2>&1
 }
 
 # --- service manager ---------------------------------------------------------
@@ -2491,7 +2545,11 @@ if [ "$MODE" = uninstall ]; then
     # install added, so asking after the purge would always answer "none" on the
     # very hosts that have something to report. Reported further down, once the
     # host is back on a congestion control this can name.
-    LEFT=$(bpftool struct_ops show 2>/dev/null | grep -c skyline_cc || true)
+    if find_bpftool; then
+        LEFT=$("$REPLY" struct_ops show 2>/dev/null | grep -c skyline_cc || true)
+    else
+        LEFT=0
+    fi
 
     # Leave the host on something deliberate, and say which. By default bbr +
     # fq: where a host that installed Skyline Speeder almost certainly came
@@ -2739,6 +2797,66 @@ else
    layout). Boot with the unified hierarchy (systemd.unified_cgroup_hierarchy=1)."
 fi
 
+# Room for what this run is about to put on the disk, asked before any of it
+# is. A source build on a host with no toolchain adds about 3.5 GiB -- measured
+# on Ubuntu 22.04: 1.0 GiB of packages and 0.35 GiB of their downloads, 1.2 GiB
+# of Rust toolchain (more while rustup unpacks it), 0.3 GiB of build output --
+# and a small VPS often does not have that. It used to find out several
+# minutes in, as whatever the tool that hit the limit happened to say: rustup's
+# "failed to extract package: No space left on device", or curl's "(23) Failure
+# writing output to destination" from inside rustup's own installer.
+#
+# Per filesystem, since / and /home, /var or /tmp may be separate ones (a
+# tmpfs /tmp is sized by memory); only for what this host still lacks; and
+# rounded up, because an install that stops half way costs more than one that
+# asks for a little more than it ends up using. A published release is a few
+# megabytes and is asked for too.
+declare -A SPACE_NEED=() SPACE_FREE=() SPACE_FOR=()
+# space_need <path> <MiB> <what for>: add to what the filesystem holding
+# <path> (or its nearest existing parent) has to take.
+space_need() {
+    local p=$1 line free mount
+    while [ ! -e "$p" ] && [ "$p" != / ]; do p=$(dirname "$p"); done
+    # -P: one line per filesystem, whatever the length of the device's name.
+    line=$(df -Pk "$p" 2>/dev/null | awk 'NR == 2 { print $4, $6 }' || true)
+    free=${line%% *} mount=${line#* }
+    case "$free" in ''|*[!0-9]*) return 0 ;; esac
+    SPACE_FREE[$mount]=$((free / 1024))
+    SPACE_NEED[$mount]=$(( ${SPACE_NEED[$mount]:-0} + $2 ))
+    SPACE_FOR[$mount]="${SPACE_FOR[$mount]:+${SPACE_FOR[$mount]}, }$3"
+}
+if [ "$SOURCE" = build ]; then
+    if ! command -v clang >/dev/null 2>&1; then
+        space_need /usr 1200 "the build packages"
+        space_need /var/cache 400 "their downloads"
+    fi
+    if ! command -v cargo >/dev/null 2>&1 && [ ! -x "${HOME:-/root}/.cargo/bin/cargo" ]; then
+        space_need "${RUSTUP_HOME:-${HOME:-/root}/.rustup}" 1500 "the Rust toolchain"
+    fi
+    [ -d "$REPO_ROOT/target/release" ] || space_need "$REPO_ROOT" 400 "the build"
+else
+    space_need /opt 60 "the release"
+fi
+space_need "${TMPDIR:-/tmp}" 100 "temporary files"
+SPACE_SHORT=
+for REPLY in "${!SPACE_NEED[@]}"; do
+    [ "${SPACE_FREE[$REPLY]}" -ge "${SPACE_NEED[$REPLY]}" ] || SPACE_SHORT+="
+   $REPLY has ${SPACE_FREE[$REPLY]} MiB free; about ${SPACE_NEED[$REPLY]} MiB are needed there for ${SPACE_FOR[$REPLY]}"
+done
+if [ -n "$SPACE_SHORT" ]; then
+    if [ "$SOURCE" = build ]; then
+        REPLY="not enough free disk space to build from source${SOURCE_REASON:+ ($SOURCE_REASON)}.$SPACE_SHORT
+   Free that much and run this again; --uninstall removes the toolchain a build
+   installed, and the build output is this tree's target/."
+    else
+        REPLY="not enough free disk space for the install.$SPACE_SHORT"
+    fi
+    # A preflight goes on to say what else it sees.
+    if [ "$MODE" = check ]; then warn "$REPLY"; else die "$REPLY"; fi
+else
+    ok "disk space: enough for this install"
+fi
+
 # --- 4. what the host runs now ---------------------------------------------
 # Recorded before anything changes: the summary reports "was", the pre-install
 # snapshot below is built from it, and --uninstall puts it back.
@@ -2972,6 +3090,42 @@ apt_update_error() {
         "$LOG" 2>/dev/null
 }
 
+# apt_has_candidate <package>: whether apt has a version of it to install. A
+# name that only other packages provide prints "Candidate: (none)", one apt
+# has never heard of prints nothing.
+apt_has_candidate() {
+    [ -n "$(apt-cache policy "$1" 2>/dev/null \
+        | awk '$1 == "Candidate:" && $2 != "(none)" && !n++ { print $2 }' || true)" ]
+}
+
+# apt_bpftool_package: where there is no bpftool package to install, put the
+# one that carries the binary into PKGS in its place. Debian, and Ubuntu from
+# 24.04, have a package of that name. Ubuntu 22.04 has only a virtual one,
+# which no kernel flavour in its archive provides any more --
+#
+#   Package bpftool is a virtual package provided by: linux-hwe-6.5-tools-common ...
+#   E: Package 'bpftool' has no installation candidate
+#
+# -- so every source build there stopped at this step, and every 22.04 host
+# builds from source: its glibc is older than the published binaries need. The
+# binary is in the kernel tools package, linux-tools-<abi>-generic, which the
+# linux-tools-generic metapackages follow. The HWE one first: 22.04's own is
+# bpftool 5.15, which cannot read the BTF of a kernel new enough to run
+# skyline_cc (BTF_KIND_ENUM64, from 6.0); the HWE stack's 6.8 can.
+# Not for a preflight to report as a problem: it is this installer's business.
+apt_bpftool_package() {
+    local i p
+    if apt_has_candidate bpftool; then return 0; fi
+    for p in "linux-tools-generic-hwe-${VERSION_ID:-}" linux-tools-generic; do
+        apt_has_candidate "$p" || continue
+        for i in "${!PKGS[@]}"; do
+            [ "${PKGS[$i]}" != bpftool ] || PKGS[$i]=$p
+        done
+        log "apt: no bpftool package on this release; taking bpftool from $p"
+        return 0
+    done
+}
+
 # apt_plan <package...>: leave in APT_SPEC a request apt says it can satisfy,
 # or return 1 with the plan it rejected in $APT_SIM and in the log.
 #
@@ -3071,6 +3225,7 @@ if [ "$MODE" = check ]; then
     # (--assumeno, --simulate).
     case "$PKG" in
         apt)
+            [ "$SOURCE" != build ] || apt_bpftool_package
             if apt_plan "${PKGS[@]}"; then
                 ok "apt can install the packages the install needs"
             else
@@ -3215,6 +3370,7 @@ fi
 # installer can do something about -- an interrupted dpkg run, a library from
 # another suite -- into a request that resolves, and everything else into this
 # message with apt's own reasoning in the log under it.
+[ "$SOURCE" != build ] || apt_bpftool_package
 if ! apt_plan "${PKGS[@]}"; then
     # "held broken packages" is apt's wording whether or not anything is
     # actually held, so say which packages really are: one held by hand is a
@@ -3300,6 +3456,24 @@ run "${IN_TREE[@]}" cargo --version \
 ok "rust: $(cd "$REPO_ROOT" && cargo --version 2>/dev/null || cargo --version)"
 
 step "Building the BPF objects"
+# By path where the command on PATH does not run (find_bpftool). Exported: the
+# Makefile reads BPFTOOL, and so does the `make bpf` infra/install-guest.sh
+# runs once more when it installs the files.
+# One named by the caller (BPFTOOL=<path>, as for make) is taken as it is.
+if [ -z "${BPFTOOL:-}" ]; then
+    find_bpftool || die "no bpftool on this host runs: 'bpftool version' fails, and there is none
+   under /usr/lib/linux-tools. Install one that does and pass it as BPFTOOL=<path>."
+    if [ "$REPLY" != bpftool ]; then
+        export BPFTOOL=$REPLY
+        info "bpftool on PATH does not run for kernel $KVER; using $BPFTOOL"
+    fi
+fi
+# Asked before the build, for a message that says what is wrong: an older
+# bpftool stops on a BTF kind it does not know, and make would only show the
+# failed redirection into vmlinux.h.
+"${BPFTOOL:-bpftool}" btf dump file /sys/kernel/btf/vmlinux format c >/dev/null 2>>"$LOG" \
+    || die "$("${BPFTOOL:-bpftool}" version 2>/dev/null | awk 'NR == 1') cannot read this kernel's BTF (/sys/kernel/btf/vmlinux):
+   it is older than kernel $KVER. Install a newer bpftool and pass it as BPFTOOL=<path>."
 run make -C "$REPO_ROOT" bpf || die "building the BPF objects failed"
 
 step "Building the Rust control plane"
