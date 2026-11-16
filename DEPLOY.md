@@ -1210,7 +1210,8 @@ asking (also with no terminal), unset or `ask` asks. Through sudo: `sudo SKYLINE
 A report is one Sentry event per error, sent with `curl` over HTTPS (TLS 1.2 or newer). It carries: the error and
 its causes, the failing step (install) or the command (`ssctl`), the version, `ID`, `VERSION_ID` and `PRETTY_NAME`
 from `/etc/os-release`, the kernel release, the architecture, the C library, the package and service manager, the
-service state, and the last 40 lines of the failing step's install log or of the daemon's log (`journalctl -u
+service state, and the last 40 lines of the failing step's install log (and, when they are above those, its first
+error lines: up to 12 lines, each match with the two lines after it) or of the daemon's log (`journalctl -u
 skyline-speederd.service -o cat`, or its lines in `/var/log/messages` under OpenRC). Before it is shown or sent,
 IPv4, IPv6 and MAC addresses, e-mail addresses, credentials in URLs, GitHub and Sentry tokens, the values of
 `token=`, `secret=` and `password=` pairs, `/home/<user>`, the host name and the invoking user's name are replaced

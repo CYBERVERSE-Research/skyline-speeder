@@ -35,14 +35,15 @@
 #
 # The terminal shows one progress line. Everything the steps print goes to
 # /var/log/skyline-speeder-install.log, which is kept; if a step fails, its
-# last lines are shown together with that path.
+# first error lines and its last lines are shown together with that path.
 #
 # A failed install, upgrade or uninstall then asks whether to send an error
 # report to the developers, and sends one only if you answer y (v shows it
 # first). It holds the error, the step, versions, distribution, kernel and the
-# failing step's last log lines, with addresses, the host name and user names
-# removed. With no terminal to ask on, nothing is sent. SKYLINE_FEEDBACK=yes
-# sends without asking; SKYLINE_FEEDBACK=no never asks.
+# failing step's first error lines and last log lines, with addresses, the
+# host name and user names removed. With no terminal to ask on, nothing is
+# sent. SKYLINE_FEEDBACK=yes sends without asking; SKYLINE_FEEDBACK=no never
+# asks.
 #
 # --uninstall removes the build toolchain it installed (clang, LLVM, bpftool,
 # rustup and what came with them) and nothing else: only packages recorded as
@@ -240,17 +241,53 @@ die() {
     exit 1
 }
 
+# step_errors <tail>: the first lines of the failing step's log that say what
+# went wrong, each with the two lines after it, at most 12 lines; nothing when
+# there are none outside the last <tail> lines, which are shown anyway.
+#
+# The end of a log is where a failure is reported, not always where it is: a
+# C compiler names the error once and then goes on for a screenful of
+# warnings about the rest of the file, make waits for its other jobs, and
+# cargo prints the panic of the build script last. The first report of a
+# failed build that reached the developers was 40 lines of -Wsign-compare
+# warnings and "make: *** [...] Error 1", from an architecture nobody here
+# had: the line that said why was above them, on one host's disk.
+#
+# A word on its own: not -Werror or -Wno-error in a command line, not a crate
+# called thiserror, and not a warning that merely mentions one.
+step_errors() {
+    [ "$LOG_READY" -eq 1 ] && [ -r "$LOG" ] || return 0
+    awk -v from="$STEP_LOG_LINE" -v keep="$1" '
+        NR > from { line[++n] = $0 }
+        END {
+            last = n - keep
+            for (i = 1; i <= last && shown < 12; i++) {
+                if (line[i] ~ /warning:/) continue
+                if (line[i] !~ /(^|[^A-Za-z0-9_-])(error|Error|ERROR|fatal|FATAL|FAILED|Killed|panicked)([^A-Za-z0-9_-]|$)|No space left on device|[Pp]ermission denied|undefined reference|[Cc]annot (find|open|allocate)|[Oo]ut of memory/) continue
+                if (shown && i > prev + 1) print "..."
+                hi = i + 2; if (hi > last) hi = last
+                for (j = i; j <= hi; j++) { print line[j]; shown++ }
+                prev = hi; i = hi
+            }
+        }' "$LOG" 2>/dev/null || true
+}
+
 # fail_report <message> <show-log-tail: 0|1>
 fail_report() {
     FAILED=1 FAIL_MESSAGE=$1
     bar_clear
     printf '%serror%s %s\n' "$RED" "$RST" "$1" >&4
     [ "$LOG_READY" -eq 1 ] || return 0
-    local lines
+    local lines first
     lines=$(wc -l <"$LOG" 2>/dev/null || echo 0)
     # Only what the failing step itself wrote, and not twice under --verbose,
     # where it has just scrolled past.
     if [ "${2:-0}" -eq 1 ] && [ "$VERBOSE" -eq 0 ] && [ "$lines" -gt "$STEP_LOG_LINE" ]; then
+        first=$(step_errors 25)
+        if [ -n "$first" ]; then
+            printf '\n  first errors in the log:\n' >&4
+            printf '%s\n' "$first" | sed 's/^/    /' >&4
+        fi
         printf '\n  last lines of the log:\n' >&4
         { tail -n +"$((STEP_LOG_LINE + 1))" "$LOG" | tail -n 25 | sed 's/^/    /' >&4; } || true
     fi
@@ -525,11 +562,12 @@ feedback_json() {
 # FEEDBACK_EVENT and as the lines `v` shows into FEEDBACK_VIEW. Built from the
 # same values, so what is shown is what would be sent.
 feedback_build() {
-    local kind=$MODE message tail= daemon= os_id os_version os_name libc arch fields json f
+    local kind=$MODE message tail= first= daemon= os_id os_version os_name libc arch fields json f
     [ "$MODE" != install ] || [ "${UPGRADE:-0}" -eq 0 ] || kind=upgrade
     message=$(printf '%s' "$FAIL_MESSAGE" | feedback_scrub)
     if [ "$LOG_READY" -eq 1 ] && [ -r "$LOG" ]; then
         tail=$(tail -n +"$((STEP_LOG_LINE + 1))" "$LOG" 2>/dev/null | tail -n 40 | feedback_scrub)
+        first=$(step_errors 40 | feedback_scrub)
     fi
     if [ -d "$FEEDBACK_DAEMON_REPORTS" ]; then
         daemon=$(cat "$FEEDBACK_DAEMON_REPORTS"/*.json 2>/dev/null | feedback_scrub)
@@ -565,6 +603,8 @@ feedback_build() {
     FEEDBACK_EVENT+=",\"fingerprint\":[\"install.sh\",\"$kind\",$f,$REPLY]"
     feedback_json "$STEP_NO/$STEP_TOTAL $STEP_NAME"
     FEEDBACK_EVENT+=",\"extra\":{\"step\":$REPLY"
+    feedback_json "$first"
+    FEEDBACK_EVENT+=",\"log_errors\":$REPLY"
     feedback_json "$tail"
     FEEDBACK_EVENT+=",\"log_tail\":$REPLY"
     feedback_json "$daemon"
@@ -575,6 +615,7 @@ feedback_build() {
         [ "$STEP_TOTAL" -eq 0 ] || printf '   step     %s\n' "$STEP_NO/$STEP_TOTAL $STEP_NAME"
         printf '   host     %s\n' "$os_name, kernel $KVER, $arch, $libc, ${PKG:-none}, ${INIT:-none}"
         printf '   tags     %s\n' "${fields[*]}"
+        [ -z "$first" ] || { printf '   errors   the first errors of the failing step:\n'; printf '%s\n' "$first" | sed 's/^/     | /'; }
         [ -z "$tail" ] || { printf '   log      the last lines of the failing step:\n'; printf '%s\n' "$tail" | sed 's/^/     | /'; }
         [ -z "$daemon" ] || { printf '   daemon   what skyline-speederd recorded when it stopped:\n'; printf '%s\n' "$daemon" | sed 's/^/     | /'; }
     )
@@ -612,9 +653,9 @@ feedback_offer() {
         printf '\n %sHelp us fix this?%s Send an error report to the Skyline Speeder developers.\n' "$BLD" "$RST" >&5
         printf '%s\n' \
             "   It holds the error above, the step, the versions, the distribution, the" \
-            "   kernel and the last lines of the failing step's log, with IP, MAC and" \
-            "   e-mail addresses, the host name and user names removed. Nothing is sent" \
-            "   unless you answer y." >&5
+            "   kernel and the first errors and the last lines of the failing step's log," \
+            "   with IP, MAC and e-mail addresses, the host name and user names removed." \
+            "   Nothing is sent unless you answer y." >&5
         while :; do
             printf '   Send it? [y/N, v to view it first] ' >&5
             answer=
