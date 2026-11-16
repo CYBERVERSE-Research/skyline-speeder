@@ -71,8 +71,10 @@ skyline-speederd has no terminal and **never sends**: `src/reports.rs` records a
 in `DAEMON_REPORTS_DIR`, and the next `ssctl` on a terminal asks. Keep the two senders in step -- what a report holds,
 what `scrub` / `feedback_scrub` remove, the question -- and keep every path that sends behind the question. `ssctl`
 asks only for failures that are not the command working as documented (a refused `enable`, a failed daemon, an
-unreadable reply), never for a drain timeout or a value out of range. Sending goes through `curl` with its
-configuration on stdin, so no binary here links a TLS stack and no command line carries the DSN.
+unreadable reply), never for a drain timeout or a value out of range; `install.sh` likewise asks nothing when it
+refuses a host that does not meet the documented requirements (`unsupported`: an older kernel, another distribution, a
+container, too little free disk space). Sending goes through `curl` with its configuration on stdin, so no binary here
+links a TLS stack and no command line carries the DSN.
 
 The DSN is in the tree only sealed (ChaCha20 under a key that is in the same files -- it keeps the DSN from scanners,
 not secret). `infra/seal-feedback-dsn.py` writes both copies, `crates/ssctl/src/feedback-dsn.sealed` and
