@@ -196,18 +196,20 @@ Without arguments, the installer first decides whether this host can run the rel
 architecture is one the release pipeline produces artifacts for (currently only x86_64), and the C library is
 new enough. There is one artifact for each of the two C libraries:
 
-- The glibc build, `skyline-speeder-<tag>-x86_64.tar.gz`: the daemon is built on Ubuntu 24.04 and needs
-  **glibc ≥ 2.38** (`getconf GNU_LIBC_VERSION`) as well as `libelf.so.1` and `libz.so.1`. Debian 13,
-  Ubuntu 24.04, Fedora 43, Rocky Linux 10 and newer versions satisfy this.
+- The glibc build, `skyline-speeder-<tag>-x86_64.tar.gz`: the daemon is built in an AlmaLinux 9 container
+  (`infra/build-glibc.sh`) and needs **glibc ≥ 2.34** (`getconf GNU_LIBC_VERSION`) as well as `libelf.so.1` and
+  `libz.so.1`. Debian 12, Ubuntu 22.04, the RHEL 9 family and newer versions satisfy this. Releases up to v0.5.4
+  were built on Ubuntu 24.04 and need glibc ≥ 2.38: on a host with an older glibc the installer builds from
+  source while such a release is the latest, and refuses `--release` naming one.
 - The musl build, `skyline-speeder-<tag>-x86_64-musl.tar.gz` (since v0.4.1): built in an Alpine 3.21
   container, it needs **musl ≥ 1.2.5** (the host is musl when `getconf GNU_LIBC_VERSION` reports no glibc and `/lib/ld-musl-*.so.1` exists — a glibc host with the Debian or Fedora musl package installed has that file too, so glibc is asked first; the version is reported by the loader itself), that is, Alpine 3.21 and newer, as well as
   `libelf`, `zlib`, `zstd-libs` and `libgcc`.
 
 The BPF objects in the two artifacts are the same set of files, byte for byte. If the host can run the
 artifact, it is installed; otherwise the installer prints one line `warn building from source: <reason>` on
-stderr and switches to a source build (for example Debian 12 with a backports kernel: the kernel is new enough,
-glibc is not). On a musl host the default path also asks the release API first: when the latest release has no
-musl build (v0.4.0 and earlier), it likewise switches to a source build.
+stderr and switches to a source build (for example an aarch64 host, or a glibc older than 2.34). On a musl host
+the default path also asks the release API first: when the latest release has no musl build (v0.4.0 and earlier),
+it likewise switches to a source build.
 
 | | Prebuilt artifact (default) | Source build (`--source`, or the default path when this host cannot run the artifact) |
 |---|---|---|

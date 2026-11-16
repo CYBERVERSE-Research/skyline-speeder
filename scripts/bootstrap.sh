@@ -15,7 +15,7 @@
 # fixed against this kernel's BTF at load time, and a prebuilt control plane,
 # with no build toolchain on this host -- on Alpine, the release's musl build.
 # A host that cannot run the published binaries (not x86_64, a glibc older
-# than 2.38, a musl older than 1.2.5) is told why and builds this tree from
+# than 2.34, a musl older than 1.2.5) is told why and builds this tree from
 # source instead. Forwarding --source builds from source unconditionally; --release <tag> pins the artifact. Either way the
 # install.sh that runs comes from --ref, which defaults to main, while the
 # artifact comes from the latest release (or --release): --ref picks the

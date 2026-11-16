@@ -30,6 +30,7 @@ ABI (`bpf/include/skyline_abi.h`) is silently misread; a defect hits every TCP c
 make bpf                     # vmlinux.h (a build product, never committed) + the three CO-RE objects
 cargo build --workspace --release
 infra/build-musl.sh          # musl control plane in an Alpine 3.21 container, as releases and CI build it
+infra/build-glibc.sh         # glibc control plane in an AlmaLinux 9 container (glibc 2.34), likewise
 make check                   # bash -n, harness tests, cargo fmt --check, cargo check -- not cargo test
 make test                    # harness tests + cargo test --workspace
 # the harness tests need Python >= 3.11 (tomllib): make check PYTHON=/path/to/python3.11

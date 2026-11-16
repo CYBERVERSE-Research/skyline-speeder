@@ -74,6 +74,18 @@ jobs:
       - name: Build and run
         run: infra/build-musl.sh
 
+  # The build release.yml makes for the glibc artifact, for the same reason: in
+  # a container with the oldest glibc the artifact is installed on, then run in
+  # clean containers of the distributions that have it.
+  glibc:
+    name: Rust on old glibc (build in AlmaLinux 9, run in clean containers)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build and run
+        run: infra/build-glibc.sh
+
   bpf:
     name: BPF (CO-RE compile only)
     runs-on: ubuntu-24.04
