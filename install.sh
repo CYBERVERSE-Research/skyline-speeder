@@ -3535,6 +3535,29 @@ fi
 run make -C "$REPO_ROOT" bpf || die "building the BPF objects failed"
 
 step "Building the Rust control plane"
+# libbpf-sys before 1.7.1 compiles its vendored libbpf against a private
+# linux/types.h that shadows the kernel's and has no __u128. Since kernel 7.3
+# the arm64 UAPI headers declare the vector registers in asm/sigcontext.h
+# (reached through <signal.h>) as __u128, so with those headers in
+# /usr/include -- a newer distribution's linux-libc-dev, or the one a
+# self-built kernel installs -- the build stops at "unknown type name
+# '__u128'" (aarch64 Ubuntu 24.04 with 7.3 headers, two error reports).
+# Force-include the two typedefs libbpf-sys 1.7.1 added. They are guarded by
+# __SIZEOF_INT128__ as upstream's are, and repeating an identical typedef is
+# valid C11, so this stays harmless on every architecture and once Cargo.lock
+# moves past libbpf-sys 1.7.0 (which needs Rust 1.82; the tree pins 1.75).
+cat >"$WORK/libbpf-u128.h" <<'EOF'
+#ifdef __SIZEOF_INT128__
+typedef __signed__ __int128 __s128 __attribute__((aligned(16)));
+typedef unsigned __int128 __u128 __attribute__((aligned(16)));
+#endif
+EOF
+# Exported, as BPFTOOL is: the cargo build infra/install-guest.sh runs once
+# more when it installs the files must see the same value. libbpf-sys asks to
+# be rebuilt when the variable changes, so without it that run compiled libbpf
+# again without the typedefs -- failing again on those hosts, and installing
+# a daemon other than the one the verifier ran everywhere else.
+export LIBBPF_SYS_EXTRA_CFLAGS="-include $WORK/libbpf-u128.h${LIBBPF_SYS_EXTRA_CFLAGS:+ $LIBBPF_SYS_EXTRA_CFLAGS}"
 # --locked, as CI and the release build: exactly the dependency versions
 # Cargo.lock records, never ones crates.io serves on the day of the install.
 run "${IN_TREE[@]}" cargo build --workspace --release --locked \
