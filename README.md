@@ -346,7 +346,7 @@ From 0.5.0, a misspelt key or one in the wrong section fails `--validate-only`, 
 | TC EGRESS | since the daemon started, everything leaving `tc_interface` whatever its congestion control: `seen` counts packets, bytes and GSO packets; then [`retransmits marked`](#retransmit-dscp-marking) and [`first-flight copies`](#first-flight-redundancy) |
 | DYNAMIC RTO, or CGROUP POLICY while it is off | see [Dynamic RTO floor and ceiling](#dynamic-rto-floor-and-ceiling); `connections seen` is how to tell whether any process is in the cgroup |
 
-`--json` prints the daemon's raw reply instead, for scripts. `ssctl snapshot <file>` has the daemon write the `status` part of it to a regular file (under systemd, `/run/skyline-speeder/` is the safe place), and `ssctl validate` checks the daemon's configuration in memory against the kernel.
+`--json` prints the daemon's raw reply instead, for scripts. `ssctl snapshot <file>` writes the `status` part of it to a regular file, and `ssctl validate` checks the daemon's configuration in memory against the kernel.
 
 ## Repository layout
 
