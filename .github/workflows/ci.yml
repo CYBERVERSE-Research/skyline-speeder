@@ -245,6 +245,21 @@ jobs:
       - name: Install shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
 
+      # The release key scripts/bootstrap.sh checks a release's source with
+      # and the one install.sh checks its artifacts with: one key, two copies,
+      # because each script runs with no tree beside it.
+      - name: The release key is the same in install.sh and bootstrap.sh
+        run: |
+          set -euo pipefail
+          for name in RELEASE_SIGNING_KEY RELEASE_SIGNING_NAMESPACE UNSIGNED_RELEASES; do
+            a=$(grep "^$name=" install.sh || true)
+            b=$(grep "^$name=" scripts/bootstrap.sh || true)
+            if [ -z "$a" ] || [ "$a" != "$b" ]; then
+              echo "::error::$name differs between install.sh and scripts/bootstrap.sh (or is missing)"
+              exit 1
+            fi
+          done
+
       # Severity warning and above. Repository-wide exclusions, with the reason
       # each one is a false positive here, live in .shellcheckrc.
       - name: shellcheck

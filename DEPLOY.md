@@ -61,9 +61,14 @@ told before anything is installed or downloaded; every other check is `install.s
 `/usr/local/src/skyline-speeder` (an existing old tree is moved
 to `<dir>.bak-<timestamp>`, not deleted), installs whatever of `curl`, `bash` and `tar` is missing with the
 host's package manager, and then runs the `install.sh` there. Other arguments are passed through unchanged:
-`... | bash -s -- --source` (on Alpine, `... | sh -s -- --source`). The `install.sh` it runs comes from `--ref`
-(default `main`), but the artifact it installs comes from the latest release (or the one `--release` names):
-`--ref` chooses the installer, not the version installed. Later upgrades or an uninstall can use that tree
+`... | bash -s -- --source` (on Alpine, `... | sh -s -- --source`). The `install.sh` it runs comes from `--ref`,
+by default the latest release (from 0.6.0 on: the release's signed `skyline-speeder-<tag>-source.tar.gz`, whose
+`.sig` the bootstrap checks against the release key before it unpacks anything; before, `main`), but the artifact it
+installs comes from the latest release (or the one `--release` names): `--ref` chooses the installer, not the
+version installed. `--ref main` takes the development tree instead, from codeload and unsigned; so does any other
+branch or commit, and a release from before v0.6.0, which has no signed source. A release tag from v0.6.0 on whose
+signed source cannot be downloaded or does not verify is refused. Because of this default, a change to `install.sh`
+merged into `main` reaches the one-line install with the next release, like everything else. Later upgrades or an uninstall can use that tree
 directly: `/usr/local/src/skyline-speeder/install.sh --uninstall`; when `--uninstall` is passed through the
 bootstrap script, it also uses this tree directly and downloads nothing. Without that tree, `--uninstall` and
 `--check` through the bootstrap script run the downloaded installer directly, and place or move no source tree.
@@ -216,7 +221,7 @@ it likewise switches to a source build.
 |---|---|---|
 | Command | `./install.sh`; `--prebuilt` installs only the artifact; `--release <tag>` pins a version | `./install.sh --source` |
 | The target host needs | No toolchain at all; the installer installs only runtime dependencies (the package lists in section 2.4) | A build toolchain (clang/LLVM, bpftool, libbpf/libelf/zlib development packages, Rust), which the installer installs and records automatically and `--uninstall` removes again |
-| What gets installed | The latest release (or the one `--release` names): changes merged into `main` after it are not included | The source tree being run (for the one-line install, `--ref`, default `main`) |
+| What gets installed | The latest release (or the one `--release` names): changes merged into `main` after it are not included | The source tree being run (for the one-line install, `--ref`: by default the latest release's signed source, `main` with `--ref main`) |
 | Where the BPF objects' types come from | The 6.12 LTS reference header pinned by the release pipeline; at load time CO-RE fixes field offsets against this host's kernel BTF | This host's `/sys/kernel/btf/vmlinux` |
 | Integrity check | The `.sha256` next to the artifact must match; a downloaded artifact without one is not installed, and a local file without one is installed unchecked, with a warning. From v0.6.0 on every release is also signed, and the `.sig` next to the artifact must verify against the release key in `install.sh` before anything is unpacked (section 2.3) | The source tree itself (`scripts/bootstrap.sh` can pin the tarball's digest with `SKYLINE_SHA256`) |
 
@@ -252,7 +257,7 @@ stderr as well.
 | `SKYLINE_REPO` | The repository releases are looked up in, default `CYBERVERSE-Research/skyline-speeder` |
 
 The arguments of `scripts/bootstrap.sh` itself: `--ref <git ref>` (environment variable `SKYLINE_REF`, default
-`main`), `--repo <owner/name>` (`SKYLINE_REPO`, the repository the source is taken from), `--src-dir <path>`
+the latest release, found through `https://github.com/<repo>/releases/latest`; `main` before 0.6.0), `--repo <owner/name>` (`SKYLINE_REPO`, the repository the source is taken from), `--src-dir <path>`
 (`SKYLINE_SRC_DIR`, default `/usr/local/src/skyline-speeder`); `SKYLINE_SHA256=<digest>` pins the downloaded
 source tarball (give it to sudo, not to curl: `curl ... | sudo SKYLINE_SHA256=<digest> bash -s -- --ref <tag>`).
 `--repo` only decides where the source comes from; to make the installer take releases from that repository too,

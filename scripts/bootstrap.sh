@@ -17,9 +17,12 @@
 # A host that cannot run the published binaries (not x86_64, a glibc older
 # than 2.34, a musl older than 1.2.5) is told why and builds this tree from
 # source instead. Forwarding --source builds from source unconditionally; --release <tag> pins the artifact. Either way the
-# install.sh that runs comes from --ref, which defaults to main, while the
-# artifact comes from the latest release (or --release): --ref picks the
-# installer, not the version installed.
+# install.sh that runs comes from --ref, which defaults to the latest release
+# -- its signed source tarball, checked against the release key below before
+# anything in it runs -- while the artifact comes from the latest release (or
+# --release): --ref picks the installer, not the version installed. --ref main
+# takes the development tree instead, which is not signed: every commit on
+# main would otherwise run as root on every new install the moment it lands.
 #
 # POSIX sh, not bash, on purpose: this is what installs bash on a host that
 # has none, before install.sh (a bash script) can run. Keep it that way -- no
@@ -30,7 +33,8 @@
 # With the body in a function, a truncated download simply never reaches the
 # call and nothing runs. Do not "simplify" this into top-level statements.
 #
-#   --ref <git-ref>     tag, branch or commit to install (default: main)
+#   --ref <git-ref>     tag, branch or commit to install (default: the latest
+#                       release; main for the development tree)
 #   --repo <owner/name> repository to fetch the tree and take releases from
 #                       (default: CYBERVERSE-Research/skyline-speeder)
 #   --src-dir <path>    where the tree lands (default: /usr/local/src/skyline-speeder)
@@ -375,6 +379,15 @@ fb_on_exit() {
 }
 # --- end of error reports --------------------------------------------------
 
+# The release key, as install.sh carries it (CI's shell job checks the two
+# copies are the same lines): a release from v0.6.0 on publishes
+# skyline-speeder-<tag>-source.tar.gz and its `ssh-keygen -Y sign` signature,
+# and a tree fetched for a release tag is unpacked only once that verifies.
+# Only the releases from before signing, by name, may come without one.
+RELEASE_SIGNING_KEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMHUlrw08jlUCQxQWBhNglTOtpuAKOrBsBCnyUkWG0ex'
+RELEASE_SIGNING_NAMESPACE=skyline-speeder-release
+UNSIGNED_RELEASES="v0.1.0 v0.2.0 v0.3.0 v0.4.0 v0.4.1 v0.4.2 v0.4.3 v0.4.4 v0.5.0 v0.5.1 v0.5.2 v0.5.3 v0.5.4 v0.5.5"
+
 main() {
     # What the error report says this script was doing, the message it
     # stopped with, and whether a failure now is worth a report at all.
@@ -382,7 +395,8 @@ main() {
     trap fb_on_exit EXIT
     trap 'FB_INTERRUPTED=1; exit 130' INT TERM
     REPO="${SKYLINE_REPO:-CYBERVERSE-Research/skyline-speeder}"
-    REF="${SKYLINE_REF:-main}"
+    # Empty: the latest release, looked up once curl is there.
+    REF="${SKYLINE_REF:-}"
     SRC_DIR="${SKYLINE_SRC_DIR:-/usr/local/src/skyline-speeder}"
 
     CSI=$(printf '\033') RED='' GRN='' YLW='' BLD='' RST=''
@@ -438,9 +452,11 @@ main() {
         */*) ;;
         *) die "--repo must be <owner>/<name>: $REPO" ;;
     esac
-    case "$REF" in
-        ''|-*|/*|*..*|*[!A-Za-z0-9_./-]*) die "not a git ref: $REF" ;;
-    esac
+    if [ -n "$REF" ]; then
+        case "$REF" in
+            -*|/*|*..*|*[!A-Za-z0-9_./-]*) die "not a git ref: $REF" ;;
+        esac
+    fi
 
     [ "$(id -u)" -eq 0 ] || die "must run as root (pipe into 'sudo bash', not 'bash'; on Alpine, run it as root)"
     # The commands printed at the end carry sudo only where there is one.
@@ -501,6 +517,11 @@ main() {
     command -v curl >/dev/null 2>&1 || NEED="$NEED curl"
     command -v tar  >/dev/null 2>&1 || NEED="$NEED tar"
     command -v bash >/dev/null 2>&1 || NEED="$NEED bash"
+    # ssh-keygen checks a release's signature, when a release's tree is what
+    # is fetched; its package is named differently by each package manager.
+    case "$REF" in
+        ''|v[0-9]*.[0-9]*) command -v ssh-keygen >/dev/null 2>&1 || NEED="$NEED ssh-keygen" ;;
+    esac
     NEED=${NEED# }
     if [ -n "$NEED" ]; then
         info "installing fetch prerequisites: $NEED"
@@ -509,6 +530,7 @@ main() {
         # $NEED unquoted on purpose: it is a list of package names.
         # shellcheck disable=SC2086
         if command -v apt-get >/dev/null 2>&1; then
+            NEED=$(printf '%s' "$NEED" | sed 's/ssh-keygen/openssh-client/')
             if ! { DEBIAN_FRONTEND=noninteractive apt-get update -qq \
                    && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq -o Dpkg::Use-Pty=0 \
                         $NEED; } >"$TMP/pkg.log" 2>&1 </dev/null; then
@@ -519,11 +541,13 @@ main() {
    itself at its package step; this bootstrap deliberately stays small."
             fi
         elif command -v dnf >/dev/null 2>&1; then
+            NEED=$(printf '%s' "$NEED" | sed 's/ssh-keygen/openssh-clients/')
             if ! dnf -y -q install $NEED >"$TMP/pkg.log" 2>&1 </dev/null; then
                 cat "$TMP/pkg.log" >&2
                 die "failed to install $NEED with dnf"
             fi
         elif command -v apk >/dev/null 2>&1; then
+            NEED=$(printf '%s' "$NEED" | sed 's/ssh-keygen/openssh-keygen/')
             # --update-cache: a fresh image may never have fetched an index.
             if ! apk add --no-progress --update-cache $NEED >"$TMP/pkg.log" 2>&1 </dev/null; then
                 cat "$TMP/pkg.log" >&2
@@ -536,14 +560,66 @@ main() {
         ok "installed $NEED"
     fi
 
+    # --- the latest release -------------------------------------------------
+    # From the redirect github.com answers /releases/latest with, not from the
+    # API: no rate limit, and nothing to parse but a URL.
+    if [ -z "$REF" ]; then
+        STAGE="finding the latest release"
+        LATEST=$(curl -q -fsSI --proto '=https' --tlsv1.2 --max-time 30 -o /dev/null \
+                 -w '%{redirect_url}' "https://github.com/${REPO}/releases/latest") || LATEST=''
+        case "$LATEST" in
+            */releases/tag/*) REF=${LATEST##*/releases/tag/} ;;
+        esac
+        case "$REF" in
+            ''|-*|/*|*..*|*[!A-Za-z0-9_./-]*)
+                die "could not find the latest release of $REPO (${LATEST:-no answer from github.com}).
+   Pass --ref <tag> for a release, or --ref main for the development tree." ;;
+        esac
+        info "latest release: $REF"
+    fi
+
     # --- download -----------------------------------------------------------
-    STAGE="downloading the source"
-    URL="https://codeload.github.com/${REPO}/tar.gz/${REF}"
-    info "fetching ${REPO}@${REF}"
     # -q first: not the caller's ~/.curlrc (see install.sh).
-    curl -q -fsSL --proto '=https' --tlsv1.2 -o "$TMP/src.tar.gz" "$URL" \
-        || die "download failed: $URL
+    # A release tag's tree comes from the release itself, signed; every other
+    # ref -- main, a branch, a commit -- and a release from before signing
+    # come from codeload, on TLS alone (and SKYLINE_SHA256 when given).
+    STAGE="downloading the source"
+    SIGNED=0
+    case "$REF" in
+        v[0-9]*.[0-9]*)
+            ASSET="https://github.com/${REPO}/releases/download/${REF}/skyline-speeder-${REF}-source.tar.gz"
+            info "fetching ${REPO} ${REF} (signed source)"
+            # curl's own 404 stays quiet: a release from before signing has
+            # none, and the lines below say what that means.
+            if curl -q -fsSL --proto '=https' --tlsv1.2 -o "$TMP/src.tar.gz" "$ASSET" 2>/dev/null \
+               && curl -q -fsSL --proto '=https' --tlsv1.2 -o "$TMP/src.tar.gz.sig" "$ASSET.sig" 2>/dev/null; then
+                printf '%s namespaces="%s" %s\n' "$RELEASE_SIGNING_NAMESPACE" \
+                    "$RELEASE_SIGNING_NAMESPACE" "$RELEASE_SIGNING_KEY" >"$TMP/release-signers"
+                if ! ssh-keygen -Y verify -f "$TMP/release-signers" -I "$RELEASE_SIGNING_NAMESPACE" \
+                       -n "$RELEASE_SIGNING_NAMESPACE" -s "$TMP/src.tar.gz.sig" \
+                       <"$TMP/src.tar.gz" >"$TMP/verify.log" 2>&1; then
+                    cat "$TMP/verify.log" >&2
+                    die "the signature of skyline-speeder-${REF}-source.tar.gz does not verify against the release key:
+   it is not the tree the release published. Nothing was unpacked."
+                fi
+                ok "signature verified (${RELEASE_SIGNING_NAMESPACE} key)"
+                SIGNED=1
+            else
+                case " $UNSIGNED_RELEASES " in
+                    *" $REF "*) warn "$REF was published before releases were signed (v0.6.0): its tree comes from codeload" ;;
+                    *) die "no signed source for $REF: $ASSET or its .sig could not be downloaded.
+   Every release from v0.6.0 on publishes both. Check that this host can reach github.com;
+   for the development tree instead, pass --ref main." ;;
+                esac
+            fi ;;
+    esac
+    if [ "$SIGNED" -eq 0 ]; then
+        URL="https://codeload.github.com/${REPO}/tar.gz/${REF}"
+        info "fetching ${REPO}@${REF}"
+        curl -q -fsSL --proto '=https' --tlsv1.2 -o "$TMP/src.tar.gz" "$URL" \
+            || die "download failed: $URL
    Check the repository and ref exist, and that this host can reach github.com."
+    fi
 
     # Optional integrity pin. Publish the digest alongside a release tag and
     # operators can verify what they are about to build and run as root. The
@@ -557,7 +633,7 @@ main() {
    expected: $SKYLINE_SHA256
    actual:   $GOT"
         ok "sha256 verified"
-    else
+    elif [ "$SIGNED" -eq 0 ]; then
         warn "no SKYLINE_SHA256 given; the tarball is trusted on TLS alone"
     fi
 
