@@ -189,14 +189,64 @@ jobs:
           echo "glibc=${GLIBC}" >> "$GITHUB_OUTPUT"
           echo "musl=${MUSL}" >> "$GITHUB_OUTPUT"
 
+          # The tree itself, for scripts/bootstrap.sh: codeload's tarball of a
+          # tag is generated on request and is not byte-stable, so it cannot
+          # carry a signature; this one can.
+          SOURCE="skyline-speeder-${TAG}-source"
+          git archive --format=tar.gz --prefix="${SOURCE}/" -o "${SOURCE}.tar.gz" HEAD
+          sha256sum "${SOURCE}.tar.gz" > "${SOURCE}.tar.gz.sha256"
+          echo "source=${SOURCE}" >> "$GITHUB_OUTPUT"
+
+      # Each tarball is signed with the release key (ssh-keygen -Y sign, the
+      # namespace install.sh checks), and each signature is then verified
+      # against the public key install.sh carries -- so a release is never
+      # published signed by a key the installer does not trust. The private
+      # key exists only as this secret and in this step's temporary file.
+      - name: Sign the artifacts
+        env:
+          SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          GLIBC: ${{ steps.assemble.outputs.glibc }}
+          MUSL: ${{ steps.assemble.outputs.musl }}
+          SOURCE: ${{ steps.assemble.outputs.source }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SIGNING_KEY:-}" ]; then
+            echo "::error::the RELEASE_SIGNING_KEY secret is not set: every release from v0.6.0 on is signed, and install.sh refuses one that is not"
+            exit 1
+          fi
+          umask 077
+          key="$RUNNER_TEMP/release-signing-key"
+          printf '%s\n' "$SIGNING_KEY" > "$key"
+          trap 'rm -f "$key"' EXIT
+          namespace=$(sed -n 's/^RELEASE_SIGNING_NAMESPACE=//p' install.sh)
+          public=$(sed -n "s/^RELEASE_SIGNING_KEY='\(.*\)'$/\1/p" install.sh)
+          [ -n "$namespace" ] && [ -n "$public" ] \
+            || { echo "::error::install.sh has no RELEASE_SIGNING_KEY / RELEASE_SIGNING_NAMESPACE"; exit 1; }
+          printf '%s namespaces="%s" %s\n' "$namespace" "$namespace" "$public" > "$RUNNER_TEMP/signers"
+          for artifact in "$GLIBC.tar.gz" "$MUSL.tar.gz" "$SOURCE.tar.gz"; do
+            ssh-keygen -q -Y sign -f "$key" -n "$namespace" "$artifact"
+            ssh-keygen -Y verify -f "$RUNNER_TEMP/signers" -I "$namespace" -n "$namespace" \
+              -s "$artifact.sig" < "$artifact" \
+              || { echo "::error::$artifact.sig does not verify against the key in install.sh: the secret and install.sh disagree"; exit 1; }
+          done
+
+      # Uploaded to a draft, and published only once every file is there:
+      # with immutable releases, a published release takes no more assets.
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        id: release
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          draft: true
           files: |
             ${{ steps.assemble.outputs.glibc }}.tar.gz
             ${{ steps.assemble.outputs.glibc }}.tar.gz.sha256
+            ${{ steps.assemble.outputs.glibc }}.tar.gz.sig
             ${{ steps.assemble.outputs.musl }}.tar.gz
             ${{ steps.assemble.outputs.musl }}.tar.gz.sha256
+            ${{ steps.assemble.outputs.musl }}.tar.gz.sig
+            ${{ steps.assemble.outputs.source }}.tar.gz
+            ${{ steps.assemble.outputs.source }}.tar.gz.sha256
+            ${{ steps.assemble.outputs.source }}.tar.gz.sig
           fail_on_unmatched_files: true
           body: |
             Prebuilt artifacts, one per C library. The one-line install takes the
@@ -211,7 +261,22 @@ jobs:
             | `skyline-speeder-${{ github.event.inputs.tag || github.ref_name }}-x86_64.tar.gz` | glibc: Debian, Ubuntu, Fedora, the RHEL family | glibc 2.34 or newer with `libelf.so.1` and `libz.so.1` (Debian 12, Ubuntu 22.04, Fedora 43, Rocky Linux 9 and AlmaLinux 9, and later); built in AlmaLinux 9 |
             | `skyline-speeder-${{ github.event.inputs.tag || github.ref_name }}-x86_64-musl.tar.gz` | musl: Alpine | Alpine 3.21 or newer (musl 1.2.5) with `libelf`, `zlib`, `zstd-libs` and `libgcc`, which the installer adds; built in Alpine 3.21 |
 
-            Both carry the same three BPF objects, byte for byte. They were compiled
+            Each tarball is signed: `<tarball>.sig` is an `ssh-keygen -Y sign` signature
+            with the release key in `install.sh` (`RELEASE_SIGNING_KEY`, namespace
+            `skyline-speeder-release`), and the installer checks it before it unpacks
+            anything. To check one by hand, with this release's `install.sh`:
+
+            ```
+            KEY=$(sed -n "s/^RELEASE_SIGNING_KEY='\(.*\)'$/\1/p" install.sh)
+            echo "skyline-speeder-release $KEY" > signers
+            ssh-keygen -Y verify -f signers -I skyline-speeder-release -n skyline-speeder-release \
+              -s <tarball>.sig < <tarball>
+            ```
+
+            `skyline-speeder-${{ github.event.inputs.tag || github.ref_name }}-source.tar.gz` is the tree
+            this release was built from, signed the same way.
+
+            Both artifacts carry the same three BPF objects, byte for byte. They were compiled
             against a pinned reference `vmlinux.h` generated from a 6.12 LTS kernel, so
             they load on 6.12 and newer. `MANIFEST` inside each tarball records the
             provenance, the C library, and the digest of every shipped binary and object.
@@ -240,3 +305,15 @@ jobs:
             Settings made with `ssctl` live only in the daemon's memory and do not carry
             over the restart; the installer writes the old `ssctl status` into
             `/var/log/skyline-speeder-install.log`.
+
+      # make_latest=legacy: "latest" goes by date and version, as it did when
+      # the action published the release itself, so a workflow_dispatch of an
+      # older tag does not become the release the one-line install takes.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.release.outputs.id }}
+        run: |
+          set -euo pipefail
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false -f make_latest=legacy --jq '"published \(.tag_name): \(.html_url)"'

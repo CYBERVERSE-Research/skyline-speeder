@@ -217,7 +217,7 @@ it likewise switches to a source build.
 | The target host needs | No toolchain at all; the installer installs only runtime dependencies (the package lists in section 2.4) | A build toolchain (clang/LLVM, bpftool, libbpf/libelf/zlib development packages, Rust), which the installer installs and records automatically and `--uninstall` removes again |
 | What gets installed | The latest release (or the one `--release` names): changes merged into `main` after it are not included | The source tree being run (for the one-line install, `--ref`, default `main`) |
 | Where the BPF objects' types come from | The 6.12 LTS reference header pinned by the release pipeline; at load time CO-RE fixes field offsets against this host's kernel BTF | This host's `/sys/kernel/btf/vmlinux` |
-| Integrity check | The `.sha256` next to the artifact must match; a downloaded artifact without one is not installed, and a local file without one is installed unchecked, with a warning | The source tree itself (`scripts/bootstrap.sh` can pin the tarball's digest with `SKYLINE_SHA256`) |
+| Integrity check | The `.sha256` next to the artifact must match; a downloaded artifact without one is not installed, and a local file without one is installed unchecked, with a warning. From v0.6.0 on every release is also signed, and the `.sig` next to the artifact must verify against the release key in `install.sh` before anything is unpacked (section 2.3) | The source tree itself (`scripts/bootstrap.sh` can pin the tarball's digest with `SKYLINE_SHA256`) |
 
 All other steps are identical: the same verifier pass, the same services (systemd units or OpenRC scripts) and
 the same configuration template.
@@ -244,7 +244,8 @@ stderr as well.
 
 | Environment variable | Effect |
 |---|---|
-| `SKYLINE_ARTIFACT_URL` | Skips the release lookup and uses an https URL (a mirror, an internal artifact repository) or a local file path directly as the artifact; takes precedence over `--release`, and when both are given it warns that `--release` was not used; `<URL>.sha256` must be there and match, `<path>.sha256` is checked when it exists (section 2.3). When the install switches to a source build (the host cannot run the artifact, or `--source`), it has no effect, and the installer likewise warns |
+| `SKYLINE_ARTIFACT_URL` | Skips the release lookup and uses an https URL (a mirror, an internal artifact repository) or a local file path directly as the artifact; takes precedence over `--release`, and when both are given it warns that `--release` was not used; `<URL>.sha256` must be there and match, `<path>.sha256` is checked when it exists, and `<URL or path>.sig` must verify unless the file name names a release from before v0.6.0 (section 2.3). When the install switches to a source build (the host cannot run the artifact, or `--source`), it has no effect, and the installer likewise warns |
+| `SKYLINE_ALLOW_UNSIGNED=yes` | Only with `SKYLINE_ARTIFACT_URL`: installs an artifact that has no `.sig` (one you built yourself, for a test bed), with a warning. A `.sig` that is there and does not verify still stops the install, and a release looked up on GitHub is never installed unsigned (section 2.3) |
 | `SKYLINE_VERBOSE=1` | Same as `--verbose` |
 | `SKYLINE_FEEDBACK` | After a failure: unset or `ask` asks on the terminal whether to send an error report, `yes` sends one without asking, `no` never asks (section 13.6). `ssctl` reads it too |
 | `SKYLINE_REPO` | The repository releases are looked up in, default `CYBERVERSE-Research/skyline-speeder` |
@@ -260,7 +261,7 @@ set the environment variable `SKYLINE_REPO`.
 
 - Default: the latest release on GitHub; `--release <tag>`: the version named;
 - `SKYLINE_ARTIFACT_URL`: an https URL or a local file path. For a host that cannot reach GitHub, copy the
-  tarball over together with its `.sha256`:
+  tarball over together with its `.sha256` and `.sig`:
 
 ```bash
 SKYLINE_ARTIFACT_URL=https://mirror.example/skyline-speeder-<tag>-x86_64.tar.gz ./install.sh --prebuilt
@@ -269,9 +270,29 @@ SKYLINE_ARTIFACT_URL=/path/to/skyline-speeder-<tag>-x86_64.tar.gz ./install.sh -
 
 The `<artifact>.sha256` published next to the artifact must match the downloaded (or copied) tarball, or the
 install aborts; it aborts too when a downloaded artifact has none, and when a local file has no `.sha256` next to
-it, the installer warns that it is unchecked. The `MANIFEST` in the tarball records the tag, the commit, the
+it, the installer warns that it is unchecked. That digest comes from the same place as the artifact, so it catches
+a broken download and nothing more.
+
+**Signatures (from v0.6.0 on).** Every release is signed: `<artifact>.sig` next to each tarball is an
+`ssh-keygen -Y sign` signature made in the release pipeline with the release key, whose public half is
+`RELEASE_SIGNING_KEY` in `install.sh` (namespace `skyline-speeder-release`). The installer checks it after the
+digest and before anything is unpacked: a signature that does not verify aborts the install, and so does a missing
+one -- for the latest release, for `--release` and for `SKYLINE_ARTIFACT_URL` alike -- except for the releases
+published before signing began (v0.1.0 to v0.5.5, listed in `UNSIGNED_RELEASES`), which are installed on their
+digest alone with a warning, and for an artifact given as `SKYLINE_ARTIFACT_URL` with `SKYLINE_ALLOW_UNSIGNED=yes`.
+The check needs `ssh-keygen` from OpenSSH 8.1 or later; the installer adds the OpenSSH client package when it is
+missing and keeps it on `--uninstall`. To check an artifact by hand:
+
+```bash
+KEY=$(sed -n "s/^RELEASE_SIGNING_KEY='\(.*\)'$/\1/p" install.sh)
+echo "skyline-speeder-release $KEY" > signers
+ssh-keygen -Y verify -f signers -I skyline-speeder-release -n skyline-speeder-release \
+    -s skyline-speeder-<tag>-x86_64.tar.gz.sig < skyline-speeder-<tag>-x86_64.tar.gz
+```
+
+The `MANIFEST` in the tarball records the tag, the commit, the
 reference header's digest, `libc=`, and the SHA-256 of every binary and object: the full content goes into the
-install log, and the summary shows one line of provenance (artifact name, commit, whether the sha256 was checked).
+install log, and the summary shows one line of provenance (artifact name, commit, whether the sha256 and the signature were checked).
 An artifact whose `libc=` does not match this host's C library (for example, `SKYLINE_ARTIFACT_URL` pointing at the
 wrong file) is rejected before the verifier, with a note on which one to use.
 
@@ -293,10 +314,10 @@ reach the default install only with the next release.
 | Attaching skyline_cc | `systemctl enable --now skyline-speeder-enable.service` (skipped with `--no-enable`) |
 | Verifying | Confirms with the new daemon that `enabled` is `true` (and, for versions with the guard, `armed`), and that the default congestion control really is `skyline_cc`; if not, restarts the enable unit once and checks again, and if it still does not hold, fails and points to `ssctl enable` and the enable unit's log |
 
-**Packages.** The prebuilt path installs only runtime dependencies: apt `curl ca-certificates tar iproute2`;
-dnf `curl ca-certificates tar
-iproute iproute-tc` plus `libelf.so.1` and `libz.so.1` requested by soname; apk `curl ca-certificates tar iproute2
-bash libelf zlib zstd-libs libgcc`. A source build installs a different list: apt `build-essential pkg-config clang llvm
+**Packages.** The prebuilt path installs only runtime dependencies: apt `curl ca-certificates tar iproute2
+openssh-client`; dnf `curl ca-certificates tar iproute iproute-tc openssh-clients` plus `libelf.so.1` and
+`libz.so.1` requested by soname; apk `curl ca-certificates tar iproute2 bash openssh-keygen libelf zlib zstd-libs
+libgcc` (the OpenSSH package provides the `ssh-keygen` that checks the release signature, from 0.6.0 on). A source build installs a different list: apt `build-essential pkg-config clang llvm
 libbpf-dev libelf-dev zlib1g-dev bpftool curl iproute2`; dnf `gcc make pkgconf-pkg-config clang llvm libbpf-devel
 elfutils-libelf-devel zlib-devel bpftool curl ca-certificates tar iproute iproute-tc`; apk `build-base pkgconf clang
 llvm libbpf-dev elfutils-dev zlib-dev linux-headers bpftool curl ca-certificates tar iproute2 bash libgcc`.
@@ -1007,8 +1028,9 @@ bootstrap script's source tree and `/sys/fs/{cgroup,bpf}/skyline-speeder`, and t
    intersected with the plan accepted for this request, which excludes packages installed by an
    unattended-upgrades run in parallel). On a host without this record — installed by hand, or installed before
    the installer started recording (before v0.3.0) — this step removes nothing. Guardrails:
-   - `iproute2` (`iproute` and `iproute-tc` on Fedora/RHEL), `curl`, `ca-certificates` and `tar` (and on Alpine
-     also `bash`) are never removed;
+   - `iproute2` (`iproute` and `iproute-tc` on Fedora/RHEL), `curl`, `ca-certificates`, `tar` and the OpenSSH
+     client (`openssh-client`, `openssh-clients` on Fedora/RHEL, `openssh-keygen` on Alpine; and on Alpine also
+     `bash`) are never removed;
    - **nor is anything these packages depend on, recursively** — keep `curl` but remove the `libcurl4t64`
      under it, and apt's only resolution is "remove curl too", with the result that not a single package of the
      toolchain can be removed;
