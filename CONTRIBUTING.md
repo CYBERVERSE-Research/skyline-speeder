@@ -88,7 +88,7 @@ Breaking any of these is a defect regardless of what else the change does.
 | `RuntimeDirectory=skyline-speeder` | `packaging/skyline-speederd.service` | **Must be the parent directory of `socket_path`** (and of `events_path`, `state_path`): the unit sets `ProtectSystem=strict`, under which this is the one directory in `/run` the daemon can write |
 | `checkpath -d /run/skyline-speeder` | `packaging/openrc/skyline-speederd` | OpenRC's `RuntimeDirectory=`: **must be the parent directory of `socket_path`** (and of `events_path`, `state_path`), where the daemon opens its event log first |
 | `StateDirectory=skyline-speeder`, `checkpath -d /var/lib/skyline-speeder` | `packaging/skyline-speederd.service`, `packaging/openrc/skyline-speederd` | **Must be the parent directory of `DAEMON_REPORTS_DIR`** (`/var/lib/skyline-speeder/reports`, `crates/skyline-common`), which `ssctl` and `install.sh` (`FEEDBACK_DAEMON_REPORTS`, and `--uninstall`, which removes it) read too: under `ProtectSystem=strict` it is the one directory under `/var/lib` the daemon can write, and a mismatch only costs a line on stderr when a report cannot be written -- the error report is silently lost |
-| Error reports | `install.sh` ("error reports"), `crates/ssctl/src/feedback.rs`, `crates/skyline-speederd/src/reports.rs` | **Sent only on a `y` typed on a terminal, or with `SKYLINE_FEEDBACK=yes`**: never with no terminal, never by skyline-speederd itself, which only records. Everything shown or sent is scrubbed first, by the same list in `feedback_scrub` and `scrub`, which `cargo test -p ssctl` runs over one text. The DSN is in the tree only sealed, in two copies that `infra/seal-feedback-dsn.py` writes together (`FEEDBACK_SEALED` in `install.sh`, `crates/ssctl/src/feedback-dsn.sealed`) and `cargo test -p ssctl` compares; a plain DSN or a Sentry auth token never goes into the tree |
+| Error reports | `install.sh` ("error reports"), `scripts/bootstrap.sh` ("error reports", POSIX sh), `crates/ssctl/src/feedback.rs`, `crates/skyline-speederd/src/reports.rs` | **Sent only on a `y` typed on a terminal, or with `SKYLINE_FEEDBACK=yes`**: never with no terminal, never by skyline-speederd itself, which only records. Everything shown or sent is scrubbed first, by the same list in `feedback_scrub`, `fb_scrub` and `scrub`, which `cargo test -p ssctl` runs over one text. The DSN is in the tree only sealed, in three copies that `infra/seal-feedback-dsn.py` writes together (`FEEDBACK_SEALED` in `install.sh` and in `scripts/bootstrap.sh`, `crates/ssctl/src/feedback-dsn.sealed`) and `cargo test -p ssctl` compares; a plain DSN or a Sentry auth token never goes into the tree |
 
 > The `RuntimeDirectory` / `socket_path` coupling is a hole this project has
 > already fallen into once: a bulk rename changed `RuntimeDirectory` to
@@ -167,8 +167,14 @@ careful around the code that touches them.
    root qdisc of `runtime.tc_interface` (`fq`, or `mq` over `fq` on a
    multi-queue NIC; when that is a VLAN, bond or bridge whose root is
    `noqueue`, the NICs with a `device` link under it instead, never a tap or
-   veth). From `enable` to `drain` the daemon is the only writer of all three
-   (after a drain, `apply-guest-profile.sh` and `install.sh --uninstall` set
+   veth). Unless `[guard] tcp_wmem_max = 0` it also raises the maximum of
+   `net.ipv4.tcp_wmem` to at least that value -- never lowers it -- and keeps it
+   there; `drain` puts back what the first raise replaced, right after
+   `fallback_cc` and under the same lock, only while the sysctl still reads
+   what the daemon wrote (something else that changed it meant it). The
+   original is also kept in `/run/skyline-speeder/tcp-wmem-hold`, so a daemon
+   restarted in between still puts it back. From `enable` to `drain` the
+   daemon is the only writer of all of them (after a drain, `apply-guest-profile.sh` and `install.sh --uninstall` set
    qdiscs of their own). `boot-enable.sh` used to write `default_qdisc=fq` once
    at boot and no longer does -- do not add it back: it cannot change a NIC's
    existing root qdisc, and two writers of one setting drift apart. Related

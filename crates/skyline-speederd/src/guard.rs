@@ -14,7 +14,12 @@
 //!   that is a VLAN, bond or bridge whose root is the kernel's default
 //!   noqueue, the NICs under it (see `managed_devices`),
 //!
-//! the last two only while `[guard] qdisc = true`. Nothing else in this
+//! - the maximum of `net.ipv4.tcp_wmem`, raised to `[guard] tcp_wmem_max`
+//!   when it is lower (never lowered) unless that is 0; `Drain` puts back
+//!   what was there before, under the same lock and right after
+//!   `fallback_cc`, unless something else changed it since,
+//!
+//! the two qdisc ones only while `[guard] qdisc = true`. Nothing else in this
 //! repository writes a different value to them while skyline_cc is enabled
 //! (the experiment harness's skyline profile writes the same ones, and drains
 //! before any other profile); infra/boot-disable.sh's cc write is the fallback
@@ -42,7 +47,8 @@ use skyline_common::{GuardDevice, GuardLive, GuardStatus, SkylineConfig};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -51,6 +57,64 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_QDISC_SYSCTL: &str = "/proc/sys/net/core/default_qdisc";
+
+const TCP_WMEM_SYSCTL: &str = "/proc/sys/net/ipv4/tcp_wmem";
+
+/// Where a raised `tcp_wmem` and what it replaced are kept between an enable
+/// and the drain, beside `runtime.state_path`: a daemon restarted in between
+/// (a crash, `systemctl restart`) still puts the original back. On /run, so a
+/// reboot, which resets the sysctl too, forgets it.
+const WMEM_HOLD_FILE: &str = "tcp-wmem-hold";
+
+/// `net.ipv4.tcp_wmem`: minimum, default and maximum, in bytes.
+pub(crate) type Wmem = [u64; 3];
+
+fn format_wmem(value: &Wmem) -> String {
+    format!("{} {} {}", value[0], value[1], value[2])
+}
+
+fn parse_wmem(text: &str) -> Option<Wmem> {
+    let mut fields = text.split_whitespace().map(str::parse::<u64>);
+    let value = [
+        fields.next()?.ok()?,
+        fields.next()?.ok()?,
+        fields.next()?.ok()?,
+    ];
+    fields.next().is_none().then_some(value)
+}
+
+/// A `tcp_wmem` this daemon raised: what was there before, and what it wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WmemHold {
+    pub(crate) original: Wmem,
+    pub(crate) written: Wmem,
+}
+
+impl WmemHold {
+    fn encode(&self) -> String {
+        format!(
+            "original {}\nwritten {}\n",
+            format_wmem(&self.original),
+            format_wmem(&self.written)
+        )
+    }
+
+    fn decode(text: &str) -> Option<Self> {
+        let mut original = None;
+        let mut written = None;
+        for line in text.lines() {
+            match line.split_once(' ') {
+                Some(("original", value)) => original = parse_wmem(value),
+                Some(("written", value)) => written = parse_wmem(value),
+                _ => return None,
+            }
+        }
+        Some(Self {
+            original: original?,
+            written: written?,
+        })
+    }
+}
 
 const SYS_CLASS_NET: &str = "/sys/class/net";
 
@@ -128,6 +192,8 @@ pub(crate) struct Settings {
     interval_s: u32,
     qdisc: bool,
     interface: Option<String>,
+    /// 0: tcp_wmem is not owned.
+    tcp_wmem_max: u32,
 }
 
 impl Settings {
@@ -137,6 +203,7 @@ impl Settings {
             interval_s: config.guard.interval_s,
             qdisc: config.guard.qdisc,
             interface: config.runtime.tc_interface.clone(),
+            tcp_wmem_max: config.guard.tcp_wmem_max,
         }
     }
 }
@@ -148,6 +215,12 @@ pub(crate) trait Host: Send + Sync {
     fn set_congestion_control(&self, name: &str) -> Result<()>;
     fn default_qdisc(&self) -> Result<String>;
     fn set_default_qdisc(&self, kind: &str) -> Result<()>;
+    fn tcp_wmem(&self) -> Result<Wmem>;
+    fn set_tcp_wmem(&self, value: &Wmem) -> Result<()>;
+    /// The hold a previous instance left (`WMEM_HOLD_FILE`), if any.
+    fn load_wmem_hold(&self) -> Option<WmemHold>;
+    /// Records `hold`, or forgets it with `None`.
+    fn save_wmem_hold(&self, hold: Option<&WmemHold>) -> Result<()>;
     fn interface_exists(&self, interface: &str) -> bool;
     /// Number of transmit queues; 1 when it cannot be read.
     fn tx_queues(&self, interface: &str) -> usize;
@@ -163,7 +236,23 @@ pub(crate) trait Host: Send + Sync {
     fn tc(&self, args: &[&str]) -> Result<String>;
 }
 
-pub(crate) struct SystemHost;
+pub(crate) struct SystemHost {
+    /// `WMEM_HOLD_FILE` beside `runtime.state_path`.
+    wmem_hold: PathBuf,
+}
+
+impl SystemHost {
+    pub(crate) fn new(config: &SkylineConfig) -> Self {
+        let dir = config
+            .runtime
+            .state_path
+            .parent()
+            .unwrap_or_else(|| Path::new("/run/skyline-speeder"));
+        Self {
+            wmem_hold: dir.join(WMEM_HOLD_FILE),
+        }
+    }
+}
 
 fn read_sysctl(path: &str) -> Result<String> {
     Ok(fs::read_to_string(path)
@@ -191,6 +280,31 @@ impl Host for SystemHost {
         // needs no `modprobe sch_fq` of its own.
         fs::write(DEFAULT_QDISC_SYSCTL, kind)
             .with_context(|| format!("set default_qdisc to {kind}"))
+    }
+
+    fn tcp_wmem(&self) -> Result<Wmem> {
+        let text = read_sysctl(TCP_WMEM_SYSCTL)?;
+        parse_wmem(&text).ok_or_else(|| anyhow!("{TCP_WMEM_SYSCTL} reads {text:?}"))
+    }
+
+    fn set_tcp_wmem(&self, value: &Wmem) -> Result<()> {
+        fs::write(TCP_WMEM_SYSCTL, format_wmem(value))
+            .with_context(|| format!("set tcp_wmem to {}", format_wmem(value)))
+    }
+
+    fn load_wmem_hold(&self) -> Option<WmemHold> {
+        WmemHold::decode(&fs::read_to_string(&self.wmem_hold).ok()?)
+    }
+
+    fn save_wmem_hold(&self, hold: Option<&WmemHold>) -> Result<()> {
+        match hold {
+            Some(hold) => fs::write(&self.wmem_hold, hold.encode()),
+            None => match fs::remove_file(&self.wmem_hold) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            },
+        }
+        .with_context(|| format!("record {}", self.wmem_hold.display()))
     }
 
     fn interface_exists(&self, interface: &str) -> bool {
@@ -279,7 +393,33 @@ fn reap_later(mut child: process::Child, unreaped: &'static AtomicUsize) {
     }
 }
 
-/// Runs `program` and returns its stdout, killing it after `timeout`. A
+/// The directories a program this daemon runs (`tc`, `ss`) is taken from,
+/// in order: the ones iproute2 installs into on every supported
+/// distribution, and never the inherited PATH, which the service manager,
+/// or whoever started the daemon by hand, decides. Running as root, the
+/// daemon would otherwise run whatever a writable directory early in that
+/// PATH held under the name `tc`.
+const SYSTEM_PROGRAM_DIRS: [&str; 4] = ["/usr/sbin", "/sbin", "/usr/bin", "/bin"];
+
+/// The first `SYSTEM_PROGRAM_DIRS` entry holding an executable `name`;
+/// when none does, the path under the first one, so running it fails as a
+/// missing program does (NotFound), which the callers turn into "not
+/// installed". Looked up on every run, so an iproute2 installed after the
+/// daemon started is found.
+pub(crate) fn system_program(name: &str) -> PathBuf {
+    SYSTEM_PROGRAM_DIRS
+        .iter()
+        .map(|dir| Path::new(dir).join(name))
+        .find(|path| {
+            fs::metadata(path)
+                .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+        .unwrap_or_else(|| Path::new(SYSTEM_PROGRAM_DIRS[0]).join(name))
+}
+
+/// Runs `program` (looked up by `system_program`) and returns its stdout,
+/// killing it after `timeout`. A
 /// non-zero exit is an error carrying its stderr. A program killed at the
 /// timeout (or that could not be waited for) is reaped in the background and
 /// counted in `unreaped` until it exits; this returns at once either way.
@@ -290,7 +430,7 @@ pub(crate) fn run_bounded(
     unreaped: &'static AtomicUsize,
 ) -> Result<String> {
     let rendered = format!("{program} {}", args.join(" "));
-    let mut child = Command::new(program)
+    let mut child = Command::new(system_program(program))
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -959,6 +1099,9 @@ struct GuardState {
     cc_restored: u64,
     default_qdisc_restored: u64,
     interface_qdisc_replaced: u64,
+    tcp_wmem_raised: u64,
+    /// Set by the first raise after a drain, cleared by the next drain.
+    wmem_hold: Option<WmemHold>,
     last_correction: Option<String>,
     last_correction_unix_s: Option<u64>,
     last_error: Option<String>,
@@ -996,6 +1139,77 @@ fn enforce_congestion_control(host: &dyn Host, state: &mut GuardState, report: &
         },
         Err(error) => report.errors.push(format!("{error:#}")),
     }
+}
+
+/// Raises the maximum of tcp_wmem to `target` when it is lower, and records
+/// what it replaced the first time since the last drain. The minimum and
+/// default are written back as they are.
+fn enforce_tcp_wmem(target: u32, host: &dyn Host, state: &mut GuardState, report: &mut PassReport) {
+    let target = u64::from(target);
+    let current = match host.tcp_wmem() {
+        Ok(current) => current,
+        Err(error) => {
+            report.errors.push(format!("{error:#}"));
+            return;
+        }
+    };
+    if current[2] >= target {
+        return;
+    }
+    let wanted = [current[0], current[1], target];
+    if let Err(error) = host.set_tcp_wmem(&wanted) {
+        report.errors.push(format!(
+            "tcp_wmem maximum is {} and could not be raised to {target}: {error:#}",
+            current[2]
+        ));
+        return;
+    }
+    state.tcp_wmem_raised = state.tcp_wmem_raised.saturating_add(1);
+    report
+        .corrections
+        .push(format!("tcp_wmem maximum {} -> {target}", current[2]));
+    // The first raise since the drain keeps what the host had; a later one
+    // (something lowered it again) keeps that first original.
+    let hold = WmemHold {
+        original: state.wmem_hold.map_or(current, |hold| hold.original),
+        written: wanted,
+    };
+    if state.wmem_hold != Some(hold) {
+        state.wmem_hold = Some(hold);
+        if let Err(error) = host.save_wmem_hold(Some(&hold)) {
+            report.errors.push(format!(
+                "{error:#}; a restarted daemon could not put tcp_wmem back on drain"
+            ));
+        }
+    }
+}
+
+/// `Drain`'s half: puts back what the first raise replaced, if the sysctl
+/// still reads what this daemon last wrote. A value something else wrote
+/// since is left alone -- that writer meant it. Returns what it did, for
+/// the drain's reply; `None` when nothing was raised.
+fn release_tcp_wmem(host: &dyn Host, state: &mut GuardState) -> Option<String> {
+    let hold = state.wmem_hold.take()?;
+    let mut line = match host.tcp_wmem() {
+        Ok(current) if current == hold.written => match host.set_tcp_wmem(&hold.original) {
+            Ok(()) => format!("tcp_wmem put back to {}", format_wmem(&hold.original)),
+            Err(error) => format!(
+                "tcp_wmem could not be put back to {}: {error:#}",
+                format_wmem(&hold.original)
+            ),
+        },
+        Ok(current) => format!(
+            "tcp_wmem left at {}: something else changed it after skyline-speederd raised it \
+             (it was {} before)",
+            format_wmem(&current),
+            format_wmem(&hold.original)
+        ),
+        Err(error) => format!("tcp_wmem not put back: {error:#}"),
+    };
+    if let Err(error) = host.save_wmem_hold(None) {
+        line.push_str(&format!(" ({error:#})"));
+    }
+    Some(line)
 }
 
 fn enforce_default_qdisc(host: &dyn Host, state: &mut GuardState, report: &mut PassReport) {
@@ -1157,6 +1371,9 @@ fn enforce(
 ) -> PassReport {
     let mut report = PassReport::default();
     enforce_congestion_control(host, state, &mut report);
+    if settings.tcp_wmem_max != 0 {
+        enforce_tcp_wmem(settings.tcp_wmem_max, host, state, &mut report);
+    }
     if settings.qdisc {
         // default_qdisc first: a fresh mq below takes its children from it.
         enforce_default_qdisc(host, state, &mut report);
@@ -1232,14 +1449,23 @@ pub(crate) struct Guard {
 
 impl Guard {
     pub(crate) fn new(config: &SkylineConfig) -> Self {
-        Self::with_host(Settings::from_config(config), Arc::new(SystemHost))
+        Self::with_host(
+            Settings::from_config(config),
+            Arc::new(SystemHost::new(config)),
+        )
     }
 
     fn with_host(settings: Settings, host: Arc<dyn Host>) -> Self {
+        // A hold a previous instance left: this one was restarted between an
+        // enable and a drain, and the drain still has to put tcp_wmem back.
+        let state = GuardState {
+            wmem_hold: host.load_wmem_hold(),
+            ..GuardState::default()
+        };
         Self {
             settings,
             host,
-            state: Arc::new(Mutex::new(GuardState::default())),
+            state: Arc::new(Mutex::new(state)),
             worker: None,
         }
     }
@@ -1300,14 +1526,21 @@ impl Guard {
     }
 
     /// `Request::Drain`: disarm, then run `then` (the fallback_cc write) while
-    /// still holding the lock. A pass already running finishes first -- each
-    /// of its tc calls bounded by TC_TIMEOUT -- and none can start between
-    /// the two and put skyline_cc back. Stays disarmed whatever `then` or the
-    /// rest of the drain returns.
-    pub(crate) fn disarm_and<T>(&self, then: impl FnOnce() -> T) -> T {
+    /// still holding the lock, and then put tcp_wmem back (see
+    /// `release_tcp_wmem`), whose line comes back beside `then`'s result. A
+    /// pass already running finishes first -- each of its tc calls bounded by
+    /// TC_TIMEOUT -- and none can start in between and put skyline_cc or the
+    /// raised maximum back. Stays disarmed whatever `then` or the rest of the
+    /// drain returns.
+    pub(crate) fn disarm_and<T>(&self, then: impl FnOnce() -> T) -> (T, Option<String>) {
         let mut state = lock(&self.state);
         state.armed = false;
-        then()
+        let result = then();
+        let released = release_tcp_wmem(&*self.host, &mut state);
+        if let Some(line) = &released {
+            eprintln!("guard: {line} (ssctl drain)");
+        }
+        (result, released)
     }
 
     pub(crate) fn status(&self) -> GuardStatus {
@@ -1321,6 +1554,9 @@ impl Guard {
                 cc_restored: state.cc_restored,
                 default_qdisc_restored: state.default_qdisc_restored,
                 interface_qdisc_replaced: state.interface_qdisc_replaced,
+                tcp_wmem_max: self.settings.tcp_wmem_max,
+                tcp_wmem_raised: state.tcp_wmem_raised,
+                tcp_wmem_saved: state.wmem_hold.map(|hold| format_wmem(&hold.original)),
                 last_correction: state.last_correction.clone(),
                 last_correction_unix_s: state.last_correction_unix_s,
                 last_error: state.last_error.clone(),
@@ -1368,6 +1604,7 @@ impl Guard {
         GuardLive {
             tcp_congestion_control: self.host.congestion_control().unwrap_or_default(),
             default_qdisc: self.host.default_qdisc().unwrap_or_default(),
+            tcp_wmem: self.host.tcp_wmem().ok().map(|value| format_wmem(&value)),
             interface: self.settings.interface.clone(),
             interface_qdisc,
             devices,
@@ -1439,6 +1676,20 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn programs_come_from_the_system_directories_not_the_path() {
+        // sh is in /bin (or /usr/bin) everywhere this runs.
+        let sh = system_program("sh");
+        assert!(SYSTEM_PROGRAM_DIRS
+            .iter()
+            .any(|dir| sh.parent() == Some(Path::new(dir))));
+        assert!(sh.is_file(), "{}", sh.display());
+        assert_eq!(
+            system_program("skyline-no-such-program"),
+            Path::new("/usr/sbin/skyline-no-such-program")
+        );
     }
 
     #[test]
@@ -1850,6 +2101,10 @@ qdisc cake 0: parent 8001:1 bandwidth unlimited \n";
     struct Fake {
         cc: String,
         default_qdisc: String,
+        tcp_wmem: Wmem,
+        refuse_tcp_wmem: bool,
+        /// What `save_wmem_hold` last recorded: the file a restarted daemon reads.
+        wmem_hold: Option<WmemHold>,
         refuse_default_qdisc: bool,
         tc_installed: bool,
         /// Model a replace the kernel accepts but does not act on.
@@ -1872,6 +2127,9 @@ qdisc cake 0: parent 8001:1 bandwidth unlimited \n";
                 inner: Mutex::new(Fake {
                     cc: cc.to_owned(),
                     default_qdisc: default_qdisc.to_owned(),
+                    tcp_wmem: KERNEL_WMEM,
+                    refuse_tcp_wmem: false,
+                    wmem_hold: None,
                     refuse_default_qdisc: false,
                     tc_installed: true,
                     ignore_replace: false,
@@ -1975,6 +2233,28 @@ qdisc cake 0: parent 8001:1 bandwidth unlimited \n";
                 bail!("set default_qdisc to {kind}: No such file or directory");
             }
             fake.default_qdisc = kind.to_owned();
+            Ok(())
+        }
+
+        fn tcp_wmem(&self) -> Result<Wmem> {
+            Ok(self.fake().tcp_wmem)
+        }
+
+        fn set_tcp_wmem(&self, value: &Wmem) -> Result<()> {
+            let mut fake = self.fake();
+            if fake.refuse_tcp_wmem {
+                bail!("set tcp_wmem: Permission denied (os error 13)");
+            }
+            fake.tcp_wmem = *value;
+            Ok(())
+        }
+
+        fn load_wmem_hold(&self) -> Option<WmemHold> {
+            self.fake().wmem_hold
+        }
+
+        fn save_wmem_hold(&self, hold: Option<&WmemHold>) -> Result<()> {
+            self.fake().wmem_hold = hold.copied();
             Ok(())
         }
 
@@ -2089,7 +2369,156 @@ qdisc cake 0: parent 8001:1 bandwidth unlimited \n";
             interval_s: 3600,
             qdisc,
             interface: Some(interface.to_owned()),
+            // Not owned: the tests of the qdisc half count every correction.
+            tcp_wmem_max: 0,
         }
+    }
+
+    /// Debian's and every stock kernel's: 4 MiB.
+    const KERNEL_WMEM: Wmem = [4096, 16384, 4_194_304];
+    const SHIPPED_WMEM_MAX: u32 = 64 * 1024 * 1024;
+
+    fn wmem_guard(host: &Arc<FakeHost>) -> Guard {
+        Guard::with_host(
+            Settings {
+                tcp_wmem_max: SHIPPED_WMEM_MAX,
+                ..settings(true)
+            },
+            host.clone(),
+        )
+    }
+
+    #[test]
+    fn enable_raises_only_the_tcp_wmem_maximum_and_drain_puts_it_back() {
+        let host = FakeHost::new("skyline_cc", "fq", FQ_ROOT, 1);
+        let guard = wmem_guard(&host);
+        let report = guard.arm_and_enforce();
+        assert_eq!(
+            report.corrections,
+            vec!["tcp_wmem maximum 4194304 -> 67108864"]
+        );
+        assert_eq!(host.fake().tcp_wmem, [4096, 16384, 67_108_864]);
+        let status = guard.status();
+        assert_eq!(status.tcp_wmem_raised, 1);
+        assert_eq!(status.tcp_wmem_saved.as_deref(), Some("4096 16384 4194304"));
+        assert_eq!(status.live.tcp_wmem.as_deref(), Some("4096 16384 67108864"));
+        assert!(host.fake().wmem_hold.is_some(), "recorded for a restart");
+
+        let (wrote, released) = guard.disarm_and(|| host.set_congestion_control("cubic"));
+        wrote.expect("fallback write");
+        assert_eq!(
+            released.as_deref(),
+            Some("tcp_wmem put back to 4096 16384 4194304")
+        );
+        assert_eq!(host.fake().tcp_wmem, KERNEL_WMEM);
+        assert!(host.fake().wmem_hold.is_none());
+        assert!(guard.status().tcp_wmem_saved.is_none());
+        // A second drain has nothing to put back.
+        assert!(guard.disarm_and(|| ()).1.is_none());
+    }
+
+    #[test]
+    fn a_larger_tcp_wmem_is_never_lowered() {
+        let host = FakeHost::new("skyline_cc", "fq", FQ_ROOT, 1);
+        host.fake().tcp_wmem = [8192, 65536, 134_217_728];
+        let guard = wmem_guard(&host);
+        assert!(guard.arm_and_enforce().corrections.is_empty());
+        assert_eq!(host.fake().tcp_wmem, [8192, 65536, 134_217_728]);
+        assert!(guard.disarm_and(|| ()).1.is_none(), "nothing to put back");
+        assert_eq!(host.fake().tcp_wmem, [8192, 65536, 134_217_728]);
+    }
+
+    #[test]
+    fn the_guard_raises_a_lowered_tcp_wmem_again_and_drain_puts_back_the_first_original() {
+        let host = FakeHost::new("skyline_cc", "fq", FQ_ROOT, 1);
+        let guard = wmem_guard(&host);
+        guard.arm_and_enforce();
+        // A sysctl --system re-applying a file with a 6 MiB maximum.
+        host.fake().tcp_wmem = [4096, 16384, 6_291_456];
+        let report = tick(&guard, Instant::now());
+        assert_eq!(
+            report.corrections,
+            vec!["tcp_wmem maximum 6291456 -> 67108864"]
+        );
+        assert_eq!(guard.status().tcp_wmem_raised, 2);
+        let (_, released) = guard.disarm_and(|| ());
+        assert_eq!(
+            released.as_deref(),
+            Some("tcp_wmem put back to 4096 16384 4194304")
+        );
+        assert_eq!(host.fake().tcp_wmem, KERNEL_WMEM);
+    }
+
+    #[test]
+    fn drain_leaves_a_tcp_wmem_something_else_changed_since() {
+        let host = FakeHost::new("skyline_cc", "fq", FQ_ROOT, 1);
+        let guard = wmem_guard(&host);
+        guard.arm_and_enforce();
+        host.fake().tcp_wmem = [4096, 16384, 268_435_456];
+        let (_, released) = guard.disarm_and(|| ());
+        let released = released.expect("a line for the reply");
+        assert!(
+            released.starts_with("tcp_wmem left at 4096 16384 268435456"),
+            "{released}"
+        );
+        assert_eq!(host.fake().tcp_wmem, [4096, 16384, 268_435_456]);
+        assert!(host.fake().wmem_hold.is_none());
+    }
+
+    #[test]
+    fn a_restarted_daemon_still_puts_tcp_wmem_back() {
+        let host = FakeHost::new("skyline_cc", "fq", FQ_ROOT, 1);
+        wmem_guard(&host).arm_and_enforce();
+        // The daemon restarts between the enable and the drain.
+        let restarted = wmem_guard(&host);
+        assert_eq!(
+            restarted.status().tcp_wmem_saved.as_deref(),
+            Some("4096 16384 4194304")
+        );
+        let (_, released) = restarted.disarm_and(|| ());
+        assert_eq!(
+            released.as_deref(),
+            Some("tcp_wmem put back to 4096 16384 4194304")
+        );
+        assert_eq!(host.fake().tcp_wmem, KERNEL_WMEM);
+    }
+
+    #[test]
+    fn a_tcp_wmem_max_of_zero_leaves_the_sysctl_alone() {
+        let host = FakeHost::new("skyline_cc", "fq", FQ_ROOT, 1);
+        let guard = guard(&host, true);
+        assert!(guard.arm_and_enforce().corrections.is_empty());
+        assert_eq!(host.fake().tcp_wmem, KERNEL_WMEM);
+        assert!(guard.disarm_and(|| ()).1.is_none());
+    }
+
+    #[test]
+    fn a_refused_tcp_wmem_write_is_an_error_and_records_nothing() {
+        let host = FakeHost::new("skyline_cc", "fq", FQ_ROOT, 1);
+        host.fake().refuse_tcp_wmem = true;
+        let guard = wmem_guard(&host);
+        let report = guard.arm_and_enforce();
+        assert!(report.corrections.is_empty());
+        assert!(
+            report.errors[0].starts_with("tcp_wmem maximum is 4194304 and could not be raised"),
+            "{:?}",
+            report.errors
+        );
+        assert!(host.fake().wmem_hold.is_none());
+        assert!(guard.disarm_and(|| ()).1.is_none());
+    }
+
+    #[test]
+    fn a_wmem_hold_survives_its_own_encoding() {
+        let hold = WmemHold {
+            original: KERNEL_WMEM,
+            written: [4096, 16384, 67_108_864],
+        };
+        assert_eq!(WmemHold::decode(&hold.encode()), Some(hold));
+        assert_eq!(WmemHold::decode("original 1 2 3\n"), None);
+        assert_eq!(WmemHold::decode("garbage"), None);
+        assert_eq!(parse_wmem("4096\t16384\t4194304"), Some(KERNEL_WMEM));
+        assert_eq!(parse_wmem("4096 16384"), None);
     }
 
     fn settings(qdisc: bool) -> Settings {
@@ -2621,7 +3050,7 @@ qdisc cake 0: parent 8001:1 bandwidth unlimited \n";
         let host = FakeHost::new("skyline_cc", "fq", FQ_ROOT, 1);
         let guard = guard(&host, true);
         guard.arm_and_enforce();
-        let wrote = guard.disarm_and(|| {
+        let (wrote, _) = guard.disarm_and(|| {
             // Held: no periodic pass can start until the fallback is written.
             assert!(guard.state.try_lock().is_err());
             host.set_congestion_control("cubic")

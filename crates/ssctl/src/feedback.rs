@@ -944,6 +944,7 @@ mod tests {
     use super::*;
 
     const INSTALL_SH: &str = include_str!("../../../install.sh");
+    const BOOTSTRAP_SH: &str = include_str!("../../../scripts/bootstrap.sh");
     /// `https://0123456789abcdef0123456789abcdef@o0.ingest.example.invalid/42`
     /// sealed by infra/seal-feedback-dsn.py under the key above.
     const SAMPLE_SEALED: &str = "0b3e66e80afc3e718e477e2ac6e1d0ae4025b48c06f923fa1b7c46ec680f6b82\
@@ -1032,14 +1033,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn install_sh_scrubs_like_ssctl() {
-        // Both senders over one text: install.sh's sed missed sntrys_ and
-        // sntryu_ (it matched sntr[ysu]_) while this file caught them, and
-        // nothing compared the two. Same environment for both, so the host
-        // and user names each takes from /proc and SUDO_USER / LOGNAME agree.
+    /// A text with one of everything a scrub removes, for the shell scrubs to
+    /// be compared with this file's. The tokens and the home directory are
+    /// put together here: as literals in a public tree they read as a leaked
+    /// token and a personal path to every scanner.
+    fn scrub_sample() -> String {
         let token = |prefix: &str, body: &str| format!("{prefix}{body}");
-        let text = format!(
+        format!(
             "bind 192.0.2.20:8080 fe80::1%eth0 ::1 [::]:443 2001:db8:0:0:1:0:0:1 failed\n\
              use std::io::Write; anyhow::Result at 12:34:56 mac 52:54:00:12:34:56 aa-bb-cc-dd-ee-ff\n\
              git clone https://user:hunter2@github.com/x/y, mail ops+alerts@mail.example.org,\n\
@@ -1053,7 +1053,52 @@ mod tests {
             token("sntrys_", "eyJpYXQiOjE3MDAwMDAwMDAuMH0=_Zm9vYmFyYmF6cXV4cXV1eA/+ab"),
             token("sntryu_", &"0123456789abcdef".repeat(4)),
             token("ghp_", "ABCDEFGHIJKLMNOPQRSTUVWX1234"),
+        )
+    }
+
+    /// `script` run by `shell -euc`, with `stdin`; its stdout, or a panic with
+    /// its stderr.
+    fn run_shell(shell: &str, script: &str, stdin: &[u8]) -> String {
+        let mut child = Command::new(shell)
+            .args(["-euc", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect(shell);
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(stdin)
+            .expect("write");
+        let out = child.wait_with_output().expect(shell);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
         );
+        String::from_utf8(out.stdout).expect("utf-8")
+    }
+
+    /// The functions between bootstrap.sh's "error reports" heading and its
+    /// end, for `sh` -- dash on Debian, Ubuntu and the CI runner, the shell
+    /// the script is written for.
+    fn bootstrap_section() -> &'static str {
+        let start = BOOTSTRAP_SH.find("# --- error reports").expect("section");
+        let end = BOOTSTRAP_SH
+            .find("# --- end of error reports")
+            .expect("end");
+        &BOOTSTRAP_SH[start..end]
+    }
+
+    #[test]
+    fn install_sh_scrubs_like_ssctl() {
+        // Both senders over one text: install.sh's sed missed sntrys_ and
+        // sntryu_ (it matched sntr[ysu]_) while this file caught them, and
+        // nothing compared the two. Same environment for both, so the host
+        // and user names each takes from /proc and SUDO_USER / LOGNAME agree.
+        let text = scrub_sample();
         let start = INSTALL_SH.find("# --- error reports").expect("section");
         let end = start + INSTALL_SH[start..].find("\non_interrupt() {").expect("end");
         let script = format!("{}\nfeedback_scrub", &INSTALL_SH[start..end]);
@@ -1084,6 +1129,89 @@ mod tests {
         );
         assert!(!rust.contains("sntry") && !rust.contains("Zm9v") && !rust.contains("eyJp"));
         assert!(rust.contains("not xghp_"), "{rust}");
+    }
+
+    #[test]
+    fn bootstrap_sh_carries_install_sh_s_seal() {
+        let bootstrap = |name: &str| {
+            BOOTSTRAP_SH
+                .lines()
+                .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
+                .unwrap_or_else(|| panic!("scripts/bootstrap.sh has no {name}= line"))
+        };
+        for name in [
+            "FEEDBACK_SEAL_KEY",
+            "FEEDBACK_SEAL_NONCE",
+            "FEEDBACK_SEALED",
+        ] {
+            assert_eq!(
+                bootstrap(name),
+                shell_value(name),
+                "{name}: seal the DSN with infra/seal-feedback-dsn.py, which writes all three copies"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_sh_chacha20_matches_rfc_8439() {
+        let key: Vec<u8> = (0..32).collect();
+        let plain = b"Ladies and Gentlemen of the class of '99: If I could offer you only one \
+                      tip for the future, sunscreen would be it.";
+        let script = format!(
+            "{}\nfb_chacha {} 000000000000004a00000000 {}",
+            bootstrap_section(),
+            hex(&key),
+            hex(plain)
+        );
+        assert_eq!(
+            run_shell("sh", &script, b""),
+            hex(&chacha20(
+                &key.try_into().unwrap(),
+                &[0, 0, 0, 0, 0, 0, 0, 0x4a, 0, 0, 0, 0],
+                plain
+            ))
+        );
+    }
+
+    #[test]
+    fn bootstrap_sh_opens_it_the_same_way() {
+        let script = format!(
+            "{}\nFEEDBACK_SEALED={SAMPLE_SEALED}\nfb_dsn && printf '%s %s' \"$FEEDBACK_PUBLIC\" \"$FEEDBACK_URL\"",
+            bootstrap_section()
+        );
+        assert_eq!(
+            run_shell("sh", &script, b""),
+            "0123456789abcdef0123456789abcdef https://o0.ingest.example.invalid/api/42/envelope/"
+        );
+        let none = format!(
+            "{}\nFEEDBACK_SEALED=\nfb_dsn || echo off",
+            bootstrap_section()
+        );
+        assert_eq!(run_shell("sh", &none, b""), "off\n");
+    }
+
+    #[test]
+    fn bootstrap_sh_scrubs_like_ssctl() {
+        let text = scrub_sample();
+        let script = format!("{}\nfb_scrub", bootstrap_section());
+        assert_eq!(
+            run_shell("sh", &script, text.as_bytes()),
+            scrub(&text).trim_end_matches('\n')
+        );
+    }
+
+    #[test]
+    fn bootstrap_sh_writes_json_and_curl_values_that_read_back() {
+        let text = "a \"quoted\" \\ path\twith a tab\nsecond line";
+        let script = format!("{}\nfb_json \"$(cat)\"", bootstrap_section());
+        let json = run_shell("sh", &script, text.as_bytes());
+        assert_eq!(serde_json::from_str::<String>(&json).expect("JSON"), text);
+
+        let envelope = "{\"type\":\"event\"}\n{\"value\":\"a \\\"q\\\" \\\\ p\"}\n";
+        let script = format!("{}\nfb_curl_quoted", bootstrap_section());
+        let quoted = run_shell("sh", &script, envelope.as_bytes());
+        assert!(!quoted.contains('\n'));
+        assert_eq!(quoted, curl_quoted(envelope));
     }
 
     #[test]

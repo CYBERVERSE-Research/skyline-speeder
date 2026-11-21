@@ -86,8 +86,12 @@ delay_ms = 10    # 0..=100
 [guard]
 interval_s = 5
 # false leaves every qdisc alone (skyline-speederd then owns only the
-# congestion control).
+# congestion control and tcp_wmem_max).
 qdisc = true
+# 0: the experiment harness (infra/apply-guest-profile.sh) sets
+# net.ipv4.tcp_wmem for each case itself, and a guard holding a maximum of its
+# own would fight it. Keep it 0 (guest_config_never_owns_global_sysctls).
+tcp_wmem_max = 0
 
 [runtime]
 bpf_dir = "/opt/skyline-speeder/bpf"

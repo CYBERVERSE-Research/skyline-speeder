@@ -222,8 +222,16 @@ delay_ms = 10    # 0..=100
 [guard]
 interval_s = 5
 # false leaves every qdisc alone (skyline-speederd then owns only the
-# congestion control).
+# congestion control and tcp_wmem_max).
 qdisc = true
+# The least maximum, in bytes, of the TCP send buffer (the third field of
+# net.ipv4.tcp_wmem) while skyline_cc is enabled: `ssctl enable` raises it to
+# this when it is lower, the guard keeps it there, and `ssctl drain` puts back
+# what was there (unless something else changed it since). Never lowered, and
+# the first two fields are left alone. The kernel's 4 MiB default stalls a
+# sender on a long, lossy path -- a VPN server's -- well before the link is
+# full. 0 leaves the sysctl alone. 0 or 4194304..=1073741824.
+tcp_wmem_max = 67108864
 
 [runtime]
 bpf_dir = "build/bpf"

@@ -8,8 +8,8 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.75"
-version = "0.5.5"
+rust-version = "1.82"
+version = "0.6.0"
 license = "GPL-2.0-only"
 
 [workspace.dependencies]

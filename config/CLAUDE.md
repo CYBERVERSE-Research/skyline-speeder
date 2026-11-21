@@ -9,7 +9,9 @@ the repository-wide conventions are in the root `CLAUDE.md` (a config field chan
 `[rack_tuning]` in `config/speeder-guest.toml` **must stay commented out in its entirety**. That config is driven
 per-case by the experiment matrix (`infra/apply-guest-profile.sh`), which controls `tcp_recovery`, `tcp_reordering`
 and `tcp_early_retrans` exactly. If `skyline-speederd` takes ownership of those global sysctls here, a daemon restart
-silently overwrites the per-case values with defaults.
+silently overwrites the per-case values with defaults. For the same reason `[guard] tcp_wmem_max = 0` there: the
+harness sets `net.ipv4.tcp_wmem` per case, and a guard holding a maximum of its own would fight it. Note that a missing
+`tcp_wmem_max` means 64 MiB, not "not owned", so the key must stay in that file with the value 0.
 
 `crates/skyline-common/src/lib.rs` has a `guest_config_never_owns_global_sysctls` test guarding this. **Do not weaken
 or delete it to make a case pass.**

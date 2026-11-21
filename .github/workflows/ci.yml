@@ -25,6 +25,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Read-only, yet each action below is pinned to a commit rather than to a tag
+# its owner can move, as in release.yml: a job here builds the code a release
+# is cut from, and an action moved onto a hostile commit would run with this
+# repository's checkout and whatever the runner holds. To update one, look the
+# new tag's commit up and replace both the hash and the comment.
 permissions:
   contents: read
 
@@ -37,7 +42,7 @@ jobs:
     name: Rust (fmt, check, test)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # libbpf-rs builds libbpf-sys, which needs libelf and zlib headers and a
       # C toolchain. pkg-config is how it finds them.
@@ -69,7 +74,7 @@ jobs:
     name: Rust on musl (build in Alpine 3.21, run in clean Alpine)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Build and run
         run: infra/build-musl.sh
@@ -81,7 +86,7 @@ jobs:
     name: Rust on old glibc (build in AlmaLinux 9, run in clean containers)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Build and run
         run: infra/build-glibc.sh
@@ -90,7 +95,7 @@ jobs:
     name: BPF (CO-RE compile only)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install clang and libbpf
         run: |
@@ -155,7 +160,7 @@ jobs:
             fi
           done
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: bpf-objects-${{ github.sha }}
           path: build/bpf/*.bpf.o
@@ -187,7 +192,7 @@ jobs:
     name: BPF (compile against the release's reference header)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install clang and libbpf
         run: |
@@ -235,7 +240,7 @@ jobs:
     name: Shell (shellcheck, syntax)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
@@ -282,9 +287,9 @@ jobs:
         # which entered the standard library in 3.11.
         python: ['3.11', '3.13']
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ matrix.python }}
 

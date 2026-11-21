@@ -26,8 +26,12 @@ re-applied by `sysctl --system`, moves every new connection off `skyline_cc` wit
 `drain` the guard (`crates/skyline-speederd/src/guard.rs`, config `[guard]`) keeps three things in place: the default
 congestion control and, with `[guard] qdisc = true` (the default), `net.core.default_qdisc = fq` and the root qdisc of
 `runtime.tc_interface` (`fq`, or `mq` over `fq` on a multi-queue NIC; when that is a VLAN, bond or bridge whose root
-is `noqueue`, the NICs with a `device` link under it instead, never a tap or veth). From `enable` to `drain` the daemon
-is the only writer of all three (after a drain, `apply-guest-profile.sh` and `install.sh --uninstall` set qdiscs of
+is `noqueue`, the NICs with a `device` link under it instead, never a tap or veth). Unless `[guard] tcp_wmem_max = 0`
+it also raises the maximum of `net.ipv4.tcp_wmem` to at least that value (never lowers it) and keeps it there; `drain`
+puts back what the first raise replaced, right after `fallback_cc` and under the same lock, only while the sysctl still
+reads what the daemon wrote (`release_tcp_wmem` in `guard.rs`; the original is also kept in
+`/run/skyline-speeder/tcp-wmem-hold` for a restarted daemon). From `enable` to `drain` the daemon is the only writer
+of all of them (after a drain, `apply-guest-profile.sh` and `install.sh --uninstall` set qdiscs of
 their own). `boot-enable.sh` **writes no `default_qdisc` either**: a boot-time write cannot change a NIC's existing
 root qdisc, and two writers of one setting drift apart. Related invariants:
 
@@ -65,11 +69,12 @@ in `config/CLAUDE.md`.
 
 ## Error reports
 
-`ssctl` (`src/feedback.rs`) and `install.sh` ("error reports") offer an error report after a failure and send one
+`ssctl` (`src/feedback.rs`), `install.sh` and `scripts/bootstrap.sh` (each under "error reports"; bootstrap's in POSIX
+sh, for its own steps before `install.sh` runs) offer an error report after a failure and send one
 only on a `y` typed on a terminal, or with `SKYLINE_FEEDBACK=yes`; with no terminal nothing is asked or sent.
 skyline-speederd has no terminal and **never sends**: `src/reports.rs` records an error `main` returns and every panic
-in `DAEMON_REPORTS_DIR`, and the next `ssctl` on a terminal asks. Keep the two senders in step -- what a report holds,
-what `scrub` / `feedback_scrub` remove, the question -- and keep every path that sends behind the question. `ssctl`
+in `DAEMON_REPORTS_DIR`, and the next `ssctl` on a terminal asks. Keep the three senders in step -- what a report holds,
+what `scrub` / `feedback_scrub` / `fb_scrub` remove, the question -- and keep every path that sends behind the question. `ssctl`
 asks only for failures that are not the command working as documented (a refused `enable`, a failed daemon, an
 unreadable reply), never for a drain timeout or a value out of range; `install.sh` likewise asks nothing when it
 refuses a host that does not meet the documented requirements (`unsupported`: an older kernel, another distribution, a
@@ -77,9 +82,10 @@ container, too little free disk space). Sending goes through `curl` with its con
 links a TLS stack and no command line carries the DSN.
 
 The DSN is in the tree only sealed (ChaCha20 under a key that is in the same files -- it keeps the DSN from scanners,
-not secret). `infra/seal-feedback-dsn.py` writes both copies, `crates/ssctl/src/feedback-dsn.sealed` and
-`FEEDBACK_SEALED` in `install.sh`; `cargo test -p ssctl` fails when they, or the key and nonce, disagree, and runs the
-shell's ChaCha20 against the Rust one and both scrubs over one text (`install_sh_scrubs_like_ssctl`: the sed once let
+not secret). `infra/seal-feedback-dsn.py` writes all three copies, `crates/ssctl/src/feedback-dsn.sealed` and
+`FEEDBACK_SEALED` in `install.sh` and in `scripts/bootstrap.sh`; `cargo test -p ssctl` fails when they, or the key and
+nonce, disagree, and runs both shells' ChaCha20 against the Rust one (bootstrap's under `sh`) and every scrub over one
+text (`install_sh_scrubs_like_ssctl`: the sed once let
 `sntrys_` / `sntryu_` tokens through while `scrub` caught them). Empty means reports are off. Never commit a plain DSN
 or a Sentry auth token.
 

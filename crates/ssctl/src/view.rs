@@ -524,6 +524,9 @@ fn guard_section(
             restored(theme, guard.cc_restored)
         ),
     );
+    if guard.tcp_wmem_max != 0 {
+        wmem_row(page, theme, guard);
+    }
     if guard.qdisc {
         let dq_ok = live.default_qdisc == "fq";
         page.row(
@@ -608,6 +611,60 @@ fn guard_section(
         for part in parts {
             page.note(&part);
         }
+    }
+}
+
+/// The maximum of `net.ipv4.tcp_wmem`: what it is, against the least the
+/// guard keeps, and what `ssctl drain` will put back.
+fn wmem_row(page: &mut Page<'_>, theme: &Theme, guard: &GuardStatus) {
+    let wanted = u64::from(guard.tcp_wmem_max);
+    let live = guard
+        .live
+        .tcp_wmem
+        .as_deref()
+        .and_then(|text| text.split_whitespace().nth(2))
+        .and_then(|field| field.parse::<u64>().ok());
+    let Some(live) = live else {
+        page.row(
+            Mark::Warn,
+            "tcp_wmem maximum",
+            &theme.yellow("(unreadable)"),
+        );
+        return;
+    };
+    let mut text = format!(
+        "{}{}",
+        mib(live),
+        times(theme, "raised", guard.tcp_wmem_raised)
+    );
+    if live < wanted {
+        text.push_str(&theme.dim(&format!("  (at least {} wanted)", mib(wanted))));
+    }
+    if let Some(saved) = &guard.tcp_wmem_saved {
+        if let Some(max) = saved.split_whitespace().nth(2).and_then(|f| f.parse().ok()) {
+            text.push_str(&theme.dim(&format!("  \u{00b7} drain puts back {}", mib(max))));
+        }
+    }
+    page.row(
+        if !guard.armed {
+            Mark::Off
+        } else if live >= wanted {
+            Mark::Good
+        } else {
+            Mark::Bad
+        },
+        "tcp_wmem maximum",
+        &text,
+    );
+}
+
+/// Bytes as MiB: a maximum read as 67108864 is easier to check as 64 MiB.
+fn mib(bytes: u64) -> String {
+    let whole = bytes / (1024 * 1024);
+    if bytes % (1024 * 1024) == 0 {
+        format!("{whole} MiB")
+    } else {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
 
@@ -1587,12 +1644,16 @@ mod tests {
                 cc_restored: 2,
                 default_qdisc_restored: 0,
                 interface_qdisc_replaced: 1,
+                tcp_wmem_max: 67_108_864,
+                tcp_wmem_raised: 1,
+                tcp_wmem_saved: Some("4096 16384 4194304".to_owned()),
                 last_correction: Some("tcp_congestion_control bbr -> skyline_cc".to_owned()),
                 last_correction_unix_s: None,
                 last_error: None,
                 live: GuardLive {
                     tcp_congestion_control: SKYLINE_CC_NAME.to_owned(),
                     default_qdisc: "fq".to_owned(),
+                    tcp_wmem: Some("4096 16384 67108864".to_owned()),
                     interface: Some("eth0".to_owned()),
                     interface_qdisc: Some("fq".to_owned()),
                     devices: vec![GuardDevice {
@@ -1677,6 +1738,8 @@ mod tests {
             "GLOBAL SYSCTLS",
             "host default cc",
             "net.core.default_qdisc",
+            "tcp_wmem maximum",
+            "drain puts back 4 MiB",
         ] {
             assert!(status_text.contains(expected), "status lacks {expected}");
             assert!(

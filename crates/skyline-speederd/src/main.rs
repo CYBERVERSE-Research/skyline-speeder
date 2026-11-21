@@ -25,7 +25,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::fd::{AsFd, AsRawFd};
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1427,12 +1427,16 @@ impl Daemon {
             // `try_handle` returns only a message, and the `ss` this costs is
             // worth running once, for this request alone.
             Request::Flows => Ok("accelerated connections enumerated".to_owned()),
-            Request::Snapshot { path } => {
-                let payload = serde_json::to_vec_pretty(&self.status())?;
-                write_snapshot(&path, &payload)
-                    .with_context(|| format!("write snapshot {}", path.display()))?;
-                Ok(format!("snapshot written to {}", path.display()))
-            }
+            // ssctl writes the file itself, from a status reply. This daemon
+            // used to write it, as root, to whatever path the client named:
+            // anyone who could reach the socket chose where root wrote, and
+            // under systemd a file in /tmp landed in the daemon's private
+            // /tmp. Only an ssctl older than this daemon still sends it.
+            Request::Snapshot { .. } => bail!(
+                "this daemon no longer writes snapshot files: ssctl {} writes them itself; \
+                 update ssctl to the daemon's version",
+                env!("CARGO_PKG_VERSION")
+            ),
             Request::Drain { timeout_s } => {
                 // Order matters, and mirrors infra/boot-disable.sh: stop
                 // handing NEW connections to skyline_cc before waiting for the
@@ -1455,9 +1459,14 @@ impl Daemon {
                 // It stays disarmed whatever the rest of the drain returns: the
                 // experiment harness drains with --timeout 0, which bails
                 // below, and then installs its own qdisc -- the guard must not
-                // fight it. Drain touches no qdisc.
-                self.guard
-                    .disarm_and(|| set_default_congestion_control(&self.config.fallback_cc))?;
+                // fight it. Drain touches no qdisc. Under the same lock, right
+                // after fallback_cc, the guard puts tcp_wmem back to what it
+                // was before the enable raised it.
+                let (fallback, wmem) = self
+                    .guard
+                    .disarm_and(|| set_default_congestion_control(&self.config.fallback_cc));
+                fallback?;
+                let wmem = wmem.map(|line| format!("; {line}")).unwrap_or_default();
                 if let Some(policy) = &mut self.policy {
                     policy.set_policy_enabled(false)?;
                 }
@@ -1483,7 +1492,7 @@ impl Daemon {
                     bail!(
                         "drain timeout expired; struct_ops remains attached, but the default \
                          congestion control is already back on {} so no new connection is \
-                         using it",
+                         using it{wmem}",
                         self.config.fallback_cc
                     );
                 }
@@ -1495,7 +1504,7 @@ impl Daemon {
                 self.draining = false;
                 Ok(format!(
                     "new sockets use {}; Skyline Speeder CC links detached (TC stats and RTO tuning, \
-                     if enabled, remain active)",
+                     if enabled, remain active){wmem}",
                     self.config.fallback_cc
                 ))
             }
@@ -1999,7 +2008,7 @@ fn validate_capabilities(report: &CapabilityReport) -> Result<()> {
 }
 
 fn command_success(program: &str, arguments: &[&str]) -> bool {
-    Command::new(program)
+    Command::new(guard::system_program(program))
         .args(arguments)
         .output()
         .map(|output| output.status.success())
@@ -2145,35 +2154,43 @@ fn handle_stream(daemon: &mut Daemon, stream: UnixStream) -> Result<bool> {
     Ok(should_shutdown)
 }
 
-/// The request line, read with `timeout` for each read and at most
-/// `MAX_REQUEST_BYTES` of it.
+/// The request line: at most `MAX_REQUEST_BYTES` of it, and all of it within
+/// `timeout`. The timeout is for the whole line, not for each read: with one
+/// per read, a client sending a byte every few seconds kept the loop, and
+/// every other client and a stop behind it, waiting for as long as it liked.
 fn read_request(stream: &UnixStream, timeout: Duration) -> Result<String> {
-    stream.set_read_timeout(Some(timeout))?;
-    let mut line = String::new();
-    BufReader::new(stream.take(MAX_REQUEST_BYTES))
-        .read_line(&mut line)
-        .context("read request")?;
-    Ok(line)
-}
-
-/// Written as root for whoever reached the socket, so only ever to a
-/// regular file: never through a symlink, never to a device (`ssctl snapshot
-/// /dev/sda` wrote JSON over the start of a disk), and never to a FIFO, whose
-/// open would block this one-request-at-a-time loop. A FIFO without a reader
-/// fails to open (O_NONBLOCK); a device opens, and is refused before
-/// anything is written.
-fn write_snapshot(path: &Path, payload: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        bail!("not a regular file");
+    let deadline = Instant::now() + timeout;
+    let mut line = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            bail!("read request: no complete line within {timeout:?}");
+        }
+        stream.set_read_timeout(Some(left))?;
+        let read = match (&*stream).read(&mut chunk) {
+            Ok(read) => read,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            // What a read the timeout ended returns.
+            Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                bail!("read request: no complete line within {timeout:?}")
+            }
+            Err(error) => return Err(error).context("read request"),
+        };
+        if read == 0 {
+            break;
+        }
+        line.extend_from_slice(&chunk[..read]);
+        if let Some(end) = line.iter().position(|&byte| byte == b'\n') {
+            line.truncate(end + 1);
+            break;
+        }
+        if line.len() as u64 >= MAX_REQUEST_BYTES {
+            line.truncate(MAX_REQUEST_BYTES as usize);
+            break;
+        }
     }
-    file.set_len(0)?;
-    file.write_all(payload)?;
-    Ok(())
+    String::from_utf8(line).context("read request")
 }
 
 /// Spawns a background thread that, on SIGTERM/SIGINT, sends a single
@@ -2763,6 +2780,30 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a_request_trickled_in_byte_by_byte_still_ends_at_the_timeout() {
+        let (client, server) = UnixStream::pair().expect("socket pair");
+        let writer = thread::spawn(move || {
+            // One byte every 50 ms: each read returns well inside a per-read
+            // timeout of 200 ms, but the line takes 1.5 s in all.
+            for byte in br#"{"command":"status"}"#.iter().chain(b"\n") {
+                if (&client).write_all(&[*byte]).is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let started = Instant::now();
+        let error = read_request(&server, Duration::from_millis(200)).expect_err("too slow");
+        assert!(started.elapsed() < Duration::from_secs(1), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("no complete line within 200ms"),
+            "{error:#}"
+        );
+        drop(server);
+        writer.join().expect("writer");
+    }
+
     /// A request this daemon cannot decode -- a command from a newer ssctl,
     /// say -- gets an answer that says so, not a closed connection.
     #[test]
@@ -2889,27 +2930,6 @@ mod tests {
                 dscp_value: 10
             })
             .is_err());
-    }
-
-    #[test]
-    fn a_snapshot_is_only_written_to_a_regular_file() {
-        let dir = scratch_dir("snapshot");
-        let file = dir.join("status.json");
-        write_snapshot(&file, b"one").expect("a new file");
-        write_snapshot(&file, b"two").expect("an existing file");
-        assert_eq!(fs::read(&file).expect("read"), b"two");
-
-        let target = dir.join("target");
-        fs::write(&target, b"keep").expect("seed");
-        let link = dir.join("link");
-        std::os::unix::fs::symlink(&target, &link).expect("symlink");
-        assert!(write_snapshot(&link, b"over").is_err());
-        assert_eq!(fs::read(&target).expect("read"), b"keep");
-
-        assert!(write_snapshot(&dir, b"over").is_err());
-        let error = write_snapshot(Path::new("/dev/null"), b"over").expect_err("a device");
-        assert_eq!(format!("{error:#}"), "not a regular file");
-        fs::remove_dir_all(&dir).expect("clean up");
     }
 
     /// A fresh directory per test; the crate has no tempfile dependency and

@@ -10,7 +10,7 @@
 [![Kernel](https://img.shields.io/badge/kernel-6.12%20LTS%2B-orange.svg)](#内核版本要求)
 [![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu%20%7C%20Fedora%20%7C%20RHEL%20%7C%20Alpine-red.svg)](install.sh)
 [![eBPF](https://img.shields.io/badge/eBPF-CO--RE%20struct__ops-green.svg)](bpf/)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-black.svg)](rust-toolchain.toml)
+[![Rust](https://img.shields.io/badge/rust-1.82%2B-black.svg)](rust-toolchain.toml)
 
 **[English](README.md)** · 简体中文
 
@@ -81,7 +81,7 @@ sudo ./install.sh --uninstall --restore-pre-install   # 同上，但还原成
 
 `--uninstall` 会先 drain 掉存量连接，删除两个服务（systemd 单元，Alpine 上是 OpenRC 脚本）、二进制和 BPF 对象，把本机切到 **bbr + fq**，并卸掉安装时装上的包。装了哪些包是记录下来的（`/etc/skyline-speeder/added-packages`），也只卸这些：不碰 `iproute2`（Fedora/RHEL 上是 `iproute` 与 `iproute-tc`）、`curl`、`ca-certificates`、`tar`（Alpine 上还有 `bash`），不碰这几个包**仍然依赖**的东西（保留 `curl` 却删掉它底下的库，apt 根本做不到），也不碰 dpkg 标为 *required*/*important* 或 dnf 保护的包。卸之前先出计划（apt 自己出，dnf 用 `rpm -e --test`；apk 本来就不会删还被依赖的包）：计划里如果要连带删掉主机上别的东西，就把造成这件事的那个包单独留下并说明，其余照卸；只有在怎么缩减都无法得到一个不越界的计划时，才一个都不卸、改为打印手工命令。rustup 工具链只在确实是安装器装的情况下才移除。`bbr` 与 `fq` 只在本次运行时生效——不写也不改 `/etc/sysctl.d` 下的任何文件，所以重启后仍由那些文件决定。加 `--restore-pre-install` 则还原成安装前那台机器用的拥塞控制与 qdisc（包括出口网卡的根 qdisc，安装时一并记录）。两种方式都保留 `/etc/skyline-speeder`，重装时你的配置还在。
 
-已发布的版本不需要编译工具链，只需要 `curl`、`tar` 和 `iproute2`（安装器会自动安装）：对象是 CO-RE 的，用固定的 6.12 参考头编译，加载时再按这台机器的内核重定位。预编译的 daemon 有两个构建：一个在 AlmaLinux 9 里构建，需要 glibc 2.34 以上以及 `libelf.so.1`、`libz.so.1`（Debian 12、Ubuntu 22.04、RHEL 9 系及更新版本满足；v0.5.4 及更早的 release 在 Ubuntu 24.04 上构建，需要 glibc 2.38）；另一个自 v0.4.1 起在 Alpine 3.21 里针对 musl 构建，Alpine 3.21 及更新会装它，外加 `libelf`、`zlib`、`zstd-libs`、`libgcc`。用户态更旧的系统，默认安装会自动改为从源码构建，`--source` 则在任何机器上都从源码构建。`--release <tag>` 指定版本；连不上 GitHub 的机器，把产物拷过去后用 `sudo SKYLINE_ARTIFACT_URL=/path/to/tarball ./install.sh --prebuilt` 安装。装上的是已发布的 release，可能比这份 README、也比 `main` 旧：`main` 上在最新 release 之后合并的改动，要等下一个 release 才会进入一键安装。安装器本身也是如此：bootstrap 下载的是最新 release 的源码包，并在运行其中任何东西之前用发布公钥校验签名；`bash -s -- --ref main` 则改用开发中的源码树。装的 release 早于这里描述的某个功能时（例如 v0.2.0 这个 release 还没有 qdisc 守护），安装器会明确提示。
+已发布的版本不需要编译工具链，只需要 `curl`、`tar` 和 `iproute2`（安装器会自动安装）：对象是 CO-RE 的，用固定的 6.12 参考头编译，加载时再按这台机器的内核重定位。预编译的 daemon 有两个构建：一个在 AlmaLinux 9 里构建，需要 glibc 2.34 以上以及 `libelf.so.1`、`libz.so.1`（Debian 12、Ubuntu 22.04、RHEL 9 系及更新版本满足；v0.5.4 及更早的 release 在 Ubuntu 24.04 上构建，需要 glibc 2.38）；另一个自 v0.4.1 起在 Alpine 3.21 里针对 musl 构建，Alpine 3.21 及更新会装它，外加 `libelf`、`zlib`、`zstd-libs`、`libgcc`。用户态更旧的系统，默认安装会自动改为从源码构建，`--source` 则在任何机器上都从源码构建。`--release <tag>` 指定版本；连不上 GitHub 的机器，把产物拷过去后用 `sudo SKYLINE_ARTIFACT_URL=/path/to/tarball ./install.sh --prebuilt` 安装。自 v0.6.0 起每个 release 都带签名，安装器在解包之前用 `install.sh` 里的发布公钥校验签名。装上的是已发布的 release，可能比这份 README、也比 `main` 旧：`main` 上在最新 release 之后合并的改动，要等下一个 release 才会进入一键安装。安装器本身也是如此：bootstrap 下载的是最新 release 的源码包，并在运行其中任何东西之前用发布公钥校验签名；`bash -s -- --ref main` 则改用开发中的源码树。装的 release 早于这里描述的某个功能时（例如 v0.2.0 这个 release 还没有 qdisc 守护），安装器会明确提示。
 
 > [!IMPORTANT]
 > **升级：** 再运行一次安装器即可。新对象通过内核验证器后，它会自己重启 `skyline-speederd`：先让现有连接排空（最多 60 秒），再重新挂载 `skyline_cc`；原先是手工 `ssctl enable` 挂载的主机也一样。用 `ssctl` 做的修改不会保留到重启之后。原先从源码构建的主机会换成已发布的版本，除非再次带上 `--source`——v0.4.1 起 Alpine 也是如此。详见 [DEPLOY.md](DEPLOY.md) 第 10 节。
@@ -138,6 +138,7 @@ Rust 编写的 `skyline-speederd` 加载 BPF 程序（都要过内核验证器�
 | [系数](#系数) | 调好的值 | 增益、护栏、上限、起步行为 | `ssctl set-module-config` |
 | [首轮冗余](#首轮冗余) | 开 | 每条连接的握手和前 64 KiB 发两份 | `ssctl set-redundancy` |
 | [拥塞控制与 qdisc 守护](#拥塞控制与-qdisc-守护) | 开，每 5 秒检查 | 守住 skyline_cc 和 `fq` | `[guard]` |
+| [发送缓冲上限](#发送缓冲上限) | 挂载期间至少 64 MiB | 调高单个 TCP socket 最多能缓存的待发送数据 | `[guard] tcp_wmem_max` |
 | [动态 RTO 上下限](#动态-rto-上下限) | 关 | 给每条连接的重传超时设上下限 | `ssctl set-rack-rto` |
 | [重传包 DSCP 标记](#重传包-dscp-标记) | 关 | 给重传包打标记，供上游网络区别对待 | `ssctl set-retransmit-dscp` |
 | [全局丢包检测 sysctl](#全局丢包检测-sysctl) | 用主机自己的值 | daemon 启动时可以代为写入的三个 `net.ipv4` sysctl | `[rack_tuning]` |
@@ -166,7 +167,7 @@ ssctl disable --module loss-classifier        # 只关一个，其余不变
 
 不带 `--modules` 的 `ssctl enable` 沿用当前的模块集合，所以执行过 `--modules` 或 `--all-off` 之后，要把四个都写上才回到全开。四个全关时，`skyline_cc` 的表现与内核自带的 TCP 一致，可以当作对比测试的中性基准。
 
-`ssctl enable` 是全机生效的：挂载成功后会写 `net.ipv4.tcp_congestion_control = skyline_cc`，这台机器上所有新建 TCP 连接都会用它，已经建立的连接保持原来的算法。它还会把 `fq` 设好、武装[守护](#拥塞控制与-qdisc-守护)、启动[首轮冗余](#首轮冗余)。`ssctl drain` 让新连接改走 `fallback_cc`，并停掉后两者。
+`ssctl enable` 是全机生效的：挂载成功后会写 `net.ipv4.tcp_congestion_control = skyline_cc`，这台机器上所有新建 TCP 连接都会用它，已经建立的连接保持原来的算法。它还会把 `fq` 设好、调高[发送缓冲上限](#发送缓冲上限)、武装[守护](#拥塞控制与-qdisc-守护)、启动[首轮冗余](#首轮冗余)。`ssctl drain` 让新连接改走 `fallback_cc`，把发送缓冲上限改回原值，并停掉守护和首轮冗余。
 
 ### 系数
 
@@ -223,6 +224,17 @@ qdisc = true      # false：qdisc 完全交给你，只守拥塞控制
 
 `ssctl status` 的 *DRIFT GUARD* 段落显示它：`ARMED`，三项各自的当前值和被改回的次数，最近一次纠正，最近一次错误（保留到下一次出错为止，可能是很久以前的），以及刻意没动的东西（`note`）。
 
+### 发送缓冲上限
+
+skyline_cc 挂载期间开启。内核默认只让单个 TCP socket 最多缓存 4 MiB 待发送的数据（`net.ipv4.tcp_wmem` 的第三项）：包括在途的数据，以及排在丢包后面等待的数据。在有丢包的长距离路径上（VPN 服务器的常态），这 4 MiB 会被占满，应用随之卡住，而链路远没有跑满。`ssctl enable` 在这个上限低于 64 MiB 时把它调到 64 MiB，守护会一直保持住，`ssctl drain` 再把被替换掉的原值写回去，除非期间有别的东西改过它。它只抬高上限：每个 socket 的缓冲仍由内核按连接的需要自动调整，总量仍受 `net.ipv4.tcp_mem` 限制，主机原本就更大的上限也绝不会被调低。代价是内存，而且只花在真正用得到的连接上。接收端的 `tcp_rmem` 要由客户端自己调高。
+
+```toml
+[guard]
+tcp_wmem_max = 67108864   # 字节；0：net.ipv4.tcp_wmem 交给你自己管
+```
+
+`ssctl status` 的 *DRIFT GUARD* 段落里的 `tcp_wmem maximum` 一行显示它：当前值、被调高的次数，以及 `drain puts back 4 MiB`，即被替换掉的原值。
+
 ### 动态 RTO 上下限
 
 默认关闭。ACK 没有按时回来时，TCP 在重传超时（RTO）之后重发，之后每再超时一次就把等待时间翻倍，最长到 120 秒。丢包随机时，下一次重发并不比上一次更难成功，等这么久的连接只是卡住了。`skyline_policy` 可以给每条连接的 RTO 设上下限：
@@ -273,7 +285,7 @@ sudo ssctl reset-retransmit-dscp                   # 回到配置文件里的 [r
 
 ### 错误报告
 
-先问，绝不默认发送。安装、升级或卸载失败时，`install.sh` 会问一次是否把错误报告发给开发者。`ssctl` 也会在这几种情况下询问：`enable` 被拒绝；daemon 因为出错而连不上；skyline-speederd 因出错退出或 panic。daemon 没有终端可以询问，所以它把错误记在 `/var/lib/skyline-speeder/reports`，下一次在终端里运行 `sudo ssctl` 时再问。**只有你回答 `y` 才会发送**；回答 `v` 可以先看要发送的完整内容。没有终端可以询问时（管道、cloud-init、cron、`--json`），既不询问也不发送。主机不满足上面的要求（内核太旧、发行版不支持、运行在容器里、磁盘空间不足）而被安装器拒绝时，只说明原因、不询问：这是安装器在正常工作。
+先问，绝不默认发送。安装、升级或卸载失败时，`install.sh` 会问一次是否把错误报告发给开发者；一键安装的 `bootstrap.sh` 在 `install.sh` 运行之前就失败时（安装 `curl`、`tar` 或 `bash`、下载、解包）也会这样问。`ssctl` 也会在这几种情况下询问：`enable` 被拒绝；daemon 因为出错而连不上；skyline-speederd 因出错退出或 panic。daemon 没有终端可以询问，所以它把错误记在 `/var/lib/skyline-speeder/reports`，下一次在终端里运行 `sudo ssctl` 时再问。**只有你回答 `y` 才会发送**；回答 `v` 可以先看要发送的完整内容。没有终端可以询问时（管道、cloud-init、cron、`--json`），既不询问也不发送。主机不满足上面的要求（内核太旧、发行版不支持、运行在容器里、磁盘空间不足）而被安装器拒绝时，只说明原因、不询问：这是安装器在正常工作。
 
 报告包含：错误信息、出错的步骤、Skyline Speeder 版本、发行版、内核、架构、C 库和服务管理器，以及出错步骤的安装日志（最早的几行报错如果在更前面，也一并带上）或 daemon 日志的最后 40 行。IPv4、IPv6 和 MAC 地址、邮箱地址、URL 里的账号密码、令牌、家目录、主机名和你的用户名，在显示或发送之前都会被去掉。报告经 HTTPS、由 `curl` 发到本项目的 Sentry；代码里的上报地址只以加密形式存在。
 
@@ -308,7 +320,7 @@ sudo systemctl restart skyline-speederd    # 挂载服务随之重新挂载 skyl
 | fallback on drain | `fallback_cc`：`ssctl drain` 之后新连接用什么算法；如果主机的 sysctl 文件在开机时指定了一个本内核有的算法，安装脚本就把它设为该算法——全新安装时如此，之后每次升级或重装也会重新设置，除非你自己改过它 |
 | modules | M1-M4；打勾表示此刻正作用于流量，所以没挂载时一个都不打勾 |
 | live connections | 此刻跑在 skyline_cc 上的连接数 |
-| DRIFT GUARD | 见[拥塞控制与 qdisc 守护](#拥塞控制与-qdisc-守护) |
+| DRIFT GUARD | 见[拥塞控制与 qdisc 守护](#拥塞控制与-qdisc-守护)；`tcp_wmem maximum` 一行见[发送缓冲上限](#发送缓冲上限) |
 | KERNEL | 内核版本；`required` 一行必须全部打勾。`optional` 里的 `RACK reorder hook` 需要打过补丁的内核，灰色是正常的 |
 | GLOBAL SYSCTLS | 见[全局丢包检测 sysctl](#全局丢包检测-sysctl) |
 | DAEMON | 运行时长，以及配置代际号：模块、系数或 RTO 上下限每变一次就加一 |
@@ -336,7 +348,7 @@ sudo systemctl restart skyline-speederd    # 挂载服务随之重新挂载 skyl
 | TC EGRESS | daemon 启动以来从 `tc_interface` 发出的全部流量，不论拥塞控制：`seen` 是包数、字节数和 GSO 包数；然后是 [`retransmits marked`](#重传包-dscp-标记) 和 [`first-flight copies`](#首轮冗余) |
 | DYNAMIC RTO，关闭时是 CGROUP POLICY | 见[动态 RTO 上下限](#动态-rto-上下限)；`connections seen` 用来判断 cgroup 里有没有进程 |
 
-要给脚本解析就加 `--json`，打印 daemon 的原始应答。`ssctl snapshot <文件>` 让 daemon 把其中的 `status` 部分写进一个普通文件（systemd 下写到 `/run/skyline-speeder/` 最稳妥），`ssctl validate` 对照内核校验 daemon 内存里的配置。
+要给脚本解析就加 `--json`，打印 daemon 的原始应答。`ssctl snapshot <文件>` 把其中的 `status` 部分写进一个普通文件，`ssctl validate` 对照内核校验 daemon 内存里的配置。
 
 ## 仓库结构
 

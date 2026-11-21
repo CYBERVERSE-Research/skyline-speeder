@@ -3,14 +3,15 @@
 
     python3 infra/seal-feedback-dsn.py            # asks for the DSN, input hidden
     ... | python3 infra/seal-feedback-dsn.py      # or reads it from stdin
-    python3 infra/seal-feedback-dsn.py --check    # both copies agree and open
+    python3 infra/seal-feedback-dsn.py --check    # all three copies agree and open
     python3 infra/seal-feedback-dsn.py --clear    # no DSN: nothing asks or sends
     python3 infra/seal-feedback-dsn.py --self-test
 
-Two copies, because the two senders cannot share one: install.sh is often
-piped in with no tree beside it, so it carries FEEDBACK_SEALED itself, and
-ssctl compiles crates/ssctl/src/feedback-dsn.sealed in. This script writes
-both, and `cargo test -p ssctl` fails when they disagree.
+Three copies, because the three senders cannot share one: install.sh and
+scripts/bootstrap.sh are often piped in with no tree beside them, so each
+carries FEEDBACK_SEALED (and the key and nonce) itself, and ssctl compiles
+crates/ssctl/src/feedback-dsn.sealed in. This script writes all three, and
+`cargo test -p ssctl` fails when they disagree.
 
 What sealing is and is not. The DSN is ChaCha20-encrypted (RFC 8439) under
 FEEDBACK_SEAL_KEY and FEEDBACK_SEAL_NONCE, which install.sh holds in plain
@@ -36,6 +37,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 INSTALL_SH = ROOT / "install.sh"
+BOOTSTRAP_SH = ROOT / "scripts" / "bootstrap.sh"
 RUST_COPY = ROOT / "crates" / "ssctl" / "src" / "feedback-dsn.sealed"
 
 # The public key, an optional legacy secret, the host (and port), an optional
@@ -108,10 +110,10 @@ def self_test() -> None:
     print("self-test passed: ChaCha20 matches RFC 8439 2.4.2")
 
 
-def shell_value(name: str) -> str:
-    match = re.search(rf"^{name}=([0-9a-f]*)$", INSTALL_SH.read_text(), re.MULTILINE)
+def shell_value(name: str, script: Path = INSTALL_SH) -> str:
+    match = re.search(rf"^{name}=([0-9a-f]*)$", script.read_text(), re.MULTILINE)
     if match is None:
-        sys.exit(f"{INSTALL_SH.relative_to(ROOT)} has no {name}=<hex> line")
+        sys.exit(f"{script.relative_to(ROOT)} has no {name}=<hex> line")
     return match.group(1)
 
 
@@ -132,13 +134,14 @@ def opens(sealed: str) -> bool:
 
 
 def write(sealed: str) -> None:
-    text = INSTALL_SH.read_text()
-    text, count = re.subn(
-        r"^FEEDBACK_SEALED=[0-9a-f]*$", f"FEEDBACK_SEALED={sealed}", text, flags=re.MULTILINE
-    )
-    if count != 1:
-        sys.exit(f"{INSTALL_SH.relative_to(ROOT)} must have exactly one FEEDBACK_SEALED= line")
-    INSTALL_SH.write_text(text)
+    for script in (INSTALL_SH, BOOTSTRAP_SH):
+        text = script.read_text()
+        text, count = re.subn(
+            r"^FEEDBACK_SEALED=[0-9a-f]*$", f"FEEDBACK_SEALED={sealed}", text, flags=re.MULTILINE
+        )
+        if count != 1:
+            sys.exit(f"{script.relative_to(ROOT)} must have exactly one FEEDBACK_SEALED= line")
+        script.write_text(text)
     RUST_COPY.write_text(f"{sealed}\n")
 
 
@@ -147,10 +150,13 @@ def check() -> None:
     rust = RUST_COPY.read_text().strip()
     if shell != rust:
         sys.exit(f"the sealed DSN in install.sh and in {RUST_COPY.relative_to(ROOT)} differ")
+    for name in ("FEEDBACK_SEAL_KEY", "FEEDBACK_SEAL_NONCE", "FEEDBACK_SEALED"):
+        if shell_value(name, BOOTSTRAP_SH) != shell_value(name):
+            sys.exit(f"{name} in {BOOTSTRAP_SH.relative_to(ROOT)} and in install.sh differ")
     if not shell:
         print("no DSN is sealed: error reports are off (nothing asks, nothing is sent)")
     elif opens(shell):
-        print("a DSN is sealed, both copies agree and it opens to a valid https DSN")
+        print("a DSN is sealed, all three copies agree and it opens to a valid https DSN")
     else:
         sys.exit("the sealed DSN does not open to a valid https DSN: seal it again")
 
@@ -195,7 +201,10 @@ def main() -> None:
     sealed = chacha20(key, nonce, public.encode("ascii")).hex()
     write(sealed)
     check()
-    print(f"wrote it to install.sh and {RUST_COPY.relative_to(ROOT)}; commit both")
+    print(
+        f"wrote it to install.sh, {BOOTSTRAP_SH.relative_to(ROOT)} and"
+        f" {RUST_COPY.relative_to(ROOT)}; commit all three"
+    )
 
 
 if __name__ == "__main__":

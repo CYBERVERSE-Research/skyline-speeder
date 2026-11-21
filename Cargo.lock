@@ -225,9 +225,9 @@ dependencies = [
 
 [[package]]
 name = "libbpf-sys"
-version = "1.4.5+v1.4.5"
+version = "1.7.1+v1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5cabee52b6f7e73308d6fd4f8e6bbbdcb97670f49f6e581c5897e4d2410b6019"
+checksum = "222dd409cbd4db5e9d40410d17a168e1f80446386ae7bafbefa9bd0c1183ff64"
 dependencies = [
  "cc",
  "nix",
@@ -248,9 +248,9 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "nix"
-version = "0.29.0"
+version = "0.31.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+checksum = "2bc81ce8148d3b4f3274da811f11cdd824ae661ee4ef732cdb229825cf5be7f7"
 dependencies = [
  "bitflags",
  "cfg-if",
@@ -368,7 +368,7 @@ dependencies = [
 
 [[package]]
 name = "skyline-common"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "bitflags",
  "bytemuck",
@@ -379,7 +379,7 @@ dependencies = [
 
 [[package]]
 name = "skyline-speederd"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -393,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "ssctl"
-version = "0.5.5"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",

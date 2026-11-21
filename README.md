@@ -10,7 +10,7 @@
 [![Kernel](https://img.shields.io/badge/kernel-6.12%20LTS%2B-orange.svg)](#kernel-requirement)
 [![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu%20%7C%20Fedora%20%7C%20RHEL%20%7C%20Alpine-red.svg)](install.sh)
 [![eBPF](https://img.shields.io/badge/eBPF-CO--RE%20struct__ops-green.svg)](bpf/)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-black.svg)](rust-toolchain.toml)
+[![Rust](https://img.shields.io/badge/rust-1.82%2B-black.svg)](rust-toolchain.toml)
 
 English · **[简体中文](README.zh.md)**
 
@@ -79,7 +79,7 @@ The installer uses the distribution's own package manager and service manager �
 
 `--uninstall` drains live flows, removes the two services (systemd units, or the OpenRC scripts on Alpine), binaries and BPF objects, puts the host on **bbr + fq**, and removes the packages the install added. It records which packages those were (`/etc/skyline-speeder/added-packages`) and removes only those: never `iproute2` (`iproute` and `iproute-tc` on Fedora/RHEL), `curl`, `ca-certificates` or `tar` (or `bash` on Alpine), never anything one of those still needs (keeping `curl` while removing the library under it is not something apt can do), and never anything dpkg calls *required* or *important* or dnf protects. The removal is planned first (by apt, or `rpm -e --test`; apk never removes what something still needs): a package something else on the host now needs is kept and named, and the rest is removed; only when no reduced plan stays inside the recorded list is nothing removed at all, and the command to do it by hand is printed instead. A rustup toolchain is removed only if the installer is the one that installed it. `bbr` and `fq` are set for that boot; no file under `/etc/sysctl.d` is written or edited, so those files decide again after a reboot. `--restore-pre-install` puts back the congestion control and qdiscs the host ran before instead — it also records those, including the egress interface's root qdisc. `/etc/skyline-speeder` is kept either way, so a reinstall keeps your settings.
 
-The published release needs no toolchain, only `curl`, `tar` and `iproute2` (the installer installs them): the objects are CO-RE, compiled against a pinned 6.12 header and relocated against this kernel when they load. The prebuilt daemon comes in two builds: one built in AlmaLinux 9, which needs glibc 2.34 or newer with `libelf.so.1` and `libz.so.1` (Debian 12, Ubuntu 22.04, the RHEL 9 family and later; releases up to v0.5.4 were built on Ubuntu 24.04 and need glibc 2.38), and, from v0.4.1, one built in Alpine 3.21 against musl, which Alpine 3.21 and later install together with `libelf`, `zlib`, `zstd-libs` and `libgcc`. On older userspace the default install builds from source by itself, and `--source` does so anywhere. `--release <tag>` pins a version, and `sudo SKYLINE_ARTIFACT_URL=/path/to/tarball ./install.sh --prebuilt` installs a copied artifact on a host with no route to GitHub. What gets installed is a published release, which can be older than this README and than `main`: a change merged after the latest release reaches the one-line install only with the next one. That holds for the installer too: the bootstrap fetches the latest release's source tree, signed, and checks it against the release key before running anything in it; `bash -s -- --ref main` takes the development tree instead. A release that predates a feature described here (the v0.2.0 release has no qdisc guard, for one) is named as such by the installer.
+The published release needs no toolchain, only `curl`, `tar` and `iproute2` (the installer installs them): the objects are CO-RE, compiled against a pinned 6.12 header and relocated against this kernel when they load. The prebuilt daemon comes in two builds: one built in AlmaLinux 9, which needs glibc 2.34 or newer with `libelf.so.1` and `libz.so.1` (Debian 12, Ubuntu 22.04, the RHEL 9 family and later; releases up to v0.5.4 were built on Ubuntu 24.04 and need glibc 2.38), and, from v0.4.1, one built in Alpine 3.21 against musl, which Alpine 3.21 and later install together with `libelf`, `zlib`, `zstd-libs` and `libgcc`. On older userspace the default install builds from source by itself, and `--source` does so anywhere. `--release <tag>` pins a version, and `sudo SKYLINE_ARTIFACT_URL=/path/to/tarball ./install.sh --prebuilt` installs a copied artifact on a host with no route to GitHub. From v0.6.0 every release is signed, and the installer checks the signature against the release key in `install.sh` before it unpacks anything. What gets installed is a published release, which can be older than this README and than `main`: a change merged after the latest release reaches the one-line install only with the next one. That holds for the installer too: the bootstrap fetches the latest release's source tree, signed, and checks it against the release key before running anything in it; `bash -s -- --ref main` takes the development tree instead. A release that predates a feature described here (the v0.2.0 release has no qdisc guard, for one) is named as such by the installer.
 
 > [!IMPORTANT]
 > **Upgrading:** run the installer again. Once the new objects pass the kernel verifier it restarts `skyline-speederd` itself, draining live flows for up to 60 seconds, and attaches `skyline_cc` again, also on a host where it was attached by hand with `ssctl enable`. Settings changed with `ssctl` do not survive the restart. A host that was built from source moves to the published release unless you pass `--source` again — on Alpine too, from v0.4.1. Details: [DEPLOY.md](DEPLOY.md) §10.
@@ -136,6 +136,7 @@ The shipped defaults are tuned values; **most deployments should change nothing.
 | [Coefficients](#coefficients) | tuned values | gains, guardrail, caps, startup behaviour | `ssctl set-module-config` |
 | [First-flight redundancy](#first-flight-redundancy) | on | sends each connection's handshake and first 64 KiB twice | `ssctl set-redundancy` |
 | [Drift guard](#drift-guard) | on, every 5 s | keeps skyline_cc and `fq` in place | `[guard]` |
+| [Send buffer ceiling](#send-buffer-ceiling) | at least 64 MiB while attached | raises the most a TCP socket may buffer for sending | `[guard] tcp_wmem_max` |
 | [Dynamic RTO floor and ceiling](#dynamic-rto-floor-and-ceiling) | off | bounds each connection's retransmission timeout | `ssctl set-rack-rto` |
 | [Retransmit DSCP marking](#retransmit-dscp-marking) | off | marks retransmissions for the network upstream | `ssctl set-retransmit-dscp` |
 | [Global loss-detection sysctls](#global-loss-detection-sysctls) | the host's own | three `net.ipv4` sysctls the daemon can set at start | `[rack_tuning]` |
@@ -164,7 +165,7 @@ ssctl disable --module loss-classifier        # one module off, the others as th
 
 `ssctl enable` without `--modules` keeps the current set, so after `--modules` or `--all-off` name all four to turn everything on again. With all four off, `skyline_cc` behaves like the kernel's own TCP: a neutral baseline for comparisons.
 
-`ssctl enable` takes effect host-wide: on a successful attach it sets `net.ipv4.tcp_congestion_control = skyline_cc`, so every new TCP connection on the machine uses it, while connections already open keep the algorithm they started with. It also puts `fq` in place, arms the [drift guard](#drift-guard) and starts [first-flight redundancy](#first-flight-redundancy). `ssctl drain` hands new connections to `fallback_cc` and stops both.
+`ssctl enable` takes effect host-wide: on a successful attach it sets `net.ipv4.tcp_congestion_control = skyline_cc`, so every new TCP connection on the machine uses it, while connections already open keep the algorithm they started with. It also puts `fq` in place, raises the [send buffer ceiling](#send-buffer-ceiling), arms the [drift guard](#drift-guard) and starts [first-flight redundancy](#first-flight-redundancy). `ssctl drain` hands new connections to `fallback_cc`, puts the send buffer ceiling back, and stops the guard and the redundancy.
 
 ### Coefficients
 
@@ -221,6 +222,17 @@ qdisc = true      # false: leave every qdisc to you and keep only the congestion
 
 `ssctl status` shows it under *DRIFT GUARD*: `ARMED`, each of the three with its current value and how many times it was put back, the last correction, the last error (kept until the next one, so it can be old), and a `note` for anything it deliberately left alone.
 
+### Send buffer ceiling
+
+On while skyline_cc is attached. The kernel lets one TCP socket buffer at most 4 MiB for sending by default (the third field of `net.ipv4.tcp_wmem`): data in flight plus what waits behind a loss. On a long path with loss -- a VPN server's -- that fills up, and the application stalls while the link is far from full. `ssctl enable` raises that maximum to 64 MiB when it is lower, the drift guard keeps it there, and `ssctl drain` puts back the value it replaced, unless something else changed it in the meantime. It only lifts the ceiling: the kernel still sizes each socket's buffer to what the connection needs, `net.ipv4.tcp_mem` still bounds the total, and a larger maximum the host already has is never lowered. The cost is memory, and only on connections that use it. The receiving side's `tcp_rmem` is the clients' to raise.
+
+```toml
+[guard]
+tcp_wmem_max = 67108864   # bytes; 0: leave net.ipv4.tcp_wmem to you
+```
+
+`ssctl status` shows it under *DRIFT GUARD* as `tcp_wmem maximum`: the value now, how many times it was raised, and `drain puts back 4 MiB`, the value it replaced.
+
 ### Dynamic RTO floor and ceiling
 
 Off by default. When no ACK comes back in time, TCP resends after its retransmission timeout (RTO) and doubles the timeout after every further miss, up to 120 seconds. Where losses are random, the next resend is no less likely to get through than the last, so a connection waiting that long is simply stuck. `skyline_policy` can bound the RTO of each connection:
@@ -271,7 +283,7 @@ On by default. The mode switches, loss events, guardrail trips, window undos and
 
 ### Error reports
 
-Asked, never assumed. When an install, an upgrade or an uninstall fails, `install.sh` asks once whether to send an error report to the developers. So does `ssctl` when `enable` is refused, when the daemon cannot be reached because it failed, and when skyline-speederd stopped on an error or panicked: the daemon has no terminal to ask on, so it records the error in `/var/lib/skyline-speeder/reports` and the next `sudo ssctl` run on a terminal asks. **Nothing is sent unless you answer `y`**; `v` shows first exactly what would be sent. With no terminal to ask on (a pipeline, cloud-init, cron, `--json`), nothing is asked and nothing is sent. A host the installer refuses because it does not meet the requirements above — an older kernel, another distribution, a container, too little free disk space — is told why and asked nothing: that is the installer working.
+Asked, never assumed. When an install, an upgrade or an uninstall fails, `install.sh` asks once whether to send an error report to the developers, and so does the one-line install's `bootstrap.sh` when it fails before `install.sh` runs (installing `curl`, `tar` or `bash`, the download, unpacking). So does `ssctl` when `enable` is refused, when the daemon cannot be reached because it failed, and when skyline-speederd stopped on an error or panicked: the daemon has no terminal to ask on, so it records the error in `/var/lib/skyline-speeder/reports` and the next `sudo ssctl` run on a terminal asks. **Nothing is sent unless you answer `y`**; `v` shows first exactly what would be sent. With no terminal to ask on (a pipeline, cloud-init, cron, `--json`), nothing is asked and nothing is sent. A host the installer refuses because it does not meet the requirements above — an older kernel, another distribution, a container, too little free disk space — is told why and asked nothing: that is the installer working.
 
 A report holds the error, the step that failed, the Skyline Speeder version, the distribution, kernel, architecture, C library and service manager, and the last 40 lines of the failing step's install log (with its first error lines, when they are further up) or of the daemon's log. IPv4, IPv6 and MAC addresses, e-mail addresses, credentials in URLs, tokens, home directories, the host name and your user name are removed before it is shown or sent. It goes over HTTPS, through `curl`, to the project's Sentry; the address it goes to is in the code only encrypted.
 
@@ -306,7 +318,7 @@ From 0.5.0, a misspelt key or one in the wrong section fails `--validate-only`, 
 | fallback on drain | `fallback_cc`: what new connections get after `ssctl drain`; the installer sets it to the one the host's sysctl files select at boot, when this kernel has it -- on a fresh install, and again on every upgrade or reinstall unless you set it yourself |
 | modules | M1-M4; a tick means acting on traffic now, so nothing is ticked while detached |
 | live connections | connections on skyline_cc now |
-| DRIFT GUARD | see [Drift guard](#drift-guard) |
+| DRIFT GUARD | see [Drift guard](#drift-guard); `tcp_wmem maximum`, see [Send buffer ceiling](#send-buffer-ceiling) |
 | KERNEL | the kernel release; every item on `required` must be ticked. `RACK reorder hook` under `optional` needs a patched kernel, and grey is normal |
 | GLOBAL SYSCTLS | see [Global loss-detection sysctls](#global-loss-detection-sysctls) |
 | DAEMON | uptime, and the configuration generation, which goes up whenever the modules, the coefficients or the RTO bounds change |
@@ -334,7 +346,7 @@ From 0.5.0, a misspelt key or one in the wrong section fails `--validate-only`, 
 | TC EGRESS | since the daemon started, everything leaving `tc_interface` whatever its congestion control: `seen` counts packets, bytes and GSO packets; then [`retransmits marked`](#retransmit-dscp-marking) and [`first-flight copies`](#first-flight-redundancy) |
 | DYNAMIC RTO, or CGROUP POLICY while it is off | see [Dynamic RTO floor and ceiling](#dynamic-rto-floor-and-ceiling); `connections seen` is how to tell whether any process is in the cgroup |
 
-`--json` prints the daemon's raw reply instead, for scripts. `ssctl snapshot <file>` has the daemon write the `status` part of it to a regular file (under systemd, `/run/skyline-speeder/` is the safe place), and `ssctl validate` checks the daemon's configuration in memory against the kernel.
+`--json` prints the daemon's raw reply instead, for scripts. `ssctl snapshot <file>` writes the `status` part of it to a regular file, and `ssctl validate` checks the daemon's configuration in memory against the kernel.
 
 ## Repository layout
 

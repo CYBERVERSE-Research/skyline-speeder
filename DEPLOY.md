@@ -126,8 +126,9 @@ install (section 2.2), which by design does not attach.
   do not.
 - `ssctl enable` (which the installer runs automatically) **takes effect host-wide**: from then on every new
   TCP connection on this host uses `skyline_cc` by default, not just some process (section 5.2).
-- While attached, `skyline-speederd` exclusively owns three settings: the default congestion control,
-  `net.core.default_qdisc` and the root qdisc of the egress NIC (section 9). The installer installs no proxy and
+- While attached, `skyline-speederd` exclusively owns four settings: the default congestion control,
+  `net.core.default_qdisc`, the root qdisc of the egress NIC, and (from 0.6.0 on) the maximum of
+  `net.ipv4.tcp_wmem`, which it raises to at least 64 MiB and puts back on `drain` (section 9). The installer installs no proxy and
   opens no port.
 
 ### 1.2 Link suitability
@@ -222,7 +223,7 @@ it likewise switches to a source build.
 | The target host needs | No toolchain at all; the installer installs only runtime dependencies (the package lists in section 2.4) | A build toolchain (clang/LLVM, bpftool, libbpf/libelf/zlib development packages, Rust), which the installer installs and records automatically and `--uninstall` removes again |
 | What gets installed | The latest release (or the one `--release` names): changes merged into `main` after it are not included | The source tree being run (for the one-line install, `--ref`: by default the latest release's signed source, `main` with `--ref main`) |
 | Where the BPF objects' types come from | The 6.12 LTS reference header pinned by the release pipeline; at load time CO-RE fixes field offsets against this host's kernel BTF | This host's `/sys/kernel/btf/vmlinux` |
-| Integrity check | The `.sha256` next to the artifact must match; a downloaded artifact without one is not installed, and a local file without one is installed unchecked, with a warning | The source tree itself (`scripts/bootstrap.sh` can pin the tarball's digest with `SKYLINE_SHA256`) |
+| Integrity check | The `.sha256` next to the artifact must match; a downloaded artifact without one is not installed, and a local file without one is installed unchecked, with a warning. From v0.6.0 on every release is also signed, and the `.sig` next to the artifact must verify against the release key in `install.sh` before anything is unpacked (section 2.3) | The source tree itself (`scripts/bootstrap.sh` can pin the tarball's digest with `SKYLINE_SHA256`) |
 
 All other steps are identical: the same verifier pass, the same services (systemd units or OpenRC scripts) and
 the same configuration template.
@@ -249,7 +250,8 @@ stderr as well.
 
 | Environment variable | Effect |
 |---|---|
-| `SKYLINE_ARTIFACT_URL` | Skips the release lookup and uses an https URL (a mirror, an internal artifact repository) or a local file path directly as the artifact; takes precedence over `--release`, and when both are given it warns that `--release` was not used; `<URL>.sha256` must be there and match, `<path>.sha256` is checked when it exists (section 2.3). When the install switches to a source build (the host cannot run the artifact, or `--source`), it has no effect, and the installer likewise warns |
+| `SKYLINE_ARTIFACT_URL` | Skips the release lookup and uses an https URL (a mirror, an internal artifact repository) or a local file path directly as the artifact; takes precedence over `--release`, and when both are given it warns that `--release` was not used; `<URL>.sha256` must be there and match, `<path>.sha256` is checked when it exists, and `<URL or path>.sig` must verify unless the file name names a release from before v0.6.0 (section 2.3). When the install switches to a source build (the host cannot run the artifact, or `--source`), it has no effect, and the installer likewise warns |
+| `SKYLINE_ALLOW_UNSIGNED=yes` | Only with `SKYLINE_ARTIFACT_URL`: installs an artifact that has no `.sig` (one you built yourself, for a test bed), with a warning. A `.sig` that is there and does not verify still stops the install, and a release looked up on GitHub is never installed unsigned (section 2.3) |
 | `SKYLINE_VERBOSE=1` | Same as `--verbose` |
 | `SKYLINE_FEEDBACK` | After a failure: unset or `ask` asks on the terminal whether to send an error report, `yes` sends one without asking, `no` never asks (section 13.6). `ssctl` reads it too |
 | `SKYLINE_REPO` | The repository releases are looked up in, default `CYBERVERSE-Research/skyline-speeder` |
@@ -265,7 +267,7 @@ set the environment variable `SKYLINE_REPO`.
 
 - Default: the latest release on GitHub; `--release <tag>`: the version named;
 - `SKYLINE_ARTIFACT_URL`: an https URL or a local file path. For a host that cannot reach GitHub, copy the
-  tarball over together with its `.sha256`:
+  tarball over together with its `.sha256` and `.sig`:
 
 ```bash
 SKYLINE_ARTIFACT_URL=https://mirror.example/skyline-speeder-<tag>-x86_64.tar.gz ./install.sh --prebuilt
@@ -274,9 +276,29 @@ SKYLINE_ARTIFACT_URL=/path/to/skyline-speeder-<tag>-x86_64.tar.gz ./install.sh -
 
 The `<artifact>.sha256` published next to the artifact must match the downloaded (or copied) tarball, or the
 install aborts; it aborts too when a downloaded artifact has none, and when a local file has no `.sha256` next to
-it, the installer warns that it is unchecked. The `MANIFEST` in the tarball records the tag, the commit, the
+it, the installer warns that it is unchecked. That digest comes from the same place as the artifact, so it catches
+a broken download and nothing more.
+
+**Signatures (from v0.6.0 on).** Every release is signed: `<artifact>.sig` next to each tarball is an
+`ssh-keygen -Y sign` signature made in the release pipeline with the release key, whose public half is
+`RELEASE_SIGNING_KEY` in `install.sh` (namespace `skyline-speeder-release`). The installer checks it after the
+digest and before anything is unpacked: a signature that does not verify aborts the install, and so does a missing
+one -- for the latest release, for `--release` and for `SKYLINE_ARTIFACT_URL` alike -- except for the releases
+published before signing began (v0.1.0 to v0.5.5, listed in `UNSIGNED_RELEASES`), which are installed on their
+digest alone with a warning, and for an artifact given as `SKYLINE_ARTIFACT_URL` with `SKYLINE_ALLOW_UNSIGNED=yes`.
+The check needs `ssh-keygen` from OpenSSH 8.1 or later; the installer adds the OpenSSH client package when it is
+missing and keeps it on `--uninstall`. To check an artifact by hand:
+
+```bash
+KEY=$(sed -n "s/^RELEASE_SIGNING_KEY='\(.*\)'$/\1/p" install.sh)
+echo "skyline-speeder-release $KEY" > signers
+ssh-keygen -Y verify -f signers -I skyline-speeder-release -n skyline-speeder-release \
+    -s skyline-speeder-<tag>-x86_64.tar.gz.sig < skyline-speeder-<tag>-x86_64.tar.gz
+```
+
+The `MANIFEST` in the tarball records the tag, the commit, the
 reference header's digest, `libc=`, and the SHA-256 of every binary and object: the full content goes into the
-install log, and the summary shows one line of provenance (artifact name, commit, whether the sha256 was checked).
+install log, and the summary shows one line of provenance (artifact name, commit, whether the sha256 and the signature were checked).
 An artifact whose `libc=` does not match this host's C library (for example, `SKYLINE_ARTIFACT_URL` pointing at the
 wrong file) is rejected before the verifier, with a note on which one to use.
 
@@ -290,18 +312,18 @@ reach the default install only with the next release.
 | Checking the system | The distribution and its package manager, the service manager; kernel ≥ 6.12, BTF, that this is the host's root in the host's network namespace (not a container: section 1.3), that `fq` is available and bpffs is mounted, cgroup v2 mounted at `/sys/fs/cgroup` (on an OpenRC host where it is not mounted yet, starts the `cgroups` service), enough free disk space for what this run installs (section 1.3); whether this host can run the released binaries |
 | Installing packages | See the package lists and planning rules below |
 | Downloading the release artifact | Prebuilt path: fetches the artifact, checks the sha256 and the `MANIFEST` |
-| Preparing the Rust toolchain / Building the BPF objects / Building the Rust control plane | Source-build path: rustup (version pinned by `rust-toolchain.toml`), `make bpf`, `cargo build --release` |
+| Preparing the Rust toolchain / Building the BPF objects / Building the Rust control plane | Source-build path: rustup (version pinned by `rust-toolchain.toml`: 1.82 from 0.6.0 on, 1.75 before; a distribution's `cargo` first on `PATH` ignores that file, so one older than `rust-version` in `Cargo.toml` is refused here with what to do), `make bpf`, `cargo build --release` |
 | Running the kernel verifier | Before any file is replaced, runs `--validate-only --verify-bpf` (section 4) with the **new** daemon and the new objects: with the installed configuration, or the template on a first install, and `bpf_dir` pointing at the new objects; the daemon is first placed at `/usr/local/sbin/.skyline-speederd.new` (`/tmp` may be noexec). A failure aborts the install, leaving the installed files and the running daemon untouched |
 | Installing files | The prebuilt path copies the files from the artifact directly (the daemon is the very file the verifier ran, renamed into place); the source-build path runs `infra/install-guest.sh`. The file list is in section 2.5 |
-| Configuring speeder.toml | Creates the configuration from the template only when it does not exist; rewrites the egress NIC and `fallback_cc` while they still hold what the installer put there (see below). These changes do not affect the conclusion of the verifier step above: `tc_interface` plays no part in validation, and `fallback_cc` is only ever changed to an algorithm this host's kernel has |
+| Configuring speeder.toml | Creates the configuration from the template only when it does not exist; rewrites the egress NIC and `fallback_cc` while they still hold what the installer put there (see below). These changes do not affect the conclusion of the verifier step above: only the form of the `tc_interface` name is validated, and the one written is a real interface's, and `fallback_cc` is only ever changed to an algorithm this host's kernel has |
 | Starting skyline-speederd | On an upgrade it is `Draining live flows (up to 60 s), restarting skyline-speederd` (section 10) |
 | Attaching skyline_cc | `systemctl enable --now skyline-speeder-enable.service` (skipped with `--no-enable`) |
 | Verifying | Confirms with the new daemon that `enabled` is `true` (and, for versions with the guard, `armed`), and that the default congestion control really is `skyline_cc`; if not, restarts the enable unit once and checks again, and if it still does not hold, fails and points to `ssctl enable` and the enable unit's log |
 
-**Packages.** The prebuilt path installs only runtime dependencies: apt `curl ca-certificates tar iproute2`;
-dnf `curl ca-certificates tar
-iproute iproute-tc` plus `libelf.so.1` and `libz.so.1` requested by soname; apk `curl ca-certificates tar iproute2
-bash libelf zlib zstd-libs libgcc`. A source build installs a different list: apt `build-essential pkg-config clang llvm
+**Packages.** The prebuilt path installs only runtime dependencies: apt `curl ca-certificates tar iproute2
+openssh-client`; dnf `curl ca-certificates tar iproute iproute-tc openssh-clients` plus `libelf.so.1` and
+`libz.so.1` requested by soname; apk `curl ca-certificates tar iproute2 bash openssh-keygen libelf zlib zstd-libs
+libgcc` (the OpenSSH package provides the `ssh-keygen` that checks the release signature, from 0.6.0 on). A source build installs a different list: apt `build-essential pkg-config clang llvm
 libbpf-dev libelf-dev zlib1g-dev bpftool curl iproute2`; dnf `gcc make pkgconf-pkg-config clang llvm libbpf-devel
 elfutils-libelf-devel zlib-devel bpftool curl ca-certificates tar iproute iproute-tc`; apk `build-base pkgconf clang
 llvm libbpf-dev elfutils-dev zlib-dev linux-headers bpftool curl ca-certificates tar iproute2 bash libgcc`.
@@ -398,6 +420,15 @@ values of a few common parameters and where to tune them, and how many packages 
 | `/run/skyline-speeder/` | Runtime: the control socket `speeder.sock`, the event log `events.jsonl`, `state.json` (section 13) |
 | `/var/lib/skyline-speeder/reports/` | The errors skyline-speederd stopped on, waiting for the next `ssctl` on a terminal to offer them as an error report (section 13.6); `StateDirectory=` in the unit (`checkpath` under OpenRC), mode 0700 |
 | `/sys/fs/cgroup/skyline-speeder`, `/sys/fs/bpf/skyline-speeder` | The cgroup of section 7; the directory under bpffs |
+
+**The daemon's sandbox.** skyline-speederd runs as root with the capabilities it needs to load BPF, attach to a
+cgroup and a NIC, and write `net.*` sysctls. From 0.6.0 on its systemd unit also takes away what it never needs:
+`NoNewPrivileges=true`, `UMask=0077` (the event log, `state.json` and the reports are readable by root only, as the
+control socket already was), `ProtectHome=true` (`/home`, `/root` and `/run/user` are invisible to it),
+`RestrictSUIDSGID=`, `LockPersonality=`, `RestrictRealtime=` and `SystemCallArchitectures=native`, on top of
+`ProtectSystem=strict` and `PrivateTmp=`. `systemd-analyze security skyline-speederd` shows the result. Under OpenRC
+only the umask applies. A drop-in that points the daemon at files under `/home` or `/root` (a configuration,
+`bpf_dir`) no longer works under systemd: keep them under `/etc`, `/opt` or `/usr/local`.
 
 ### 2.6 Releases older than the guard
 
@@ -580,7 +611,9 @@ file behind, and OpenRC, unlike systemd's `RuntimeDirectory=`, does not empty `/
 4. Arms the guard and immediately runs one full check (section 9): with `[guard] qdisc = true` (the default),
    writes `fq` into `net.core.default_qdisc` and replaces the egress NIC's root qdisc with `fq` (on a
    multi-queue NIC, an `mq` whose child queues are all `fq`; for a VLAN, bond or bridge, the physical NICs under
-   it are changed instead);
+   it are changed instead); and raises the maximum of `net.ipv4.tcp_wmem` (its third field) to
+   `[guard] tcp_wmem_max`, 64 MiB by default, when it is lower (from 0.6.0 on; never lowered; `0` leaves it
+   alone);
 5. Turns on first-flight redundancy: every SYN-ACK this host sends that has a socket (whatever congestion
    control its connection will run: none has been chosen when it is sent), and the SYN and the first 64 KiB
    (retransmissions within them included) of `skyline_cc` connections, are each sent twice, the second copy
@@ -805,13 +838,22 @@ section 8.1 advises.
 it takes effect, so changing the sysctl alone does not reach the NIC; and the "one-click BBR" scripts common on
 VPSes write `bbr` and `cake`/`fq_pie` into `/etc/sysctl.d`, after which any `sysctl --system` quietly flips the
 congestion control back to `bbr`, and from then on new connections bypass `skyline_cc` without any error. So
-from `enable` to the next `drain`, `skyline-speederd` exclusively owns three settings:
-`net.ipv4.tcp_congestion_control` and, with `[guard] qdisc = true` (the default), `net.core.default_qdisc` and
-the root qdisc of the managed NICs. It checks once immediately on `enable` and then again every
+from `enable` to the next `drain`, `skyline-speederd` exclusively owns `net.ipv4.tcp_congestion_control`, with
+`[guard] qdisc = true` (the default) `net.core.default_qdisc` and the root qdisc of the managed NICs, and from
+0.6.0 on the maximum of `net.ipv4.tcp_wmem`. It checks once immediately on `enable` and then again every
 `[guard] interval_s` seconds (5 by default); whatever has been changed is changed back, with a log line
 `guard: <item> <old value> -> <new value> (...)`. Neither the guard nor the installer **modifies**
 `/etc/sysctl.conf` or any file under `/etc/sysctl.d`. `drain` lifts the guard immediately and touches no qdisc.
 The full rules are in `docs/02-interface-reference.md` section 9.
+
+**The send buffer (`tcp_wmem`, from 0.6.0 on).** The kernel's default maximum of 4 MiB holds a sender to 4 MiB
+in flight plus what waits behind a loss: on the long, lossy paths of a VPN server the writer stalls well before
+the link is full. `enable` raises the maximum (the third field) to `[guard] tcp_wmem_max`, 64 MiB by default,
+only when it is lower, leaves the minimum and default as they are, and the guard keeps it there; `drain` puts
+back what was there before, unless something else has changed it since (then it is left alone, and the drain's
+reply says so). Autotuning still sizes each socket, and `net.ipv4.tcp_mem` still bounds the total. Set
+`tcp_wmem_max = 0` to leave the sysctl alone, for example when `/etc/sysctl.d` already manages it. The receive
+side, `tcp_rmem`, is on the clients: on a long path they may need a larger maximum too.
 
 **Managed NICs.** That is `runtime.tc_interface` itself; when its root is the kernel default `noqueue` (VLAN,
 bond, bridge), packets actually queue in the root qdisc of the physical NICs under it, so the guard walks down
@@ -941,7 +983,9 @@ control (after this, no check writes `skyline_cc` back) →
 processes in the cgroup are no longer switched to `skyline_cc` → stop first-flight redundancy →
 wait for existing `skyline_cc` connections to end naturally (300 seconds by default, overridden by
 `--timeout`) → once they have all ended, unregister the struct_ops. From then on new connections fall back to
-`fallback_cc`. `drain` does not touch qdiscs: `default_qdisc` and the NIC's root qdisc stay `fq`.
+`fallback_cc`. Right after the `fallback_cc` write, under the same lock, the maximum of `net.ipv4.tcp_wmem` is
+put back to what it was before `enable` raised it, unless something else changed it since (section 9). `drain`
+does not touch qdiscs: `default_qdisc` and the NIC's root qdisc stay `fq`.
 
 > [!IMPORTANT]
 > **A `drain` run over SSH always runs into the timeout**: your own SSH connection is a `skyline_cc` flow and
@@ -973,9 +1017,9 @@ systemctl stop skyline-speeder-enable.service skyline-speederd.service
 ```
 
 Stopping the daemon (equivalent to SIGTERM) first stops the guard thread, then unregisters all struct_ops and
-BPF links; by itself it **writes no sysctl** (deliberately). When the enable unit is active, stopping the
+BPF links; by itself it **writes no sysctl** (deliberately), so a raised `tcp_wmem` stays raised. When the enable unit is active, stopping the
 daemon stops that unit first, and its ExecStop (`boot-disable.sh`) writes `fallback_cc` back: it runs
-`ssctl drain` first, and only afterwards, if the default is still `skyline_cc` (the daemon is already gone and
+`ssctl drain` first (which also puts `tcp_wmem` back), and only afterwards, if the default is still `skyline_cc` (the daemon is already gone and
 the drain could not run), writes it once itself — in the reverse order, the still-armed guard would change the
 value just written back into `skyline_cc` again. On a host attached with a bare `ssctl enable`, run
 `ssctl drain` before stopping.
@@ -1012,8 +1056,9 @@ bootstrap script's source tree and `/sys/fs/{cgroup,bpf}/skyline-speeder`, and t
    intersected with the plan accepted for this request, which excludes packages installed by an
    unattended-upgrades run in parallel). On a host without this record — installed by hand, or installed before
    the installer started recording (before v0.3.0) — this step removes nothing. Guardrails:
-   - `iproute2` (`iproute` and `iproute-tc` on Fedora/RHEL), `curl`, `ca-certificates` and `tar` (and on Alpine
-     also `bash`) are never removed;
+   - `iproute2` (`iproute` and `iproute-tc` on Fedora/RHEL), `curl`, `ca-certificates`, `tar` and the OpenSSH
+     client (`openssh-client`, `openssh-clients` on Fedora/RHEL, `openssh-keygen` on Alpine; and on Alpine also
+     `bash`) are never removed;
    - **nor is anything these packages depend on, recursively** — keep `curl` but remove the `libcurl4t64`
      under it, and apt's only resolution is "remove curl too", with the result that not a single package of the
      toolchain can be removed;
@@ -1174,11 +1219,10 @@ The one-line install applies as usual; these are the only differences:
   (guardrail trips, section 13.3), and the rest are ACKs at the cap.
 - `/run/skyline-speeder/state.json` is rewritten only when the daemon starts and after each successfully
   handled request; it is **not** live state. For monitoring, call `ssctl status --json`.
-- With `ssctl snapshot <path>` the daemon writes the file, and a relative path is resolved against the
-  daemon's working directory; it writes only regular files and refuses a target that is a symbolic link,
-  directory, device or FIFO (since 0.5.2). On systemd hosts the daemon runs under
-  `ProtectSystem=strict` with a private `/tmp`: most paths are read-only to it, and a file it writes into
-  `/tmp` is invisible to you; writing under `/run/skyline-speeder/` is the safest choice.
+- `ssctl snapshot <path>` writes the status JSON to the file itself, as the user running it (since 0.6.0;
+  before, the daemon wrote it as root, relative to its own working directory and, under systemd, into its
+  private `/tmp`). A relative path is resolved against the current directory; only a regular file is
+  written, and a target that is a symbolic link, directory, device or FIFO is refused.
 
 ### 13.3 Event log
 
@@ -1216,10 +1260,11 @@ Nothing is ever sent without a `y`. The question comes after these, once each:
 | Where | When |
 |---|---|
 | `install.sh` | An install, upgrade or `--uninstall` fails (not `--check`, not a refusal before anything ran such as "must run as root", not a host that does not meet the hard prerequisites of section 1.3 — an unsupported kernel or distribution, no BTF, no cgroup v2, a container, no `fq`, too little free disk space, a release asked for by name that this host cannot run — and not Ctrl-C) |
+| `scripts/bootstrap.sh` | Its own steps fail, before `install.sh` runs: installing `curl`, `tar` or `bash`, the download, `SKYLINE_SHA256`, unpacking, placing the tree (from 0.6.0; not `--check`, not a wrong argument or "must run as root", not a kernel below the floor, not Ctrl-C, and nothing once `install.sh` has taken over, which asks about its own). Its report carries the stage, the package manager's last 40 lines when that is what failed, and the tags below without `source` and `release_asked`; it holds the third sealed copy of the DSN |
 | `ssctl` | `enable` is refused; the daemon cannot be reached and its service manager has given up on it (`failed`, OpenRC's `crashed`); a reply does not decode |
 | `ssctl` | skyline-speederd recorded an error it stopped on (`main` returned an error) or a panic in any thread, in `/var/lib/skyline-speeder/reports/` -- asked about after the command's own output, on the next `ssctl` run on a terminal |
 
-It is asked only on a terminal: `install.sh` asks on `/dev/tty`, `ssctl` only when it runs as root without
+It is asked only on a terminal: `install.sh` and `bootstrap.sh` ask on `/dev/tty`, `ssctl` only when it runs as root without
 `--json` and both stdin and stderr are terminals. Answers: `y` sends, `v` shows every field that would be sent and
 asks again, anything else (or five minutes without an answer) sends nothing. A daemon report is removed once it
 is sent or declined, so it is asked about once; one that could not be sent stays for the next time. A report
