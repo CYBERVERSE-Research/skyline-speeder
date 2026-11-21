@@ -4,7 +4,7 @@
 
 **基于 eBPF 的发送端 TCP 加速，专为高丢包、高延迟链路设计**
 
-*只部署在发送数据的服务器上。客户端保持原生 TCP，无需安装软件、打补丁或做任何配置。*
+*只需部署在发送数据的服务器上。客户端照常使用系统自带的 TCP，不用装软件、不用打补丁，也不用改配置。*
 
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
 [![Kernel](https://img.shields.io/badge/kernel-6.12%20LTS%2B-orange.svg)](#运行要求)
@@ -24,22 +24,22 @@
 
 ## 这是什么
 
-Skyline Speeder 是一款单边 TCP 加速软件。它以 eBPF 程序的形式运行在发送数据的服务器上，面向丢包严重、往返时延长、标准 TCP 会崩溃的链路。接收端无需任何改动。
+Skyline Speeder 是一款单边 TCP 加速软件，以 eBPF 程序的形式运行在发送端服务器上，专门针对丢包严重、往返时延长的链路——在这类链路上，标准 TCP 的速度往往一落千丈。接收端什么都不用动。
 
-它把服务器的拥塞控制换成 `skyline_cc`，核心只有一个假设：**丢包本身不携带拥塞信息。**
+它把服务器的拥塞控制算法换成 `skyline_cc`，整套设计建立在一个假设上：**丢包本身说明不了拥塞。**
 
-- **先测量，再发送：** 窗口跟随实测带宽 × 基准 RTT，丢包从不让它缩小。
-- **补偿并平滑发送：** 按实测丢包率放大发送速率（有上限），经 `fq` 均匀发出。
-- **只有一道刹车：** 只有排队时延上升和 ECN 标记才会让它降速。
-- **短响应优先：** 每条连接的握手和前 64 KiB 间隔 10 ms 发两遍，丢一个包只多花几毫秒，而不是等重传定时器。
+- **先测量，再发送：** 拥塞窗口按实测带宽 × 基准 RTT 设定，丢包不会让它缩小。
+- **补偿丢包，匀速发送：** 按实测丢包率适当提高发送速率（有上限），再经 `fq` 均匀发出。
+- **只踩一种刹车：** 只有排队时延上升或收到 ECN 标记时才降速。
+- **先保短响应：** 每条连接的握手和前 64 KiB 数据间隔 10 ms 各发两份，丢一个包只多耗几毫秒，不必干等重传定时器。
 
 > [!IMPORTANT]
-> 它只在丢包与队列无关时有用。如果固定速率的 UDP 流不丢包、TCP 却大量重传，说明丢包来自拥塞瓶颈处的队列溢出，这时它不是合适的工具。
+> 只有丢包与排队无关时它才管用。如果固定速率的 UDP 流几乎不丢包，TCP 却在大量重传，说明丢包是拥塞瓶颈处队列溢出造成的，这种情况请不要用它。
 
 ## 运行要求
 
-- **Linux 6.12 LTS 或更新**，并且有 `/sys/kernel/btf/vmlinux`。6.1、6.6 LTS 分支以及 Debian 12、Ubuntu 22.04/24.04 的自带内核都太旧。
-- 物理机或 KVM 虚拟机，不能是容器（LXC、Proxmox CT）。
+- **Linux 6.12 LTS 及以上**，且存在 `/sys/kernel/btf/vmlinux`。6.1、6.6 LTS 以及 Debian 12、Ubuntu 22.04/24.04 自带的内核都太旧，用不了。
+- 物理机或 KVM 虚拟机均可，容器（LXC、Proxmox CT）不行。
 - Debian、Ubuntu、Fedora、RHEL 系（Rocky Linux、AlmaLinux、CentOS Stream）或 Alpine。
 
 ## 快速开始
@@ -48,20 +48,20 @@ Skyline Speeder 是一款单边 TCP 加速软件。它以 eBPF 程序的形式�
 curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash
 ```
 
-Alpine 上以 root 运行：
+Alpine 请用 root 执行：
 
 ```sh
 wget -qO- https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sh
 ```
 
-它安装最新发布的版本，不在主机上装编译器；把每个 BPF 对象交给内核验证器检查，然后让每条新 TCP 连接都使用 `skyline_cc`，重启后依然生效。它不安装代理，也不开放端口。装完检查：
+脚本会安装最新的发布版（不会往主机上装编译器），先用内核验证器检查每个 BPF 对象，再把 `skyline_cc` 设为所有新建 TCP 连接的拥塞控制，重启后依然有效。它不装代理，也不开端口。装好后看一眼：
 
 ```bash
-ssctl status    # 本机是否已被接管？显示 ACCELERATING 即是
-ssctl flows     # 哪些连接正在加速，算法做了哪些决定
+ssctl status    # 本机是否已接管？显示 ACCELERATING 就对了
+ssctl flows     # 哪些连接在加速，算法是怎么调的
 ```
 
-卸载（主机切回 bbr + fq）：
+卸载（卸载后主机改用 bbr + fq）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash -s -- --uninstall
@@ -69,46 +69,46 @@ curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder
 
 ## 进阶使用
 
-**从克隆的仓库安装**，可以先读脚本再运行：
+**想先看过脚本再运行**，可以克隆仓库后安装：
 
 ```bash
 git clone https://github.com/CYBERVERSE-Research/skyline-speeder.git
 cd skyline-speeder
-sudo ./install.sh --check      # 只做预检，不改任何东西
-sudo ./install.sh              # 发布版本（无法运行时才从源码构建）
-sudo ./install.sh --source     # 从这份源码构建
-sudo ./install.sh --release v0.6.0   # 指定的发布版本，装不上就停止
+sudo ./install.sh --check      # 只做预检，不改动系统
+sudo ./install.sh              # 安装发布版（本机跑不了时才从源码构建）
+sudo ./install.sh --source     # 用当前源码构建
+sudo ./install.sh --release v0.6.0   # 安装指定的发布版，装不了就中止
 sudo ./install.sh --uninstall --restore-pre-install   # 卸载，并恢复安装前的拥塞控制和 qdisc
 ```
 
-升级时再运行一次安装脚本即可。它会排空现有连接（最多 60 秒），然后重新挂载 `skyline_cc`。
+升级只需再跑一次安装脚本：它会先让现有连接排空（最多等 60 秒），再重新挂载 `skyline_cc`。
 
 **日常操作：**
 
 ```bash
-sudo ssctl drain                                # 平滑卸载：新连接改用 fallback_cc
+sudo ssctl drain                                # 平滑停用：新连接改走 fallback_cc
 sudo ssctl enable                               # 重新挂载
-sudo ssctl enable --all-off                     # 关闭全部模块的 skyline_cc：用作对比基线
-sudo ssctl set-redundancy --disable             # 不再重复发送首轮数据，适合按流量计费的出口
-sudo ssctl set-module-config --max-pacing-mbps 500   # 绝对覆盖：没写的参数都回到默认值
+sudo ssctl enable --all-off                     # 所有模块都关掉的 skyline_cc，做对比基线用
+sudo ssctl set-redundancy --disable             # 关闭首段数据双发，出口按流量计费时建议关
+sudo ssctl set-module-config --max-pacing-mbps 500   # 整体覆盖：没写到的参数一律恢复默认
 ```
 
-出厂默认值是调好的，大多数部署什么都不用改。`ssctl set-*` 的修改在守护进程重启前有效；要长期保留，写进 `/etc/skyline-speeder/speeder.toml`。
+默认参数已经调好，绝大多数场景无需改动。`ssctl set-*` 的改动在守护进程重启后失效；想长期保留，请写进 `/etc/skyline-speeder/speeder.toml`。
 
 **文档**（英文）：
 
 | 文档 | 内容 |
 |---|---|
-| [docs/01-features.md](docs/01-features.md) | 安装脚本做了什么、工作原理、每个功能的默认值、代价与开关、`ssctl status` 和 `ssctl flows` 的逐行解释、从源码构建 |
-| [docs/usage.md](docs/usage.md) | 每个开关与参数及其取值范围、四套预设、排障 |
+| [docs/01-features.md](docs/01-features.md) | 安装脚本具体做了什么、工作原理、各功能的默认值、代价与开关、`ssctl status` 和 `ssctl flows` 逐行说明、从源码构建 |
+| [docs/usage.md](docs/usage.md) | 所有开关和参数的取值范围、四套预设、故障排查 |
 | [DEPLOY.md](DEPLOY.md) | 部署与运维手册：安装、验证、升级、卸载 |
-| [docs/02-interface-reference.md](docs/02-interface-reference.md) | `ssctl` 命令、通信协议、配置字段、事件码 |
-| [docs/03-design.md](docs/03-design.md) | 架构与各模块的工作方式 |
-| [docs/04-performance-report.md](docs/04-performance-report.md) | 受控双 VM 测试床上与 bbr 的对比 |
+| [docs/02-interface-reference.md](docs/02-interface-reference.md) | `ssctl` 命令、通信协议、配置项、事件码 |
+| [docs/03-design.md](docs/03-design.md) | 整体架构与各模块原理 |
+| [docs/04-performance-report.md](docs/04-performance-report.md) | 在受控的双 VM 测试床上与 bbr 对比 |
 
 ## 实测性能
 
-bbr、[tcp-brutal](https://github.com/HyNetworks/tcp-brutal) 和 skyline_cc 都只装在服务器端，跑在同一条真实的跨境链路上：新加坡的 KVM VPS 向华南（广东）的阿里云 ECS（200 Mbps，原生 TCP）发送。RTT 70-73 ms，丢包 10-30%，晚高峰实测；8 轮 × 3 种算法 × 5 个场景。
+在同一条真实的跨境线路上对比 bbr、[tcp-brutal](https://github.com/HyNetworks/tcp-brutal) 和 skyline_cc，三者都只部署在服务器端：新加坡的 KVM VPS 向华南的阿里云 ECS（200 Mbps，系统自带 TCP）发数据。RTT 70-73 ms，丢包率 10-30%，晚高峰实测；共 8 轮 × 3 种算法 × 5 个场景。
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/single-ended-ataglance-dark.svg">
@@ -119,16 +119,16 @@ bbr、[tcp-brutal](https://github.com/HyNetworks/tcp-brutal) 和 skyline_cc 都�
 |---|---|---|
 | **视频**（6 MB 分片 @ 48 Mbps） | **tcp-brutal** | 起播 7/8 轮，分片 p95 6/8 轮 |
 | **游戏**（ping-pong，60 msg/s） | **skyline_cc** | 抖动 5/8 轮，>150 ms 卡顿 4/8 轮 |
-| **大文件，4 条流** | skyline_cc 与 tcp-brutal，都领先 bbr | 中位数 117 / 115 vs 77 Mbps |
+| **大文件，4 条流** | skyline_cc 与 tcp-brutal，均领先 bbr | 中位数 117 / 115 vs 77 Mbps |
 | **大文件，1 条流** | bbr 与 skyline_cc 打平；tcp-brutal 垫底 | 中位数 59 / 53 / 46 Mbps |
-| **网页加载** | 没有稳定的胜者 | 轮与轮之间的波动大于差距 |
+| **网页加载** | 没有稳定的胜者 | 各轮之间的波动比差距还大 |
 | **服务器重传**，占全部发送分段的比例 | bbr 最低 | bbr 9.1%、skyline_cc 10.4%、tcp-brutal 10.9% |
 
-这是单条链路上的实地测量，不代表你的链路：skyline_cc 用的是 0.1.0 的默认系数，即现在的 "high random loss" 预设。方法、条件与完整结果见 [docs/01-features.md](docs/01-features.md#measured-performance-in-detail)。
+这只是一条线路上的实测，不代表你的线路也会如此：skyline_cc 用的是 0.1.0 的默认系数，也就是现在的 "high random loss" 预设。测试方法、条件和完整结果见 [docs/01-features.md](docs/01-features.md#measured-performance-in-detail)。
 
 ## 许可
 
-GPL-2.0，见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)；版权所有 (c) 2026 **CYBERVERSE LLC**。"Skyline Speeder" 和 "CYBERVERSE" 是 CYBERVERSE LLC 的商标。参与贡献前请先读 [CONTRIBUTING.md](CONTRIBUTING.md)。
+GPL-2.0，见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)；版权所有 (c) 2026 **CYBERVERSE LLC**。"Skyline Speeder" 和 "CYBERVERSE" 是 CYBERVERSE LLC 的商标。想参与贡献，请先阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ---
 

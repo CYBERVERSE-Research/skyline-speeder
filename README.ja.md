@@ -2,9 +2,9 @@
 
 # Skyline Speeder
 
-**高パケットロス・高遅延リンク向けの、eBPF による送信側 TCP 高速化**
+**高ロス・高遅延の回線向け、eBPF ベースの送信側 TCP 高速化**
 
-*送信側のサーバーにだけ導入します。クライアントは標準の TCP のままで、ソフトウェアもパッチも設定も要りません。*
+*導入するのは送信側のサーバーだけです。クライアント側は標準の TCP のままでよく、ソフトウェアのインストールもパッチも設定も不要です。*
 
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
 [![Kernel](https://img.shields.io/badge/kernel-6.12%20LTS%2B-orange.svg)](#動作要件)
@@ -16,31 +16,31 @@
 
 ---
 
-### **[Skyline Connect](https://www.skylineconnect.io)** 独占スポンサー
+### 単独スポンサー：**[Skyline Connect](https://www.skylineconnect.io)**
 
 ---
 
 </div>
 
-## これは何か
+## 概要
 
-Skyline Speeder は片側だけで動く TCP 高速化ソフトウェアです。データを送信するサーバー上で eBPF プログラムとして動作し、パケットロスが多く往復遅延の長い、標準の TCP では速度が崩れてしまうリンクを対象にしています。受信側には一切手を加えません。
+Skyline Speeder は、片側に導入するだけで使える TCP 高速化ソフトウェアです。データを送信するサーバー上で eBPF プログラムとして動作し、パケットロスが多く RTT の長い、通常の TCP ではまともに速度が出なくなるような回線を対象としています。受信側には一切手を加えません。
 
-サーバーの輻輳制御を `skyline_cc` に置き換えます。前提はひとつだけです：**パケットロスそのものは輻輳の情報を持たない。**
+サーバーの輻輳制御アルゴリズムを `skyline_cc` に置き換えます。`skyline_cc` の設計の前提はただひとつ、**パケットロスそれ自体は輻輳について何の情報ももたらさない**、というものです。
 
-- **測ってから送る：** ウィンドウは実測帯域 × 基準 RTT に従い、ロスで縮むことはありません。
-- **補償してペーシング：** 送信レートを実測ロス率に応じて（上限付きで）引き上げ、`fq` を通して均等な間隔で送り出します。
-- **ブレーキはひとつ：** 減速するのはキューイング遅延の増加と ECN マークのときだけです。
-- **短い応答を優先：** 各接続のハンドシェイクと最初の 64 KiB を 10 ms 間隔で 2 回送るため、1 パケットのロスは再送タイマーではなく数ミリ秒で済みます。
+- **測ってから送る：** ウィンドウは実測した帯域幅 × ベース RTT で決まり、パケットが失われても縮小しません。
+- **ロスを補ってペーシング：** 実測したロス率に応じて送信レートを（上限まで）引き上げ、`fq` で等間隔に送出します。
+- **ブレーキはひとつだけ：** 減速のきっかけになるのは、キューイング遅延の増加と ECN マークだけです。
+- **短い応答を優先：** 各接続のハンドシェイクと最初の 64 KiB を、10 ms ずらして 2 回送信します。そのため 1 パケット失われても、再送タイマーを待たずに数ミリ秒の遅れで済みます。
 
 > [!IMPORTANT]
-> 効果があるのは、ロスがキューと無関係な場合だけです。固定レートの UDP ではロスがないのに TCP が大量に再送しているなら、ロスの原因は混雑したボトルネックでのキューあふれであり、このツールの出番ではありません。
+> 効果があるのは、ロスがキューとは無関係に発生している場合に限られます。固定レートの UDP フローではロスが出ないのに TCP だけが大量に再送しているなら、そのロスは輻輳したボトルネックでのキューあふれが原因であり、本ツールの出番ではありません。
 
 ## 動作要件
 
-- **Linux 6.12 LTS 以降**で、`/sys/kernel/btf/vmlinux` があること。6.1・6.6 LTS 系列や、Debian 12・Ubuntu 22.04/24.04 の標準カーネルは古すぎます。
-- 物理ホストまたは KVM 仮想マシン。コンテナ（LXC、Proxmox CT）では動きません。
-- Debian、Ubuntu、Fedora、RHEL 系（Rocky Linux、AlmaLinux、CentOS Stream）または Alpine。
+- **Linux 6.12 LTS 以降**で、`/sys/kernel/btf/vmlinux` が存在すること。6.1 / 6.6 の LTS 系列や、Debian 12・Ubuntu 22.04/24.04 の標準カーネルは古すぎるため対象外です。
+- 物理マシンまたは KVM 仮想マシンであること。コンテナ（LXC、Proxmox CT）は不可です。
+- Debian、Ubuntu、Fedora、RHEL 系（Rocky Linux、AlmaLinux、CentOS Stream）、Alpine のいずれか。
 
 ## クイックスタート
 
@@ -48,92 +48,92 @@ Skyline Speeder は片側だけで動く TCP 高速化ソフトウェアです�
 curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash
 ```
 
-Alpine では root で：
+Alpine の場合は root で実行します：
 
 ```sh
 wget -qO- https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sh
 ```
 
-最新の公開リリースをインストールし（ホストにコンパイラは入れません）、すべての BPF オブジェクトをカーネルの検証器に通したうえで、新しい TCP 接続すべてに `skyline_cc` を使わせ、再起動後もその状態を保ちます。プロキシは入れず、ポートも開けません。インストール後の確認：
+これで最新の公開リリースがインストールされます。ホストにコンパイラは入れません。すべての BPF オブジェクトをカーネルのベリファイアにかけたうえで、以降の新しい TCP 接続はすべて `skyline_cc` を輻輳制御に使うよう設定し、再起動後もその設定を維持します。プロキシは導入せず、ポートも一切開きません。インストール後は次のコマンドで確認できます：
 
 ```bash
-ssctl status    # このホストは切り替わったか？ ACCELERATING なら OK
-ssctl flows     # どの接続が高速化され、アルゴリズムが何を決めたか
+ssctl status    # skyline_cc に切り替わっているか（ACCELERATING なら切り替え済み）
+ssctl flows     # どの接続が高速化対象か、アルゴリズムがどう判断したか
 ```
 
-アンインストール（ホストは bbr + fq に戻ります）：
+アンインストールすると、ホストは bbr + fq の構成になります：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | sudo bash -s -- --uninstall
 ```
 
-## 応用的な使い方
+## 高度な使い方
 
-**クローンしたリポジトリからインストール**すれば、実行前にスクリプトを読めます：
+**リポジトリをクローンしてインストール**すると、実行前にスクリプトの中身を確認できます：
 
 ```bash
 git clone https://github.com/CYBERVERSE-Research/skyline-speeder.git
 cd skyline-speeder
-sudo ./install.sh --check      # 事前チェックのみ、何も変更しない
-sudo ./install.sh              # 公開リリース（動かせない場合のみソースからビルド）
-sudo ./install.sh --source     # このソースツリーからビルド
-sudo ./install.sh --release v0.6.0   # 指定した公開リリース、無理なら中止
-sudo ./install.sh --uninstall --restore-pre-install   # アンインストールし、導入前の輻輳制御と qdisc に戻す
+sudo ./install.sh --check      # 事前チェックのみ（何も変更しない）
+sudo ./install.sh              # 公開リリースを導入（実行できない環境でのみビルド）
+sudo ./install.sh --source     # このツリーをソースからビルド
+sudo ./install.sh --release v0.6.0   # 指定した公開リリースを導入（できなければ中止）
+sudo ./install.sh --uninstall --restore-pre-install   # 削除し、輻輳制御と qdisc を導入前の設定に戻す
 ```
 
-アップグレードはインストーラーをもう一度実行するだけです。既存の接続を最大 60 秒かけて排出し、`skyline_cc` を再びアタッチします。
+アップグレードするには、インストーラーをもう一度実行するだけです。稼働中のフローを最大 60 秒かけてドレインし、`skyline_cc` を再アタッチします。
 
-**日常の操作：**
+**日常の運用：**
 
 ```bash
-sudo ssctl drain                                # 穏やかに切り離す：新しい接続は fallback_cc へ
-sudo ssctl enable                               # 再びアタッチ
-sudo ssctl enable --all-off                     # 全モジュールを止めた skyline_cc：比較用のベースライン
-sudo ssctl set-redundancy --disable             # 最初のデータの二重送信を止める（従量課金の回線向け）
-sudo ssctl set-module-config --max-pacing-mbps 500   # 全体上書き：省いたフラグは既定値に戻る
+sudo ssctl drain                                # グレースフルに切り離す（新規接続は fallback_cc を使用）
+sudo ssctl enable                               # 再アタッチ
+sudo ssctl enable --all-off                     # 全モジュール無効の skyline_cc（比較用のベースライン）
+sudo ssctl set-redundancy --disable             # 冒頭データの二重送信を止める（アウトバウンド転送量が従量課金の環境向け）
+sudo ssctl set-module-config --max-pacing-mbps 500   # 丸ごと上書き：省略したフラグはすべて既定値に戻る
 ```
 
-出荷時の既定値は調整済みで、ほとんどの環境では何も変える必要はありません。`ssctl set-*` の変更はデーモンの再起動まで有効です。残したい場合は `/etc/skyline-speeder/speeder.toml` に書きます。
+同梱の既定値はチューニング済みの値なので、ほとんどの環境では変更不要です。`ssctl set-*` による変更はデーモンを再起動するまで有効です。永続化するには `/etc/skyline-speeder/speeder.toml` に記述してください。
 
 **ドキュメント**（英語）：
 
 | ドキュメント | 内容 |
 |---|---|
-| [docs/01-features.md](docs/01-features.md) | インストーラーの動作、仕組み、各機能の既定値・コスト・切り替え方、`ssctl status` と `ssctl flows` の各行の意味、ソースからのビルド |
-| [docs/usage.md](docs/usage.md) | すべてのスイッチとパラメーターとその範囲、4 つのプリセット、トラブルシューティング |
-| [DEPLOY.md](DEPLOY.md) | デプロイと運用のマニュアル：インストール、検証、アップグレード、削除 |
-| [docs/02-interface-reference.md](docs/02-interface-reference.md) | `ssctl` コマンド、通信プロトコル、設定項目、イベントコード |
+| [docs/01-features.md](docs/01-features.md) | インストーラーが行う処理、動作の仕組み、全機能の既定値・コスト・切り替え方法、`ssctl status` / `ssctl flows` の出力の各行の見方、ソースからのビルド方法 |
+| [docs/usage.md](docs/usage.md) | 全スイッチとパラメーター（設定範囲付き）、4 つのプリセット、トラブルシューティング |
+| [DEPLOY.md](DEPLOY.md) | デプロイ・運用マニュアル（インストール、動作確認、アップグレード、アンインストール） |
+| [docs/02-interface-reference.md](docs/02-interface-reference.md) | `ssctl` のコマンド、ワイヤープロトコル、設定項目、イベントコード |
 | [docs/03-design.md](docs/03-design.md) | アーキテクチャと各モジュールの仕組み |
-| [docs/04-performance-report.md](docs/04-performance-report.md) | 管理された 2 台構成の VM テストベッドでの bbr との比較 |
+| [docs/04-performance-report.md](docs/04-performance-report.md) | 条件を統制した 2 台の VM によるテストベッドでの bbr との比較 |
 
 ## 実測性能
 
-bbr、[tcp-brutal](https://github.com/HyNetworks/tcp-brutal)、skyline_cc をいずれもサーバー側だけに適用し、同じ実在の国際リンクで比較しました：シンガポールの KVM VPS から、華南（広東）の Alibaba Cloud ECS（200 Mbps、標準 TCP）へ送信。RTT 70-73 ms、ロス率 10-30%、夜間ピーク時に測定。8 ローテーション × 3 アルゴリズム × 5 シナリオ。
+bbr、[tcp-brutal](https://github.com/HyNetworks/tcp-brutal)、skyline_cc を、いずれもサーバー側にだけ適用し、実在する国際回線 1 本で比較しました。送信側はシンガポールの KVM VPS、受信側は標準 TCP のままの華南の Alibaba Cloud ECS（200 Mbps）です。RTT 70〜73 ms、ロス率 10〜30%、夜のピーク時間帯に測定し、8 ローテーション × 3 アルゴリズム × 5 シナリオで実施しました。
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/single-ended-ataglance-dark.svg">
-  <img alt="ゲーム、動画、ウェブ、大容量転送での tcp-brutal と skyline_cc の bbr 比の実測結果" src="docs/images/single-ended-ataglance-light.svg">
+  <img alt="ゲーム・動画・Web・大容量転送における tcp-brutal と skyline_cc の実測結果（bbr をベースラインとした比較）" src="docs/images/single-ended-ataglance-light.svg">
 </picture>
 
 | シナリオ | 勝者 | 差 |
 |---|---|---|
-| **動画**（6 MB チャンク @ 48 Mbps） | **tcp-brutal** | 再生開始 7/8 ローテーション、チャンク p95 6/8 |
-| **ゲーム**（ping-pong、60 msg/s） | **skyline_cc** | ジッター 5/8、150 ms 超の停止 4/8 |
-| **大容量、4 ストリーム** | skyline_cc と tcp-brutal、ともに bbr を上回る | 中央値 117 / 115 vs 77 Mbps |
-| **大容量、1 ストリーム** | bbr と skyline_cc が互角、tcp-brutal が最下位 | 中央値 59 / 53 / 46 Mbps |
-| **ウェブページ読み込み** | 安定した勝者なし | ローテーション間のばらつきが差より大きい |
-| **サーバーの再送**、全送信セグメントに占める割合 | bbr が最小 | bbr 9.1%、skyline_cc 10.4%、tcp-brutal 10.9% |
+| **動画**（6 MB チャンク @ 48 Mbps） | **tcp-brutal** | 再生開始時間 7/8 ローテーション、チャンク p95 6/8 |
+| **ゲーム**（ping-pong、60 msg/s） | **skyline_cc** | ジッター 5/8、150 ms 超の途切れ 4/8 |
+| **大容量転送（4 ストリーム）** | skyline_cc と tcp-brutal（いずれも bbr を上回る） | 中央値 117 / 115 vs 77 Mbps |
+| **大容量転送（1 ストリーム）** | bbr と skyline_cc が互角、tcp-brutal が最下位 | 中央値 59 / 53 / 46 Mbps |
+| **Web ページの読み込み** | 勝者が一定しない | ローテーションごとのばらつきがアルゴリズム間の差を上回る |
+| **サーバー側の再送率**（全送信セグメントに占める割合） | bbr が最も低い | bbr 9.1%、skyline_cc 10.4%、tcp-brutal 10.9% |
 
-ひとつのリンクでの実地測定であり、あなたのリンクでの結果を保証するものではありません。skyline_cc は 0.1.0 の既定係数、現在の "high random loss" プリセットで動かしました。方法、条件、全結果は [docs/01-features.md](docs/01-features.md#measured-performance-in-detail) にあります。
+これは 1 本の回線で行った実環境での測定であり、お使いの回線で同じ結果が得られることを示すものではありません。skyline_cc は 0.1.0 の既定値（現在の "high random loss" プリセット）で動かしています。測定方法、条件、全結果は [docs/01-features.md](docs/01-features.md#measured-performance-in-detail) を参照してください。
 
 ## ライセンス
 
-GPL-2.0。[LICENSE](LICENSE) と [NOTICE](NOTICE) を参照してください。Copyright (c) 2026 **CYBERVERSE LLC**。"Skyline Speeder" と "CYBERVERSE" は CYBERVERSE LLC の商標です。貢献する前に [CONTRIBUTING.md](CONTRIBUTING.md) をお読みください。
+GPL-2.0 です。[LICENSE](LICENSE) と [NOTICE](NOTICE) を参照してください。Copyright (c) 2026 **CYBERVERSE LLC**。"Skyline Speeder" および "CYBERVERSE" は CYBERVERSE LLC の商標です。コントリビュートする前に [CONTRIBUTING.md](CONTRIBUTING.md) をお読みください。
 
 ---
 
 <div align="center">
 
-**[Skyline Connect](https://www.skylineconnect.io)** 独占スポンサー
+単独スポンサー：**[Skyline Connect](https://www.skylineconnect.io)**
 
 </div>
