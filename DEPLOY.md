@@ -1255,10 +1255,11 @@ Nothing is ever sent without a `y`. The question comes after these, once each:
 | Where | When |
 |---|---|
 | `install.sh` | An install, upgrade or `--uninstall` fails (not `--check`, not a refusal before anything ran such as "must run as root", not a host that does not meet the hard prerequisites of section 1.3 — an unsupported kernel or distribution, no BTF, no cgroup v2, a container, no `fq`, too little free disk space, a release asked for by name that this host cannot run — and not Ctrl-C) |
+| `scripts/bootstrap.sh` | Its own steps fail, before `install.sh` runs: installing `curl`, `tar` or `bash`, the download, `SKYLINE_SHA256`, unpacking, placing the tree (from 0.6.0; not `--check`, not a wrong argument or "must run as root", not a kernel below the floor, not Ctrl-C, and nothing once `install.sh` has taken over, which asks about its own). Its report carries the stage, the package manager's last 40 lines when that is what failed, and the tags below without `source` and `release_asked`; it holds the third sealed copy of the DSN |
 | `ssctl` | `enable` is refused; the daemon cannot be reached and its service manager has given up on it (`failed`, OpenRC's `crashed`); a reply does not decode |
 | `ssctl` | skyline-speederd recorded an error it stopped on (`main` returned an error) or a panic in any thread, in `/var/lib/skyline-speeder/reports/` -- asked about after the command's own output, on the next `ssctl` run on a terminal |
 
-It is asked only on a terminal: `install.sh` asks on `/dev/tty`, `ssctl` only when it runs as root without
+It is asked only on a terminal: `install.sh` and `bootstrap.sh` ask on `/dev/tty`, `ssctl` only when it runs as root without
 `--json` and both stdin and stderr are terminals. Answers: `y` sends, `v` shows every field that would be sent and
 asks again, anything else (or five minutes without an answer) sends nothing. A daemon report is removed once it
 is sent or declined, so it is asked about once; one that could not be sent stays for the next time. A report

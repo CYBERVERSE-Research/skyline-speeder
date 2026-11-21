@@ -49,7 +49,7 @@ skyline-speederd --config config/speeder.toml --validate-only --verify-bpf   # v
   `RuntimeDirectory=` and OpenRC's `checkpath -d` are the parent of `socket_path`, `events_path` and `state_path`;
   `StateDirectory=` and the second `checkpath` are the parent of `DAEMON_REPORTS_DIR`. → `packaging/CLAUDE.md`
 - **Error reports** are sent only on a `y` typed on a terminal (or `SKYLINE_FEEDBACK=yes`), scrubbed first; the daemon
-  only records. The DSN is in the tree only sealed, by `infra/seal-feedback-dsn.py`, in two copies. → `crates/CLAUDE.md`
+  only records. The DSN is in the tree only sealed, by `infra/seal-feedback-dsn.py`, in three copies. → `crates/CLAUDE.md`
 - **`PRR-SSRB`** in `bpf/skyline_cc.bpf.c` is RFC 6937 terminology, not the project's old name SSR: never rename it, and
   protect it with word boundaries in a bulk rename.
 - **Configuration plane:** every `set-*` command is an absolute overwrite; a switch writes the slot before the sequence
