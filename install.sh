@@ -3511,6 +3511,18 @@ IN_TREE=(sh -c 'cd "$0" && exec "$@"' "$REPO_ROOT")
 # toolchain. Make it happen here, so the download is not hidden inside the build.
 run "${IN_TREE[@]}" cargo --version \
     || die "cargo cannot run the toolchain rust-toolchain.toml pins"
+# A cargo that is not rustup's -- a distribution's package, first on PATH --
+# ignores rust-toolchain.toml and builds with whatever Rust it is (Debian 12
+# packages 1.63, Ubuntu 24.04 1.75), and the build then fails deep inside a
+# dependency that needs a newer one. Say so first. Cargo.toml's rust-version is
+# what the tree needs.
+RUST_NEEDED=$(awk -F'"' '/^rust-version[[:space:]]*=/ { print $2; exit }' "$REPO_ROOT/Cargo.toml")
+RUST_HAVE=$("${IN_TREE[@]}" rustc --version 2>/dev/null | awk '{ print $2 }') || true
+if [ -n "$RUST_NEEDED" ] && [ -n "$RUST_HAVE" ] && version_older "$RUST_HAVE" "$RUST_NEEDED"; then
+    unsupported "the Rust on PATH ($(command -v rustc || echo rustc), $RUST_HAVE) is older than the $RUST_NEEDED this
+   tree needs, and it is not rustup's, so rust-toolchain.toml cannot pick a newer one.
+   Remove the distribution's cargo and rustc (or put rustup's ~/.cargo/bin first on PATH) and run again."
+fi
 ok "rust: $(cd "$REPO_ROOT" && cargo --version 2>/dev/null || cargo --version)"
 
 step "Building the BPF objects"
@@ -3535,29 +3547,15 @@ fi
 run make -C "$REPO_ROOT" bpf || die "building the BPF objects failed"
 
 step "Building the Rust control plane"
-# libbpf-sys before 1.7.1 compiles its vendored libbpf against a private
+# libbpf-sys before 1.7.1 compiled its vendored libbpf against a private
 # linux/types.h that shadows the kernel's and has no __u128. Since kernel 7.3
 # the arm64 UAPI headers declare the vector registers in asm/sigcontext.h
 # (reached through <signal.h>) as __u128, so with those headers in
-# /usr/include -- a newer distribution's linux-libc-dev, or the one a
-# self-built kernel installs -- the build stops at "unknown type name
-# '__u128'" (aarch64 Ubuntu 24.04 with 7.3 headers, two error reports).
-# Force-include the two typedefs libbpf-sys 1.7.1 added. They are guarded by
-# __SIZEOF_INT128__ as upstream's are, and repeating an identical typedef is
-# valid C11, so this stays harmless on every architecture and once Cargo.lock
-# moves past libbpf-sys 1.7.0 (which needs Rust 1.82; the tree pins 1.75).
-cat >"$WORK/libbpf-u128.h" <<'EOF'
-#ifdef __SIZEOF_INT128__
-typedef __signed__ __int128 __s128 __attribute__((aligned(16)));
-typedef unsigned __int128 __u128 __attribute__((aligned(16)));
-#endif
-EOF
-# Exported, as BPFTOOL is: the cargo build infra/install-guest.sh runs once
-# more when it installs the files must see the same value. libbpf-sys asks to
-# be rebuilt when the variable changes, so without it that run compiled libbpf
-# again without the typedefs -- failing again on those hosts, and installing
-# a daemon other than the one the verifier ran everywhere else.
-export LIBBPF_SYS_EXTRA_CFLAGS="-include $WORK/libbpf-u128.h${LIBBPF_SYS_EXTRA_CFLAGS:+ $LIBBPF_SYS_EXTRA_CFLAGS}"
+# /usr/include the build stopped at "unknown type name '__u128'" (aarch64
+# Ubuntu 24.04 with 7.3 headers, two error reports). Cargo.lock now takes
+# libbpf-sys 1.7.1, which defines the two typedefs itself, and this step no
+# longer force-includes them through LIBBPF_SYS_EXTRA_CFLAGS as it did while
+# the tree pinned a Rust too old for it (0.5.5, #52).
 # --locked, as CI and the release build: exactly the dependency versions
 # Cargo.lock records, never ones crates.io serves on the day of the install.
 run "${IN_TREE[@]}" cargo build --workspace --release --locked \

@@ -10,7 +10,7 @@
 [![Kernel](https://img.shields.io/badge/kernel-6.12%20LTS%2B-orange.svg)](#kernel-requirement)
 [![Platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu%20%7C%20Fedora%20%7C%20RHEL%20%7C%20Alpine-red.svg)](install.sh)
 [![eBPF](https://img.shields.io/badge/eBPF-CO--RE%20struct__ops-green.svg)](bpf/)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-black.svg)](rust-toolchain.toml)
+[![Rust](https://img.shields.io/badge/rust-1.82%2B-black.svg)](rust-toolchain.toml)
 
 English · **[简体中文](README.zh.md)**
 
