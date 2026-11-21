@@ -273,7 +273,7 @@ sudo ssctl reset-retransmit-dscp                   # 回到配置文件里的 [r
 
 ### 错误报告
 
-先问，绝不默认发送。安装、升级或卸载失败时，`install.sh` 会问一次是否把错误报告发给开发者。`ssctl` 也会在这几种情况下询问：`enable` 被拒绝；daemon 因为出错而连不上；skyline-speederd 因出错退出或 panic。daemon 没有终端可以询问，所以它把错误记在 `/var/lib/skyline-speeder/reports`，下一次在终端里运行 `sudo ssctl` 时再问。**只有你回答 `y` 才会发送**；回答 `v` 可以先看要发送的完整内容。没有终端可以询问时（管道、cloud-init、cron、`--json`），既不询问也不发送。主机不满足上面的要求（内核太旧、发行版不支持、运行在容器里、磁盘空间不足）而被安装器拒绝时，只说明原因、不询问：这是安装器在正常工作。
+先问，绝不默认发送。安装、升级或卸载失败时，`install.sh` 会问一次是否把错误报告发给开发者；一键安装的 `bootstrap.sh` 在 `install.sh` 运行之前就失败时（安装 `curl`、`tar` 或 `bash`、下载、解包）也会这样问。`ssctl` 也会在这几种情况下询问：`enable` 被拒绝；daemon 因为出错而连不上；skyline-speederd 因出错退出或 panic。daemon 没有终端可以询问，所以它把错误记在 `/var/lib/skyline-speeder/reports`，下一次在终端里运行 `sudo ssctl` 时再问。**只有你回答 `y` 才会发送**；回答 `v` 可以先看要发送的完整内容。没有终端可以询问时（管道、cloud-init、cron、`--json`），既不询问也不发送。主机不满足上面的要求（内核太旧、发行版不支持、运行在容器里、磁盘空间不足）而被安装器拒绝时，只说明原因、不询问：这是安装器在正常工作。
 
 报告包含：错误信息、出错的步骤、Skyline Speeder 版本、发行版、内核、架构、C 库和服务管理器，以及出错步骤的安装日志（最早的几行报错如果在更前面，也一并带上）或 daemon 日志的最后 40 行。IPv4、IPv6 和 MAC 地址、邮箱地址、URL 里的账号密码、令牌、家目录、主机名和你的用户名，在显示或发送之前都会被去掉。报告经 HTTPS、由 `curl` 发到本项目的 Sentry；代码里的上报地址只以加密形式存在。
 
