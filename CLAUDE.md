@@ -86,10 +86,10 @@ The `CLAUDE.md` files are public: no host addresses, account names, tokens or pe
   (`cargo test -p ssctl -- --nocapture renders_for_review` prints both reports); an invariant → its directory's
   `CLAUDE.md`, `CONTRIBUTING.md` and the PR template's Invariants list; algorithm behaviour → `docs/03`.
 - **Does it need a release?** Every PR answers in its "Prebuilt release" section. The one-line install takes the latest
-  release, not `main` (hosts that cannot run it build `main`: `prebuilt_blocker` in `install.sh`), so a change in
-  `bpf/`, `crates/`, `config/speeder-guest.toml`, `packaging/` or a shipped `infra/*.sh` reaches users only with a
-  release; `install.sh` and `scripts/bootstrap.sh` usually take effect on merge; docs, CI and the harness never need
-  one. Several PRs may share a release, but each PR says so.
+  release, not `main`: its artifact, and its signed source tree for `install.sh` (hosts that cannot run the artifact
+  build that tree: `prebuilt_blocker` in `install.sh`), so a change in `bpf/`, `crates/`, `config/speeder-guest.toml`,
+  `packaging/`, a shipped `infra/*.sh` or `install.sh` reaches users only with a release; `scripts/bootstrap.sh`
+  takes effect on merge; docs, CI and the harness never need one. Several PRs may share a release, but each PR says so.
 - **Releasing:** bump `[workspace.package] version` and the three crates in `Cargo.lock` (builds run `--locked`), then
   tag `v<version>`; `release.yml` refuses a mismatch. **No changelog:** the repository keeps none -- never add
   `CHANGELOG.md` or a release-notes file. If the data plane changed, rerun `infra/kernel/core-portability.sh` first.

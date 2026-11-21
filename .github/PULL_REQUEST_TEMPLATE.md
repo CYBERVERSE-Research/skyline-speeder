@@ -50,13 +50,13 @@ Kernel it ran on: `uname -r` =
 ## Prebuilt release
 
 <!-- The one-line install installs the latest release's prebuilt artifact, not
-     main. A change in bpf/, crates/, config/speeder-guest.toml, packaging/ or
-     the infra/*.sh that release.yml ships reaches those users only with the
-     next release (a host that cannot run the published binaries builds main
-     from source instead); install.sh and scripts/bootstrap.sh are fetched from
-     main and take effect on merge for later one-line installs, but not for a
-     tree an earlier install kept. Answer "needed" (now, or with the next
-     release) or "not needed", and why. -->
+     main, with the install.sh of that release's signed source tree. A change
+     in bpf/, crates/, config/speeder-guest.toml, packaging/, the infra/*.sh
+     that release.yml ships or install.sh reaches those users only with the
+     next release (a host that cannot run the published binaries builds that
+     release's tree from source); scripts/bootstrap.sh is fetched from main and
+     takes effect on merge. Answer "needed" (now, or with the next release) or
+     "not needed", and why. -->
 
 ## Performance claims
 

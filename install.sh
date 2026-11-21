@@ -72,7 +72,9 @@
 # BPF objects were built against a pinned reference header from the oldest
 # supported kernel, and CO-RE fixes the field offsets against THIS kernel when
 # they load. It is what `main` has released, not what `main` holds: a change
-# merged after the latest tag reaches this path only with the next release.
+# merged after the latest tag reaches this path only with the next release --
+# and so does a change to this file, which the one-line install takes from the
+# latest release's signed source too (scripts/bootstrap.sh), not from main.
 # --source compiles the objects against this machine's kernel BTF and the
 # control plane from this tree, installing the toolchain for it (--uninstall
 # takes that away again). Everything else about the install is identical.
@@ -2415,8 +2417,8 @@ prebuilt_blocker() {
 # release_lacks_musl: whether the latest release publishes no musl build --
 # every release before v0.4.1 -- with its tag in REPLY. The default install
 # on a musl host asks before it starts, and builds from source instead of
-# stopping at the download: this installer is fetched from main, so it can run
-# before a release that has the musl build exists. An unanswered question (no
+# stopping at the download: this installer can be newer than the release it
+# installs (--ref main, a tree an operator keeps, --release of an old tag). An unanswered question (no
 # curl or wget yet, no route to GitHub, the API's rate limit) is not a "no";
 # the download step then says what is wrong.
 release_lacks_musl() {
@@ -2441,8 +2443,8 @@ release_lacks_musl() {
 # build moved to an older glibc (PREBUILT_GLIBC_OLD_BEFORE) while this host's
 # glibc is older than those need, with its tag in REPLY. Such a host passes
 # prebuilt_blocker, which knows the releases of today; this install.sh also
-# runs from `main` before the first such release exists, and with --release
-# for an old one, and the old daemon would fail at the verifier step with
+# runs from `main` (--ref main) before the first such release exists, and with
+# --release for an old one, and the old daemon would fail at the verifier step with
 # "version `GLIBC_2.38' not found". As in release_lacks_musl, an unanswered
 # question is not a "no".
 release_needs_newer_glibc() {

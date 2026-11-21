@@ -341,16 +341,17 @@ See `.gitignore`. In particular:
 
 - Say whether the change needs a new prebuilt release, and why (the "Prebuilt
   release" section of the PR template). The one-line install installs the
-  latest release's prebuilt artifact, not `main` (a host that cannot run the
-  published binaries -- not x86_64, glibc older than 2.34, musl older than
-  1.2.5 -- builds the fetched tree, `main` by default, from source), so a change
-  that lives in the artifact reaches those users only with the next release --
-  and nothing fails in the meantime; it just is not there:
+  latest release's prebuilt artifact, not `main`, with the `install.sh` of that
+  release's signed source tree (a host that cannot run the published binaries
+  -- not x86_64, glibc older than 2.34, musl older than 1.2.5 -- builds that
+  tree from source), so a change reaches those users only with the next
+  release -- and nothing fails in the meantime; it just is not there:
 
   | The change touches | Release needed? | Why |
   |---|---|---|
   | `bpf/`, `crates/`, `config/speeder-guest.toml`, `packaging/` (the systemd units and the OpenRC scripts), the `infra/*.sh` that `release.yml` ships | **yes** | it is in the artifact (the OpenRC scripts from v0.4.1 on: Alpine installs the musl artifact, and the installer prefers the two scripts in it) |
-  | `install.sh`, `scripts/bootstrap.sh` | usually not | the one-line install always runs the installer from `main`; but `bootstrap.sh --uninstall`, and an upgrade run from the tree an install keeps, use the installer kept in `/usr/local/src/skyline-speeder`, not `main`'s. Release first when the new installer needs something the released artifact does not have yet |
+  | `install.sh` | **yes** | from 0.6.0 the one-line install runs the `install.sh` of the latest release's signed source tree, not `main`'s (`--ref main` takes `main`'s); `bootstrap.sh --uninstall`, and an upgrade run from the tree an install keeps, use the installer kept in `/usr/local/src/skyline-speeder` |
+  | `scripts/bootstrap.sh` | no | the one-line command fetches it from `main` itself; keep it working with the installer of the latest release |
   | docs, the experiment harness, CI, anything only a source build uses | no | not in the artifact |
 
   A release can wait and bundle several PRs, but the PR has to say that it goes
