@@ -412,9 +412,24 @@ pub struct GuardConfig {
     #[serde(default = "default_guard_interval_s")]
     pub interval_s: u32,
     /// `false` leaves every qdisc alone: skyline-speederd then owns only the
-    /// congestion control.
+    /// congestion control (and `tcp_wmem_max`).
     #[serde(default = "default_true")]
     pub qdisc: bool,
+    /// The least maximum, in bytes, `ssctl enable` gives the TCP send buffer
+    /// (the third field of `net.ipv4.tcp_wmem`) and the guard keeps while
+    /// armed; `ssctl drain` puts back what was there, unless something else
+    /// changed it since. Only ever raised: a host already above it is left
+    /// alone, and the minimum and default fields are never touched. 0 means
+    /// skyline-speederd does not own the sysctl (the experiment harness's
+    /// `config/speeder-guest.toml`, whose cases set it themselves).
+    ///
+    /// Why: the kernel's 4 MiB default caps a sender at 4 MiB in flight plus
+    /// what waits behind a loss. On a VPN server's long, lossy paths that
+    /// stalls the writer well before the link is full. Autotuning still
+    /// sizes each socket; this only lifts the ceiling, and `tcp_mem` still
+    /// bounds the total.
+    #[serde(default = "default_tcp_wmem_max")]
+    pub tcp_wmem_max: u32,
 }
 
 impl Default for GuardConfig {
@@ -422,8 +437,21 @@ impl Default for GuardConfig {
         Self {
             interval_s: DEFAULT_GUARD_INTERVAL_S,
             qdisc: true,
+            tcp_wmem_max: DEFAULT_TCP_WMEM_MAX,
         }
     }
+}
+
+/// `[guard] tcp_wmem_max` when the key is not there: 64 MiB, also for a
+/// configuration written before the key existed, which an upgrade keeps.
+pub const DEFAULT_TCP_WMEM_MAX: u32 = 64 * 1024 * 1024;
+/// The range a non-zero `tcp_wmem_max` must be in: from the kernel's own 4
+/// MiB default (anything less would never be written) to 1 GiB.
+pub const MIN_TCP_WMEM_MAX: u32 = 4 * 1024 * 1024;
+pub const MAX_TCP_WMEM_MAX: u32 = 1024 * 1024 * 1024;
+
+fn default_tcp_wmem_max() -> u32 {
+    DEFAULT_TCP_WMEM_MAX
 }
 
 /// See `GuardConfig::interval_s`.
@@ -858,6 +886,14 @@ impl SkylineConfig {
                 "guard.interval_s",
                 "0..=3600 (0 = no periodic re-check)",
                 self.guard.interval_s,
+            ));
+        }
+        let wmem = self.guard.tcp_wmem_max;
+        if wmem != 0 && !(MIN_TCP_WMEM_MAX..=MAX_TCP_WMEM_MAX).contains(&wmem) {
+            return Err(ConfigError::Range(
+                "guard.tcp_wmem_max",
+                "0 (not owned) or 4194304..=1073741824",
+                wmem,
             ));
         }
         Ok(())
@@ -1349,6 +1385,16 @@ pub struct GuardStatus {
     /// Times the root qdisc of a managed device (`runtime.tc_interface`, or
     /// a NIC under it -- see `GuardLive::devices`) was replaced.
     pub interface_qdisc_replaced: u64,
+    /// Echo of `[guard] tcp_wmem_max`; 0 = not owned (and 0 from a daemon
+    /// older than the field).
+    pub tcp_wmem_max: u32,
+    /// Times the maximum of `net.ipv4.tcp_wmem` was raised to it, the write
+    /// `ssctl enable` makes included.
+    pub tcp_wmem_raised: u64,
+    /// What `ssctl drain` puts back, as the sysctl reads ("4096 16384
+    /// 4194304"): the value before this daemon first raised it. `None` when
+    /// it has raised nothing since the last drain.
+    pub tcp_wmem_saved: Option<String>,
     /// Human-readable, e.g. "tcp_congestion_control bbr -> skyline_cc".
     pub last_correction: Option<String>,
     pub last_correction_unix_s: Option<u64>,
@@ -1372,6 +1418,9 @@ pub struct GuardStatus {
 pub struct GuardLive {
     pub tcp_congestion_control: String,
     pub default_qdisc: String,
+    /// `net.ipv4.tcp_wmem` as it reads ("4096 16384 67108864"); `None` when
+    /// it cannot be read, and from a daemon older than the field.
+    pub tcp_wmem: Option<String>,
     /// `runtime.tc_interface`.
     pub interface: Option<String>,
     /// Summary of that interface's own root qdisc: "fq", "mq/fq", "cake",
@@ -1756,6 +1805,7 @@ mod tests {
             GuardConfig {
                 interval_s: DEFAULT_GUARD_INTERVAL_S,
                 qdisc: true,
+                tcp_wmem_max: DEFAULT_TCP_WMEM_MAX,
             }
         );
         for path in SHIPPED_CONFIGS {
@@ -1769,9 +1819,20 @@ mod tests {
                 .unwrap_or_else(|| panic!("{path} should declare [guard]"));
             assert!(table.contains_key("interval_s"), "{path}");
             assert!(table.contains_key("qdisc"), "{path}");
+            assert!(table.contains_key("tcp_wmem_max"), "{path}");
 
             let shipped = SkylineConfig::load(path).expect("load shipped config");
-            assert_eq!(shipped.guard, GuardConfig::default(), "{path}");
+            // The guest config owns no global sysctl beyond the congestion
+            // control and the qdiscs; see guest_config_never_owns_global_sysctls.
+            let expected = if path.ends_with("speeder-guest.toml") {
+                GuardConfig {
+                    tcp_wmem_max: 0,
+                    ..GuardConfig::default()
+                }
+            } else {
+                GuardConfig::default()
+            };
+            assert_eq!(shipped.guard, expected, "{path}");
         }
     }
 
@@ -1830,6 +1891,25 @@ mod tests {
         assert!(config.rack_tuning.tcp_recovery.is_none());
         assert!(config.rack_tuning.tcp_reordering.is_none());
         assert!(config.rack_tuning.tcp_early_retrans.is_none());
+        // infra/apply-guest-profile.sh sets tcp_wmem per case; a guard holding
+        // its own maximum would fight it.
+        assert_eq!(config.guard.tcp_wmem_max, 0);
+    }
+
+    #[test]
+    fn tcp_wmem_max_is_zero_or_in_range() {
+        let mut config = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        for good in [0, MIN_TCP_WMEM_MAX, DEFAULT_TCP_WMEM_MAX, MAX_TCP_WMEM_MAX] {
+            config.guard.tcp_wmem_max = good;
+            config.validate().expect("in range");
+        }
+        for bad in [1, MIN_TCP_WMEM_MAX - 1, MAX_TCP_WMEM_MAX + 1] {
+            config.guard.tcp_wmem_max = bad;
+            assert!(matches!(
+                config.validate(),
+                Err(ConfigError::Range("guard.tcp_wmem_max", _, _))
+            ));
+        }
     }
 
     #[test]

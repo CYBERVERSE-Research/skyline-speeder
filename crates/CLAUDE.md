@@ -26,8 +26,12 @@ re-applied by `sysctl --system`, moves every new connection off `skyline_cc` wit
 `drain` the guard (`crates/skyline-speederd/src/guard.rs`, config `[guard]`) keeps three things in place: the default
 congestion control and, with `[guard] qdisc = true` (the default), `net.core.default_qdisc = fq` and the root qdisc of
 `runtime.tc_interface` (`fq`, or `mq` over `fq` on a multi-queue NIC; when that is a VLAN, bond or bridge whose root
-is `noqueue`, the NICs with a `device` link under it instead, never a tap or veth). From `enable` to `drain` the daemon
-is the only writer of all three (after a drain, `apply-guest-profile.sh` and `install.sh --uninstall` set qdiscs of
+is `noqueue`, the NICs with a `device` link under it instead, never a tap or veth). Unless `[guard] tcp_wmem_max = 0`
+it also raises the maximum of `net.ipv4.tcp_wmem` to at least that value (never lowers it) and keeps it there; `drain`
+puts back what the first raise replaced, right after `fallback_cc` and under the same lock, only while the sysctl still
+reads what the daemon wrote (`release_tcp_wmem` in `guard.rs`; the original is also kept in
+`/run/skyline-speeder/tcp-wmem-hold` for a restarted daemon). From `enable` to `drain` the daemon is the only writer
+of all of them (after a drain, `apply-guest-profile.sh` and `install.sh --uninstall` set qdiscs of
 their own). `boot-enable.sh` **writes no `default_qdisc` either**: a boot-time write cannot change a NIC's existing
 root qdisc, and two writers of one setting drift apart. Related invariants:
 

@@ -13,7 +13,7 @@ bulk rename, a new writer of a sysctl, an ABI change), read the `CLAUDE.md` of e
 |---|---|
 | `bpf/CLAUDE.md` | vmlinux.h and kfunc declarations, CO-RE portability, the algorithm name, ABI versions, the two struct_ops maps |
 | `crates/CLAUDE.md` | order and writers of the global sysctls, the guard, configuration-plane semantics |
-| `config/CLAUDE.md` | `[rack_tuning]` in the guest config, `tc_interface` |
+| `config/CLAUDE.md` | `[rack_tuning]` and `tcp_wmem_max` in the guest config, `tc_interface` |
 | `packaging/CLAUDE.md` | install paths, `RuntimeDirectory=` / `checkpath` |
 | `infra/CLAUDE.md` | boot scripts and sysctls, the scripts a release ships, `core-portability.sh` |
 | `docs/CLAUDE.md` | documentation map |
@@ -54,8 +54,8 @@ skyline-speederd --config config/speeder.toml --validate-only --verify-bpf   # v
   protect it with word boundaries in a bulk rename.
 - **Configuration plane:** every `set-*` command is an absolute overwrite; a switch writes the slot before the sequence
   number, and BPF reads only each flow's own copy. → `crates/CLAUDE.md`
-- **`[rack_tuning]`** in `config/speeder-guest.toml` stays commented out; never weaken
-  `guest_config_never_owns_global_sysctls` to make a case pass. → `config/CLAUDE.md`
+- **`[rack_tuning]`** in `config/speeder-guest.toml` stays commented out, and its `[guard] tcp_wmem_max` stays 0;
+  never weaken `guest_config_never_owns_global_sysctls` to make a case pass. → `config/CLAUDE.md`
 
 ## Silent failures (no error, just no effect)
 

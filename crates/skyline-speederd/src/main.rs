@@ -1455,9 +1455,14 @@ impl Daemon {
                 // It stays disarmed whatever the rest of the drain returns: the
                 // experiment harness drains with --timeout 0, which bails
                 // below, and then installs its own qdisc -- the guard must not
-                // fight it. Drain touches no qdisc.
-                self.guard
-                    .disarm_and(|| set_default_congestion_control(&self.config.fallback_cc))?;
+                // fight it. Drain touches no qdisc. Under the same lock, right
+                // after fallback_cc, the guard puts tcp_wmem back to what it
+                // was before the enable raised it.
+                let (fallback, wmem) = self
+                    .guard
+                    .disarm_and(|| set_default_congestion_control(&self.config.fallback_cc));
+                fallback?;
+                let wmem = wmem.map(|line| format!("; {line}")).unwrap_or_default();
                 if let Some(policy) = &mut self.policy {
                     policy.set_policy_enabled(false)?;
                 }
@@ -1483,7 +1488,7 @@ impl Daemon {
                     bail!(
                         "drain timeout expired; struct_ops remains attached, but the default \
                          congestion control is already back on {} so no new connection is \
-                         using it",
+                         using it{wmem}",
                         self.config.fallback_cc
                     );
                 }
@@ -1495,7 +1500,7 @@ impl Daemon {
                 self.draining = false;
                 Ok(format!(
                     "new sockets use {}; Skyline Speeder CC links detached (TC stats and RTO tuning, \
-                     if enabled, remain active)",
+                     if enabled, remain active){wmem}",
                     self.config.fallback_cc
                 ))
             }
