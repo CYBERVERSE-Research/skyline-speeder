@@ -170,6 +170,18 @@ pub struct RuntimeConfig {
     pub tc_interface: Option<String>,
 }
 
+/// Whether `name` is one the kernel accepts for a network interface
+/// (`dev_valid_name` in net/core/dev.c).
+pub fn is_interface_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() < 16
+        && name != "."
+        && name != ".."
+        && !name
+            .bytes()
+            .any(|byte| byte == b'/' || byte == b':' || byte.is_ascii_whitespace())
+}
+
 /// M1 tier-1 knobs: default values for global (net-namespace-wide) RACK
 /// sysctls. `None` means "skyline-speederd does not own this sysctl" -- ownership is
 /// handed entirely to the experiment harness (`infra/apply-guest-profile.sh`)
@@ -653,6 +665,19 @@ impl SkylineConfig {
             return Err(ConfigError::Invalid(
                 "fallback_cc must name another algorithm than skyline_cc",
             ));
+        }
+        // The name is joined under /sys/class/net and handed to tc as is:
+        // "../.." or an absolute path read files outside it, and a name the
+        // kernel cannot have only failed later, as a tc_error. The rules are
+        // the kernel's own (dev_valid_name): IFNAMSIZ less the NUL, not "."
+        // or "..", and no '/', ':' or whitespace.
+        if let Some(interface) = &self.runtime.tc_interface {
+            if !is_interface_name(interface) {
+                return Err(ConfigError::Invalid(
+                    "runtime.tc_interface must be a network interface name: 1 to 15 bytes, \
+                     not \".\" or \"..\", without '/', ':' or whitespace",
+                ));
+            }
         }
         // Every float below goes to the kernel through permille(), which turns
         // a NaN into 0 and an infinity into u32::MAX, and serde_json writes
@@ -1565,6 +1590,9 @@ pub enum Request {
     },
     Status,
     Flows,
+    /// Sent only by an ssctl older than 0.6.0, and refused: ssctl now writes
+    /// a snapshot itself from a status reply. Kept so that such an ssctl is
+    /// told what to do rather than "unknown variant".
     Snapshot {
         path: PathBuf,
     },
@@ -1773,6 +1801,35 @@ mod tests {
             let shipped = SkylineConfig::load(path).expect("load shipped config");
             assert_eq!(shipped.guard, GuardConfig::default(), "{path}");
         }
+    }
+
+    #[test]
+    fn tc_interface_must_be_a_name_the_kernel_accepts() {
+        let mut config = SkylineConfig::load("../../config/speeder.toml").expect("load config");
+        for good in ["eth0", "data0", "enp1s0f0.100", "a-very-long-nm0"] {
+            config.runtime.tc_interface = Some(good.to_owned());
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{good}: {error}"));
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../../etc",
+            "/dev",
+            "eth0:1",
+            "eth 0",
+            "sixteen-bytes-x0",
+        ] {
+            config.runtime.tc_interface = Some(bad.to_owned());
+            assert!(
+                matches!(config.validate(), Err(ConfigError::Invalid(_))),
+                "{bad:?} was accepted"
+            );
+        }
+        config.runtime.tc_interface = None;
+        config.validate().expect("unset is allowed");
     }
 
     #[test]

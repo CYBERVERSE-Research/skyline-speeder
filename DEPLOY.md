@@ -288,7 +288,7 @@ reach the default install only with the next release.
 | Preparing the Rust toolchain / Building the BPF objects / Building the Rust control plane | Source-build path: rustup (version pinned by `rust-toolchain.toml`), `make bpf`, `cargo build --release` |
 | Running the kernel verifier | Before any file is replaced, runs `--validate-only --verify-bpf` (section 4) with the **new** daemon and the new objects: with the installed configuration, or the template on a first install, and `bpf_dir` pointing at the new objects; the daemon is first placed at `/usr/local/sbin/.skyline-speederd.new` (`/tmp` may be noexec). A failure aborts the install, leaving the installed files and the running daemon untouched |
 | Installing files | The prebuilt path copies the files from the artifact directly (the daemon is the very file the verifier ran, renamed into place); the source-build path runs `infra/install-guest.sh`. The file list is in section 2.5 |
-| Configuring speeder.toml | Creates the configuration from the template only when it does not exist; rewrites the egress NIC and `fallback_cc` while they still hold what the installer put there (see below). These changes do not affect the conclusion of the verifier step above: `tc_interface` plays no part in validation, and `fallback_cc` is only ever changed to an algorithm this host's kernel has |
+| Configuring speeder.toml | Creates the configuration from the template only when it does not exist; rewrites the egress NIC and `fallback_cc` while they still hold what the installer put there (see below). These changes do not affect the conclusion of the verifier step above: only the form of the `tc_interface` name is validated, and the one written is a real interface's, and `fallback_cc` is only ever changed to an algorithm this host's kernel has |
 | Starting skyline-speederd | On an upgrade it is `Draining live flows (up to 60 s), restarting skyline-speederd` (section 10) |
 | Attaching skyline_cc | `systemctl enable --now skyline-speeder-enable.service` (skipped with `--no-enable`) |
 | Verifying | Confirms with the new daemon that `enabled` is `true` (and, for versions with the guard, `armed`), and that the default congestion control really is `skyline_cc`; if not, restarts the enable unit once and checks again, and if it still does not hold, fails and points to `ssctl enable` and the enable unit's log |
@@ -1169,11 +1169,10 @@ The one-line install applies as usual; these are the only differences:
   (guardrail trips, section 13.3), and the rest are ACKs at the cap.
 - `/run/skyline-speeder/state.json` is rewritten only when the daemon starts and after each successfully
   handled request; it is **not** live state. For monitoring, call `ssctl status --json`.
-- With `ssctl snapshot <path>` the daemon writes the file, and a relative path is resolved against the
-  daemon's working directory; it writes only regular files and refuses a target that is a symbolic link,
-  directory, device or FIFO (since 0.5.2). On systemd hosts the daemon runs under
-  `ProtectSystem=strict` with a private `/tmp`: most paths are read-only to it, and a file it writes into
-  `/tmp` is invisible to you; writing under `/run/skyline-speeder/` is the safest choice.
+- `ssctl snapshot <path>` writes the status JSON to the file itself, as the user running it (since 0.6.0;
+  before, the daemon wrote it as root, relative to its own working directory and, under systemd, into its
+  private `/tmp`). A relative path is resolved against the current directory; only a regular file is
+  written, and a target that is a symbolic link, directory, device or FIFO is refused.
 
 ### 13.3 Event log
 
