@@ -150,7 +150,7 @@ ADDED_RUSTUP=/etc/skyline-speeder/added-rustup
 # A package the package manager protects (dpkg: required or important) is
 # skipped for the same reason, whatever its name. These are the apt names;
 # detect_platform sets the dnf and apk ones.
-KEEP_PKGS=(iproute2 curl ca-certificates tar)
+KEEP_PKGS=(iproute2 curl ca-certificates tar openssh-client)
 PKG=            # apt | dnf | apk, or empty: set by detect_platform
 INIT=           # systemd | openrc, or empty: set by detect_platform
 SVC_SUFFIX=     # ".service" under systemd, so messages name the unit as before
@@ -177,6 +177,24 @@ PREBUILT_GLIBC_MIN=2.34
 PREBUILT_GLIBC_OLD_MIN=2.38
 PREBUILT_GLIBC_OLD_BEFORE=0.5.5
 PREBUILT_MUSL_MIN=1.2.5
+
+# Every release from v0.6.0 on is signed: release.yml runs `ssh-keygen -Y sign`
+# over each artifact with the private half of this key (the
+# RELEASE_SIGNING_KEY secret) and publishes <artifact>.sig beside it, and
+# fetch_prebuilt checks that signature before anything is unpacked. The
+# .sha256 beside an artifact comes from the same place as the artifact, so it
+# catches a broken download and nothing more; the signature is what a
+# replaced artifact, a hijacked release or a stolen token cannot forge.
+# scripts/bootstrap.sh carries the same key, and CI's shell job checks the two
+# copies agree; release.yml refuses to publish a signature this key does not
+# verify.
+RELEASE_SIGNING_KEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMHUlrw08jlUCQxQWBhNglTOtpuAKOrBsBCnyUkWG0ex'
+RELEASE_SIGNING_NAMESPACE=skyline-speeder-release
+# The releases published before signing began, which carry only a .sha256.
+# Only these tags may be installed without a signature: any other one, the
+# latest included, must be signed. A list rather than "older than 0.6.0", so
+# that an unsigned release published under a lower number is refused too.
+UNSIGNED_RELEASES="v0.1.0 v0.2.0 v0.3.0 v0.4.0 v0.4.1 v0.4.2 v0.4.3 v0.4.4 v0.5.0 v0.5.1 v0.5.2 v0.5.3 v0.5.4 v0.5.5"
 
 # `-qq` silences apt but not dpkg, which still prints an unpack line per
 # package plus a "Reading database" progress bar. Dpkg::Use-Pty=0 stops the
@@ -767,10 +785,10 @@ detect_platform() {
         *" alpine "*) command -v apk >/dev/null 2>&1 && PKG=apk ;;
     esac
     case "$PKG" in
-        dnf) KEEP_PKGS=(iproute iproute-tc curl ca-certificates tar) ;;
+        dnf) KEEP_PKGS=(iproute iproute-tc curl ca-certificates tar openssh-clients) ;;
         # bash as well: it is what runs this script, and on Alpine it is not
         # there until something asks for it.
-        apk) KEEP_PKGS=(iproute2 curl ca-certificates tar bash) ;;
+        apk) KEEP_PKGS=(iproute2 curl ca-certificates tar bash openssh-keygen) ;;
     esac
     if [ -d /run/systemd/system ]; then
         INIT=systemd SVC_SUFFIX=.service
@@ -2972,12 +2990,13 @@ export DEBIAN_FRONTEND=noninteractive
 # libgcc: the musl build of skyline-speederd links libgcc_s for unwinding, and
 # nothing else in the list would keep it once the toolchain was removed by hand.
 case "$PKG:$SOURCE" in
-    apt:prebuilt) PKGS=(curl ca-certificates tar iproute2) ;;
+    apt:prebuilt) PKGS=(curl ca-certificates tar iproute2 openssh-client) ;;
     apt:*)        PKGS=(build-essential pkg-config clang llvm libbpf-dev libelf-dev zlib1g-dev bpftool curl iproute2) ;;
-    dnf:prebuilt) PKGS=(curl ca-certificates tar iproute iproute-tc 'libelf.so.1()(64bit)' 'libz.so.1()(64bit)') ;;
+    dnf:prebuilt) PKGS=(curl ca-certificates tar iproute iproute-tc openssh-clients
+                        'libelf.so.1()(64bit)' 'libz.so.1()(64bit)') ;;
     dnf:*)        PKGS=(gcc make pkgconf-pkg-config clang llvm libbpf-devel elfutils-libelf-devel zlib-devel
                         bpftool curl ca-certificates tar iproute iproute-tc) ;;
-    apk:prebuilt) PKGS=(curl ca-certificates tar iproute2 bash libelf zlib zstd-libs libgcc) ;;
+    apk:prebuilt) PKGS=(curl ca-certificates tar iproute2 bash openssh-keygen libelf zlib zstd-libs libgcc) ;;
     apk:*)        PKGS=(build-base pkgconf clang llvm libbpf-dev elfutils-dev zlib-dev linux-headers
                         bpftool curl ca-certificates tar iproute2 bash libgcc) ;;
 esac
@@ -3566,6 +3585,57 @@ fi
 PREBUILT_ROOT=     # the unpacked artifact's top directory
 PROVENANCE=        # one line for the summary; MANIFEST itself goes to the log
 
+# release_signature_ok <file> <signature>: whether <signature> is an
+# `ssh-keygen -Y sign` signature of <file> by RELEASE_SIGNING_KEY, made for
+# RELEASE_SIGNING_NAMESPACE (a signature made for anything else with the same
+# key does not count). ssh-keygen's own output goes to the log.
+release_signature_ok() {
+    local signers="$WORK/release-signers"
+    printf '%s namespaces="%s" %s\n' "$RELEASE_SIGNING_NAMESPACE" "$RELEASE_SIGNING_NAMESPACE" \
+        "$RELEASE_SIGNING_KEY" >"$signers"
+    ssh-keygen -Y verify -f "$signers" -I "$RELEASE_SIGNING_NAMESPACE" \
+        -n "$RELEASE_SIGNING_NAMESPACE" -s "$2" <"$1" >>"$LOG" 2>&1
+}
+
+# check_release_signature <tag> <where the artifact came from>: checks
+# $staging/artifact.sig, which fetch_prebuilt put beside the artifact when
+# there was one, and says what it found. A signature that does not verify
+# stops the install. Without one, only a release from UNSIGNED_RELEASES goes
+# ahead, on its sha256 alone -- or, for SKYLINE_ARTIFACT_URL only, an artifact
+# the operator vouches for with SKYLINE_ALLOW_UNSIGNED=yes (one built for a
+# test bed, say). Sets REPLY to the words for the provenance line.
+check_release_signature() {
+    local tag=$1 source=$2 sig="$staging/artifact.sig"
+    if [ -s "$sig" ]; then
+        command -v ssh-keygen >/dev/null 2>&1 \
+            || die "ssh-keygen (OpenSSH) is not installed, and the release signature cannot be checked without it"
+        # Captured first: under pipefail, ssh-keygen's own failure (it always
+        # fails here, with no file to verify) would decide the pipeline.
+        local probe
+        probe=$(ssh-keygen -Y verify 2>&1 || true)
+        if printf '%s\n' "$probe" | grep -qiE 'illegal option|unknown option|invalid option'; then
+            unsupported "this host's ssh-keygen is older than OpenSSH 8.1 and cannot check a release signature (-Y verify)"
+        fi
+        release_signature_ok "$staging/artifact.tar.gz" "$sig" \
+            || die "the signature of $source does not verify against this installer's release key:
+   the artifact is not the one the release published, or was signed by another key.
+   Nothing was unpacked. The details are in $LOG."
+        ok "signature verified (${RELEASE_SIGNING_NAMESPACE} key)"
+        REPLY="sha256 and signature verified"
+    elif [ -n "$tag" ] && [[ " $UNSIGNED_RELEASES " == *" $tag "* ]]; then
+        warn "$tag was published before releases were signed (v0.6.0): only its sha256 was checked"
+        REPLY="sha256 verified, unsigned release"
+    elif [ -n "${SKYLINE_ARTIFACT_URL:-}" ] && [ "${SKYLINE_ALLOW_UNSIGNED:-}" = yes ]; then
+        warn "no signature beside $source; installing it unsigned because SKYLINE_ALLOW_UNSIGNED=yes"
+        REPLY="sha256 verified, NOT signed"
+    else
+        die "no signature could be found for $source (looked for ${source}.sig).
+   Every release from v0.6.0 on is signed, and an artifact that is not cannot be told
+   from a replaced one. Copy the .sig beside the artifact, or, for an artifact you built
+   yourself, set SKYLINE_ALLOW_UNSIGNED=yes with SKYLINE_ARTIFACT_URL."
+    fi
+}
+
 fetch_prebuilt() {
     local api="https://api.github.com/repos/${REPO_SLUG}/releases"
     local arch; arch=$(uname -m)
@@ -3587,6 +3657,9 @@ fetch_prebuilt() {
     # restriction is worth keeping.
     local url=${SKYLINE_ARTIFACT_URL:-}
     local local_artifact=
+    # The release the artifact belongs to: from the API's reply, or for
+    # SKYLINE_ARTIFACT_URL from the file name release.yml gives it.
+    local tag=
     if [ -n "$url" ] && [ -f "$url" ]; then
         local_artifact=$url
         url=
@@ -3626,6 +3699,13 @@ fetch_prebuilt() {
     fi
     [ -n "$url" ] || die "no prebuilt artifact for $arch in that release.
    Published artifacts are per-architecture; build from source instead."
+    tag=$(awk 'match($0, /"tag_name": *"[^"]*"/) {
+                   t = substr($0, RSTART, RLENGTH); sub(/^"tag_name": *"/, "", t)
+                   sub(/"$/, "", t); print t; exit }' "$staging/release.json")
+    fi
+    if [ -z "$tag" ]; then
+        tag=$(basename -- "${local_artifact:-$url}" \
+              | sed -n 's/^skyline-speeder-\(v[0-9][0-9.]*\)-.*\.tar\.gz$/\1/p')
     fi
     # The precedence DEPLOY.md §2.2 documents, said where it applies: a
     # --release beside the variable used to be dropped without a word.
@@ -3637,12 +3717,17 @@ fetch_prebuilt() {
         cp -- "$local_artifact" "$staging/artifact.tar.gz"
         [ -r "${local_artifact}.sha256" ] \
             && cp -- "${local_artifact}.sha256" "$staging/artifact.sha256"
+        [ -r "${local_artifact}.sig" ] \
+            && cp -- "${local_artifact}.sig" "$staging/artifact.sig"
     else
         info "downloading $(basename -- "$url")"
         run curl -q -fsSL --proto '=https' --tlsv1.2 -o "$staging/artifact.tar.gz" "$url" \
             || die "artifact download failed"
         run curl -q -fsSL --proto '=https' --tlsv1.2 -o "$staging/artifact.sha256" \
             "${url}.sha256" || rm -f "$staging/artifact.sha256"
+        # Releases before v0.6.0 have none: check_release_signature decides.
+        run curl -q -fsSL --proto '=https' --tlsv1.2 -o "$staging/artifact.sig" \
+            "${url}.sig" || rm -f "$staging/artifact.sig"
     fi
 
     # The digest is published beside the artifact. Verify it: this tarball is
@@ -3668,6 +3753,9 @@ fetch_prebuilt() {
    Publish the .sha256 beside it (sha256sum <artifact> > <artifact>.sha256), or copy both
    to this host and point SKYLINE_ARTIFACT_URL at the local file."
     fi
+
+    check_release_signature "$tag" "$(basename -- "${local_artifact:-$url}")"
+    verified=$REPLY
 
     run tar -xzf "$staging/artifact.tar.gz" -C "$staging" || die "artifact did not unpack"
     PREBUILT_ROOT=$(find "$staging" -mindepth 1 -maxdepth 1 -type d -name 'skyline-speeder-*' | head -1)
