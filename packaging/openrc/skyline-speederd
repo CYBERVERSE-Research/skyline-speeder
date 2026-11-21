@@ -17,6 +17,11 @@ required_files="/etc/skyline-speeder/speeder.toml"
 respawn_delay=2
 respawn_max=5
 respawn_period=60
+# UMask= of the systemd unit. Not no_new_privs: from OpenRC 0.45 until 0.52
+# supervise-daemon.sh passed it as --no_new_privs, an option supervise-daemon
+# does not take, and the service would not start. OpenRC has no counterpart
+# for the rest of the unit's sandbox.
+umask=077
 # SIGTERM is what makes the daemon stop its guard and unregister skyline_cc
 # on the way out (impl Drop for Daemon); a KILL skips all of it.
 retry="TERM/30/KILL/5"

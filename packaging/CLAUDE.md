@@ -18,6 +18,16 @@ directory; the repository-wide conventions are in the root `CLAUDE.md`.
 > but `ProtectSystem=strict` leaves all of `/run` except `RuntimeDirectory=` read-only, so a mismatch makes it fail
 > when it opens the event log, and systemd restarts it over and over. If you touch either side, check the other.
 
+## The daemon's sandbox
+
+`skyline-speederd.service` sets `NoNewPrivileges=true`, `UMask=0077`, `ProtectHome=true`, `RestrictSUIDSGID=`,
+`LockPersonality=`, `RestrictRealtime=` and `SystemCallArchitectures=native` beside `ProtectSystem=strict` and
+`PrivateTmp=`. Do not add `ProtectKernelTunables=` (the daemon writes `net.*` sysctls), `ProtectKernelModules=` (it
+reads `/lib/modules`), `ProtectControlGroups=` (the `ExecStartPre=` mkdir and the cgroup attach) or
+`PrivateNetwork=`, and check every new path the daemon writes against `ProtectSystem=strict` and `ProtectHome=`.
+The OpenRC script sets only `umask`: its `no_new_privs` reached supervise-daemon as an option it does not take from
+OpenRC 0.45 to 0.51, and the service would not start.
+
 ## The enable unit
 
 `skyline-speeder-enable.service` (`openrc/skyline-speeder-enable` under OpenRC) exists to remove the "`enable` never

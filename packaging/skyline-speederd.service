@@ -10,7 +10,25 @@ ExecStartPre=/bin/mkdir -p /sys/fs/bpf/skyline-speeder /sys/fs/cgroup/skyline-sp
 ExecStart=/usr/local/sbin/skyline-speederd --config /etc/skyline-speeder/speeder.toml
 Restart=on-failure
 RestartSec=2
-NoNewPrivileges=false
+# The daemon runs as root with every capability it was given: it loads BPF,
+# attaches to a cgroup and a NIC, and writes /proc/sys. What follows takes
+# away what it never needs, so a flaw in it reaches less. Not set, on purpose:
+# ProtectKernelTunables= (it writes net.* sysctls), ProtectKernelModules= (it
+# reads /lib/modules to say whether a module is there), ProtectControlGroups=
+# (the mkdir above and the cgroup attach), PrivateNetwork= (it attaches to
+# the host's NIC), and a SystemCallFilter= that would have to track bpf(2).
+# It never executes a setuid program: tc and ss are plain binaries.
+NoNewPrivileges=true
+# events.jsonl, state.json and the reports it writes are for root only, as
+# the control socket already is (0600 whatever the umask).
+UMask=0077
+# /home, /root and /run/user are none of its business: ssctl writes a
+# snapshot itself, and nothing else the daemon writes lives there.
+ProtectHome=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
 ProtectSystem=strict
 RuntimeDirectory=skyline-speeder
 # /var/lib/skyline-speeder: where the daemon records an error it stops on, for
