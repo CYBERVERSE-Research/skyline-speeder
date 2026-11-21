@@ -394,6 +394,15 @@ values of a few common parameters and where to tune them, and how many packages 
 | `/var/lib/skyline-speeder/reports/` | The errors skyline-speederd stopped on, waiting for the next `ssctl` on a terminal to offer them as an error report (section 13.6); `StateDirectory=` in the unit (`checkpath` under OpenRC), mode 0700 |
 | `/sys/fs/cgroup/skyline-speeder`, `/sys/fs/bpf/skyline-speeder` | The cgroup of section 7; the directory under bpffs |
 
+**The daemon's sandbox.** skyline-speederd runs as root with the capabilities it needs to load BPF, attach to a
+cgroup and a NIC, and write `net.*` sysctls. From 0.6.0 on its systemd unit also takes away what it never needs:
+`NoNewPrivileges=true`, `UMask=0077` (the event log, `state.json` and the reports are readable by root only, as the
+control socket already was), `ProtectHome=true` (`/home`, `/root` and `/run/user` are invisible to it),
+`RestrictSUIDSGID=`, `LockPersonality=`, `RestrictRealtime=` and `SystemCallArchitectures=native`, on top of
+`ProtectSystem=strict` and `PrivateTmp=`. `systemd-analyze security skyline-speederd` shows the result. Under OpenRC
+only the umask applies. A drop-in that points the daemon at files under `/home` or `/root` (a configuration,
+`bpf_dir`) no longer works under systemd: keep them under `/etc`, `/opt` or `/usr/local`.
+
 ### 2.6 Releases older than the guard
 
 `--prebuilt`/`--release` installs a published release, which may be older than the `install.sh` running.
