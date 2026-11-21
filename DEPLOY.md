@@ -121,8 +121,9 @@ install (section 2.2), which by design does not attach.
   do not.
 - `ssctl enable` (which the installer runs automatically) **takes effect host-wide**: from then on every new
   TCP connection on this host uses `skyline_cc` by default, not just some process (section 5.2).
-- While attached, `skyline-speederd` exclusively owns three settings: the default congestion control,
-  `net.core.default_qdisc` and the root qdisc of the egress NIC (section 9). The installer installs no proxy and
+- While attached, `skyline-speederd` exclusively owns four settings: the default congestion control,
+  `net.core.default_qdisc`, the root qdisc of the egress NIC, and (from 0.6.0 on) the maximum of
+  `net.ipv4.tcp_wmem`, which it raises to at least 64 MiB and puts back on `drain` (section 9). The installer installs no proxy and
   opens no port.
 
 ### 1.2 Link suitability
@@ -584,7 +585,9 @@ file behind, and OpenRC, unlike systemd's `RuntimeDirectory=`, does not empty `/
 4. Arms the guard and immediately runs one full check (section 9): with `[guard] qdisc = true` (the default),
    writes `fq` into `net.core.default_qdisc` and replaces the egress NIC's root qdisc with `fq` (on a
    multi-queue NIC, an `mq` whose child queues are all `fq`; for a VLAN, bond or bridge, the physical NICs under
-   it are changed instead);
+   it are changed instead); and raises the maximum of `net.ipv4.tcp_wmem` (its third field) to
+   `[guard] tcp_wmem_max`, 64 MiB by default, when it is lower (from 0.6.0 on; never lowered; `0` leaves it
+   alone);
 5. Turns on first-flight redundancy: every SYN-ACK this host sends that has a socket (whatever congestion
    control its connection will run: none has been chosen when it is sent), and the SYN and the first 64 KiB
    (retransmissions within them included) of `skyline_cc` connections, are each sent twice, the second copy
@@ -809,13 +812,22 @@ section 8.1 advises.
 it takes effect, so changing the sysctl alone does not reach the NIC; and the "one-click BBR" scripts common on
 VPSes write `bbr` and `cake`/`fq_pie` into `/etc/sysctl.d`, after which any `sysctl --system` quietly flips the
 congestion control back to `bbr`, and from then on new connections bypass `skyline_cc` without any error. So
-from `enable` to the next `drain`, `skyline-speederd` exclusively owns three settings:
-`net.ipv4.tcp_congestion_control` and, with `[guard] qdisc = true` (the default), `net.core.default_qdisc` and
-the root qdisc of the managed NICs. It checks once immediately on `enable` and then again every
+from `enable` to the next `drain`, `skyline-speederd` exclusively owns `net.ipv4.tcp_congestion_control`, with
+`[guard] qdisc = true` (the default) `net.core.default_qdisc` and the root qdisc of the managed NICs, and from
+0.6.0 on the maximum of `net.ipv4.tcp_wmem`. It checks once immediately on `enable` and then again every
 `[guard] interval_s` seconds (5 by default); whatever has been changed is changed back, with a log line
 `guard: <item> <old value> -> <new value> (...)`. Neither the guard nor the installer **modifies**
 `/etc/sysctl.conf` or any file under `/etc/sysctl.d`. `drain` lifts the guard immediately and touches no qdisc.
 The full rules are in `docs/02-interface-reference.md` section 9.
+
+**The send buffer (`tcp_wmem`, from 0.6.0 on).** The kernel's default maximum of 4 MiB holds a sender to 4 MiB
+in flight plus what waits behind a loss: on the long, lossy paths of a VPN server the writer stalls well before
+the link is full. `enable` raises the maximum (the third field) to `[guard] tcp_wmem_max`, 64 MiB by default,
+only when it is lower, leaves the minimum and default as they are, and the guard keeps it there; `drain` puts
+back what was there before, unless something else has changed it since (then it is left alone, and the drain's
+reply says so). Autotuning still sizes each socket, and `net.ipv4.tcp_mem` still bounds the total. Set
+`tcp_wmem_max = 0` to leave the sysctl alone, for example when `/etc/sysctl.d` already manages it. The receive
+side, `tcp_rmem`, is on the clients: on a long path they may need a larger maximum too.
 
 **Managed NICs.** That is `runtime.tc_interface` itself; when its root is the kernel default `noqueue` (VLAN,
 bond, bridge), packets actually queue in the root qdisc of the physical NICs under it, so the guard walks down
@@ -945,7 +957,9 @@ control (after this, no check writes `skyline_cc` back) →
 processes in the cgroup are no longer switched to `skyline_cc` → stop first-flight redundancy →
 wait for existing `skyline_cc` connections to end naturally (300 seconds by default, overridden by
 `--timeout`) → once they have all ended, unregister the struct_ops. From then on new connections fall back to
-`fallback_cc`. `drain` does not touch qdiscs: `default_qdisc` and the NIC's root qdisc stay `fq`.
+`fallback_cc`. Right after the `fallback_cc` write, under the same lock, the maximum of `net.ipv4.tcp_wmem` is
+put back to what it was before `enable` raised it, unless something else changed it since (section 9). `drain`
+does not touch qdiscs: `default_qdisc` and the NIC's root qdisc stay `fq`.
 
 > [!IMPORTANT]
 > **A `drain` run over SSH always runs into the timeout**: your own SSH connection is a `skyline_cc` flow and
@@ -977,9 +991,9 @@ systemctl stop skyline-speeder-enable.service skyline-speederd.service
 ```
 
 Stopping the daemon (equivalent to SIGTERM) first stops the guard thread, then unregisters all struct_ops and
-BPF links; by itself it **writes no sysctl** (deliberately). When the enable unit is active, stopping the
+BPF links; by itself it **writes no sysctl** (deliberately), so a raised `tcp_wmem` stays raised. When the enable unit is active, stopping the
 daemon stops that unit first, and its ExecStop (`boot-disable.sh`) writes `fallback_cc` back: it runs
-`ssctl drain` first, and only afterwards, if the default is still `skyline_cc` (the daemon is already gone and
+`ssctl drain` first (which also puts `tcp_wmem` back), and only afterwards, if the default is still `skyline_cc` (the daemon is already gone and
 the drain could not run), writes it once itself — in the reverse order, the still-armed guard would change the
 value just written back into `skyline_cc` again. On a host attached with a bare `ssctl enable`, run
 `ssctl drain` before stopping.

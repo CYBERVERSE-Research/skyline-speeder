@@ -136,6 +136,7 @@ The shipped defaults are tuned values; **most deployments should change nothing.
 | [Coefficients](#coefficients) | tuned values | gains, guardrail, caps, startup behaviour | `ssctl set-module-config` |
 | [First-flight redundancy](#first-flight-redundancy) | on | sends each connection's handshake and first 64 KiB twice | `ssctl set-redundancy` |
 | [Drift guard](#drift-guard) | on, every 5 s | keeps skyline_cc and `fq` in place | `[guard]` |
+| [Send buffer ceiling](#send-buffer-ceiling) | at least 64 MiB while attached | raises the most a TCP socket may buffer for sending | `[guard] tcp_wmem_max` |
 | [Dynamic RTO floor and ceiling](#dynamic-rto-floor-and-ceiling) | off | bounds each connection's retransmission timeout | `ssctl set-rack-rto` |
 | [Retransmit DSCP marking](#retransmit-dscp-marking) | off | marks retransmissions for the network upstream | `ssctl set-retransmit-dscp` |
 | [Global loss-detection sysctls](#global-loss-detection-sysctls) | the host's own | three `net.ipv4` sysctls the daemon can set at start | `[rack_tuning]` |
@@ -164,7 +165,7 @@ ssctl disable --module loss-classifier        # one module off, the others as th
 
 `ssctl enable` without `--modules` keeps the current set, so after `--modules` or `--all-off` name all four to turn everything on again. With all four off, `skyline_cc` behaves like the kernel's own TCP: a neutral baseline for comparisons.
 
-`ssctl enable` takes effect host-wide: on a successful attach it sets `net.ipv4.tcp_congestion_control = skyline_cc`, so every new TCP connection on the machine uses it, while connections already open keep the algorithm they started with. It also puts `fq` in place, arms the [drift guard](#drift-guard) and starts [first-flight redundancy](#first-flight-redundancy). `ssctl drain` hands new connections to `fallback_cc` and stops both.
+`ssctl enable` takes effect host-wide: on a successful attach it sets `net.ipv4.tcp_congestion_control = skyline_cc`, so every new TCP connection on the machine uses it, while connections already open keep the algorithm they started with. It also puts `fq` in place, raises the [send buffer ceiling](#send-buffer-ceiling), arms the [drift guard](#drift-guard) and starts [first-flight redundancy](#first-flight-redundancy). `ssctl drain` hands new connections to `fallback_cc`, puts the send buffer ceiling back, and stops the guard and the redundancy.
 
 ### Coefficients
 
@@ -220,6 +221,17 @@ qdisc = true      # false: leave every qdisc to you and keep only the congestion
 ```
 
 `ssctl status` shows it under *DRIFT GUARD*: `ARMED`, each of the three with its current value and how many times it was put back, the last correction, the last error (kept until the next one, so it can be old), and a `note` for anything it deliberately left alone.
+
+### Send buffer ceiling
+
+On while skyline_cc is attached. The kernel lets one TCP socket buffer at most 4 MiB for sending by default (the third field of `net.ipv4.tcp_wmem`): data in flight plus what waits behind a loss. On a long path with loss -- a VPN server's -- that fills up, and the application stalls while the link is far from full. `ssctl enable` raises that maximum to 64 MiB when it is lower, the drift guard keeps it there, and `ssctl drain` puts back the value it replaced, unless something else changed it in the meantime. It only lifts the ceiling: the kernel still sizes each socket's buffer to what the connection needs, `net.ipv4.tcp_mem` still bounds the total, and a larger maximum the host already has is never lowered. The cost is memory, and only on connections that use it. The receiving side's `tcp_rmem` is the clients' to raise.
+
+```toml
+[guard]
+tcp_wmem_max = 67108864   # bytes; 0: leave net.ipv4.tcp_wmem to you
+```
+
+`ssctl status` shows it under *DRIFT GUARD* as `tcp_wmem maximum`: the value now, how many times it was raised, and `drain puts back 4 MiB`, the value it replaced.
 
 ### Dynamic RTO floor and ceiling
 
@@ -306,7 +318,7 @@ From 0.5.0, a misspelt key or one in the wrong section fails `--validate-only`, 
 | fallback on drain | `fallback_cc`: what new connections get after `ssctl drain`; the installer sets it to the one the host's sysctl files select at boot, when this kernel has it -- on a fresh install, and again on every upgrade or reinstall unless you set it yourself |
 | modules | M1-M4; a tick means acting on traffic now, so nothing is ticked while detached |
 | live connections | connections on skyline_cc now |
-| DRIFT GUARD | see [Drift guard](#drift-guard) |
+| DRIFT GUARD | see [Drift guard](#drift-guard); `tcp_wmem maximum`, see [Send buffer ceiling](#send-buffer-ceiling) |
 | KERNEL | the kernel release; every item on `required` must be ticked. `RACK reorder hook` under `optional` needs a patched kernel, and grey is normal |
 | GLOBAL SYSCTLS | see [Global loss-detection sysctls](#global-loss-detection-sysctls) |
 | DAEMON | uptime, and the configuration generation, which goes up whenever the modules, the coefficients or the RTO bounds change |

@@ -167,8 +167,14 @@ careful around the code that touches them.
    root qdisc of `runtime.tc_interface` (`fq`, or `mq` over `fq` on a
    multi-queue NIC; when that is a VLAN, bond or bridge whose root is
    `noqueue`, the NICs with a `device` link under it instead, never a tap or
-   veth). From `enable` to `drain` the daemon is the only writer of all three
-   (after a drain, `apply-guest-profile.sh` and `install.sh --uninstall` set
+   veth). Unless `[guard] tcp_wmem_max = 0` it also raises the maximum of
+   `net.ipv4.tcp_wmem` to at least that value -- never lowers it -- and keeps it
+   there; `drain` puts back what the first raise replaced, right after
+   `fallback_cc` and under the same lock, only while the sysctl still reads
+   what the daemon wrote (something else that changed it meant it). The
+   original is also kept in `/run/skyline-speeder/tcp-wmem-hold`, so a daemon
+   restarted in between still puts it back. From `enable` to `drain` the
+   daemon is the only writer of all of them (after a drain, `apply-guest-profile.sh` and `install.sh --uninstall` set
    qdiscs of their own). `boot-enable.sh` used to write `default_qdisc=fq` once
    at boot and no longer does -- do not add it back: it cannot change a NIC's
    existing root qdisc, and two writers of one setting drift apart. Related

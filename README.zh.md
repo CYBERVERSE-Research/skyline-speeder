@@ -138,6 +138,7 @@ Rust 编写的 `skyline-speederd` 加载 BPF 程序（都要过内核验证器�
 | [系数](#系数) | 调好的值 | 增益、护栏、上限、起步行为 | `ssctl set-module-config` |
 | [首轮冗余](#首轮冗余) | 开 | 每条连接的握手和前 64 KiB 发两份 | `ssctl set-redundancy` |
 | [拥塞控制与 qdisc 守护](#拥塞控制与-qdisc-守护) | 开，每 5 秒检查 | 守住 skyline_cc 和 `fq` | `[guard]` |
+| [发送缓冲上限](#发送缓冲上限) | 挂载期间至少 64 MiB | 调高单个 TCP socket 最多能缓存的待发送数据 | `[guard] tcp_wmem_max` |
 | [动态 RTO 上下限](#动态-rto-上下限) | 关 | 给每条连接的重传超时设上下限 | `ssctl set-rack-rto` |
 | [重传包 DSCP 标记](#重传包-dscp-标记) | 关 | 给重传包打标记，供上游网络区别对待 | `ssctl set-retransmit-dscp` |
 | [全局丢包检测 sysctl](#全局丢包检测-sysctl) | 用主机自己的值 | daemon 启动时可以代为写入的三个 `net.ipv4` sysctl | `[rack_tuning]` |
@@ -166,7 +167,7 @@ ssctl disable --module loss-classifier        # 只关一个，其余不变
 
 不带 `--modules` 的 `ssctl enable` 沿用当前的模块集合，所以执行过 `--modules` 或 `--all-off` 之后，要把四个都写上才回到全开。四个全关时，`skyline_cc` 的表现与内核自带的 TCP 一致，可以当作对比测试的中性基准。
 
-`ssctl enable` 是全机生效的：挂载成功后会写 `net.ipv4.tcp_congestion_control = skyline_cc`，这台机器上所有新建 TCP 连接都会用它，已经建立的连接保持原来的算法。它还会把 `fq` 设好、武装[守护](#拥塞控制与-qdisc-守护)、启动[首轮冗余](#首轮冗余)。`ssctl drain` 让新连接改走 `fallback_cc`，并停掉后两者。
+`ssctl enable` 是全机生效的：挂载成功后会写 `net.ipv4.tcp_congestion_control = skyline_cc`，这台机器上所有新建 TCP 连接都会用它，已经建立的连接保持原来的算法。它还会把 `fq` 设好、调高[发送缓冲上限](#发送缓冲上限)、武装[守护](#拥塞控制与-qdisc-守护)、启动[首轮冗余](#首轮冗余)。`ssctl drain` 让新连接改走 `fallback_cc`，把发送缓冲上限改回原值，并停掉守护和首轮冗余。
 
 ### 系数
 
@@ -222,6 +223,17 @@ qdisc = true      # false：qdisc 完全交给你，只守拥塞控制
 ```
 
 `ssctl status` 的 *DRIFT GUARD* 段落显示它：`ARMED`，三项各自的当前值和被改回的次数，最近一次纠正，最近一次错误（保留到下一次出错为止，可能是很久以前的），以及刻意没动的东西（`note`）。
+
+### 发送缓冲上限
+
+skyline_cc 挂载期间开启。内核默认只让单个 TCP socket 最多缓存 4 MiB 待发送的数据（`net.ipv4.tcp_wmem` 的第三项）：包括在途的数据，以及排在丢包后面等待的数据。在有丢包的长距离路径上（VPN 服务器的常态），这 4 MiB 会被占满，应用随之卡住，而链路远没有跑满。`ssctl enable` 在这个上限低于 64 MiB 时把它调到 64 MiB，守护会一直保持住，`ssctl drain` 再把被替换掉的原值写回去，除非期间有别的东西改过它。它只抬高上限：每个 socket 的缓冲仍由内核按连接的需要自动调整，总量仍受 `net.ipv4.tcp_mem` 限制，主机原本就更大的上限也绝不会被调低。代价是内存，而且只花在真正用得到的连接上。接收端的 `tcp_rmem` 要由客户端自己调高。
+
+```toml
+[guard]
+tcp_wmem_max = 67108864   # 字节；0：net.ipv4.tcp_wmem 交给你自己管
+```
+
+`ssctl status` 的 *DRIFT GUARD* 段落里的 `tcp_wmem maximum` 一行显示它：当前值、被调高的次数，以及 `drain puts back 4 MiB`，即被替换掉的原值。
 
 ### 动态 RTO 上下限
 
@@ -308,7 +320,7 @@ sudo systemctl restart skyline-speederd    # 挂载服务随之重新挂载 skyl
 | fallback on drain | `fallback_cc`：`ssctl drain` 之后新连接用什么算法；如果主机的 sysctl 文件在开机时指定了一个本内核有的算法，安装脚本就把它设为该算法——全新安装时如此，之后每次升级或重装也会重新设置，除非你自己改过它 |
 | modules | M1-M4；打勾表示此刻正作用于流量，所以没挂载时一个都不打勾 |
 | live connections | 此刻跑在 skyline_cc 上的连接数 |
-| DRIFT GUARD | 见[拥塞控制与 qdisc 守护](#拥塞控制与-qdisc-守护) |
+| DRIFT GUARD | 见[拥塞控制与 qdisc 守护](#拥塞控制与-qdisc-守护)；`tcp_wmem maximum` 一行见[发送缓冲上限](#发送缓冲上限) |
 | KERNEL | 内核版本；`required` 一行必须全部打勾。`optional` 里的 `RACK reorder hook` 需要打过补丁的内核，灰色是正常的 |
 | GLOBAL SYSCTLS | 见[全局丢包检测 sysctl](#全局丢包检测-sysctl) |
 | DAEMON | 运行时长，以及配置代际号：模块、系数或 RTO 上下限每变一次就加一 |
