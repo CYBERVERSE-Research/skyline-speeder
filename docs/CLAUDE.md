@@ -7,13 +7,14 @@ change".
 
 | Document | Reader and content |
 |---|---|
-| `README.md` / `README.zh.md` | Users, in the order a newcomer needs it: what it is → the kernel requirement → quick start → how it works and how the three algorithms differ → configuration (what a default install runs, a subsection per feature, and what every line of `ssctl status` and `ssctl flows` means) → layout → building from source → documentation → measured performance → contributing → license. The English and Chinese READMEs say the same thing |
+| `README.md` and its six translations (`README.zh.md`, `.zh-TW`, `.ja`, `.ko`, `.ru`, `.fr`) | Users, short: what it is → requirements → quick start → advanced usage (installing from a clone, everyday `ssctl` commands, the documentation table) → a summary of the measured performance → license. All seven say the same thing, with the same headings, tables and code blocks (only comments in code are translated) |
+| `docs/01-features.md` | Everything the README leaves out, in English: what the installer does → how it works and how the three algorithms differ → configuration (what a default install runs, a subsection per feature, and what every line of `ssctl status` and `ssctl flows` means) → layout → building from source → the measured performance in full |
 | `DEPLOY.md` | **The one deployment and operations manual**, written for automation agents and followed by people: prerequisites, every installer step, verification gates, the cgroup, the guard, upgrades, removal, troubleshooting |
 | `docs/usage.md` | Newcomers: every switch and parameter, four presets, dynamic RTO, DSCP, finding the cause of a stalled connection |
 | `docs/02-interface-reference.md` | `ssctl` commands, the wire protocol, status fields and counters, ABI versions, configuration fields, event codes, guard rules |
 | `docs/03-design.md` | How each module works, the trade-offs, open questions |
 | `docs/04-performance-report.md` | The two-VM test bed's data, what it does and does not show, its limits |
 | `research/experiments/README.md` | The experiment harness and how to reproduce a run |
-| `research/experiments/single-ended/README.md`, `RESULTS.md` | The one-path field comparison of bbr, tcp-brutal and skyline_cc: method, per-run data, raw records and the scripts to reproduce it; the README's measured-performance figures and numbers come from here. Not test-bed data, and never in `docs/04-performance-report.md` |
+| `research/experiments/single-ended/README.md`, `RESULTS.md` | The one-path field comparison of bbr, tcp-brutal and skyline_cc: method, per-run data, raw records and the scripts to reproduce it; the measured-performance figures of the READMEs and `docs/01-features.md` and numbers come from here. Not test-bed data, and never in `docs/04-performance-report.md` |
 | `CONTRIBUTING.md` | The conventions of the `CLAUDE.md` files, for human contributors |
 | `CLAUDE.md` and the `CLAUDE.md` in `bpf/`, `crates/`, `config/`, `packaging/`, `infra/` and `docs/` | AI coding agents: the root file is loaded in every session and holds the repository-wide rules and an index; each directory's file is loaded once an agent reads or edits a file there and holds that directory's details |
