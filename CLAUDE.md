@@ -77,12 +77,13 @@ The `CLAUDE.md` files are public: no host addresses, account names, tokens or pe
 
 ## Every change
 
-- **Language (hard rule):** `README.zh.md` is the only Chinese file; everything else -- docs, comments, script and
-  report output, test strings, commits, PRs -- is English. The two READMEs change together.
+- **Language (hard rule):** the README's six translations (`README.zh.md`, `.zh-TW`, `.ja`, `.ko`, `.ru`, `.fr`) are
+  the only non-English files; everything else -- docs, comments, script and report output, test strings, commits,
+  PRs -- is English. The seven READMEs change together; the details live in `docs/01-features.md`, English only.
 - **Docs to update** (full table in `CONTRIBUTING.md`): ABI struct → its version + `docs/02` section 5; `ssctl` command
   or field → `docs/02`; config field → `config/*.toml` + `docs/02` section 6; install flow → `DEPLOY.md`, `install.sh`,
   `scripts/bootstrap.sh` (and the READMEs and `docs/usage.md` where they describe it); a new feature, default or report
-  wording in `crates/ssctl/src/view.rs` → both READMEs' feature table, its subsection and the report key
+  wording in `crates/ssctl/src/view.rs` → `docs/01-features.md`'s feature table, its subsection and the report key
   (`cargo test -p ssctl -- --nocapture renders_for_review` prints both reports); an invariant → its directory's
   `CLAUDE.md`, `CONTRIBUTING.md` and the PR template's Invariants list; algorithm behaviour → `docs/03`.
 - **Does it need a release?** Every PR answers in its "Prebuilt release" section. The one-line install takes the latest

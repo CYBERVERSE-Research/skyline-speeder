@@ -65,8 +65,8 @@ Key points:
   different pieces of code but conditional branches in the same code (see the bit definitions in
   `docs/02-interface-reference.md` section 7).
 
-What each of the `bpf/`/`crates/`/`infra/`/`config/` directories is responsible for is in the README's "Repository
-layout" section and in the comments at the top of the sources; the interfaces are in
+What each of the `bpf/`/`crates/`/`infra/`/`config/` directories is responsible for is in the "Repository
+layout" section of `docs/01-features.md` and in the comments at the top of the sources; the interfaces are in
 `docs/02-interface-reference.md`; this document covers only the mechanisms themselves.
 
 IPv4/IPv6 dual stack: the control plane (the Rust side) has no notion of addresses at all -- it knows only interface

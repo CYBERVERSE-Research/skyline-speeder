@@ -241,14 +241,15 @@ and **must not be used to draw performance conclusions**.
 
 | Document | Reader and content |
 |---|---|
-| `README.md` / `README.zh.md` | Users, in the order a newcomer needs it: what it is, the kernel requirement, quick start, how it works and how the three algorithms differ, configuration (what a default install runs, a subsection per feature, and what every line of `ssctl status` and `ssctl flows` means), layout, building, documentation, measured performance, contributing, license. The two say the same thing |
+| `README.md` and its translations `README.zh.md` (Simplified Chinese), `README.zh-TW.md`, `README.ja.md`, `README.ko.md`, `README.ru.md`, `README.fr.md` | Users, short: what it is, the requirements, quick start, advanced usage (installing from a clone, the everyday `ssctl` commands, the documentation), a summary of the measured performance, license. All seven say the same thing |
+| `docs/01-features.md` | Everything the README leaves out: what the installer does, how it works and how the three algorithms differ, configuration (what a default install runs, a subsection per feature, and what every line of `ssctl status` and `ssctl flows` means), layout, building from source, the measured performance in full |
 | `DEPLOY.md` | The one deployment and operations manual, written for automation agents and followed by people: prerequisites, every installer step, verification gates, the cgroup, the guard, upgrades, removal, troubleshooting |
 | `docs/usage.md` | Newcomers: every switch and parameter, four presets, dynamic RTO, DSCP, finding the cause of a stalled connection |
 | `docs/02-interface-reference.md` | `ssctl` commands, the wire protocol, status fields and counters, ABI versions, configuration fields, event codes, guard rules |
 | `docs/03-design.md` | How each module works, the trade-offs, open questions |
 | `docs/04-performance-report.md` | The two-VM test bed's data, what it does and does not show |
 | `research/experiments/README.md` | The experiment harness and how to reproduce a run |
-| `research/experiments/single-ended/` | The one-path field comparison of bbr, tcp-brutal and skyline_cc the README's performance section cites; not test-bed data |
+| `research/experiments/single-ended/` | The one-path field comparison of bbr, tcp-brutal and skyline_cc the performance sections of the READMEs and `docs/01-features.md` cite; not test-bed data |
 | `CLAUDE.md` and the `CLAUDE.md` in `bpf/`, `crates/`, `config/`, `packaging/`, `infra/` and `docs/` | The same conventions, for AI coding agents. The root file is loaded in every session and holds the repository-wide rules and an index; each directory's file is loaded when an agent reads or edits a file there and holds that directory's details |
 
 ## Documentation you must update with your change
@@ -258,17 +259,17 @@ and **must not be used to draw performance conclusions**.
 | ABI struct | `skyline_abi.h` + `crates/skyline-common` + the version that covers it (`SKYLINE_ABI_VERSION`, `SKYLINE_RTO_TUNING_ABI_VERSION`, `SKYLINE_RETRANSMIT_DSCP_ABI_VERSION` or `SKYLINE_REDUNDANCY_ABI_VERSION`) + `docs/02-interface-reference.md` section 5 |
 | `ssctl` command or field | `docs/02-interface-reference.md` |
 | Config field | `config/*.toml` + `docs/02-interface-reference.md` section 6 |
-| Install flow | `DEPLOY.md` + `install.sh` + `scripts/bootstrap.sh` (and both READMEs and `docs/usage.md` where they describe it) |
+| Install flow | `DEPLOY.md` + `install.sh` + `scripts/bootstrap.sh` (and the READMEs, `docs/01-features.md` and `docs/usage.md` where they describe it) |
 | Algorithm behaviour | `docs/03-design.md`; performance claims need data in `docs/04-performance-report.md` |
-| Anything user-facing in the README | Both `README.md` and `README.zh.md` |
-| A new feature, a changed default, or report wording in `crates/ssctl/src/view.rs` | Both READMEs' table of what a default install runs, the feature's subsection, and the line-by-line key to `ssctl status` and `ssctl flows` (`cargo test -p ssctl -- --nocapture renders_for_review` prints both reports) |
+| Anything user-facing in the README | `README.md` and all six translations |
+| A new feature, a changed default, or report wording in `crates/ssctl/src/view.rs` | `docs/01-features.md`: the table of what a default install runs, the feature's subsection, and the line-by-line key to `ssctl status` and `ssctl flows` (`cargo test -p ssctl -- --nocapture renders_for_review` prints both reports) |
 | A hard invariant or the contribution process | This file, the `CLAUDE.md` of the directory the invariant lives in (the same conventions, for AI coding agents; the root `CLAUDE.md` keeps a one-line summary of each) and the Invariants list in `.github/PULL_REQUEST_TEMPLATE.md` |
 | A release (`v*` tag) | `[workspace.package] version` in `Cargo.toml` and the three workspace crates in `Cargo.lock`; `release.yml` refuses a tag that is not exactly `v<version>`. There is no changelog to update: the repository keeps none |
 
 ## Style
 
-- **Language:** everything in this repository is English except `README.zh.md`, the Chinese twin of
-  `README.md`; the two READMEs change together.
+- **Language:** everything in this repository is English except the six translations of `README.md`:
+  `README.zh.md` (Simplified Chinese), `README.zh-TW.md`, `README.ja.md`, `README.ko.md`, `README.ru.md`, `README.fr.md`; the seven READMEs change together.
 - **Rust:** `cargo fmt` is mandatory; `make check` enforces it.
 - **BPF C:** four-space indentation.
 - **Shell:** `set -euo pipefail`; the POSIX sh scripts (`scripts/bootstrap.sh`,

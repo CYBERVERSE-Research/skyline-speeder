@@ -1302,11 +1302,12 @@ A daemon report, `/var/lib/skyline-speeder/reports/<hash>.json`, one JSON object
 
 | Document | Contents |
 |---|---|
-| [README.md](README.md) / [README.zh.md](README.zh.md) | In the order you get started: what it is, the kernel requirement, quick start, how it works, configuration (every feature, and every line of `ssctl status` / `ssctl flows`), measured performance |
+| [README.md](README.md) (and six translations) | What it is, the requirements, quick start, advanced usage, a summary of the measured performance |
+| [docs/01-features.md](docs/01-features.md) | What the installer does, how it works, configuration (every feature, and every line of `ssctl status` / `ssctl flows`), building from source, the measured performance in full |
 | [docs/usage.md](docs/usage.md) | For newcomers: every switch and parameter, the four preset recipes, dynamic RTO, DSCP, troubleshooting stalls |
 | [docs/02-interface-reference.md](docs/02-interface-reference.md) | `ssctl` commands, the wire protocol, status fields, configuration fields, event codes, guard rules |
 | [docs/03-design.md](docs/03-design.md) | The design of each module and its trade-offs |
 | [docs/04-performance-report.md](docs/04-performance-report.md) | Test-bed data, validity boundaries and limitations (section 8) |
 | [research/experiments/README.md](research/experiments/README.md) | Reproducing the performance tests in your own environment |
-| [research/experiments/single-ended/](research/experiments/single-ended/) | The field comparison on a single public Internet path cited in the README's *Measured performance*: method, per-round data, raw records and scripts (not test-bed data) |
+| [research/experiments/single-ended/](research/experiments/single-ended/) | The field comparison on a single public Internet path cited in the README's *Measured performance* and in `docs/01-features.md`: method, per-round data, raw records and scripts (not test-bed data) |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Building, the verifier, hard invariants, the release process |

@@ -40,10 +40,10 @@ Kernel it ran on: `uname -r` =
 - [ ] ABI change → `skyline_abi.h` + `crates/skyline-common` + the version that covers it + `docs/02-interface-reference.md` §5
 - [ ] `ssctl` command or field → `docs/02-interface-reference.md`
 - [ ] Config field → `config/*.toml` + `docs/02-interface-reference.md` §6
-- [ ] Install flow → `DEPLOY.md` + `install.sh` + `scripts/bootstrap.sh` (and both READMEs and `docs/usage.md` where they describe it)
+- [ ] Install flow → `DEPLOY.md` + `install.sh` + `scripts/bootstrap.sh` (and the READMEs, `docs/01-features.md` and `docs/usage.md` where they describe it)
 - [ ] Algorithm behaviour → `docs/03-design.md`
-- [ ] User-facing README change → **both** `README.md` and `README.zh.md`
-- [ ] New feature, changed default or `ssctl` report wording → both READMEs' feature table, the feature's subsection, and the key to `ssctl status` / `ssctl flows`
+- [ ] User-facing README change → `README.md` **and** its six translations (`zh`, `zh-TW`, `ja`, `ko`, `ru`, `fr`)
+- [ ] New feature, changed default or `ssctl` report wording → `docs/01-features.md`: the feature table, the feature's subsection, and the key to `ssctl status` / `ssctl flows`
 - [ ] Invariant or contribution process → the directory's `CLAUDE.md` (and its summary in the root `CLAUDE.md`) + `CONTRIBUTING.md` + this template
 - [ ] Release → `Cargo.toml` version + `Cargo.lock` (no changelog: the repository keeps none)
 
