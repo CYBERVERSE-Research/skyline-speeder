@@ -11,9 +11,11 @@ use skyline_common::{
     Module, ModuleTuningConfig, RackRtoConfig, RedundancyConfig, Request, Response,
     RetransmitDscpConfig,
 };
+use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use style::{ColorChoice, Theme};
 
 #[derive(Debug, Parser)]
@@ -74,6 +76,12 @@ enum Command {
     /// `status`.
     #[command(visible_alias = "flow")]
     Flows,
+    /// Write the complete status JSON to a file, for scripts to collect.
+    ///
+    /// ssctl writes it, as the user running it, from a status reply: a
+    /// relative path is relative to the current directory. Only a regular
+    /// file is written; a symbolic link, directory, device or FIFO is
+    /// refused.
     Snapshot {
         path: PathBuf,
     },
@@ -263,7 +271,8 @@ fn request(command: Command) -> Request {
         Command::Disable { module } => Request::DisableModule { module },
         Command::Status => Request::Status,
         Command::Flows => Request::Flows,
-        Command::Snapshot { path } => Request::Snapshot { path },
+        // The file is written here, from the status the reply carries.
+        Command::Snapshot { .. } => Request::Status,
         Command::Drain { timeout } => Request::Drain { timeout_s: timeout },
         Command::SetRackRto {
             disable,
@@ -385,14 +394,28 @@ fn run(arguments: Arguments, theme: &Theme, feedback: &Feedback) -> Result<i32> 
     // a drain that timed out, a value out of range -- are the command
     // working as documented.
     let enable = matches!(arguments.command, Command::Enable { .. });
+    let snapshot = match &arguments.command {
+        Command::Snapshot { path } => Some(path.clone()),
+        _ => None,
+    };
     let request = request(arguments.command);
-    let wants = View::of(&request);
+    let wants = if snapshot.is_some() {
+        View::Action
+    } else {
+        View::of(&request)
+    };
     serde_json::to_writer(&mut stream, &request)?;
     stream.write_all(b"\n")?;
 
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
-    let response: Response = serde_json::from_str(line.trim()).context("decode daemon response")?;
+    let mut response: Response =
+        serde_json::from_str(line.trim()).context("decode daemon response")?;
+    if let Some(path) = &snapshot {
+        if response.ok {
+            take_snapshot(&mut response, path);
+        }
+    }
 
     if arguments.json {
         // Unchanged from 0.2.0, deliberately: this is what install.sh, the
@@ -419,6 +442,45 @@ fn run(arguments: Arguments, theme: &Theme, feedback: &Feedback) -> Result<i32> 
         }
         Ok(1)
     }
+}
+
+/// Writes the status a reply carries to `path` and says so in the reply's
+/// message, which is then printed as for any action. A file that cannot be
+/// written turns the reply into a failure: that is the command working as
+/// documented, so it asks for no report.
+fn take_snapshot(response: &mut Response, path: &Path) {
+    let written = match &response.status {
+        Some(status) => serde_json::to_vec_pretty(status)
+            .map_err(anyhow::Error::from)
+            .and_then(|payload| write_snapshot(path, &payload)),
+        None => Err(anyhow::anyhow!("the daemon's reply carries no status")),
+    };
+    match written {
+        Ok(()) => response.message = format!("snapshot written to {}", path.display()),
+        Err(error) => {
+            response.ok = false;
+            response.message = format!("write snapshot {}: {error:#}", path.display());
+        }
+    }
+}
+
+/// Only ever to a regular file: never through a symlink, never to a device
+/// (`ssctl snapshot /dev/sda`, when the daemon wrote it as root, put JSON
+/// over the start of a disk), and never to a FIFO, whose open would block
+/// until something read it. A FIFO without a reader fails to open
+/// (O_NONBLOCK); a device opens, and is refused before anything is written.
+fn write_snapshot(path: &Path, payload: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        anyhow::bail!("not a regular file");
+    }
+    file.set_len(0)?;
+    file.write_all(payload)?;
+    Ok(())
 }
 
 /// Writes a report to stdout. A reader that has what it wanted may close the
@@ -696,5 +758,44 @@ mod tests {
         };
         let shipped = SkylineConfig::load("../../config/speeder.toml").expect("load config");
         assert_eq!(from_cli, ModuleTuningConfig::from_config(&shipped));
+    }
+
+    #[test]
+    fn a_snapshot_asks_for_the_status_and_is_written_here() {
+        let arguments = Arguments::parse_from(["ssctl", "snapshot", "status.json"]);
+        assert!(matches!(request(arguments.command), Request::Status));
+
+        let mut response = Response {
+            ok: true,
+            message: "status returned".to_owned(),
+            status: None,
+            flows: None,
+        };
+        take_snapshot(&mut response, Path::new("unused.json"));
+        assert!(!response.ok, "a reply without a status writes nothing");
+        assert!(!Path::new("unused.json").exists());
+    }
+
+    #[test]
+    fn a_snapshot_is_only_written_to_a_regular_file() {
+        let dir = std::env::temp_dir().join(format!("ssctl-snapshot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let file = dir.join("status.json");
+        write_snapshot(&file, b"one").expect("a new file");
+        write_snapshot(&file, b"two").expect("an existing file");
+        assert_eq!(std::fs::read(&file).expect("read"), b"two");
+
+        let target = dir.join("target");
+        std::fs::write(&target, b"keep").expect("seed");
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert!(write_snapshot(&link, b"over").is_err());
+        assert_eq!(std::fs::read(&target).expect("read"), b"keep");
+
+        assert!(write_snapshot(&dir, b"over").is_err());
+        let error = write_snapshot(Path::new("/dev/null"), b"over").expect_err("a device");
+        assert_eq!(format!("{error:#}"), "not a regular file");
+        std::fs::remove_dir_all(&dir).expect("clean up");
     }
 }

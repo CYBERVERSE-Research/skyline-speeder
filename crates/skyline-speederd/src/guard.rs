@@ -42,7 +42,8 @@ use skyline_common::{GuardDevice, GuardLive, GuardStatus, SkylineConfig};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
-use std::path::Path;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -279,7 +280,33 @@ fn reap_later(mut child: process::Child, unreaped: &'static AtomicUsize) {
     }
 }
 
-/// Runs `program` and returns its stdout, killing it after `timeout`. A
+/// The directories a program this daemon runs (`tc`, `ss`) is taken from,
+/// in order: the ones iproute2 installs into on every supported
+/// distribution, and never the inherited PATH, which the service manager,
+/// or whoever started the daemon by hand, decides. Running as root, the
+/// daemon would otherwise run whatever a writable directory early in that
+/// PATH held under the name `tc`.
+const SYSTEM_PROGRAM_DIRS: [&str; 4] = ["/usr/sbin", "/sbin", "/usr/bin", "/bin"];
+
+/// The first `SYSTEM_PROGRAM_DIRS` entry holding an executable `name`;
+/// when none does, the path under the first one, so running it fails as a
+/// missing program does (NotFound), which the callers turn into "not
+/// installed". Looked up on every run, so an iproute2 installed after the
+/// daemon started is found.
+pub(crate) fn system_program(name: &str) -> PathBuf {
+    SYSTEM_PROGRAM_DIRS
+        .iter()
+        .map(|dir| Path::new(dir).join(name))
+        .find(|path| {
+            fs::metadata(path)
+                .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+                .unwrap_or(false)
+        })
+        .unwrap_or_else(|| Path::new(SYSTEM_PROGRAM_DIRS[0]).join(name))
+}
+
+/// Runs `program` (looked up by `system_program`) and returns its stdout,
+/// killing it after `timeout`. A
 /// non-zero exit is an error carrying its stderr. A program killed at the
 /// timeout (or that could not be waited for) is reaped in the background and
 /// counted in `unreaped` until it exits; this returns at once either way.
@@ -290,7 +317,7 @@ pub(crate) fn run_bounded(
     unreaped: &'static AtomicUsize,
 ) -> Result<String> {
     let rendered = format!("{program} {}", args.join(" "));
-    let mut child = Command::new(program)
+    let mut child = Command::new(system_program(program))
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1439,6 +1466,20 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn programs_come_from_the_system_directories_not_the_path() {
+        // sh is in /bin (or /usr/bin) everywhere this runs.
+        let sh = system_program("sh");
+        assert!(SYSTEM_PROGRAM_DIRS
+            .iter()
+            .any(|dir| sh.parent() == Some(Path::new(dir))));
+        assert!(sh.is_file(), "{}", sh.display());
+        assert_eq!(
+            system_program("skyline-no-such-program"),
+            Path::new("/usr/sbin/skyline-no-such-program")
+        );
     }
 
     #[test]
